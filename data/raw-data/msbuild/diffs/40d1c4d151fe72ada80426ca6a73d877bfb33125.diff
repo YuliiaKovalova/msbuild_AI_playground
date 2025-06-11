@@ -1,0 +1,177 @@
+diff --git a/NuGet.config b/NuGet.config
+index d7187b4d64a..c652ed068be 100644
+--- a/NuGet.config
++++ b/NuGet.config
+@@ -1,4 +1,4 @@
+-<?xml version="1.0" encoding="utf-8"?>
++﻿<?xml version="1.0" encoding="utf-8"?>
+ <configuration>
+   <packageSources>
+     <clear />
+@@ -9,6 +9,7 @@
+     <add key="dotnet8" value="https://dnceng.pkgs.visualstudio.com/public/_packaging/dotnet8/nuget/v3/index.json" />
+     <add key="dotnet8-transport" value="https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet8-transport/nuget/v3/index.json" />
+     <add key="BuildXL" value="https://pkgs.dev.azure.com/ms/BuildXL/_packaging/BuildXL/nuget/v3/index.json" />
++    <add key="NuGet" value="https://api.nuget.org/v3/index.json" />
+   </packageSources>
+   <disabledPackageSources />
+ </configuration>
+diff --git a/eng/Packages.props b/eng/Packages.props
+index 6f4d99b91a9..bd2477cc46d 100644
+--- a/eng/Packages.props
++++ b/eng/Packages.props
+@@ -2,7 +2,6 @@
+   <!-- Import references updated by Dependabot.
+        This file is for package references updated manually or by Darc/Maestro. -->
+   <Import Project="dependabot\Packages.props" />
+-
+   <!--
+     Make sure to update the binding redirects (in src\MSBuild\app.config and src\MSBuild\app.amd64.config) for any changes to
+     the list of assemblies redistributed by MSBuild (non-MSBuild assemblies in the .vsix package).
+@@ -30,6 +29,7 @@
+     <PackageVersion Include="System.Text.Json" Version="$(SystemTextJsonVersion)" />
+     <PackageVersion Include="System.Threading.Channels" Version="$(SystemThreadingChannelsVersion)" />
+     <PackageVersion Include="System.Threading.Tasks.Dataflow" Version="$(SystemThreadingTasksDataflowVersion)" />
++    <PackageVersion Include="wasmtime" Version="19.0.1" />
+     <PackageVersion Include="xunit.console" Version="$(XUnitVersion)" />
+   </ItemGroup>
+-</Project>
++</Project>
+\ No newline at end of file
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index 8bb06dd496f..d810fe19f35 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -195,6 +195,7 @@
+     <Compile Include="CombinePath.cs" />
+     <Compile Include="CommandLineBuilderExtension.cs" />
+     <Compile Include="ResourceHandling\*.cs" />
++    <Compile Include="WasmTask.cs" />
+     <Compile Include="GetCompatiblePlatform.cs" />
+     <Compile Include="SetRidAgnosticValueForProjects.cs" />
+     <Compile Include="BuildCacheDisposeWrapper.cs" />
+@@ -671,6 +672,7 @@
+     <PackageReference Include="Microsoft.IO.Redist" Condition="'$(FeatureMSIORedist)' == 'true'" />
+     <PackageReference Include="System.Collections.Immutable" />
+     <PackageReference Include="System.Resources.Extensions" />
++    <PackageReference Include="wasmtime" />
+   </ItemGroup>
+ 
+   <!-- Mimics AddRefAssemblies from MSBuild.csproj -->
+diff --git a/src/Tasks/Microsoft.Common.tasks b/src/Tasks/Microsoft.Common.tasks
+index 35018eb1918..0487c0a422a 100644
+--- a/src/Tasks/Microsoft.Common.tasks
++++ b/src/Tasks/Microsoft.Common.tasks
+@@ -81,6 +81,7 @@
+   <UsingTask TaskName="Microsoft.Build.Tasks.ResolveNativeReference"                AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.ResolveNonMSBuildProjectOutput"        AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.ResolveSDKReference"                   AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
++  <UsingTask TaskName="Microsoft.Build.Tasks.WasmTask"                              AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.SetRidAgnosticValueForProjects"        AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.SGen"                                  AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.SignFile"                              AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+diff --git a/src/Tasks/WasmTask.cs b/src/Tasks/WasmTask.cs
+new file mode 100644
+index 00000000000..2f30096058e
+--- /dev/null
++++ b/src/Tasks/WasmTask.cs
+@@ -0,0 +1,99 @@
++using System;
++using System.IO;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Utilities;
++using Wasmtime;
++
++#nullable disable
++
++namespace Microsoft.Build.Tasks
++{
++
++    public class WasmTask : Task
++    {
++        [Required]
++        public string WasmFilePath { get; set; }
++
++        // public string[] Arguments { get; set; }
++        // TBD
++        public bool EnableTmp { get; set; } = false;
++
++        // TBD outputs
++        public string HomeDir { get; set; } = null;
++
++        public bool InheritEnv { get; set; } = false;
++
++        public bool EnableIO { get; set; } = true;
++
++        public override bool Execute()
++        {
++            try
++            {
++                using var engine = new Engine();
++                using var module = Module.FromFile(engine, WasmFilePath);
++                using var linker = new Linker(engine);
++                linker.DefineWasi(); // important and not documented clearly in wasmtime-dotnet!
++
++                var wasiConfigBuilder = new WasiConfiguration();
++
++                if (InheritEnv)
++                {
++                    wasiConfigBuilder = wasiConfigBuilder.WithInheritedEnvironment();
++                }
++                string tmpPath = "tmp"; // TBD
++                if (EnableTmp)
++                {
++                    Directory.CreateDirectory(tmpPath);
++                    wasiConfigBuilder = wasiConfigBuilder.WithPreopenedDirectory(tmpPath, "tmp");
++                }
++                if (HomeDir != null)
++                {
++                    wasiConfigBuilder = wasiConfigBuilder.WithPreopenedDirectory(".", HomeDir);
++                }
++
++                if (EnableIO)
++                {
++                    wasiConfigBuilder = wasiConfigBuilder.WithStandardOutput("output.txt")
++                                                         .WithStandardError("error.txt");
++                }
++
++                using var store = new Store(engine);
++                store.SetWasiConfiguration(wasiConfigBuilder);
++
++                Instance instance = linker.Instantiate(store, module);
++                Action fn = instance.GetAction("execute"); // TBD parameters
++
++                if (fn == null)
++                {
++                    Log.LogError("Function 'execute' not found in the WebAssembly module.");
++                    return false;
++                }
++
++                fn.Invoke();
++            }
++            catch (Exception ex)
++            {
++                Log.LogErrorFromException(ex, true);
++                return false;
++            }
++            finally
++            {
++                if (EnableTmp)
++                {
++                    Directory.Delete("tmp", true);
++                }
++            }
++
++            if (EnableIO)
++            {
++                string output = File.ReadAllText("output.txt");
++                string error = File.ReadAllText("error.txt");
++
++                Log.LogMessage(MessageImportance.Normal, $"Output: {output}");
++                Log.LogMessage(MessageImportance.Normal, $"Error: {error}");
++            }
++
++            return true; // TBD return result of the function
++        }
++    }
++}

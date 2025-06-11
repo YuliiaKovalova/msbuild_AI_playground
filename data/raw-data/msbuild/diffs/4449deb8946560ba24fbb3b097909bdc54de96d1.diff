@@ -1,0 +1,183 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 9c59416ea49..0eeae6a3a94 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -634,7 +634,8 @@ ILoggingService InitializeLoggingService()
+                     _buildParameters.ForwardingLoggers,
+                     _buildParameters.WarningsAsErrors,
+                     _buildParameters.WarningsNotAsErrors,
+-                    _buildParameters.WarningsAsMessages);
++                    _buildParameters.WarningsAsMessages,
++                    out ILogger buildCheckLogger);
+ 
+                 _nodeManager.RegisterPacketHandler(NodePacketType.LogMessage, LogMessagePacket.FactoryForDeserialization, loggingService as INodePacketHandler);
+ 
+@@ -2951,6 +2952,34 @@ private void OnProjectStarted(object sender, ProjectStartedEventArgs e)
+             });
+         }
+ 
++        public void AttachBuildCheckForReplay(
++            IEnumerable<ILogger> loggers,
++            IEnumerable<ForwardingLoggerRecord> forwardingLoggers,
++            ISet<string> warningsAsErrors,
++            ISet<string> warningsNotAsErrors,
++            ISet<string> warningsAsMessages,
++            out ILogger buildCheckLogger)
++        {
++            _buildParameters = new BuildParameters
++            {
++                MaxNodeCount = 1,
++                IsBuildCheckEnabled = true
++            };
++
++            lock (_syncLock)
++            {
++                AttachDebugger();
++
++                CreateLoggingService(
++                loggers,
++                forwardingLoggers,
++                warningsAsErrors,
++                warningsNotAsErrors,
++                warningsAsMessages,
++                out buildCheckLogger);
++            }
++        }
++
+         /// <summary>
+         /// Creates a logging service around the specified set of loggers.
+         /// </summary>
+@@ -2959,7 +2988,8 @@ private ILoggingService CreateLoggingService(
+             IEnumerable<ForwardingLoggerRecord> forwardingLoggers,
+             ISet<string> warningsAsErrors,
+             ISet<string> warningsNotAsErrors,
+-            ISet<string> warningsAsMessages)
++            ISet<string> warningsAsMessages,
++            out ILogger buildCheckLogger)
+         {
+             Debug.Assert(Monitor.IsEntered(_syncLock));
+ 
+@@ -2998,7 +3028,7 @@ private ILoggingService CreateLoggingService(
+                     loggerSwitchParameters: null,
+                     verbosity: LoggerVerbosity.Quiet);
+ 
+-                ILogger buildCheckLogger =
++                buildCheckLogger =
+                     new BuildCheckConnectorLogger(new AnalyzerLoggingContextFactory(loggingService),
+                         buildCheckManagerProvider.Instance);
+ 
+@@ -3006,6 +3036,10 @@ private ILoggingService CreateLoggingService(
+ 
+                 forwardingLoggers = forwardingLoggers?.Concat(forwardingLogger) ?? forwardingLogger;
+             }
++            else
++            {
++                buildCheckLogger = null;
++            }
+ 
+             try
+             {
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 54ca70e61ef..9a0861f9b83 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -68,8 +68,8 @@ public void SampleAnalyzerIntegrationTest_ReplayAnalyzedBuild(bool buildInOutOfP
+         string logFile = _env.ExpectFile(".binlog").Path;
+ 
+         RunnerUtilities.ExecBootstrapedMSBuild(
+-            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -bl:{logFile} {(analysisRequested ? " -analyze" : string.Empty)}",
+-            out bool success, false, _env.Output);
++            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -bl:{logFile} {(analysisRequested ? "-analyze" : string.Empty)}",
++            out bool success);
+ 
+         success.ShouldBeTrue();
+ 
+@@ -104,13 +104,18 @@ public void SampleAnalyzerIntegrationTest_AnalyzeOnBuildReplay(bool buildInOutOf
+ 
+         RunnerUtilities.ExecBootstrapedMSBuild(
+             $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -bl:{logFile}",
+-            out bool success, false, _env.Output);
++            out bool success);
+ 
+         success.ShouldBeTrue();
+ 
++        // string output = RunnerUtilities.ExecBootstrapedMSBuild(
++        //  $"{logFile} -flp:logfile={Path.Combine(projectDirectory!, "logFile.log")};verbosity=diagnostic {(analysisRequested ? "-analyze" : string.Empty)}",
++        //  out success, false, _env.Output);
++
+         string output = RunnerUtilities.ExecBootstrapedMSBuild(
+-            $"{logFile} -flp:logfile={Path.Combine(projectDirectory!, "logFile.log")};verbosity=diagnostic {(analysisRequested ? " -analyze" : string.Empty)}",
+-            out success, false, _env.Output);
++          $"{logFile} {(analysisRequested ? "-analyze" : string.Empty)}",
++          out success, false, _env.Output);
++
+         _env.Output.WriteLine(output);
+ 
+         success.ShouldBeTrue();
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 9fa6956ae03..1499e87f9ea 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -808,7 +808,15 @@ public static ExitType Execute(
+                     // as if a build is happening
+                     if (FileUtilities.IsBinaryLogFilename(projectFile))
+                     {
+-                        ReplayBinaryLog(projectFile, loggers, distributedLoggerRecords, cpuCount);
++                        ReplayBinaryLog(
++                            projectFile,
++                            loggers,
++                            distributedLoggerRecords,
++                            cpuCount,
++                            isBuildCheckEnabled,
++                            warningsAsErrors,
++                            warningsNotAsErrors,
++                            warningsAsMessages);
+                     }
+                     else if (outputPropertiesItemsOrTargetResults && FileUtilities.IsSolutionFilename(projectFile))
+                     {
+@@ -4406,10 +4414,35 @@ private static void ReplayBinaryLog(
+             string binaryLogFilePath,
+             ILogger[] loggers,
+             IEnumerable<DistributedLoggerRecord> distributedLoggerRecords,
+-            int cpuCount)
++            int cpuCount,
++            bool isBuildCheckEnabled,
++            ISet<string> warningsAsErrors,
++            ISet<string> warningsNotAsErrors,
++            ISet<string> warningsAsMessages)
+         {
+             var replayEventSource = new BinaryLogReplayEventSource();
+ 
++            ILogger buildCheckLogger = null;
++
++            if (isBuildCheckEnabled)
++            {
++                List<ForwardingLoggerRecord> remoteLoggerRecords = new List<ForwardingLoggerRecord>();
++                foreach (DistributedLoggerRecord distRecord in distributedLoggerRecords)
++                {
++                    remoteLoggerRecords.Add(new ForwardingLoggerRecord(distRecord.CentralLogger, distRecord.ForwardingLoggerDescription));
++                }
++
++                BuildManager.DefaultBuildManager.AttachBuildCheckForReplay(
++                    loggers,
++                    remoteLoggerRecords,
++                    warningsAsErrors,
++                    warningsNotAsErrors,
++                    warningsAsMessages,
++                    out buildCheckLogger);
++
++                buildCheckLogger.Initialize(replayEventSource);
++            }
++
+             foreach (var distributedLoggerRecord in distributedLoggerRecords)
+             {
+                 ILogger centralLogger = distributedLoggerRecord.CentralLogger;
+@@ -4454,6 +4487,8 @@ private static void ReplayBinaryLog(
+             {
+                 distributedLoggerRecord.CentralLogger?.Shutdown();
+             }
++
++            buildCheckLogger?.Shutdown();
+         }
+ 
+         /// <summary>

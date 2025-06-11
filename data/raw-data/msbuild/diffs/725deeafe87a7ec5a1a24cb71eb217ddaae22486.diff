@@ -1,0 +1,145 @@
+diff --git a/documentation/specs/event-source.md b/documentation/specs/event-source.md
+index 18936da2249..cf482946781 100644
+--- a/documentation/specs/event-source.md
++++ b/documentation/specs/event-source.md
+@@ -21,6 +21,7 @@ EventSource is primarily used to profile code. For MSBuild specifically, a major
+ | GenerateResourceOverall | Uses resource APIs to transform resource files into strongly-typed resource classes. |
+ | LoadDocument | Loads an XMLDocumentWithLocation from a path.
+ | MSBuildExe | Executes MSBuild from the command line. |
++| MSBuildServerBuild | Executes a build from the MSBuildServer node. |
+ | PacketReadSize | Reports the size of a packet sent between nodes. Note that this does not include time information. |
+ | Parse | Parses an XML document into a ProjectRootElement. |
+ | ProjectGraphConstruction | Constructs a dependency graph among projects. |
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 6ad55123bc3..6cdc1116905 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -11,6 +11,7 @@
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Client;
++using Microsoft.Build.Eventing;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+@@ -115,14 +116,19 @@ public MSBuildClient(string exeLocation, string dllLocation)
+         /// or the manner in which it failed.</returns>
+         public MSBuildClientExitResult Execute(string commandLine, CancellationToken cancellationToken)
+         {
++            CommunicationsUtilities.Trace("Executing build with command line '{0}'", commandLine);
+             string serverRunningMutexName = OutOfProcServerNode.GetRunningServerMutexName(_handshake);
+             string serverBusyMutexName = OutOfProcServerNode.GetBusyServerMutexName(_handshake);
+ 
+             // Start server it if is not running.
+             bool serverIsAlreadyRunning = ServerNamedMutex.WasOpen(serverRunningMutexName);
+-            if (!serverIsAlreadyRunning && !TryLaunchServer())
++            if (!serverIsAlreadyRunning)
+             {
+-                return _exitResult;
++                CommunicationsUtilities.Trace("Server was not running. Starting server now.");
++                if (!TryLaunchServer())
++                {
++                    return _exitResult;
++                }
+             }
+ 
+             // Check that server is not busy.
+@@ -144,6 +150,7 @@ public MSBuildClientExitResult Execute(string commandLine, CancellationToken can
+ 
+             // Send build command.
+             // Let's send it outside the packet pump so that we easier and quicker deal with possible issues with connection to server.
++            MSBuildEventSource.Log.MSBuildServerBuildStart(commandLine);
+             if (!TrySendBuildCommand(commandLine))
+             {
+                 CommunicationsUtilities.Trace("Failure to connect to a server.");
+@@ -201,6 +208,7 @@ public MSBuildClientExitResult Execute(string commandLine, CancellationToken can
+                 _exitResult.MSBuildClientExitType = MSBuildClientExitType.Unexpected;
+             }
+ 
++            MSBuildEventSource.Log.MSBuildServerBuildStop(commandLine);
+             CommunicationsUtilities.Trace("Build finished.");
+             return _exitResult;
+         }
+@@ -245,7 +253,8 @@ private bool TryLaunchServer()
+         }
+ 
+         private Process LaunchNode(string exeLocation, string msBuildServerArguments, Dictionary<string, string> serverEnvironmentVariables)
+-        { 
++        {
++            CommunicationsUtilities.Trace("Launching server node from {0} with arguments {1}", exeLocation, msBuildServerArguments);
+             ProcessStartInfo processStartInfo = new() 
+             {
+                 FileName = exeLocation,
+@@ -273,7 +282,7 @@ private bool TrySendBuildCommand(string commandLine)
+             {
+                 ServerNodeBuildCommand buildCommand = GetServerNodeBuildCommand(commandLine);
+                 WritePacket(_nodeStream, buildCommand);
+-                CommunicationsUtilities.Trace("Build command send...");
++                CommunicationsUtilities.Trace("Build command sent...");
+             }
+             catch (Exception ex)
+             {
+diff --git a/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs b/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs
+index c2402156971..b2c82c88ab6 100644
+--- a/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs
++++ b/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs
+@@ -214,7 +214,7 @@ private void RunReadLoop(Stream localStream, ManualResetEvent localPacketPumpShu
+ 
+                         case 1:
+                             {
+-                                // Client recieved a packet header. Read the rest of a package.
++                                // Client recieved a packet header. Read the rest of it.
+                                 int headerBytesRead = 0;
+ #if FEATURE_APM
+                                 headerBytesRead = localStream.EndRead(result);
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index 25b39f379be..7c119ce2929 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -85,13 +85,14 @@ public OutOfProcServerNode(Func<string, (int exitCode, string exitType)> buildFu
+         /// <returns>The reason for shutting down.</returns>
+         public NodeEngineShutdownReason Run(out Exception? shutdownException)
+         {
+-            var handshake = new ServerNodeHandshake(
++            ServerNodeHandshake handshake = new(
+                 CommunicationsUtilities.GetHandshakeOptions(taskHost: false, architectureFlagToSet: XMakeAttributes.GetCurrentMSBuildArchitecture()));
+ 
+             _serverBusyMutexName = GetBusyServerMutexName(handshake);
+ 
+             // Handled race condition. If two processes spawn to start build Server one will die while
+             // one Server client connects to the other one and run build on it.
++            CommunicationsUtilities.Trace("Starting new server node with handshake {0}", handshake);
+             using var serverRunningMutex = ServerNamedMutex.OpenOrCreateMutex(GetRunningServerMutexName(handshake), out bool mutexCreatedNew);
+             if (!mutexCreatedNew)
+             {
+@@ -275,6 +276,7 @@ private void HandlePacket(INodePacket packet)
+ 
+         private void HandleServerNodeBuildCommand(ServerNodeBuildCommand command)
+         {
++            CommunicationsUtilities.Trace("Building with MSBuild server with command line {0}", command.CommandLine);
+             using var serverBusyMutex = ServerNamedMutex.OpenOrCreateMutex(name: _serverBusyMutexName, createdNew: out var holdsMutex);
+             if (!holdsMutex)
+             {
+diff --git a/src/Framework/MSBuildEventSource.cs b/src/Framework/MSBuildEventSource.cs
+index b4e335f7849..e7bc6e2f433 100644
+--- a/src/Framework/MSBuildEventSource.cs
++++ b/src/Framework/MSBuildEventSource.cs
+@@ -599,6 +599,18 @@ public void OutOfProcSdkResolverServiceRequestSdkPathFromMainNodeStop(int submis
+             WriteEvent(80, submissionId, sdkName, solutionPath, projectPath, success, wasResultCached);
+         }
+ 
++        [Event(81, Keywords = Keywords.All)]
++        public void MSBuildServerBuildStart(string commandLine)
++        {
++            WriteEvent(81, commandLine);
++        }
++
++        [Event(82, Keywords = Keywords.All)]
++        public void MSBuildServerBuildStop(string commandLine)
++        {
++            WriteEvent(82, commandLine);
++        }
++
+         #endregion
+     }
+ }

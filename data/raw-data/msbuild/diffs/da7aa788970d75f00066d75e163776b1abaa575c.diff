@@ -1,0 +1,797 @@
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs b/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
+new file mode 100644
+index 00000000000..a2559e01bf5
+--- /dev/null
++++ b/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
+@@ -0,0 +1,52 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++//
++
++using System;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BackEnd.Components.RequestBuilder
++{
++    internal class AssemblyLoadsTracker : IDisposable
++    {
++        private readonly LoggingContext _loggingContext;
++
++        private AssemblyLoadsTracker(LoggingContext loggingContext) => _loggingContext = loggingContext;
++
++        public static IDisposable StartTracking(LoggingContext loggingContext)
++        {
++            var tracker = new AssemblyLoadsTracker(loggingContext);
++            tracker.StartTracking();
++            return tracker;
++        }
++
++        public void Dispose()
++        {
++            StopTracking();
++        }
++        private void StartTracking()
++        {
++            AppDomain.CurrentDomain.AssemblyLoad += CurrentDomainOnAssemblyLoad;
++        }
++
++        private void StopTracking()
++        {
++            AppDomain.CurrentDomain.AssemblyLoad -= CurrentDomainOnAssemblyLoad;
++        }
++
++        private void CurrentDomainOnAssemblyLoad(object? sender, AssemblyLoadEventArgs args)
++        {
++            // what about FormatResourceStringIgnoreCodeAndKeyword ??
++            string? message = ResourceUtilities.GetResourceString("TaskAssemblyLoaded");
++            string? assemblyName = args.LoadedAssembly.FullName;
++            string? assemblyPath = args.LoadedAssembly.Location;
++            Guid mvid = args.LoadedAssembly.ManifestModule.ModuleVersionId;
++
++            AssemblyLoadBuildEventArgs buildArgs = new(assemblyName, assemblyPath, mvid, message);
++            buildArgs.BuildEventContext = _loggingContext.BuildEventContext;
++            _loggingContext.LogBuildEvent(buildArgs);
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+index 8679287cd8a..0a4aea07542 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+@@ -13,6 +13,7 @@
+ #endif
+ using System.Threading;
+ using System.Threading.Tasks;
++using Microsoft.Build.BackEnd.Components.RequestBuilder;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Eventing;
+@@ -662,6 +663,7 @@ private void ExecuteIntrinsicTask(ItemBucket bucket)
+         /// </summary>
+         private async Task<WorkUnitResult> InitializeAndExecuteTask(TaskLoggingContext taskLoggingContext, ItemBucket bucket, IDictionary<string, string> taskIdentityParameters, TaskHost taskHost, TaskExecutionMode howToExecuteTask)
+         {
++            using var assemblyLoadsTracker = AssemblyLoadsTracker.StartTracking(taskLoggingContext);
+             if (!_taskExecutionHost.InitializeForBatch(taskLoggingContext, bucket, taskIdentityParameters))
+             {
+                 ProjectErrorUtilities.ThrowInvalidProject(_targetChildInstance.Location, "TaskDeclarationOrUsageError", _taskNode.Name);
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs b/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
+index 46c583f3472..9f58466ba0e 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
+@@ -30,6 +30,7 @@ internal enum BinaryLogRecordKind
+         NameValueList,
+         String,
+         TaskParameter,
+-        ResponseFileUsed, 
++        ResponseFileUsed,
++        AssemblyLoad,
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index a93e2074044..627cb5a87a4 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -188,6 +188,9 @@ public BuildEventArgs Read()
+                 case BinaryLogRecordKind.PropertyInitialValueSet:
+                     result = ReadPropertyInitialValueSetEventArgs();
+                     break;
++                case BinaryLogRecordKind.AssemblyLoad:
++                    result = ReadAssemblyLoadEventArgs();
++                    break;
+                 default:
+                     break;
+             }
+@@ -800,6 +803,27 @@ private BuildEventArgs ReadPropertyInitialValueSetEventArgs()
+             return e;
+         }
+ 
++        private AssemblyLoadBuildEventArgs ReadAssemblyLoadEventArgs()
++        {
++            var fields = ReadBuildEventArgsFields(readImportance: true);
++
++            string assemblyName = ReadDeduplicatedString();
++            string assemblyPath = ReadDeduplicatedString();
++            Guid mvid = ReadGuid();
++
++            var e = new AssemblyLoadBuildEventArgs(
++                assemblyName,
++                assemblyPath,
++                mvid,
++                fields.Message,
++                fields.HelpKeyword,
++                fields.SenderName,
++                fields.Importance);
++            SetCommonFields(e, fields);
++
++            return e;
++        }
++
+         /// <summary>
+         /// For errors and warnings these 8 fields are written out explicitly
+         /// (their presence is not marked as a bit in the flags). So we have to
+@@ -1205,6 +1229,11 @@ private bool ReadBoolean()
+             return binaryReader.ReadBoolean();
+         }
+ 
++        private unsafe Guid ReadGuid()
++        {
++            return new Guid(binaryReader.ReadBytes(sizeof(Guid)));
++        }
++
+         private DateTime ReadDateTime()
+         {
+             return new DateTime(binaryReader.ReadInt64(), (DateTimeKind)ReadInt32());
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+index 79dac4ce124..05c19781b2f 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+@@ -438,6 +438,7 @@ private void Write(BuildMessageEventArgs e)
+                 case EnvironmentVariableReadEventArgs environmentVariableRead: Write(environmentVariableRead); break;
+                 case PropertyInitialValueSetEventArgs propertyInitialValueSet: Write(propertyInitialValueSet); break;
+                 case CriticalBuildMessageEventArgs criticalBuildMessage: Write(criticalBuildMessage); break;
++                case AssemblyLoadBuildEventArgs assemblyLoad: Write(assemblyLoad); break;
+                 default: // actual BuildMessageEventArgs
+                     Write(BinaryLogRecordKind.Message);
+                     WriteMessageFields(e, writeImportance: true);
+@@ -469,6 +470,15 @@ private void Write(TargetSkippedEventArgs e)
+             binaryWriter.WriteOptionalBuildEventContext(e.OriginalBuildEventContext);
+         }
+ 
++        private void Write(AssemblyLoadBuildEventArgs e)
++        {
++            Write(BinaryLogRecordKind.AssemblyLoad);
++            WriteMessageFields(e, writeImportance: true);
++            WriteDeduplicatedString(e.AssemblyName);
++            WriteDeduplicatedString(e.AssemblyPath);
++            Write(e.MVID);
++        }
++
+         private void Write(CriticalBuildMessageEventArgs e)
+         {
+             Write(BinaryLogRecordKind.CriticalBuildMessage);
+@@ -1088,6 +1098,15 @@ private void Write(bool boolean)
+             binaryWriter.Write(boolean);
+         }
+ 
++        private unsafe void Write(Guid guid)
++        {
++            byte* ptr = (byte*)&guid;
++            for (int i = 0; i < sizeof(Guid); i++, ptr++)
++            {
++                binaryWriter.Write(*ptr);
++            }
++        }
++
+         private void WriteDeduplicatedString(string text)
+         {
+             var (recordId, _) = HashString(text);
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index a0bc0207854..561c1f5497c 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -157,6 +157,7 @@
+     <Compile Include="BackEnd\Components\ProjectCache\*.cs" />
+     <Compile Include="BackEnd\Components\Communications\CurrentHost.cs" />
+     <Compile Include="BackEnd\Components\Communications\ServerNodeEndpointOutOfProc.cs" />
++    <Compile Include="BackEnd\Components\RequestBuilder\AssemblyLoadsTracker.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\SdkResolverException.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+     <Compile Include="FileSystem\*.cs" />
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 7b1b4f411e1..d241a9327f8 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1,17 +1,17 @@
+ ﻿<?xml version="1.0" encoding="utf-8"?>
+ <root>
+-  <!--
+-    Microsoft ResX Schema
+-
++  <!-- 
++    Microsoft ResX Schema 
++    
+     Version 2.0
+-
+-    The primary goals of this format is to allow a simple XML format
+-    that is mostly human readable. The generation and parsing of the
+-    various data types are done through the TypeConverter classes
++    
++    The primary goals of this format is to allow a simple XML format 
++    that is mostly human readable. The generation and parsing of the 
++    various data types are done through the TypeConverter classes 
+     associated with the data types.
+-
++    
+     Example:
+-
++    
+     ... ado.net/XML headers & schema ...
+     <resheader name="resmimetype">text/microsoft-resx</resheader>
+     <resheader name="version">2.0</resheader>
+@@ -26,36 +26,36 @@
+         <value>[base64 mime encoded string representing a byte array form of the .NET Framework object]</value>
+         <comment>This is a comment</comment>
+     </data>
+-
+-    There are any number of "resheader" rows that contain simple
++                
++    There are any number of "resheader" rows that contain simple 
+     name/value pairs.
+-
+-    Each data row contains a name, and value. The row also contains a
+-    type or mimetype. Type corresponds to a .NET class that support
+-    text/value conversion through the TypeConverter architecture.
+-    Classes that don't support this are serialized and stored with the
++    
++    Each data row contains a name, and value. The row also contains a 
++    type or mimetype. Type corresponds to a .NET class that support 
++    text/value conversion through the TypeConverter architecture. 
++    Classes that don't support this are serialized and stored with the 
+     mimetype set.
+-
+-    The mimetype is used for serialized objects, and tells the
+-    ResXResourceReader how to depersist the object. This is currently not
++    
++    The mimetype is used for serialized objects, and tells the 
++    ResXResourceReader how to depersist the object. This is currently not 
+     extensible. For a given mimetype the value must be set accordingly:
+-
+-    Note - application/x-microsoft.net.object.binary.base64 is the format
+-    that the ResXResourceWriter will generate, however the reader can
++    
++    Note - application/x-microsoft.net.object.binary.base64 is the format 
++    that the ResXResourceWriter will generate, however the reader can 
+     read any of the formats listed below.
+-
++    
+     mimetype: application/x-microsoft.net.object.binary.base64
+-    value   : The object must be serialized with
++    value   : The object must be serialized with 
+             : System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+             : and then encoded with base64 encoding.
+-
++    
+     mimetype: application/x-microsoft.net.object.soap.base64
+-    value   : The object must be serialized with
++    value   : The object must be serialized with 
+             : System.Runtime.Serialization.Formatters.Soap.SoapFormatter
+             : and then encoded with base64 encoding.
+ 
+     mimetype: application/x-microsoft.net.object.bytearray.base64
+-    value   : The object must be serialized into a byte array
++    value   : The object must be serialized into a byte array 
+             : using a System.ComponentModel.TypeConverter
+             : and then encoded with base64 encoding.
+     -->
+@@ -142,7 +142,7 @@
+   <data name="WaitingForEndOfBuild" xml:space="preserve">
+     <value>The operation cannot be completed because EndBuild has already been called but existing submissions have not yet completed.</value>
+   </data>
+-  <data name="EnvironmentDerivedPropertyRead">
++  <data name="EnvironmentDerivedPropertyRead" xml:space="preserve">
+     <value>Property '{0}' with value '{1}' expanded from the environment.</value>
+   </data>
+   <data name="SubmissionAlreadyComplete" xml:space="preserve">
+@@ -1141,7 +1141,7 @@
+       LOCALIZATION: "{2}" is a localized message from a CLR/FX exception. Also, Microsoft.Build.Framework should not be localized
+     </comment>
+   </data>
+-  <data name="TaskReturnedFalseButDidNotLogError">
++  <data name="TaskReturnedFalseButDidNotLogError" xml:space="preserve">
+     <value>MSB4181: The "{0}" task returned false but did not log an error.</value>
+     <comment>{StrBegin="MSB4181: "}</comment>
+   </data>
+@@ -1271,7 +1271,7 @@
+     <value>MSB4067: The element &lt;{0}&gt; beneath element &lt;{1}&gt; is unrecognized.</value>
+     <comment>{StrBegin="MSB4067: "}</comment>
+   </data>
+-  <data name="PropertyOutsidePropertyGroupInTarget" xml:space="preserve" Condition="$([MSBuild]::AreFeaturesEnabled('17.6'))">
++  <data name="PropertyOutsidePropertyGroupInTarget" xml:space="preserve">
+     <value>MSB4067: The element &lt;{0}&gt; beneath element &lt;{1}&gt; is unrecognized. If you intended this to be a property, enclose it within a &lt;PropertyGroup&gt; element.</value>
+     <comment>{StrBegin="MSB4067: "}</comment>
+   </data>
+@@ -1711,7 +1711,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>MSB4231: ProjectRootElement can't reload if it contains unsaved changes.</value>
+     <comment>{StrBegin="MSB4231: "}</comment>
+   </data>
+-  <data name="LogTaskInputs.Truncated">
++  <data name="LogTaskInputs.Truncated" xml:space="preserve">
+     <value>The parameters have been truncated beyond this point. To view all parameters, clear the MSBUILDTRUNCATETASKINPUTLOGGING environment variable.</value>
+   </data>
+   <data name="MetaprojectGenerated" xml:space="preserve">
+@@ -1942,9 +1942,9 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     </comment>
+   </data>
+   <data name="ProjectCacheHitWithOutputs" xml:space="preserve">
+-    <value>{0} -> Cache Hit</value>
++    <value>{0} -&gt; Cache Hit</value>
+     <comment>
+-      {StrBegin="{0} -> "}LOCALIZATION: This string is used to indicate progress and matches the format for a log message from Microsoft.Common.CurrentVersion.targets. {0} is a project name.
++      {StrBegin="{0} -&gt; "}LOCALIZATION: This string is used to indicate progress and matches the format for a log message from Microsoft.Common.CurrentVersion.targets. {0} is a project name.
+     </comment>
+   </data>
+   <data name="ProjectCacheMissWithDefaultTargets" xml:space="preserve">
+@@ -1971,10 +1971,13 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+       LOCALIZATION: {0} is a file path. {1} is a comma-separated list of target names
+     </comment>
+   </data>
+-   <data name="DefaultSDKResolverError" xml:space="preserve">
++  <data name="DefaultSDKResolverError" xml:space="preserve">
+     <value>MSB4276: The default SDK resolver failed to resolve SDK "{0}" because directory "{1}" did not exist.</value>
+   </data>
+   <data name="SDKResolverReturnedNull" xml:space="preserve">
+     <value>SDK resolver "{0}" returned null.</value>
+   </data>
+-</root>
++  <data name="TaskAssemblyLoaded" xml:space="preserve">
++    <value>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</value>
++  </data>
++</root>
+\ No newline at end of file
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 0fd2a55f4a1..ebc36558e5a 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">Úloha {0} požadovala tento počet jader: {1}. Získala tento počet jader: {2}. Teď používá celkem tento počet jader: {3}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">Úloha {0} uvolnila tento počet jader: {1}. Teď používá celkem tento počet jader: {2}</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 49aab4ca53c..060f326f6bf 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">Die Aufgabe "{0}" hat {1} Kerne angefordert und {2} Kerne erhalten und belegt jetzt insgesamt {3} Kerne.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">Die Aufgabe "{0}" hat {1} Kerne freigegeben und belegt jetzt insgesamt {2} Kerne.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 3e8d9e420ce..00509c5eb66 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">La tarea "{0}" solicitó {1} núcleos, adquirió {2} núcleos y ahora retiene un total de {3} núcleos.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">La tarea "{0}" liberó {1} núcleos y ahora retiene un total de {2} núcleos.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 369cad1fc61..da96ca07bfe 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">La tâche "{0}" a demandé {1} cœurs et a obtenu {2} cœurs. Elle détient désormais {3} cœurs au total.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">La tâche "{0}" a libéré {1} cœur. Elle détient désormais {2} cœurs au total.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 16c46738aa3..60c95653c4e 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">L'attività "{0}" ha richiesto {1} core, ha acquisito {2} core e ora contiene {3} core in totale.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">L'attività "{0}" ha rilasciato {1} core e ora contiene {2} core in totale.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 2767d3b459d..45d3cfa1ced 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">タスク "{0}" では、{1} 個のコアを要求し、{2} 個のコアを取得したため、現在合計 {3} 個のコアを保持しています。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">タスク "{0}" では、{1} 個のコアを解放したため、現在合計 {2} 個のコアを保持しています。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index a8b9e95d0a2..6c6165d4905 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">"{0}" 작업에서 코어 {1}개를 요청했고 코어 {2}개를 획득했으며 지금 총 {3}개의 코어를 보유하고 있습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">"{0}" 작업에서 코어 {1}개를 해제했고 지금 총 {2}개의 코어를 보유하고 있습니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index dd63fc75115..829956a3efa 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">Zadanie „{0}” żądało {1} rdzeni, uzyskało {2} i teraz jego łączna liczba rdzeni to {3}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">Zadanie „{0}” zwolniło rdzenie ({1}) i teraz jego łączna liczba rdzeni to {2}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 54b6e04475e..82a1761a6fa 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">A tarefa "{0}" solicitou {1} núcleos, adquiriu {2} núcleos e agora contém {3} núcleos no total.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">A tarefa "{0}" liberou {1} núcleos e agora contém {2} núcleos no total.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 75cd9f7d0c3..9210d385f4a 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">Задача "{0}" запросила указанное число ядер ({1}) и получила указанное число ядер ({2}). Теперь общее число ядер, которыми располагает задача, равно {3}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">Задача "{0}" освободила указанное число ядер ({1}). Теперь общее число ядер, которыми располагает задача, равно {2}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 83a86862dee..e00b37e8d9c 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">"{0}" görevi {1} çekirdek istedi, {2} çekirdek aldı ve şu anda toplam {3} çekirdek tutuyor.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">"{0}" görevi {1} çekirdeği serbest bıraktı. Şu anda toplam {2} çekirdek tutuyor.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 9be6ea491ba..53c6288fcae 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">任务“{0}”请求了 {1} 个核心，已获取 {2} 个核心，现总共包含 {3} 个核心。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">任务“{0}”发布了 {1} 个核心，现总共包含 {2} 个核心。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 70f6dd3f097..ef4384032c5 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -416,6 +416,11 @@
+         <target state="translated">工作 "{0}" 已要求 {1} 個核心、已取得 {2} 個核心，現在共保留 {3} 個核心。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="TaskAssemblyLoaded">
++        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2})</source>
++        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2})</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+         <target state="translated">工作 "{0}" 已發行 {1} 個核心，現在共保留 {2} 個核心。</target>
+diff --git a/src/Framework/AssemblyLoadBuildEventArgs.cs b/src/Framework/AssemblyLoadBuildEventArgs.cs
+new file mode 100644
+index 00000000000..aace6c1e508
+--- /dev/null
++++ b/src/Framework/AssemblyLoadBuildEventArgs.cs
+@@ -0,0 +1,36 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++//
++
++#nullable disable
++
++using System;
++
++namespace Microsoft.Build.Framework
++{
++    [Serializable]
++    public class AssemblyLoadBuildEventArgs : BuildMessageEventArgs // or LazyFormattedBuildEventArgs?
++    {
++        public AssemblyLoadBuildEventArgs()
++        { }
++
++        public AssemblyLoadBuildEventArgs(
++            string assemblyName,
++            string assemblyPath,
++            Guid mvid,
++            string message,
++            string helpKeyword = null,
++            string senderName = null,
++            MessageImportance importance = MessageImportance.Low)
++            : base(message, helpKeyword, senderName, importance/*, DateTime.UtcNow, assemblyName, assemblyPath, mvid*/)
++        {
++            AssemblyName = assemblyName;
++            AssemblyPath = assemblyPath;
++            MVID = mvid;
++        }
++
++        public string AssemblyName { get; private set; }
++        public string AssemblyPath { get; private set; }
++        public Guid MVID { get; private set; }
++    }
++}
+diff --git a/src/MSBuildTaskHost/MSBuildTaskHost.csproj b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+index 0628e295bd9..2eb61137bc5 100644
+--- a/src/MSBuildTaskHost/MSBuildTaskHost.csproj
++++ b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+@@ -43,6 +43,9 @@
+     <Compile Include="..\Framework\EnvironmentVariableReadEventArgs.cs">
+       <Link>EnvironmentVariableReadEventArgs.cs</Link>
+     </Compile>
++    <Compile Include="..\Framework\AssemblyLoadBuildEventArgs.cs">
++      <Link>AssemblyLoadBuildEventArgs.cs</Link>
++    </Compile>
+     <Compile Include="..\Framework\BuildEnvironmentState.cs">
+       <Link>BuildEnvironmentState.cs</Link>
+     </Compile>
+diff --git a/src/Shared/BinaryTranslator.cs b/src/Shared/BinaryTranslator.cs
+index 05abbdbab95..a1e1f2b6a28 100644
+--- a/src/Shared/BinaryTranslator.cs
++++ b/src/Shared/BinaryTranslator.cs
+@@ -186,6 +186,15 @@ public void Translate(ref double value)
+                 value = _reader.ReadDouble();
+             }
+ 
++            /// <summary>
++            /// Translates a guid.
++            /// </summary>
++            /// <param name="value">The value to be translated.</param>
++            public unsafe void Translate(ref Guid value)
++            {
++                value = new Guid(_reader.ReadBytes(sizeof(Guid)));
++            }
++
+             /// <summary>
+             /// Translates a string.
+             /// </summary>
+@@ -869,6 +878,23 @@ public void Translate(ref double value)
+                 _writer.Write(value);
+             }
+ 
++            /// <summary>
++            /// Translates a guid.
++            /// </summary>
++            /// <param name="value">The value to be translated.</param>
++            public void Translate(ref Guid value)
++            {
++                Guid val = value;
++                unsafe
++                {
++                    byte* ptr = (byte*)&val;
++                    for (int i = 0; i < sizeof(Guid); i++, ptr++)
++                    {
++                        _writer.Write(*ptr);
++                    }
++                }
++            }
++
+             /// <summary>
+             /// Translates a string.
+             /// </summary>
+diff --git a/src/Shared/ITranslator.cs b/src/Shared/ITranslator.cs
+index 3a507470744..8576ebac216 100644
+--- a/src/Shared/ITranslator.cs
++++ b/src/Shared/ITranslator.cs
+@@ -152,6 +152,12 @@ BinaryWriter Writer
+         /// <param name="value">The value to be translated.</param>
+         void Translate(ref double value);
+ 
++        /// <summary>
++        /// Translates a guid.
++        /// </summary>
++        /// <param name="value">The value to be translated.</param>
++        void Translate(ref Guid value);
++
+         /// <summary>
+         /// Translates a string array.
+         /// </summary>
+diff --git a/src/Shared/LogMessagePacketBase.cs b/src/Shared/LogMessagePacketBase.cs
+index 7d518897aa6..b8c5574edd7 100644
+--- a/src/Shared/LogMessagePacketBase.cs
++++ b/src/Shared/LogMessagePacketBase.cs
+@@ -139,7 +139,12 @@ internal enum LoggingEventType : int
+         /// <summary>
+         /// Event is a ResponseFileUsedEventArgs
+         /// </summary>
+-        ResponseFileUsedEvent = 20
++        ResponseFileUsedEvent = 20,
++
++        /// <summary>
++        /// Event is an AssemblyLoadBuildEventArgs
++        /// </summary>
++        AssemblyLoadEvent = 21,
+     }
+     #endregion
+ 
+@@ -332,9 +337,10 @@ internal void WriteToStream(ITranslator translator)
+                 bool eventCanSerializeItself = methodInfo != null;
+ 
+ #if !TASKHOST && !MSBUILDENTRYPOINTEXE
+-                if (_buildEvent is ProjectEvaluationStartedEventArgs ||
+-                    _buildEvent is ProjectEvaluationFinishedEventArgs ||
+-                    _buildEvent is EnvironmentVariableReadEventArgs)
++                if (_buildEvent is ProjectEvaluationStartedEventArgs
++                    or ProjectEvaluationFinishedEventArgs
++                    or EnvironmentVariableReadEventArgs
++                    or AssemblyLoadBuildEventArgs)
+                 {
+                     // switch to serialization methods that we provide in this file
+                     // and don't use the WriteToStream inherited from LazyFormattedBuildEventArgs
+@@ -523,6 +529,7 @@ private BuildEventArgs GetBuildEventArgFromId()
+                 LoggingEventType.TaskCommandLineEvent => new TaskCommandLineEventArgs(null, null, MessageImportance.Normal),
+                 LoggingEventType.EnvironmentVariableReadEvent => new EnvironmentVariableReadEventArgs(),
+                 LoggingEventType.ResponseFileUsedEvent => new ResponseFileUsedEventArgs(null),
++                LoggingEventType.AssemblyLoadEvent => new AssemblyLoadBuildEventArgs(),
+ #if !TASKHOST // MSBuildTaskHost is targeting Microsoft.Build.Framework.dll 3.5
+                 LoggingEventType.TaskParameterEvent => new TaskParameterEventArgs(0, null, null, true, default),
+                 LoggingEventType.ProjectEvaluationStartedEvent => new ProjectEvaluationStartedEventArgs(),
+@@ -629,6 +636,10 @@ private LoggingEventType GetLoggingEventId(BuildEventArgs eventArg)
+             {
+                 return LoggingEventType.ResponseFileUsedEvent;
+             }
++            else if (eventType == typeof(AssemblyLoadBuildEventArgs))
++            {
++                return LoggingEventType.AssemblyLoadEvent;
++            }
+             else
+             {
+                 return LoggingEventType.CustomEvent;
+@@ -689,12 +700,34 @@ private void WriteEventToStream(BuildEventArgs buildEvent, LoggingEventType even
+                 case LoggingEventType.EnvironmentVariableReadEvent:
+                     WriteEnvironmentVariableReadEventArgs((EnvironmentVariableReadEventArgs)buildEvent, translator);
+                     break;
++                case LoggingEventType.AssemblyLoadEvent:
++                    WriteAssemblyLoadEventArgs((AssemblyLoadBuildEventArgs)buildEvent, translator);
++                    break;
+                 default:
+                     ErrorUtilities.ThrowInternalError("Not Supported LoggingEventType {0}", eventType.ToString());
+                     break;
+             }
+         }
+ 
++        /// <summary>
++        /// Serializes AssemblyLoadBuildEventArgs Event argument to the stream. Does not work properly on TaskHosts due to BuildEventContext serialization not being
++        /// enabled on TaskHosts..
++        /// TODO: Is this possibly problematic??
++        /// </summary>
++        private void WriteAssemblyLoadEventArgs(AssemblyLoadBuildEventArgs assemblyLoadBuildEventArgs, ITranslator translator)
++        {
++            string assemblyName = assemblyLoadBuildEventArgs.AssemblyName;
++            translator.Translate(ref assemblyName);
++            string assemblyPath = assemblyLoadBuildEventArgs.AssemblyPath;
++            translator.Translate(ref assemblyPath);
++            Guid assemblyMvid = assemblyLoadBuildEventArgs.MVID;
++            translator.Translate(ref assemblyMvid);
++            BuildEventContext context = assemblyLoadBuildEventArgs.BuildEventContext;
++#if !CLR2COMPATIBILITY
++            translator.Translate(ref context);
++#endif
++        }
++
+         /// <summary>
+         /// Serializes EnvironmentVariableRead Event argument to the stream. Does not work properly on TaskHosts due to BuildEventContext serialization not being
+         /// enabled on TaskHosts, but that shouldn't matter, as this should never be called from a TaskHost anyway.
+@@ -1062,10 +1095,33 @@ private BuildEventArgs ReadEventFromStream(LoggingEventType eventType, ITranslat
+                 LoggingEventType.ResponseFileUsedEvent => ReadResponseFileUsedEventFromStream(translator, message, helpKeyword, senderName),
+                 LoggingEventType.BuildWarningEvent => ReadBuildWarningEventFromStream(translator, message, helpKeyword, senderName),
+                 LoggingEventType.EnvironmentVariableReadEvent => ReadEnvironmentVariableReadEventFromStream(translator, message, helpKeyword, senderName),
++                LoggingEventType.AssemblyLoadEvent => ReadAssemblyLoadEventFromStream(translator, message, helpKeyword, senderName),
+                 _ => null,
+             };
+         }
+ 
++        /// <summary>
++        /// Read and reconstruct an AssemblyLoadBuildEventArgs from the stream.
++        /// TODO: Task host support?
++        /// </summary>
++        private AssemblyLoadBuildEventArgs ReadAssemblyLoadEventFromStream(ITranslator translator, string message, string helpKeyword, string senderName)
++        {
++            string assemblyName = null;
++            translator.Translate(ref assemblyName);
++            string assemblyPath = null;
++            translator.Translate(ref assemblyPath);
++            Guid assemblyMvid = Guid.Empty;
++            translator.Translate(ref assemblyMvid);
++            BuildEventContext context = null;
++#if !CLR2COMPATIBILITY
++            translator.Translate(ref context);
++#endif
++
++            AssemblyLoadBuildEventArgs args = new(assemblyName, assemblyPath, assemblyMvid, message, helpKeyword, senderName);
++            args.BuildEventContext = context;
++            return args;
++        }
++
+         /// <summary>
+         /// Read and reconstruct an EnvironmentVariableReadEventArgs from the stream. This message should never be called from a TaskHost, so although the context translation does not work, that's ok.
+         /// </summary>

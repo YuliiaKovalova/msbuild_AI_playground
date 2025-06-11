@@ -1,0 +1,1625 @@
+diff --git a/global.json b/global.json
+index 67c77c202c4..853a648e358 100644
+--- a/global.json
++++ b/global.json
+@@ -3,7 +3,7 @@
+     "allowPrerelease": true
+   },
+   "tools": {
+-    "dotnet": "6.0.101",
++    "dotnet": "6.0.200",
+     "vs": {
+       "version": "17.0"
+     }
+diff --git a/src/Build/BackEnd/Components/SdkResolution/MainNodeSdkResolverService.cs b/src/Build/BackEnd/Components/SdkResolution/MainNodeSdkResolverService.cs
+index 3d35548d260..04b7ad67ed0 100644
+--- a/src/Build/BackEnd/Components/SdkResolution/MainNodeSdkResolverService.cs
++++ b/src/Build/BackEnd/Components/SdkResolution/MainNodeSdkResolverService.cs
+@@ -7,10 +7,7 @@
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using System;
+-using System.Collections.Concurrent;
+ using System.Collections.Generic;
+-using System.Threading;
+-using System.Threading.Tasks;
+ 
+ #nullable disable
+ 
+@@ -18,7 +15,7 @@ namespace Microsoft.Build.BackEnd.SdkResolution
+ {
+     /// <summary>
+     /// An implementation of <see cref="ISdkResolverService"/> that is hosted in the main node for multi-proc builds.  This instance of the service
+-    /// listens for requests from out-of-proc nodes so that SDK resolution is handled in a central location.  This instance is registered in <see cref="BuildComponentFactoryCollection.RegisterDefaultFactories"/>
++    /// handles requests from out-of-proc nodes so that SDK resolution is handled in a central location.  This instance is registered in <see cref="BuildComponentFactoryCollection.RegisterDefaultFactories"/>
+     /// and can be overridden for different contexts.  This service calls the <see cref="SdkResolverService"/> to do any actual SDK resolution
+     /// because the <see cref="SdkResolverService"/> is used for stand-alone evaluations where there is no build context available so caching
+     /// is not an option.
+@@ -28,26 +25,6 @@ namespace Microsoft.Build.BackEnd.SdkResolution
+     /// </summary>
+     internal sealed class MainNodeSdkResolverService : HostedSdkResolverServiceBase
+     {
+-        /// <summary>
+-        /// An object used for locking in this class instance.
+-        /// </summary>
+-        private readonly object _lockObject = new object();
+-
+-        /// <summary>
+-        /// A <see cref="Task"/> running in the background which handles requests from remote nodes.
+-        /// </summary>
+-        private Task _requestHandler;
+-
+-        /// <summary>
+-        /// An event which is signaled when a request is received from a remote host.
+-        /// </summary>
+-        private ManualResetEvent _requestReceivedEvent;
+-
+-        /// <summary>
+-        /// A list of requests from remote hosts which need to be processed.
+-        /// </summary>
+-        private ConcurrentQueue<SdkResolverRequest> _requests;
+-
+         private readonly ISdkResolverService _cachedSdkResolver = new CachingSdkResolverService();
+ 
+         /// <summary>
+@@ -55,6 +32,8 @@ internal sealed class MainNodeSdkResolverService : HostedSdkResolverServiceBase
+         /// </summary>
+         public static IBuildComponent CreateComponent(BuildComponentType type)
+         {
++            ErrorUtilities.VerifyThrowArgumentOutOfRange(type == BuildComponentType.SdkResolverService, nameof(type));
++
+             return new MainNodeSdkResolverService();
+         }
+ 
+@@ -78,148 +57,52 @@ public override void ClearCaches()
+         /// <inheritdoc cref="INodePacketHandler.PacketReceived"/>
+         public override void PacketReceived(int node, INodePacket packet)
+         {
+-            switch (packet.Type)
+-            {
+-                case NodePacketType.ResolveSdkRequest:
+-                    HandleRequest(node, packet as SdkResolverRequest);
+-                    break;
+-            }
+-        }
+-
+-        /// <inheritdoc cref="ISdkResolverService.ResolveSdk"/>
+-        public override SdkResult ResolveSdk(int submissionId, SdkReference sdk, LoggingContext loggingContext, ElementLocation sdkReferenceLocation, string solutionPath, string projectPath, bool interactive, bool isRunningInVisualStudio)
+-        {
+-            ErrorUtilities.VerifyThrowInternalNull(sdk, nameof(sdk));
+-            ErrorUtilities.VerifyThrowInternalNull(loggingContext, nameof(loggingContext));
+-            ErrorUtilities.VerifyThrowInternalNull(sdkReferenceLocation, nameof(sdkReferenceLocation));
+-            ErrorUtilities.VerifyThrowInternalLength(projectPath, nameof(projectPath));
+-
+-            return _cachedSdkResolver.ResolveSdk(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio);
+-        }
+-
+-        /// <summary>
+-        /// Handles a request from a remote node.
+-        /// </summary>
+-        /// <param name="node">The ID of the remote node.</param>
+-        /// <param name="request">The <see cref="SdkResolverRequest"/> containing information about the SDK to resolve.</param>
+-        /// <remarks>This method must not directly handle requests because it would block requests from other nodes.  Instead, it simply
+-        /// adds requests to a queue which are processed by a background thread.</remarks>
+-        private void HandleRequest(int node, SdkResolverRequest request)
+-        {
+-            if (_requestHandler == null)
++            if (packet is not SdkResolverRequest request)
+             {
+-                // Start the background thread which will process queued requests if it has not already been started.
+-                lock (_lockObject)
+-                {
+-                    if (_requestHandler == null)
+-                    {
+-                        // Create the event used to signal that a request was received
+-                        _requestReceivedEvent = new ManualResetEvent(initialState: false);
+-
+-                        // Create the queue used to store requests that need to be processed
+-                        _requests = new ConcurrentQueue<SdkResolverRequest>();
+-
+-                        // Create the thread which processes requests
+-                        _requestHandler = Task.Factory.StartNew(RequestHandlerPumpProc, TaskCreationOptions.LongRunning);
+-                    }
+-                }
++                return;
+             }
+ 
+             // Associate the node with the request
+             request.NodeId = node;
+ 
+-            _requests.Enqueue(request);
++            SdkResult response = null;
+ 
+-            // Signal that one or more requests have been received
+-            _requestReceivedEvent.Set();
+-        }
+-
+-        /// <summary>
+-        /// Processes all requests that are currently in the queue.
+-        /// </summary>
+-        private void ProcessRequests()
+-        {
+-            // Store a list of threads which are resolving SDKs
+-            List<Task> tasks = new List<Task>(_requests.Count);
+-
+-            SdkResolverRequest item;
+-
+-            while (_requests.TryDequeue(out item))
+-            {
+-                SdkResolverRequest request = item;
+-
+-                // Start a thread to resolve an SDK and add it to the list of threads
+-                tasks.Add(Task.Run(() =>
+-                {
+-                    SdkResult response = null;
+-                    try
+-                    {
+-                        // Create an SdkReference from the request
+-                        SdkReference sdkReference = new SdkReference(request.Name, request.Version, request.MinimumVersion);
+-
+-                        ILoggingService loggingService = Host.GetComponent(BuildComponentType.LoggingService) as ILoggingService;
+-
+-                        // This call is usually cached so is very fast but can take longer for a new SDK that is downloaded.  Other queued threads for different SDKs will complete sooner and continue on which unblocks evaluations
+-                        response = ResolveSdk(request.SubmissionId, sdkReference, new EvaluationLoggingContext(loggingService, request.BuildEventContext, request.ProjectPath), request.ElementLocation, request.SolutionPath, request.ProjectPath, request.Interactive, request.IsRunningInVisualStudio);
+-                    }
+-                    catch (Exception e)
+-                    {
+-                        ILoggingService loggingService = Host.GetComponent(BuildComponentType.LoggingService) as ILoggingService;
+-
+-                        EvaluationLoggingContext loggingContext = new EvaluationLoggingContext(loggingService, request.BuildEventContext, request.ProjectPath);
+-
+-                        loggingService.LogFatalBuildError(loggingContext.BuildEventContext, e, new BuildEventFileInfo(request.ElementLocation));
+-                    }
+-                    finally
+-                    {
+-                        // Get the node manager and send the response back to the node that requested the SDK
+-                        INodeManager nodeManager = Host.GetComponent(BuildComponentType.NodeManager) as INodeManager;
+-
+-                        nodeManager.SendData(request.NodeId, response);
+-                    }
+-                }));
+-            }
+-
+-            // Wait for all tasks to complete
+-            Task.WaitAll(tasks.ToArray());
+-        }
+-
+-        /// <summary>
+-        /// A background thread that waits for requests to be received.
+-        /// </summary>
+-        private void RequestHandlerPumpProc()
+-        {
+             try
+             {
+-                Thread.CurrentThread.Name = "MSBuild SDK Resolver";
++                // Create an SdkReference from the request
++                SdkReference sdkReference = new SdkReference(request.Name, request.Version, request.MinimumVersion);
+ 
+-                while (true)
+-                {
+-                    WaitHandle[] handles = new WaitHandle[] { ShutdownEvent, _requestReceivedEvent };
++                ILoggingService loggingService = Host.GetComponent(BuildComponentType.LoggingService) as ILoggingService;
+ 
+-                    int waitId = WaitHandle.WaitAny(handles);
+-                    switch (waitId)
+-                    {
+-                        case 0:
+-                            return;
+-
+-                        case 1:
+-                            _requestReceivedEvent.Reset();
++                // This call is usually cached so is very fast but can take longer for a new SDK that is downloaded.  Other queued threads for different SDKs will complete sooner and continue on which unblocks evaluations
++                response = ResolveSdk(request.SubmissionId, sdkReference, new EvaluationLoggingContext(loggingService, request.BuildEventContext, request.ProjectPath), request.ElementLocation, request.SolutionPath, request.ProjectPath, request.Interactive, request.IsRunningInVisualStudio);
++            }
++            catch (Exception e)
++            {
++                ILoggingService loggingService = Host.GetComponent(BuildComponentType.LoggingService) as ILoggingService;
+ 
+-                            ProcessRequests();
+-                            break;
++                EvaluationLoggingContext loggingContext = new EvaluationLoggingContext(loggingService, request.BuildEventContext, request.ProjectPath);
+ 
+-                        default:
+-                            ErrorUtilities.ThrowInternalError("waitId {0} out of range.", waitId);
+-                            break;
+-                    }
+-                }
++                loggingService.LogFatalBuildError(loggingContext.BuildEventContext, e, new BuildEventFileInfo(request.ElementLocation));
+             }
+-            catch (Exception e)
++            finally
+             {
+-                ExceptionHandling.DumpExceptionToFile(e);
+-                throw;
++                // Get the node manager and send the response back to the node that requested the SDK
++                INodeManager nodeManager = Host.GetComponent(BuildComponentType.NodeManager) as INodeManager;
++
++                nodeManager.SendData(request.NodeId, response);
+             }
+         }
++
++        /// <inheritdoc cref="ISdkResolverService.ResolveSdk"/>
++        public override SdkResult ResolveSdk(int submissionId, SdkReference sdk, LoggingContext loggingContext, ElementLocation sdkReferenceLocation, string solutionPath, string projectPath, bool interactive, bool isRunningInVisualStudio)
++        {
++            ErrorUtilities.VerifyThrowInternalNull(sdk, nameof(sdk));
++            ErrorUtilities.VerifyThrowInternalNull(loggingContext, nameof(loggingContext));
++            ErrorUtilities.VerifyThrowInternalNull(sdkReferenceLocation, nameof(sdkReferenceLocation));
++            ErrorUtilities.VerifyThrowInternalLength(projectPath, nameof(projectPath));
++
++            return _cachedSdkResolver.ResolveSdk(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio);
++        }
+     }
+ }
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 4043f931854..bc4f28a26e1 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: Došlo k pokusu o vytvoření více přepsání stejné úlohy: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">Vytvořilo se přepsání pomocí úlohy: {0} v {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">Jedná se o neošetřenou výjimku v MSBuildu – HLASUJTE PROSÍM PRO EXISTUJÍCÍ PROBLÉM NEBO VYTVOŘTE NOVÝ NA https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 6b035bde1f8..2d5371cd4e4 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: Es wurde versucht, mehrere Außerkraftsetzungen derselben Aufgabe zu erstellen: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">Außerkraftsetzung mit Task erstellt: {0} bei {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">Dies ist eine nicht behandelte Ausnahme in MSBuild. RUFEN SIE EIN VORHANDENES PROBLEM AUF, ODER ERSTELLEN SIE EIN NEUES UNTER https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 09cc68eb3a7..ae8a6a1e189 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: Se intentaron crear varias invalidaciones de la misma tarea: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">Se creó una invalidación mediante la tarea: {0} en {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">Esta es una excepción no controlada en MSBuild. VOTE POR UN PROBLEMA EXISTENTE O PRESENTE UNO NUEVO EN https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 38ce28929da..0ffddfbe011 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: Tentative de création de plusieurs remplacements de la même tâche : {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">Remplacement créé à l’aide de la tâche : {0} au {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">Il s’agit d’une exception non gérée dans MSBuild -- VOTEZ POUR UN PROBLÈME EXISTANT OU ENTREZ UN NOUVEAU FICHIER À https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index abfcf608a12..11aec49efc6 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: tentativo di creare più sostituzioni della stessa attività: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">È stata creata una sostituzione con l'attività: {0} in {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">Si tratta di un'eccezione non gestita in MSBuild-- ESEGUIRE L'UPVOTE DI UN PROBLEMA ESISTENTE O DI UN FILE NUOVO IN https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index a609a92f4c5..1bf7a2f0d24 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: 同じタスクの複数のオーバーライドを作成しようとしました: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">タスクを使用してオーバーライドを作成しました: {1} の {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">これは MSBuild でハンドルされない例外です -- 既存の問題に賛成票を投じるか、https://aka.ms/msbuild/unhandled で新しい問題を提起してください。
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 168d3129afc..8f5d34f5cce 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: 동일한 작업의 여러 재정의를 만들려고 했습니다. {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">다음 작업을 사용하여 재정의를 만들었습니다. {1}의 {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,8 +432,8 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+-    {0}</target>
++        <target state="translated">MSBuild에서 처리되지 않은 예외입니다. https://aka.ms/msbuild/unhandled에서 기존 문제에 찬성 투표하거나 새 문제를 제출하세요.
++ {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="UninitializedPropertyRead">
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 7e69028c66e..b893482a44e 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: Podjęto próbę utworzenia wielu zastąpień tego samego zadania: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">Utworzono zastąpienie przy użyciu zadania: {0} o {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">To jest nieobsługiwany wyjątek w programie MSBuild — POPRZYJ ISTNIEJĄCY PROBLEM LUB ZAREJESTRUJ NOWY NA https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 1bc25d198f2..ad14ba37ca1 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: tentativa de criar várias substituições da mesma tarefa: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">Criou uma substituição usando a tarefa: {0} em {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">Esta é uma exceção sem tratamento no MSBuild -- VOTE A FAVOR DE UM PROBLEMA EXISTENTE OU REGISTRE UM NOVO EM https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 883f9984beb..04004fbdfe1 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: попытка создать несколько переопределений одной задачи: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">Создано переопределение с помощью задачи {0} в {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">Это необработанное исключение в MSBuild — ПРОГОЛОСУЙТЕ ЗА СУЩЕСТВУЮЩУЮ ПРОБЛЕМУ ИЛИ СОЗДАЙТЕ НОВУЮ на сайте https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 4b61a9f80be..5fc8f54ba4e 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: Aynı {0} görevi için birden çok geçersiz kılma işlemi oluşturulmaya çalışıldı</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">{0} görevi kullanılarak geçersiz kılma işlemi oluşturuldu, saat: {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">Bu, MSBuild'de işlenmeyen bir özel durumdur -- LÜTFEN MEVCUT BIR SORUNA DESTEK OYU VERIN VEYA MEVCUT BIR SORUNU BİLDİRİN: https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 3d8fdf8c70b..4a9d18a374e 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: 已尝试创建同一任务的多个重写: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">已使用任务创建替代: {0} 位于 {1}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">这是 MSBuild 中未经处理的异常 -- 请对现有问题投赞成票或在 https://aka.ms/msbuild/unhandled 上提交新问题。
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 7c4850b32df..214240db01c 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DuplicateOverrideUsingTaskElement">
+         <source>MSB4275: Attempted to create multiple overrides of the same task: {0}</source>
+-        <target state="new">MSB4275: Attempted to create multiple overrides of the same task: {0}</target>
++        <target state="translated">MSB4275: 已嘗試建立相同工作的多個覆寫: {0}</target>
+         <note>{StrBegin="MSB4275: "}</note>
+       </trans-unit>
+       <trans-unit id="EmptyOutputCacheFile">
+@@ -226,7 +226,7 @@
+       </trans-unit>
+       <trans-unit id="OverrideUsingTaskElementCreated">
+         <source>Created an override using task: {0} at {1}</source>
+-        <target state="new">Created an override using task: {0} at {1}</target>
++        <target state="translated">已使用下列工作建立覆寫: 於 {1} 的 {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheBeginBuild">
+@@ -432,7 +432,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
+     {0}</source>
+-        <target state="new">This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled.
++        <target state="translated">這是 MSBuild 中未處理的例外狀況 -- 請針對現有的問題附議，或在 https://aka.ms/msbuild/unhandled 提交新的問題。
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/MSBuild/Resources/xlf/Strings.cs.xlf b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+index eb722c34566..c44516a6bf5 100644
+--- a/src/MSBuild/Resources/xlf/Strings.cs.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Nedefinovaná proměnná prostředí předaná jako přepínač.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,14 +270,14 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     Seznam kódů upozornění, které se nemají považovat za chyby.
++                     Pomocí středníku nebo čárky oddělte
++                     více kódů upozornění. Nemá žádný vliv, pokud přepínač -warnaserror
++                     není nastavený.
+ 
+-                     Example:
++                     Příklad:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1250,7 +1250,7 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Při použití přepínače -warnNotAsError zadejte jeden nebo více kódů upozornění.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1267,7 +1267,7 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: Přepínač -warnnotaserror nelze zadat, pokud není zadán také přepínač -warnaserror a není prázdný.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1335,7 +1335,7 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">{0} přišla z {1}</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1371,9 +1371,9 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    Úplný příkazový řádek:{1}
++  Přepínače připojené pomocí souborů odpovědí:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.de.xlf b/src/MSBuild/Resources/xlf/Strings.de.xlf
+index 8d327b858f6..f79253774c2 100644
+--- a/src/MSBuild/Resources/xlf/Strings.de.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.de.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Nicht definierte Umgebungsvariable, die als Switch übergeben wurde.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,14 +270,14 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     Liste der Warnungscodes, die nicht als Fehler behandelt werden sollen.
++                     Semikolon oder Komma zum Trennen verwenden
++                     mehrere Warnungscodes. Hat keine Auswirkungen, wenn der -warnaserror
++                     Switch nicht festgelegt ist.
+ 
+-                     Example:
++Beispiel:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1242,7 +1242,7 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Geben Sie mindestens einen Warnungscode an, wenn Sie den „-warnNotAsError“-Switch verwenden.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1259,7 +1259,7 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: Der „-warnnotaserror“-Switch kann nur angegeben werden, wenn auch der „-warnaserror“-Switch angegeben wurde und leer gelassen wird.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1327,7 +1327,7 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">„{0}“ stammt aus „{1}“</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1363,9 +1363,9 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    Vollständige Befehlszeile: „{1}“
++  Switches, die von Antwortdateien angefügt werden:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.es.xlf b/src/MSBuild/Resources/xlf/Strings.es.xlf
+index fb05178d9c1..5c04132fae5 100644
+--- a/src/MSBuild/Resources/xlf/Strings.es.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.es.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Variable de entorno no definida pasada como modificador.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,14 +270,14 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     Lista de códigos de advertencia para que no se traten como errores.
++                     Use un punto y coma o una coma para separar
++                     varios códigos de advertencia. No tiene efecto si el modificador -warnaserror
++                     no se ha establecido.
+ 
+-                     Example:
++                     Ejemplo:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1251,7 +1251,7 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Especifique uno o varios códigos de advertencia al usar el modificador -warnNotAsError.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1268,7 +1268,7 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: No se puede especificar el modificador -warnnotaserror a menos que también se especifique el modificador -warnaserror y se deje vacío.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1336,7 +1336,7 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">'{0}' procedía de '{1}'</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1372,9 +1372,9 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    Línea de comandos completa: '{1}'
++  Modificadores anexados por archivos de respuesta: {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.fr.xlf b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+index 948ad72833b..995bffa6350 100644
+--- a/src/MSBuild/Resources/xlf/Strings.fr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: variable d’environnement non définie passée en tant que commutateur.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,16 +270,16 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
+-      -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++        <target state="translated">
++     -warnNotAsError[:code[;code2]]
++                     Liste des codes d’avertissement à traiter non comme des erreurs.
++                     Utiliser un point-virgule ou une virgule pour séparer
++                     plusieurs codes d’avertissement. N’a aucun effet si -warnaserror
++                     n’est pas défini.
+ 
+-                     Example:
++                     Exemple:
+                        -warnNotAsError:MSB3026
+-    </target>
++   </target>
+         <note>
+       LOCALIZATION: "-warnNotAsError" should not be localized.
+       LOCALIZATION: None of the lines should be longer than a standard width console window, eg 80 chars.
+@@ -1242,7 +1242,7 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Spécifiez un ou plusieurs codes d’avertissement lors de l’utilisation du commutateur -warnNotAsError.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1259,7 +1259,7 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: Impossible de spécifier le commutateur -warnnotaserror, sauf si le commutateur -warnaserror est également spécifié et laissé vide.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1327,7 +1327,7 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">'{0}' provient de '{1}'</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1363,9 +1363,9 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++ ligne de commande complète : «{1}»
++ Commutateurs ajoutés par les fichiers réponse :{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.it.xlf b/src/MSBuild/Resources/xlf/Strings.it.xlf
+index 9c477e9ecde..ab0acb73e22 100644
+--- a/src/MSBuild/Resources/xlf/Strings.it.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.it.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: variabile di ambiente non definita passata come opzione.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -277,14 +277,14 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     Elenco di codici di avviso da non considerare come errori.
++                     Usare un punto e virgola o una virgola per separare
++                     più codici di avviso. Non ha alcun effetto se l’opzione -warnaserror
++                     non è impostata.
+ 
+-                     Example:
++Esempio:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1264,7 +1264,7 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: specificare uno o più codici di avviso quando si usa l'opzione -warnNotAsError.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1281,7 +1281,7 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: non è possibile specificare l'opzione -warnnotaserror a meno che non venga specificata e lasciata vuota anche l'opzione -warnaserror.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1349,7 +1349,7 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">'{0}' proviene da '{1}'</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1385,9 +1385,9 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    Riga di comando completa: '{1}'
++  Opzioni accodate da file di risposta:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.ja.xlf b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+index a0b7493db5b..41444e220b0 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ja.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: 未定義の環境変数が切り替えとして渡されました。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,14 +270,14 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     エラーとして扱わない警告コードのリスト.
++                     セミコロンまたはコンマを使用して、複数の警告コード
++                     区切ります。-warnaserror スイッチが設定されていない場合
++                     効果はありません。
+ 
+-                     Example:
++                     例:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1242,7 +1242,7 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: -warnNotAsError スイッチを使用する場合は、1 つ以上の警告コードを指定してください。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1259,7 +1259,7 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: -war nullerror スイッチも指定され、空のままにしない限り、-warnnotaserror スイッチを指定できません。</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1327,7 +1327,7 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">`{0}`からの `{1}`</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1363,9 +1363,9 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    完全なコマンド ライン: `{1}`
++ 応答ファイルによって追加されたスイッチ:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.ko.xlf b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+index 97fd6ebcca1..38e5e44c459 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ko.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: 정의되지 않은 환경 변수가 스위치로 전달되었습니다.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,16 +270,16 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
+-      -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++        <target state="translated">
++       -warnNotAsError[:code[;code2]]
++                     오류로 처리하지 않을 경고 코드 목록입니다.
++                     세미콜론이나 쉼표를 사용하여 구분하세요.
++                     여러 경고 코드. -warnaserror
++ 스위치가 설정되어 있지 않으면 효과가 없습니다.
+ 
+-                     Example:
+-                       -warnNotAsError:MSB3026
+-    </target>
++                     예:
++                     -warnNotAsError:MSB3026
++   </target>
+         <note>
+       LOCALIZATION: "-warnNotAsError" should not be localized.
+       LOCALIZATION: None of the lines should be longer than a standard width console window, eg 80 chars.
+@@ -1242,7 +1242,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: -warnNotAsError 스위치를 사용할 때 하나 이상의 경고 코드를 지정하세요.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1259,7 +1259,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: -warnaserror 스위치도 지정하고 비어 있지 않으면 -warnnotaserror 스위치를 지정할 수 없습니다.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1327,7 +1327,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">'{0}'은(는) '{1}'에서 제공되었습니다.</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1363,9 +1363,9 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++   전체 명령줄: '{1}'
++  응답 파일에 의해 추가된 스위치:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.pl.xlf b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+index 2a3609c667f..a0301139fb7 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pl.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Niezdefiniowana zmienna środowiskowa przekazana jako przełącznik.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -277,11 +277,11 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
+-      -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
++        <target state="translated">
++ -warnNotAsError[:code[;code2]]
++ Lista kodów ostrzeżeń, które mają być traktowane jako błędy. 
++ Rozdziel średnik lub przecinek
++ wiele kodów ostrzeżeń. Nie ma żadnego efektu, jeśli przełącznik -warnaserror
+                      switch is not set.
+ 
+                      Example:
+@@ -1256,7 +1256,7 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Określ co najmniej jeden kod ostrzeżenia podczas korzystania z przełącznika –warnNotAsError.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1273,7 +1273,7 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: Nie można określić przełącznika –warnnotaserror, chyba że przełącznik –warnaserror również jest określony i pozostanie pusty.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1341,7 +1341,7 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">Element „{0}“ pochodzi z „{1}“</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1377,9 +1377,9 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++ Pełny wiersz polecenia: „{1}“
++ Przełączniki dołączane przez pliki odpowiedzi: {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+index 9cc07ad04be..65bb4fa8ef0 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. Todos os direitos reservados.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: variável de ambiente indefinida passada como comutador.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -271,14 +271,14 @@ isoladamente.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     Lista de códigos de aviso para tratar e não tratar como erros.
++                     Use ponto e vírgula ou vírgula para separar
++                     vários códigos de aviso. Não tem efeito se o -warnaserror
++                     interruptor não está definido.
+ 
+-                     Example:
++                     Examplo:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1243,7 +1243,7 @@ isoladamente.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: especifique um ou mais códigos de aviso ao usar a opção -warnNotAsError.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1260,7 +1260,7 @@ isoladamente.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: A opção -warnnotaserror não pode ser especificada, a menos que a opção -warnaserror também seja especificada e deixada em branco.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1328,7 +1328,7 @@ isoladamente.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">'{0}' proveniente de '{1}'</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1364,9 +1364,9 @@ isoladamente.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    Linha de comando completa: '{1}'
++  Comutadores acrescentados por arquivos de resposta:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.ru.xlf b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+index f6b73ec7a63..afe39bd1474 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ru.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: в качестве параметра передана неопределенная переменная среды.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -269,14 +269,14 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     Список кодов предупреждений, которые не будут рассматриваться как ошибки.
++                     Используйте точку с запятой или запятую для разделения
++                     нескольких кодов предупреждения. Не действует, если параметр -warnaserror
++                     не задан.
+ 
+-                     Example:
++                     Пример:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1241,7 +1241,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: укажите один или несколько кодов предупреждений при использовании параметра -warnNotAsError.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1258,7 +1258,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: невозможно задать параметр -warnnotaserror, если параметр -warnaserror также не задан и не оставлен пустым.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1326,7 +1326,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">\"{0}\" получен из \"{1}\"</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1362,9 +1362,9 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    Полная командная строка: '{1}'
++  Параметры, добавленные файлами откликов:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.tr.xlf b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+index 6f3327051c3..f0d21717f61 100644
+--- a/src/MSBuild/Resources/xlf/Strings.tr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+@@ -57,7 +57,7 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: Tanımlanmamış ortam değişkeni anahtar olarak geçirildi.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,14 +270,14 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
+-      -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++        <target state="translated">
++-warnNotAsError[:code[;code2]]
++                     Hata olarak kabul edilmeyen uyarı kodlarının listesi.
++                     Ayırmak için noktalı virgül veya virgül kullanın
++                    çoklu uyarı kodları -warnaserror ise hiçbir etkisi yoktur
++                     anahtarı ayarlanmadı.
+ 
+-                     Example:
++Örnek:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1246,7 +1246,7 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: -warnNotAsError anahtarını kullanırken bir veya daha fazla uyarı kodu belirtin.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1263,7 +1263,7 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: -warnnotaserror anahtarı, -warnaserror anahtarı da belirtilmedikçe ve boş bırakılmadıkça belirtilemez.</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1331,7 +1331,7 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">'{0}', '{1}' kaynağından geldi</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1367,9 +1367,9 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    Tam komut satırı: '{1}'
++  Yanıt dosyaları tarafından eklenen anahtarlar:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+index 58c2ad54fcd..71e98f61fd7 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: 未定义的环境变量作为开关传入。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,14 +270,14 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     不视为错误的警告代码列表.
++                     使用分号或逗号分隔
++                     多个警告代码。如果未设置 -warnaserror
++                     开关，则不会产生任何影响。
+ 
+-                     Example:
++                     示例:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1242,7 +1242,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: 使用 -warnNotAsError 开关时指定一个或多个警告代码。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1259,7 +1259,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: 除非还指定了 -warnaserror 开关并将其留空，否则无法指定 -warnnotaserror 开关。</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1327,7 +1327,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">“{0}”来自“{1}”</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1363,9 +1363,9 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    完整命令行:“{1}”
++  响应文件追加的开关: {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+index 5273b8d77a8..cf86b834dd9 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+@@ -57,7 +57,7 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+       </trans-unit>
+       <trans-unit id="EnvironmentVariableAsSwitch">
+         <source>MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Undefined environment variable passed in as switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: 以切換參數傳入未定義的環境變數。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This error is shown when a user passes in an environment variable (including from a response file)
+@@ -270,14 +270,14 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+                      Example:
+                        -warnNotAsError:MSB3026
+     </source>
+-        <target state="new">
++        <target state="translated">
+       -warnNotAsError[:code[;code2]]
+-                     List of warning codes to treats not treat as errors.
+-                     Use a semicolon or a comma to separate
+-                     multiple warning codes. Has no effect if the -warnaserror
+-                     switch is not set.
++                     要視為不視為錯誤的警告碼清單。
++                     使用分號或逗號分隔
++                     多個警告碼。如果 -warnaserror 沒有作用
++                     未設定切換參數。
+ 
+-                     Example:
++範例:
+                        -warnNotAsError:MSB3026
+     </target>
+         <note>
+@@ -1242,7 +1242,7 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+       </trans-unit>
+       <trans-unit id="MissingWarnNotAsErrorParameterError">
+         <source>MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</source>
+-        <target state="new">MSBUILD : error MSB1060: Specify one or more warning codes when using the -warnNotAsError switch.</target>
++        <target state="translated">MSBUILD : error MSB1060: 使用 -warnNotAsError 切換參數時，請指定一或多個警告碼。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1060: "}
+       UE: This happens if the user does something like "msbuild.exe -warnNotAsError:" without any codes.
+@@ -1259,7 +1259,7 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+       </trans-unit>
+       <trans-unit id="NotWarnAsErrorWithoutWarnAsError">
+         <source>MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</source>
+-        <target state="new">MSBUILD : error MSB1062: The -warnnotaserror switch cannot be specified unless the -warnaserror switch is also specified and left empty.</target>
++        <target state="translated">MSBUILD : error MSB1062: 除非同時指定 -warnaserror 切換參數且保留空白，否則無法指定 -warnnotaserror 切換參數。</target>
+         <note>{StrBegin="MSBUILD : error MSB1062: "}LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:", "-warnnotaserror" and "-warnaserror" should not be localized.</note>
+       </trans-unit>
+       <trans-unit id="OptionalLoggerCreationMessage">
+@@ -1327,7 +1327,7 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+       </trans-unit>
+       <trans-unit id="ResponseFileSwitchFromLocation">
+         <source>'{0}' came from '{1}'</source>
+-        <target state="new">'{0}' came from '{1}'</target>
++        <target state="translated">'{0}' 來自 '{1}'</target>
+         <note>
+       These are response file switches with the location of the response file on disk.
+     </note>
+@@ -1363,9 +1363,9 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+         <source>{0}
+     Full command line: '{1}'
+   Switches appended by response files:{2}</source>
+-        <target state="new">{0}
+-    Full command line: '{1}'
+-  Switches appended by response files:{2}</target>
++        <target state="translated">{0}
++    完整命令列: '{1}'
++  回應檔案附加的切換參數:{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TargetsCouldNotBePrinted">

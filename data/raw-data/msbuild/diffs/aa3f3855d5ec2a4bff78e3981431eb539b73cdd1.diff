@@ -1,0 +1,223 @@
+diff --git a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+index 05ea23f5425..6c85709a550 100644
+--- a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
++++ b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+@@ -3,6 +3,7 @@
+ 
+ using System.Collections.Generic;
+ using Microsoft.Build.BackEnd.Components.Caching;
++using Microsoft.Build.BackEnd.Components.ResourceManager;
+ using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.Shared;
+ 
+@@ -78,6 +79,8 @@ public void RegisterDefaultFactories()
+ 
+             // SDK resolution
+             _componentEntriesByType[BuildComponentType.SdkResolverService] = new BuildComponentEntry(BuildComponentType.SdkResolverService, MainNodeSdkResolverService.CreateComponent, CreationPattern.Singleton);
++
++            _componentEntriesByType[BuildComponentType.TaskResourceManager] = new BuildComponentEntry(BuildComponentType.TaskResourceManager, ResourceManagerService.CreateComponent, CreationPattern.Singleton);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/IBuildComponentHost.cs b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+index 6e18d9ec4ef..718e83ae794 100644
+--- a/src/Build/BackEnd/Components/IBuildComponentHost.cs
++++ b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+@@ -128,6 +128,11 @@ internal enum BuildComponentType
+         /// The SDK resolution service.
+         /// </summary>
+         SdkResolverService,
++
++        /// <summary>
++        /// Resource manager for tasks to use via <see cref="Microsoft.Build.Framework.IBuildEngine7.RequestCores(int)"/>.
++        /// </summary>
++        TaskResourceManager,
+     }
+ 
+     /// <summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index da942692a31..2d001fa83e9 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -23,6 +23,7 @@
+ using Microsoft.Build.BackEnd.Components.Caching;
+ using System.Reflection;
+ using Microsoft.Build.Eventing;
++using Microsoft.Build.BackEnd.Components.ResourceManager;
+ 
+ namespace Microsoft.Build.BackEnd
+ {
+@@ -667,37 +668,32 @@ public IReadOnlyDictionary<string, string> GetGlobalProperties()
+         #endregion
+ 
+         int runningTotal = 0;
+-        Semaphore cpuCount;
+ 
+         public int RequestCores(int requestedCores)
+         {
++            var rms = _host.GetComponent(BuildComponentType.TaskResourceManager) as ResourceManagerService;
++
+             int coresAcquiredBeforeMoreCoresGetAcquired = runningTotal;
+ 
+-            cpuCount ??= Semaphore.OpenExisting("cpuCount");
++            var coresAcquired = rms.RequestCores(requestedCores);
+ 
+-            // Keep requesting cores until we can't anymore, or we've gotten the number of cores we wanted.
+-            for (int i = 0; i < requestedCores; i++)
+-            {
+-                if(cpuCount.WaitOne(0))
+-                {
+-                    runningTotal++;
+-                }
+-                else
+-                {
+-                    break;
+-                }
+-            }
++            runningTotal += coresAcquired;
+ 
+-            return runningTotal - coresAcquiredBeforeMoreCoresGetAcquired;
++            return coresAcquired;
+         }
+ 
+         public void ReleaseCores(int coresToRelease)
+         {
+-            cpuCount ??= Semaphore.OpenExisting("cpuCount");
++            var rms = _host.GetComponent(BuildComponentType.TaskResourceManager) as ResourceManagerService;
+ 
+             coresToRelease = Math.Min(runningTotal, coresToRelease);
+ 
+-            cpuCount.Release(coresToRelease);
++            if (coresToRelease >= 1)
++            {
++                runningTotal -= coresToRelease;
++
++                rms.ReleaseCores(coresToRelease);
++            }
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/ResourceManager/ResourceManagerService.cs b/src/Build/BackEnd/Components/ResourceManager/ResourceManagerService.cs
+new file mode 100644
+index 00000000000..ad65923dcf1
+--- /dev/null
++++ b/src/Build/BackEnd/Components/ResourceManager/ResourceManagerService.cs
+@@ -0,0 +1,81 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using Microsoft.Build.Shared;
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading;
++using System.Threading.Tasks;
++
++#nullable enable
++
++namespace Microsoft.Build.BackEnd.Components.ResourceManager
++{
++    class ResourceManagerService : IBuildComponent
++    {
++        Semaphore? s = null;
++
++        internal static IBuildComponent CreateComponent(BuildComponentType type)
++        {
++            ErrorUtilities.VerifyThrow(type == BuildComponentType.TaskResourceManager, "Cannot create components of type {0}", type);
++
++            return new ResourceManagerService();
++        }
++
++        public void InitializeComponent(IBuildComponentHost host)
++        {
++            const string SemaphoreName = "cpuCount"; // TODO
++
++            int resourceCount = host.BuildParameters.MaxNodeCount; // TODO: tweakability
++
++            s = new Semaphore(resourceCount, resourceCount, SemaphoreName); // TODO: SemaphoreSecurity?
++        }
++
++        public void ShutdownComponent()
++        {
++            s?.Dispose();
++            s = null;
++        }
++
++        public int RequestCores(int requestedCores)
++        {
++            if (s is null)
++            {
++                // TODO: ErrorUtilities should be annotated so this can just be `ErrorUtilities.VerifyThrow`
++                // https://github.com/microsoft/msbuild/issues/5163
++                throw new InternalErrorException($"{nameof(ResourceManagerService)} was called while uninitialized");
++            }
++
++            int i = 0;
++
++            // Keep requesting cores until we can't anymore, or we've gotten the number of cores we wanted.
++            for (i = 0; i < requestedCores; i++)
++            {
++                if (!s.WaitOne(0))
++                {
++                    return i;
++                }
++
++                Console.WriteLine("Got a core");
++            }
++
++            return i;
++        }
++
++        public void ReleaseCores(int coresToRelease)
++        {
++            if (s is null)
++            {
++                // TODO: ErrorUtilities should be annotated so this can just be `ErrorUtilities.VerifyThrow`
++                // https://github.com/microsoft/msbuild/issues/5163
++                throw new InternalErrorException($"{nameof(ResourceManagerService)} was called while uninitialized");
++            }
++
++            ErrorUtilities.VerifyThrow(coresToRelease > 0, "Tried to release {0} cores", coresToRelease);
++
++            s.Release(coresToRelease);
++        }
++    }
++}
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index aa55562d5a5..5329a7386e3 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -157,6 +157,7 @@
+     <Compile Include="BackEnd\BuildManager\CacheAggregator.cs" />
+     <Compile Include="BackEnd\Components\Caching\ConfigCacheWithOverride.cs" />
+     <Compile Include="BackEnd\Components\Caching\ResultsCacheWithOverride.cs" />
++    <Compile Include="BackEnd\Components\ResourceManager\ResourceManagerService.cs" />
+     <Compile Include="ObjectModelRemoting\ConstructionObjectLinks\ProjectUsingTaskParameterElementLink.cs" />
+     <Compile Include="ObjectModelRemoting\ExternalProjectsProvider.cs" />
+     <Compile Include="ObjectModelRemoting\LinkedObjectFactory.cs" />
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 19ad5bd1ded..7b96f13f170 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -1176,7 +1176,6 @@ string outputResultsCache
+ #if MSBUILDENABLEVSPROFILING
+                     DataCollection.CommentMarkProfile(8800, "Pending Build Request from MSBuild.exe");
+ #endif
+-                   new Semaphore(cpuCount, cpuCount, "cpuCount");
+ 
+                     BuildResultCode? result = null;
+ 
+diff --git a/test-project.proj b/test-project.proj
+index 745430c88b4..194b8744343 100644
+--- a/test-project.proj
++++ b/test-project.proj
+@@ -1,5 +1,7 @@
+ <Project>
+   <Target Name="X">
+     <SemaphoreCPUTask />
++    <Message Importance="High" Text="Middle" />
++    <SemaphoreCPUTask />
+   </Target>
+ </Project>
+\ No newline at end of file

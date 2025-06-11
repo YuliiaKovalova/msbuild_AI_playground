@@ -1,0 +1,326 @@
+diff --git a/src/Build.UnitTests/BackEnd/CacheSerialization_Tests.cs b/src/Build.UnitTests/BackEnd/CacheSerialization_Tests.cs
+index 3fe17d7c9a2..610c64becac 100644
+--- a/src/Build.UnitTests/BackEnd/CacheSerialization_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/CacheSerialization_Tests.cs
+@@ -117,6 +117,13 @@ public void OnlySerializeCacheEntryWithSmallestConfigId(object configCache, obje
+         [MemberData(nameof(CacheData))]
+         public void OnlySerializeResultsForSpecifiedTargets(object configCache, object resultsCache)
+         {
++            // Setup:
++            // 1. Create a config with id 1 whose project is built with top-level targets target1
++            // and target2.
++            // 2. Send a build request and collect the BuildResults for targets target1, target2,
++            // and target3.
++            // 3. Ensure the BuildResult for target3 is excluded from output cache serialization
++            // since it's not a top-level target.
+             string cacheFile = null;
+             try
+             {
+diff --git a/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs b/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
+index e26877afbae..8ad20245723 100644
+--- a/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
+@@ -726,7 +726,8 @@ public void TestDetailedSummary()
+         /// </summary>
+         /// <param name="configId">The configuration id.</param>
+         /// <param name="projectFullPath">The project's full path.</param>
+-        /// <param name="configCache">The config cache in which to place to configuration.</param>
++        /// <param name="configCache">The config cache in which to place the configuration. If
++        /// <see cref="langword"="null" />, use the host's config cache.</param>
+         private void CreateConfiguration(int configId, string projectFullPath, ConfigCache configCache = null)
+         {
+             BuildRequestData data = new(projectFullPath, new Dictionary<string, string>(), "4.0", Array.Empty<string>(), null);
+@@ -748,7 +749,8 @@ private void CreateConfiguration(int configId, string projectFullPath, ConfigCac
+         /// created and cached.</param>
+         /// <param name="target">The target for which there will be a result.</param>
+         /// <param name="workUnitResult">The result of executing the specified target.</param>
+-        /// <param name="resultsCache">The results cache to contain the <see cref="BuildResult"/>.</param>
++        /// <param name="resultsCache">The results cache to contain the <see cref="BuildResult"/>.
++        /// If <see cref="langword"="null"/>, use the host's results cache.</param>
+         /// <returns>The build result.</returns>
+         private BuildResult CacheBuildResult(BuildRequest request, string target, WorkUnitResult workUnitResult, ResultsCache resultsCache = null)
+         {
+diff --git a/src/Build.UnitTests/Graph/IsolateProjects_Tests.cs b/src/Build.UnitTests/Graph/IsolateProjects_Tests.cs
+index 13ac4404fb1..4d87ff97b64 100644
+--- a/src/Build.UnitTests/Graph/IsolateProjects_Tests.cs
++++ b/src/Build.UnitTests/Graph/IsolateProjects_Tests.cs
+@@ -7,11 +7,14 @@
+ using System.Linq;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.UnitTests;
+ using Shouldly;
+ using Xunit;
+ using Xunit.Abstractions;
++using ExpectedNodeBuildOutput = System.Collections.Generic.Dictionary<Microsoft.Build.Graph.ProjectGraphNode, string[]>;
++using OutputCacheDictionary = System.Collections.Generic.Dictionary<Microsoft.Build.Graph.ProjectGraphNode, string>;
+ 
+ #nullable disable
+ 
+@@ -263,6 +266,108 @@ public void IsolationRelatedMessageShouldBePresentInIsolatedBuildsWithMessaging(
+                 isolateProjects: ProjectIsolationMode.MessageUponIsolationViolation);
+         }
+ 
++        [Fact]
++        public void UndeclaredReferenceBuildResultNotPresentInOutputCache()
++        {
++            // Create the graph 1 -> 2 -> 3, where 2 is a declared project reference
++            // and 3 is an undeclared project reference.
++            // 3 outputs an item UndeclaredReferenceTargetItem that 2 outputs.
++            // Run under ProjectIsolationMode.MessageUponIsolationViolation mode
++            // and verify that 3's build result is not present in 2's output results
++            // cache since, under this mode, only the results of the project
++            // to build under isolation (2) should be serialized.
++            // See CacheSerialization.SerializeCaches for more info.
++            string undeclaredReferenceFile = GraphTestingUtilities.CreateProjectFile(
++                _env,
++                3,
++                extraContent: @"
++                    <Target Name='UndeclaredReferenceTarget' Outputs='@(UndeclaredReferenceTargetItem)'>
++                        <ItemGroup>
++                            <UndeclaredReferenceTargetItem Include='Foo.cs' />
++                        </ItemGroup>
++                        <Message Text='Message from undeclared reference' Importance='High' />
++                    </Target>",
++                defaultTargets: "UndeclaredReferenceTarget").Path;
++            string declaredReferenceContents = string.Format(
++                @"
++                <Target Name='DeclaredReferenceTarget' Outputs='@(UndeclaredReferenceTargetItem)'>
++                    <MSBuild
++                        Projects='{0}'
++                        Targets='UndeclaredReferenceTarget'>
++                        <Output TaskParameter='TargetOutputs' ItemName='UndeclaredReferenceTargetItem' />
++                    </MSBuild>
++                </Target>".Cleanup(),
++                undeclaredReferenceFile).Cleanup();
++            string declaredReferenceFile = GraphTestingUtilities.CreateProjectFile(
++                _env,
++                2,
++                extraContent: declaredReferenceContents,
++                defaultTargets: "DeclaredReferenceTarget").Path;
++            string rootProjectContents = string.Format(
++                @"
++                <ItemGroup>
++                    <ProjectReference Include='{0}' />
++                </ItemGroup>
++                <Target Name='BuildDeclaredReference'>
++                    <MSBuild
++                        Projects='{1}'
++                        Targets='DeclaredReferenceTarget'
++                    />
++                </Target>".Cleanup(),
++                declaredReferenceFile,
++                declaredReferenceFile).Cleanup();
++            string rootFile = GraphTestingUtilities.CreateProjectFile(
++                _env,
++                1,
++                extraContent: rootProjectContents,
++                defaultTargets: "BuildDeclaredReference").Path;
++            var projectGraph = new ProjectGraph(
++                rootFile,
++                new Dictionary<string, string>(),
++                _env.CreateProjectCollection().Collection);
++            var expectedOutput = new ExpectedNodeBuildOutput();
++            var outputCaches = new OutputCacheDictionary();
++            ProjectGraphNode[] topoSortedProjectGraphNodes = projectGraph.ProjectNodesTopologicallySorted.ToArray();
++            Dictionary<string, (BuildResult Result, MockLogger Logger)> results = ResultCacheBasedBuilds_Tests.BuildUsingCaches(
++                _env,
++                topoSortedProjectGraphNodes,
++                expectedOutput,
++                outputCaches,
++                generateCacheFiles: true,
++                assertBuildResults: false,
++                projectIsolationMode: ProjectIsolationMode.MessageUponIsolationViolation);
++            var deserializedOutputCacheDeclaredReference = CacheSerialization.DeserializeCaches(outputCaches[topoSortedProjectGraphNodes[0]]);
++            var deserializedOutputCacheRoot = CacheSerialization.DeserializeCaches(outputCaches[topoSortedProjectGraphNodes[1]]);
++            deserializedOutputCacheDeclaredReference.exception.ShouldBeNull();
++            deserializedOutputCacheRoot.exception.ShouldBeNull();
++            BuildResult[] declaredReferenceBuildResults = deserializedOutputCacheDeclaredReference.ResultsCache.GetEnumerator().ToArray();
++            BuildResult[] rootBuildResults = deserializedOutputCacheRoot.ResultsCache.GetEnumerator().ToArray();
++
++            // Both the root and declared reference projects should only have one build result.
++            declaredReferenceBuildResults.Length.ShouldBe(1);
++            rootBuildResults.Length.ShouldBe(1);
++            declaredReferenceBuildResults[0].OverallResult.ShouldBe(BuildResultCode.Success);
++            rootBuildResults[0].OverallResult.ShouldBe(BuildResultCode.Success);
++            MockLogger rootLogger = results["1"].Logger;
++            MockLogger declaredReferenceLogger = results["2"].Logger;
++            rootLogger.ErrorCount.ShouldBe(0);
++            declaredReferenceLogger.ErrorCount.ShouldBe(0);
++            rootLogger.Errors.ShouldBeEmpty();
++            declaredReferenceLogger.Errors.ShouldBeEmpty();
++            rootLogger.AllBuildEvents.OfType<ProjectStartedEventArgs>().Count().ShouldBe(2);
++            declaredReferenceLogger.AllBuildEvents.OfType<ProjectStartedEventArgs>().Count().ShouldBe(2);
++
++            // One undeclared reference was built in isolation violation.
++            declaredReferenceLogger.AssertMessageCount("Message from undeclared reference", 1);
++            declaredReferenceLogger.AssertMessageCount("MSB4260", 1);
++
++            // The declared reference project's output item is that of the undeclared reference
++            // project.
++            declaredReferenceBuildResults[0]["DeclaredReferenceTarget"].Items.Length.ShouldBe(1);
++            declaredReferenceBuildResults[0]["DeclaredReferenceTarget"].Items[0].ItemSpec.ShouldBe("Foo.cs");
++            rootBuildResults[0]["BuildDeclaredReference"].Items.Length.ShouldBe(0);
++        }
++
+         [Theory]
+         [InlineData("BuildDeclaredReference")]
+         [InlineData("BuildDeclaredReferenceViaTask")]
+diff --git a/src/Build.UnitTests/Graph/ResultCacheBasedBuilds_Tests.cs b/src/Build.UnitTests/Graph/ResultCacheBasedBuilds_Tests.cs
+index cb40be2fbad..7215b07bde6 100644
+--- a/src/Build.UnitTests/Graph/ResultCacheBasedBuilds_Tests.cs
++++ b/src/Build.UnitTests/Graph/ResultCacheBasedBuilds_Tests.cs
+@@ -298,7 +298,7 @@ public void BuildProjectGraphUsingCaches(Dictionary<int, int[]> edges)
+             var outputCaches = new OutputCacheDictionary();
+ 
+             // Build unchanged project files using caches.
+-            BuildUsingCaches(topoSortedNodes, expectedOutput, outputCaches, generateCacheFiles: true);
++            BuildUsingCaches(_env, topoSortedNodes, expectedOutput, outputCaches, generateCacheFiles: true);
+ 
+             // Change the project files to remove all items.
+             var collection = _env.CreateProjectCollection().Collection;
+@@ -318,6 +318,7 @@ public void BuildProjectGraphUsingCaches(Dictionary<int, int[]> edges)
+ 
+             // Build again using the first caches. Project file changes from references should not be visible.
+             BuildUsingCaches(
++                _env,
+                 topoSortedNodes,
+                 expectedOutput,
+                 outputCaches,
+@@ -343,7 +344,7 @@ public void OutputCacheShouldNotContainInformationFromInputCaches()
+ 
+             var outputCaches = new OutputCacheDictionary();
+ 
+-            BuildUsingCaches(topoSortedNodes, expectedOutput, outputCaches, generateCacheFiles: true);
++            BuildUsingCaches(_env, topoSortedNodes, expectedOutput, outputCaches, generateCacheFiles: true);
+ 
+             var rootNode = topoSortedNodes.First(n => Path.GetFileNameWithoutExtension(n.ProjectInstance.FullPath) == "1");
+             var outputCache = outputCaches[rootNode];
+@@ -381,12 +382,12 @@ public void MissingResultFromCacheShouldErrorDueToIsolatedBuildCacheEnforcement(
+ 
+             var outputCaches = new OutputCacheDictionary();
+ 
+-            BuildUsingCaches(topoSortedNodes, expectedOutput, outputCaches, generateCacheFiles: true);
++            BuildUsingCaches(_env, topoSortedNodes, expectedOutput, outputCaches, generateCacheFiles: true);
+ 
+             // remove cache for project 3 to cause a cache miss
+             outputCaches.Remove(expectedOutput.Keys.First(n => ProjectNumber(n) == "3"));
+ 
+-            var results = BuildUsingCaches(topoSortedNodes, expectedOutput, outputCaches, generateCacheFiles: false, assertBuildResults: false);
++            var results = BuildUsingCaches(_env, topoSortedNodes, expectedOutput, outputCaches, generateCacheFiles: false, assertBuildResults: false);
+ 
+             results["3"].Result.OverallResult.ShouldBe(BuildResultCode.Success);
+             results["2"].Result.OverallResult.ShouldBe(BuildResultCode.Success);
+@@ -408,21 +409,25 @@ public void MissingResultFromCacheShouldErrorDueToIsolatedBuildCacheEnforcement(
+         /// When it is false, it uses the filled in <param name="outputCaches"/> and <param name="expectedNodeBuildOutput"/> to simulate a fully cached build.
+         /// 
+         /// </summary>
++        /// <param name="env">The test environment under which to run.</param>
+         /// <param name="topoSortedNodes"></param>
+         /// <param name="expectedNodeBuildOutput"></param>
+         /// <param name="outputCaches"></param>
+         /// <param name="generateCacheFiles"></param>
+         /// <param name="assertBuildResults"></param>
+         /// <param name="expectedOutputProducer"></param>
++        /// <param name="projectIsolationMode">The isolation mode under which to run.</param>
+         /// <returns></returns>
+-        private Dictionary<string, (BuildResult Result, MockLogger Logger)> BuildUsingCaches(
++        internal static Dictionary<string, (BuildResult Result, MockLogger Logger)> BuildUsingCaches(
++            TestEnvironment env,
+             IReadOnlyCollection<ProjectGraphNode> topoSortedNodes,
+             ExpectedNodeBuildOutput expectedNodeBuildOutput,
+             OutputCacheDictionary outputCaches,
+             bool generateCacheFiles,
+             bool assertBuildResults = true,
+             // (current node, expected output dictionary) -> actual expected output for current node
+-            Func<ProjectGraphNode, ExpectedNodeBuildOutput, string[]> expectedOutputProducer = null)
++            Func<ProjectGraphNode, ExpectedNodeBuildOutput, string[]> expectedOutputProducer = null,
++            ProjectIsolationMode projectIsolationMode = ProjectIsolationMode.False)
+         {
+             expectedOutputProducer ??= ((node, expectedOutputs) => expectedOutputs[node]);
+ 
+@@ -445,12 +450,13 @@ public void MissingResultFromCacheShouldErrorDueToIsolatedBuildCacheEnforcement(
+ 
+                 var buildParameters = new BuildParameters
+                 {
+-                    InputResultsCacheFiles = cacheFilesForReferences
++                    InputResultsCacheFiles = cacheFilesForReferences,
++                    ProjectIsolationMode = projectIsolationMode,
+                 };
+ 
+                 if (generateCacheFiles)
+                 {
+-                    outputCaches[node] = _env.DefaultTestDirectory.CreateFile($"OutputCache-{ProjectNumber(node)}").Path;
++                    outputCaches[node] = env.DefaultTestDirectory.CreateFile($"OutputCache-{ProjectNumber(node)}").Path;
+                     buildParameters.OutputResultsCacheFile = outputCaches[node];
+                 }
+ 
+@@ -461,7 +467,8 @@ public void MissingResultFromCacheShouldErrorDueToIsolatedBuildCacheEnforcement(
+                 var result = BuildProjectFileUsingBuildManager(
+                     node.ProjectInstance.FullPath,
+                     null,
+-                    buildParameters);
++                    buildParameters,
++                    node.ProjectInstance.DefaultTargets);
+ 
+                 results[ProjectNumber(node)] = (result, logger);
+ 
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 8e1287dd563..a82e8218ef6 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -527,6 +527,11 @@ public void BeginBuild(BuildParameters parameters)
+ 
+                 if (_buildParameters.UsesCachedResults() && parameters.ProjectIsolationMode == ProjectIsolationMode.False)
+                 {
++                    // If input or output caches are used and the project isolation mode is set to
++                    // ProjectIsolationMode.False, then set it to ProjectIsolationMode.True. The explicit
++                    // condition on ProjectIsolationMode is necessary to ensure that, if we're using input
++                    // or output caches and ProjectIsolationMode is set to ProjectIsolationMode.MessageUponIsolationViolation,
++                    // ProjectIsolationMode isn't changed to ProjectIsolationMode.True.
+                     _buildParameters.ProjectIsolationMode = ProjectIsolationMode.True;
+                 }
+ 
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index 231fb137359..380200d434d 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -2056,8 +2056,8 @@ internal void RecordResultToCurrentCacheIfConfigNotInOverrideCache(BuildResult r
+             // override cache, which can happen if we are building in the project isolation mode
+             // ProjectIsolationMode.MessageUponIsolationViolation, and the received result was built by an
+             // isolation-violating dependency project.
+-            if (_configCache is not ConfigCacheWithOverride
+-                || !((ConfigCacheWithOverride)_configCache).HasConfigurationInOverrideCache(result.ConfigurationId))
++            if (_configCache is not ConfigCacheWithOverride configCacheWithOverride
++                || !configCacheWithOverride.HasConfigurationInOverrideCache(result.ConfigurationId))
+             {
+                 _resultsCache.AddResult(result);
+             }
+diff --git a/src/Shared/UnitTests/ObjectModelHelpers.cs b/src/Shared/UnitTests/ObjectModelHelpers.cs
+index a8f02e7d2cc..a3205aa8177 100644
+--- a/src/Shared/UnitTests/ObjectModelHelpers.cs
++++ b/src/Shared/UnitTests/ObjectModelHelpers.cs
+@@ -1377,7 +1377,11 @@ public static BuildResult BuildProjectContentUsingBuildManager(string content, M
+             }
+         }
+ 
+-        public static BuildResult BuildProjectFileUsingBuildManager(string projectFile, MockLogger logger = null, BuildParameters parameters = null)
++        public static BuildResult BuildProjectFileUsingBuildManager(
++            string projectFile,
++            MockLogger logger = null,
++            BuildParameters parameters = null,
++            List<string> defaultTargets = null)
+         {
+             using (var buildManager = new BuildManager())
+             {
+@@ -1394,7 +1398,7 @@ public static BuildResult BuildProjectFileUsingBuildManager(string projectFile,
+                     projectFile,
+                     new Dictionary<string, string>(),
+                     MSBuildConstants.CurrentToolsVersion,
+-                    Array.Empty<string>(),
++                    defaultTargets?.ToArray() ?? Array.Empty<string>(),
+                     null);
+ 
+                 var result = buildManager.Build(

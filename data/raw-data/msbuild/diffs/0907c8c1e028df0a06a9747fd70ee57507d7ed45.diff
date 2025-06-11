@@ -1,0 +1,252 @@
+diff --git a/eng/BootStrapMsBuild.props b/eng/BootStrapMsBuild.props
+index 858cf76ac54..51cb0bb8ead 100644
+--- a/eng/BootStrapMsBuild.props
++++ b/eng/BootStrapMsBuild.props
+@@ -5,16 +5,20 @@
+    relying on bootstrapped MSBuild
+    -->
+ 
++  <PropertyGroup Condition="!$(TargetFramework.StartsWith('net4'))">
++    <NetVersion>8.0.302</NetVersion>
++  </PropertyGroup>
++
+   <PropertyGroup>
+     <BootstrapDestination>$(ArtifactsBinDir)bootstrap\</BootstrapDestination>
+     <BootstrapDestination Condition="'$(Platform)' == 'x64' or '$(Platform)' == 'arm64'">$(BootstrapDestination)$(Platform)\</BootstrapDestination>
+-    <BootstrapDestination>$(BootstrapDestination)$(TargetFramework.ToLowerInvariant())\MSBuild\</BootstrapDestination>
++    <BootstrapDestination>$(BootstrapDestination)$(TargetFramework.ToLowerInvariant())\sdk\$(NetVersion)\</BootstrapDestination>
+   </PropertyGroup>
+-  
++
+   <PropertyGroup Condition="$(TargetFramework.StartsWith('net4'))">
+     <BootstrapBinaryDestination>$(BootstrapDestination)$(TargetMSBuildToolsVersion)\Bin</BootstrapBinaryDestination>
+   </PropertyGroup>
+-  
++
+   <PropertyGroup Condition="!$(TargetFramework.StartsWith('net4'))">
+     <BootstrapBinaryDestination>$(BootstrapDestination)</BootstrapBinaryDestination>
+   </PropertyGroup>
+diff --git a/eng/BootStrapMsBuild.targets b/eng/BootStrapMsBuild.targets
+index d9d327ebde6..c9cf2f030be 100644
+--- a/eng/BootStrapMsBuild.targets
++++ b/eng/BootStrapMsBuild.targets
+@@ -206,7 +206,6 @@
+   <Target Name="BootstrapNetCore" DependsOnTargets="CleanBootstrapFolder">
+ 
+     <PropertyGroup>
+-      <NetVersion>8.0.302</NetVersion>
+       <InstallDir>$(ArtifactsBinDir)bootstrap\$(TargetFramework)\</InstallDir>
+     </PropertyGroup>
+ 
+@@ -216,9 +215,15 @@
+   <Target Name="BootstrapNetCorePatch" AfterTargets="BootstrapNetCore">
+ 
+     <ItemGroup>
+-      <FreshlyBuiltNetBinaries Include="$(OutDir)**\*.*" />
++     <!-- *.deps.json are excluded because they will cause the conflicts on an attempt to build solution with the bootstraped bits. -->
++      <FreshlyBuiltNetBinaries Include="$(OutDir)**\*.*" Exclude="$(OutDir)**\*.deps.json" />
+     </ItemGroup>
+ 
++    <!-- The copying of these dependencies is required by bootstrap\**\sdk\**\NuGet.RestoreEx.targets. Otherwise NuGet.Build.Tasks.dll can not be found. -->
++    <Copy SourceFiles="@(_NuGetRuntimeDependencies)"
++          DestinationFolder="$(BootstrapDestination)"
++          SkipUnchangedFiles="true" />
++
+     <Copy SourceFiles="@(FreshlyBuiltNetBinaries)"
+       DestinationFiles="@(FreshlyBuiltNetBinaries->'$(InstallDir)sdk\$(NetVersion)\%(RecursiveDir)%(Filename)%(Extension)')" />
+ 
+diff --git a/eng/cibuild_bootstrapped_msbuild.ps1 b/eng/cibuild_bootstrapped_msbuild.ps1
+index 27d122276b7..2d34c6854d5 100644
+--- a/eng/cibuild_bootstrapped_msbuild.ps1
++++ b/eng/cibuild_bootstrapped_msbuild.ps1
+@@ -78,14 +78,18 @@ try {
+ 
+   if ($msbuildEngine -eq 'vs')
+   {
+-    $buildToolPath = Join-Path $bootstrapRoot "net472\MSBuild\Current\Bin\MSBuild.exe"
++    $buildToolPath = Join-Path $bootstrapRoot "net472\sdk\Current\Bin\MSBuild.exe"
+     $buildToolCommand = "";
+     $buildToolFramework = "net472"
+   }
+   else
+   {
+     $buildToolPath = Join-Path $bootstrapRoot "net8.0\dotnet.exe"
+-    $buildToolCommand = "";
++
++    # Must be consistent with the version in BootStrapMsBuild.props
++    $netVersion="8.0.302"
++    $buildToolCommand = Join-Path $bootstrapRoot "net8.0\sdk" $netVersion "MSBuild.dll";
++
+     $buildToolFramework = "net8.0"
+   }
+ 
+diff --git a/eng/cibuild_bootstrapped_msbuild.sh b/eng/cibuild_bootstrapped_msbuild.sh
+index d1ebb55f28c..e6d42eacbe8 100755
+--- a/eng/cibuild_bootstrapped_msbuild.sh
++++ b/eng/cibuild_bootstrapped_msbuild.sh
+@@ -55,11 +55,13 @@ then
+ fi
+ 
+ bootstrapRoot="$Stage1Dir/bin/bootstrap"
++# Must be consistent with the version in BootStrapMsBuild.props
++netVersion="8.0.302"
+ 
+ if [ $host_type = "core" ]
+ then
+   _InitializeBuildTool="$bootstrapRoot/net8.0/dotnet"
+-  _InitializeBuildToolCommand=""
++  _InitializeBuildToolCommand="$bootstrapRoot/net8.0/sdk/$netVersion/MSBuild.dll"
+   _InitializeBuildToolFramework="net8.0"
+ else
+   echo "Unsupported hostType ($host_type)"
+diff --git a/src/MSBuild.Bootstrap.Utils/Tasks/InstallDotNetCoreTask.cs b/src/MSBuild.Bootstrap.Utils/Tasks/InstallDotNetCoreTask.cs
+index 5e11d8833b7..a1c5ebf8df0 100644
+--- a/src/MSBuild.Bootstrap.Utils/Tasks/InstallDotNetCoreTask.cs
++++ b/src/MSBuild.Bootstrap.Utils/Tasks/InstallDotNetCoreTask.cs
+@@ -42,15 +42,23 @@ public override bool Execute()
+             return RunScript(executionSettings);
+         }
+ 
+-        private void DownloadScript(string scriptName, string scriptPath)
++        private async void DownloadScript(string scriptName, string scriptPath)
+         {
+             using (HttpClient client = new HttpClient())
+             {
+-                HttpResponseMessage response = client.GetAsync($"{DotNetInstallBaseUrl}{scriptName}").Result;
+-                response.EnsureSuccessStatusCode();
+-
+-                string scriptContent = response.Content.ReadAsStringAsync().Result;
+-                File.WriteAllText(scriptPath, scriptContent);
++                HttpResponseMessage response = await client.GetAsync($"{DotNetInstallBaseUrl}{scriptName}");
++                if (response.IsSuccessStatusCode)
++                {
++                    string scriptContent = await response.Content.ReadAsStringAsync();
++                    if (!string.IsNullOrEmpty(scriptContent))
++                    {
++                        File.WriteAllText(scriptPath, scriptContent);
++                    }
++                }
++                else
++                {
++                    Log.LogError($"Install-scripts download from {DotNetInstallBaseUrl} error. Status code: {response.StatusCode}.");
++                }
+             }
+         }
+ 
+@@ -74,7 +82,7 @@ private void MakeScriptExecutable(string scriptPath)
+                 },
+             })
+             {
+-                process.Start();
++                _ = process.Start();
+                 process.WaitForExit();
+             }
+         }
+@@ -83,20 +91,24 @@ private bool RunScript(ScriptExecutionSettings executionSettings)
+         {
+             using (Process process = new Process { StartInfo = executionSettings.StartInfo })
+             {
+-                process.Start();
+-                string output = process.StandardOutput.ReadToEnd();
+-                Log.LogMessage(output);
++                bool started = process.Start();
++                if (started)
++                {
++                    string output = process.StandardOutput.ReadToEnd() ?? string.Empty;
++                    Log.LogMessage($"Install-scripts output logs: {output}");
+ 
+-                string errors = process.StandardError.ReadToEnd();
+-                process.WaitForExit();
++                    process.WaitForExit();
+ 
+-                if (process.ExitCode != 0)
+-                {
+-                    if (!string.IsNullOrEmpty(errors))
++                    if (process.ExitCode != 0)
+                     {
+-                        Log.LogError("Errors: " + errors);
++                        string errors = process.StandardError.ReadToEnd() ?? string.Empty;
++                        Log.LogError("Install-scripts execution errors: " + errors);
+                     }
+                 }
++                else
++                {
++                    Log.LogError("Process for install-scripts execution has not started.");
++                }
+             }
+ 
+             return !Log.HasLoggedErrors;
+@@ -122,7 +134,7 @@ private ScriptExecutionSettings SetupScriptsExecutionSettings()
+             string scriptPath = Path.Combine(DotNetInstallScriptRootPath, $"{ScriptName}.{scriptExtension}");
+             string scriptArgs = IsWindows
+                 ? $"-NoProfile -ExecutionPolicy Bypass -File {scriptPath} -Version {Version} -InstallDir {InstallDir}"
+-                : $"--version {Version} --install-dir {InstallDir}";
++                : $"{scriptPath} --version {Version} --install-dir {InstallDir}";
+ 
+             var startInfo = new ProcessStartInfo
+             {
+diff --git a/src/MSBuild.Bootstrap/MSBuild.Bootstrap.csproj b/src/MSBuild.Bootstrap/MSBuild.Bootstrap.csproj
+index c3a491af369..b3246518064 100644
+--- a/src/MSBuild.Bootstrap/MSBuild.Bootstrap.csproj
++++ b/src/MSBuild.Bootstrap/MSBuild.Bootstrap.csproj
+@@ -18,7 +18,7 @@
+     <ProjectReference Include="..\Framework\Microsoft.Build.Framework.csproj" />
+     <ProjectReference Include="..\Tasks\Microsoft.Build.Tasks.csproj" />
+     <ProjectReference Include="..\Utilities\Microsoft.Build.Utilities.csproj" />
+-    <ProjectReference Condition="$(TargetFramework) != '$(FullFrameworkTFM)'" Include="..\MSBuild.Bootstrap.Utils\MSBuild.Bootstrap.Utils.csproj" />
++    <ProjectReference Include="..\MSBuild.Bootstrap.Utils\MSBuild.Bootstrap.Utils.csproj" />
+   </ItemGroup>
+   <ItemGroup>
+     <!-- This file is needed so the dotnet CLI knows how to map preview SDK versions to tfms (because tfms do not have preview information on them) -->
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 088d2c00179..febd164695c 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -316,7 +316,7 @@ private static bool CanRunServerBasedOnCommandLineSwitches(
+                     commandLineSwitches.IsParameterizedSwitchSet(CommandLineSwitches.ParameterizedSwitch.NodeMode) ||
+                     commandLineSwitches[CommandLineSwitches.ParameterlessSwitch.Version] ||
+                     FileUtilities.IsBinaryLogFilename(projectFile) ||
+-                    ProcessNodeReuseSwitch(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.NodeReuse]) == false ||
++                    !ProcessNodeReuseSwitch(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.NodeReuse]) ||
+                     IsInteractiveBuild(commandLineSwitches))
+                 {
+                     canRunServer = false;
+diff --git a/src/Tasks/BootstrapperUtil/BootstrapperBuilder.cs b/src/Tasks/BootstrapperUtil/BootstrapperBuilder.cs
+index accb98d7438..c22ab73bc9f 100644
+--- a/src/Tasks/BootstrapperUtil/BootstrapperBuilder.cs
++++ b/src/Tasks/BootstrapperUtil/BootstrapperBuilder.cs
+@@ -2121,7 +2121,7 @@ private bool AddVerificationInformation(XmlNode packageFileNode, string fileSour
+                     // If the public key in the file doesn't match the public key on disk, issue a build warning
+                     // Skip this check if the public key attribute is "0", as this means we're expecting the public key
+                     // comparison to be skipped at install time because the file is signed by an MS trusted cert.
+-                    if (publicKeyAttribute.Value.Equals("0", StringComparison.OrdinalIgnoreCase) == false &&
++                    if (!publicKeyAttribute.Value.Equals("0", StringComparison.OrdinalIgnoreCase) &&
+                         publicKey?.Equals(publicKeyAttribute.Value, StringComparison.OrdinalIgnoreCase) == false)
+                     {
+                         results?.AddMessage(BuildMessage.CreateMessage(BuildMessageSeverity.Warning, "GenerateBootstrapper.DifferingPublicKeys", PUBLICKEY_ATTRIBUTE, builder.Name, fileSource));
+diff --git a/src/Tasks/Copy.cs b/src/Tasks/Copy.cs
+index c51b3db6e91..cbf1f263e91 100644
+--- a/src/Tasks/Copy.cs
++++ b/src/Tasks/Copy.cs
+@@ -288,7 +288,7 @@ private void LogAlwaysRetryDiagnosticFromResources(string messageResourceName, p
+             }
+ 
+             if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_8) &&
+-                Traits.Instance.EscapeHatches.CopyWithoutDelete != true &&
++                !Traits.Instance.EscapeHatches.CopyWithoutDelete &&
+                 destinationFileState.FileExists &&
+                 !destinationFileState.IsReadOnly)
+             {
+diff --git a/src/Tasks/ManifestUtil/TrustInfo.cs b/src/Tasks/ManifestUtil/TrustInfo.cs
+index 8776175eddc..bc10cb1d02c 100644
+--- a/src/Tasks/ManifestUtil/TrustInfo.cs
++++ b/src/Tasks/ManifestUtil/TrustInfo.cs
+@@ -500,7 +500,7 @@ private void ReadTrustInfo(string xml)
+             // Partial trust is not supported on .NET Core.
+             // Fail if loaded manifest does not specify full-trust.
+             // It can happen if manifest is manually modifed.
+-            if (unrestrictedAttribute == null || (false == Boolean.Parse(unrestrictedAttribute.Value)))
++            if (unrestrictedAttribute == null || (!Boolean.Parse(unrestrictedAttribute.Value)))
+             {
+                 throw new ArgumentException("Partial trust is not supported.");
+             }

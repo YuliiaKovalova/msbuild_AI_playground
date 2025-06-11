@@ -1,0 +1,635 @@
+diff --git a/src/Shared/AssemblyNameExtension.cs b/src/Shared/AssemblyNameExtension.cs
+index 1d4f2a4bf71..0bd6dbc004f 100644
+--- a/src/Shared/AssemblyNameExtension.cs
++++ b/src/Shared/AssemblyNameExtension.cs
+@@ -9,6 +9,7 @@
+ using System.Configuration.Assemblies;
+ using System.Runtime.Serialization;
+ using System.IO;
++using Microsoft.Build.BackEnd;
+ #if FEATURE_ASSEMBLYLOADCONTEXT
+ using System.Reflection.PortableExecutable;
+ using System.Reflection.Metadata;
+@@ -54,7 +55,7 @@ internal enum PartialComparisonFlags : int
+     /// between the two is done lazily on demand.
+     /// </summary>
+     [Serializable]
+-    internal sealed class AssemblyNameExtension : ISerializable, IEquatable<AssemblyNameExtension>
++    internal sealed class AssemblyNameExtension : ISerializable, IEquatable<AssemblyNameExtension>, ITranslatable
+     {
+         private AssemblyName asAssemblyName = null;
+         private string asString = null;
+@@ -173,6 +174,14 @@ private AssemblyNameExtension(SerializationInfo info, StreamingContext context)
+             remappedFrom = (HashSet<AssemblyNameExtension>) info.GetValue("remapped", typeof(HashSet<AssemblyNameExtension>));
+         }
+ 
++        /// <summary>
++        /// Ctor for deserializing from state file (custom binary serialization) using translator.
++        /// </summary>
++        internal AssemblyNameExtension(ITranslator translator) : this()
++        {
++            Translate(translator);
++        }
++
+         /// <summary>
+         /// To be used as a delegate. Gets the AssemblyName of the given file.
+         /// </summary>
+@@ -251,10 +260,18 @@ private void InitializeRemappedFrom()
+         {
+             if (remappedFrom == null)
+             {
+-                remappedFrom = new HashSet<AssemblyNameExtension>(AssemblyNameComparer.GenericComparerConsiderRetargetable);
++                remappedFrom = CreateRemappedFrom();
+             }
+         }
+ 
++        /// <summary>
++        /// Create remappedFrom HashSet. Used by deserialization as well.
++        /// </summary>
++        private static HashSet<AssemblyNameExtension> CreateRemappedFrom()
++        {
++            return new HashSet<AssemblyNameExtension>(AssemblyNameComparer.GenericComparerConsiderRetargetable);
++        }
++
+         /// <summary>
+         /// Assume there is a string version, create the AssemblyName version.
+         /// </summary>
+@@ -993,5 +1010,19 @@ public void GetObjectData(SerializationInfo info, StreamingContext context)
+             info.AddValue("immutable", immutable);
+             info.AddValue("remapped", remappedFrom);
+         }
++
++        public void Translate(ITranslator translator)
++        {
++            translator.Translate(ref asAssemblyName);
++            translator.Translate(ref asString);
++            translator.Translate(ref isSimpleName);
++            translator.Translate(ref hasProcessorArchitectureInFusionName);
++            translator.Translate(ref immutable);
++            
++            // TODO: consider some kind of protection against infinite loop during serialization, hint: pre serialize check for cycle in graph
++            translator.TranslateHashSet(ref remappedFrom,
++                (ITranslator t) => new AssemblyNameExtension(t),
++                (int capacity) => CreateRemappedFrom());
++        }
+     }
+ }
+diff --git a/src/Shared/TranslatorHelpers.cs b/src/Shared/TranslatorHelpers.cs
+index 130ad05d9cd..c7b0481f173 100644
+--- a/src/Shared/TranslatorHelpers.cs
++++ b/src/Shared/TranslatorHelpers.cs
+@@ -1,7 +1,11 @@
+ ﻿// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
++using System;
+ using System.Collections.Generic;
++using System.Configuration.Assemblies;
++using System.Globalization;
++using System.Reflection;
+ 
+ namespace Microsoft.Build.BackEnd
+ {
+@@ -40,12 +44,12 @@ public static void Translate<T>(
+ 
+         static ObjectTranslator<T> AdaptFactory<T>(NodePacketValueFactory<T> valueFactory) where T : ITranslatable
+         {
+-            void Translate(ITranslator translator, ref T objectToTranslate)
++            void TranslateUsingValueFactory(ITranslator translator, ref T objectToTranslate)
+             {
+-                TranslatorHelpers.Translate<T>(translator, ref objectToTranslate, valueFactory);
++                translator.Translate(ref objectToTranslate, valueFactory);
+             }
+ 
+-            return Translate;
++            return TranslateUsingValueFactory;
+         }
+ 
+         public static void Translate<T>(
+@@ -102,5 +106,164 @@ public static void TranslateDictionary<D, T>(
+         {
+             translator.TranslateDictionary(ref dictionary, AdaptFactory(valueFactory), collectionCreator);
+         }
++
++        public static void TranslateHashSet<T>(
++            this ITranslator translator,
++            ref HashSet<T> hashSet,
++            NodePacketValueFactory<T> valueFactory,
++            NodePacketCollectionCreator<HashSet<T>> collectionFactory) where T : class, ITranslatable
++        {
++            if (!translator.TranslateNullable(hashSet))
++                return;
++
++            int count = hashSet.Count;
++            translator.Translate(ref count);
++
++            if (translator.Mode == TranslationDirection.ReadFromStream)
++            {
++                hashSet = collectionFactory(count);
++                for (int i = 0; i < count; i++)
++                {
++                    T value = default(T);
++                    translator.Translate(ref value, valueFactory);
++                    hashSet.Add(value);
++                }
++            }
++
++            if (translator.Mode == TranslationDirection.WriteToStream)
++            {
++                foreach (T item in hashSet)
++                {
++                    T value = item;
++                    translator.Translate(ref value, valueFactory);
++                }
++            }
++        }
++
++        public static void Translate(this ITranslator translator, ref AssemblyName assemblyName)
++        {
++            if (!translator.TranslateNullable(assemblyName))
++                return;
++
++            string name = null;
++            Version version = null;
++            AssemblyNameFlags flags = default;
++            ProcessorArchitecture processorArchitecture = default;
++            CultureInfo cultureInfo = null;
++            System.Configuration.Assemblies.AssemblyHashAlgorithm hashAlgorithm = default;
++            AssemblyVersionCompatibility versionCompatibility = default;
++            string codeBase = null;
++
++            byte[] publicKey = null;
++            byte[] publicKeyToken = null;
++
++            if (translator.Mode == TranslationDirection.WriteToStream)
++            {
++                name = assemblyName.Name;
++                version = assemblyName.Version;
++                flags = assemblyName.Flags;
++                processorArchitecture = assemblyName.ProcessorArchitecture;
++                cultureInfo = assemblyName.CultureInfo;
++                hashAlgorithm = assemblyName.HashAlgorithm;
++                versionCompatibility = assemblyName.VersionCompatibility;
++                codeBase = assemblyName.CodeBase;
++
++                publicKey = assemblyName.GetPublicKey(); // TODO: no need to serialize, public key is not used anywhere in context of RAR, only public key token
++                publicKeyToken = assemblyName.GetPublicKeyToken();
++            }
++
++            translator.Translate(ref name);
++            translator.Translate(ref version);
++            translator.TranslateEnum(ref flags, (int)flags);
++            translator.TranslateEnum(ref processorArchitecture, (int)processorArchitecture);
++            translator.Translate(ref cultureInfo);
++            translator.TranslateEnum(ref hashAlgorithm, (int)hashAlgorithm);
++            translator.TranslateEnum(ref versionCompatibility, (int)versionCompatibility);
++            translator.Translate(ref codeBase);
++
++            translator.Translate(ref publicKey);
++            translator.Translate(ref publicKeyToken);
++
++            if (translator.Mode == TranslationDirection.ReadFromStream)
++            {
++                assemblyName = new AssemblyName
++                {
++                    Name = name,
++                    Version = version,
++                    Flags = flags,
++                    ProcessorArchitecture = processorArchitecture,
++                    CultureInfo = cultureInfo,
++                    HashAlgorithm = hashAlgorithm,
++                    VersionCompatibility = versionCompatibility,
++                    CodeBase = codeBase,
++                    // AssemblyName.KeyPair is not used anywhere, additionally StrongNameKeyPair is not supported in .net core 5-
++                    // and throws platform not supported exception when serialized or deserialized
++                    KeyPair = null,
++                };
++
++                assemblyName.SetPublicKey(publicKey);
++                assemblyName.SetPublicKeyToken(publicKeyToken);
++            }
++        }
++
++        public static void Translate(this ITranslator translator, ref CultureInfo cultureInfo)
++        {
++            if (!translator.TranslateNullable(cultureInfo))
++                return;
++
++            int lcid = default;
++
++            if (translator.Mode == TranslationDirection.ReadFromStream)
++            {
++                lcid = cultureInfo.LCID;
++            }
++
++            translator.Translate(ref lcid);
++
++            if (translator.Mode == TranslationDirection.ReadFromStream)
++            {
++                cultureInfo = new CultureInfo(lcid);
++            }
++        }
++
++        public static void Translate(this ITranslator translator, ref Version version)
++        {
++            if (!translator.TranslateNullable(version))
++                return;
++
++            int major = 0;
++            int minor = 0;
++            int build = 0;
++            int revision = 0;
++
++            if (translator.Mode == TranslationDirection.WriteToStream)
++            {
++                major = version.Major;
++                minor = version.Minor;
++                build = version.Build;
++                revision = version.Revision;
++            }
++
++            translator.Translate(ref major);
++            translator.Translate(ref minor);
++            translator.Translate(ref build);
++            translator.Translate(ref revision);
++
++            if (translator.Mode == TranslationDirection.ReadFromStream)
++            {
++                if (build < 0)
++                {
++                    version = new Version(major, minor);
++                }
++                else if (revision < 0)
++                {
++                    version = new Version(major, minor, build);
++                }
++                else
++                {
++                    version = new Version(major, minor, build, revision);
++                }
++            }
++        }
+     }
+ }
+diff --git a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+index b7e72734291..d94d8460812 100644
+--- a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
++++ b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+@@ -1886,7 +1886,7 @@ private void LogConflict(Reference reference, string fusionName, StringBuilder l
+         /// </summary>
+         private void ReadStateFile()
+         {
+-            _cache = (SystemState)StateFileBase.DeserializeCache(_stateFile, Log, typeof(SystemState));
++            _cache = SystemState.DeserializeCacheByTranslator(_stateFile, Log);
+ 
+             // Construct the cache if necessary.
+             if (_cache == null)
+@@ -1899,6 +1899,32 @@ private void ReadStateFile()
+         /// Write out the state file if a state name was supplied and the cache is dirty.
+         /// </summary>
+         private void WriteStateFile()
++        {
++            if (!string.IsNullOrEmpty(_stateFile) && _cache.IsDirty)
++            {
++                _cache.SerializeCacheByTranslator(_stateFile, Log);
++            }
++        }
++
++        /// <summary>
++        /// TODO: to be deleted
++        /// </summary>
++        private void ReadStateFileBinaryFormatter()
++        {
++            _cache = (SystemState)StateFileBase.DeserializeCache(_stateFile, Log, typeof(SystemState));
++
++            // Construct the cache if necessary.
++            if (_cache == null)
++            {
++                _cache = new SystemState();
++            }
++        }
++
++        /// <summary>
++        /// Write out the state file if a state name was supplied and the cache is dirty.
++        /// TODO: to be deleted
++        /// </summary>
++        private void WriteStateFileBinaryFormatter()
+         {
+             if (!string.IsNullOrEmpty(_stateFile) && _cache.IsDirty)
+             {
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index 97daccd3aae..cb35f0b945b 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -27,6 +27,14 @@
+       <LogicalName>System.Design.resources</LogicalName>
+     </EmbeddedResource>
+   </ItemGroup>
++  <ItemGroup>
++    <!-- Binary serialization by ITranslatable -->
++    <Compile Include="..\Shared\ITranslatable.cs" />
++    <Compile Include="..\Shared\ITranslator.cs" />
++    <Compile Include="..\Shared\BinaryTranslator.cs" />
++    <Compile Include="..\Shared\InterningBinaryReader.cs" />
++    <Compile Include="..\Shared\TranslatorHelpers.cs" />    
++  </ItemGroup> 
+   <ItemGroup>
+     <!-- Source Files -->
+     <Compile Include="..\Shared\EnvironmentUtilities.cs">
+@@ -81,7 +89,7 @@
+     <Compile Include="..\Shared\NGen.cs">
+       <Link>NGen.cs</Link>
+     </Compile>
+-    <Compile Include="..\Shared\IConstrainedEqualityComparer.cs"/>
++    <Compile Include="..\Shared\IConstrainedEqualityComparer.cs" />
+     <Compile Include="..\Shared\PropertyParser.cs">
+       <Link>PropertyParser.cs</Link>
+       <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
+@@ -515,6 +523,7 @@
+     <Compile Include="TaskExtension.cs">
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+     </Compile>
++    <Compile Include="TaskTranslatorHelpers.cs" />
+     <Compile Include="Telemetry.cs" />
+     <Compile Include="ToolTaskExtension.cs">
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+diff --git a/src/Tasks/SystemState.cs b/src/Tasks/SystemState.cs
+index 1dd51c92c86..9a9d47d64ed 100644
+--- a/src/Tasks/SystemState.cs
++++ b/src/Tasks/SystemState.cs
+@@ -8,11 +8,15 @@
+ using System.Diagnostics;
+ using System.Diagnostics.CodeAnalysis;
+ using System.IO;
++using System.Linq;
+ using System.Runtime.Serialization;
+ using System.Runtime.Versioning;
+ using System.Security.Permissions;
++using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Shared;
++using Microsoft.Build.Shared.FileSystem;
+ using Microsoft.Build.Tasks.AssemblyDependency;
++using Microsoft.Build.Utilities;
+ 
+ namespace Microsoft.Build.Tasks
+ {
+@@ -20,8 +24,11 @@ namespace Microsoft.Build.Tasks
+     /// Class is used to cache system state.
+     /// </summary>
+     [Serializable]
+-    internal sealed class SystemState : StateFileBase, ISerializable
++    internal sealed class SystemState : StateFileBase, ISerializable, ITranslatable
+     {
++        private static readonly byte[] TranslateContractSignature = new []{(byte)'M', (byte)'B', (byte)'R', (byte)'S', (byte)'C', }; // Microsoft Build Rar State Cache
++        private static readonly byte TranslateContractVersion = 0x01;
++
+         /// <summary>
+         /// Cache at the SystemState instance level. Has the same contents as <see cref="instanceLocalFileStateCache"/>.
+         /// It acts as a flag to enforce that an entry has been checked for staleness only once.
+@@ -31,7 +38,7 @@ internal sealed class SystemState : StateFileBase, ISerializable
+         /// <summary>
+         /// Cache at the SystemState instance level. It is serialized and reused between instances.
+         /// </summary>
+-        private Hashtable instanceLocalFileStateCache = new Hashtable(StringComparer.OrdinalIgnoreCase);
++        private Dictionary<string, FileState> instanceLocalFileStateCache = new Dictionary<string, FileState>(StringComparer.OrdinalIgnoreCase);
+ 
+         /// <summary>
+         /// LastModified information is purely instance-local. It doesn't make sense to
+@@ -108,7 +115,7 @@ internal sealed class SystemState : StateFileBase, ISerializable
+         /// Class that holds the current file state.
+         /// </summary>
+         [Serializable]
+-        private sealed class FileState : ISerializable
++        private sealed class FileState : ISerializable, ITranslatable
+         {
+             /// <summary>
+             /// The last modified time for this file.
+@@ -148,6 +155,14 @@ internal FileState(DateTime lastModified)
+                 this.lastModified = lastModified;
+             }
+ 
++            /// <summary>
++            /// Ctor for translator deserialization
++            /// </summary>
++            internal FileState(ITranslator translator)
++            {
++                Translate(translator);
++            }
++
+             /// <summary>
+             /// Deserializing constuctor.
+             /// </summary>
+@@ -192,6 +207,23 @@ public void GetObjectData(SerializationInfo info, StreamingContext context)
+                 }
+             }
+ 
++            /// <summary>
++            /// Reads/writes this class
++            /// </summary>
++            public void Translate(ITranslator translator)
++            {
++                ErrorUtilities.VerifyThrowArgumentNull(translator, nameof(translator));
++
++                translator.Translate(ref lastModified);
++                translator.Translate(ref assemblyName,
++                    (ITranslator t) => new AssemblyNameExtension(t));
++                translator.TranslateArray(ref dependencies,
++                    (ITranslator t) => new AssemblyNameExtension(t));
++                translator.Translate(ref scatterFiles);
++                translator.Translate(ref runtimeVersion);
++                translator.Translate(ref frameworkName);
++            }
++
+             /// <summary>
+             /// Gets the last modified date.
+             /// </summary>
+@@ -246,7 +278,14 @@ internal SystemState(SerializationInfo info, StreamingContext context)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(info, nameof(info));
+ 
+-            instanceLocalFileStateCache = (Hashtable)info.GetValue("fileState", typeof(Hashtable));
++            var localFilesAsHashTable = (Hashtable)info.GetValue("fileState", typeof(Hashtable));
++
++            instanceLocalFileStateCache = localFilesAsHashTable.Cast<DictionaryEntry>()
++                .ToDictionary(
++                    kvp => (string)kvp.Key,
++                    kvp => (FileState)kvp.Value,
++                    StringComparer.OrdinalIgnoreCase);
++
+             isDirty = false;
+         }
+ 
+@@ -264,6 +303,93 @@ AssemblyTableInfo[] installedAssemblyTableInfos
+             redistList = RedistList.GetRedistList(installedAssemblyTableInfos);
+         }
+ 
++        /// <summary>
++        /// Writes the contents of this object out to the specified file.
++        /// TODO: once all derived classes from StateFileBase adopt new serialization, we shall consider to mode this into base class
++        /// </summary>
++        internal void SerializeCacheByTranslator(string stateFile, TaskLoggingHelper log)
++        {
++            try
++            {
++                if (!string.IsNullOrEmpty(stateFile))
++                {
++                    if (FileSystems.Default.FileExists(stateFile))
++                    {
++                        File.Delete(stateFile);
++                    }
++
++                    using var s = new FileStream(stateFile, FileMode.CreateNew);
++                    var translator = BinaryTranslator.GetWriteTranslator(s);
++
++                    // write file signature
++                    translator.Writer.Write(TranslateContractSignature); 
++                    translator.Writer.Write(TranslateContractVersion);
++
++                    Translate(translator);
++                }
++            }
++            catch (Exception e)
++            {
++                // If there was a problem writing the file (like it's read-only or locked on disk, for
++                // example), then eat the exception and log a warning.  Otherwise, rethrow.
++                if (ExceptionHandling.NotExpectedSerializationException(e))
++                    throw;
++
++                // Not being able to serialize the cache is not an error, but we let the user know anyway.
++                // Don't want to hold up processing just because we couldn't read the file.
++                log.LogWarningWithCodeFromResources("General.CouldNotWriteStateFile", stateFile, e.Message);
++            }
++        }
++
++        /// <summary>
++        /// Read the contents of this object out to the specified file.
++        /// TODO: once all derived classes from StateFileBase adopt new serialization, we shall consider to mode this into base class
++        /// </summary>
++        internal static SystemState DeserializeCacheByTranslator(string stateFile, TaskLoggingHelper log)
++        {
++            // First, we read the cache from disk if one exists, or if one does not exist
++            // then we create one.
++            try
++            {
++                if (!string.IsNullOrEmpty(stateFile) && FileSystems.Default.FileExists(stateFile))
++                {
++                    using FileStream s = new FileStream(stateFile, FileMode.Open);
++                    var translator = BinaryTranslator.GetReadTranslator(s, buffer:null); // TODO: shared buffering?
++
++                    // verify file signature
++                    var contractSignature = translator.Reader.ReadBytes(TranslateContractSignature.Length);
++                    var contractVersion = translator.Reader.ReadByte();
++
++                    if (!contractSignature.SequenceEqual(TranslateContractSignature) || contractVersion != TranslateContractVersion)
++                    {
++                        log.LogMessageFromResources("General.CouldNotReadStateFileMessage", stateFile, log.FormatResourceString("General.IncompatibleStateFileType"));
++                        return null;
++                    }
++
++                    SystemState systemState = new SystemState();
++                    systemState.Translate(translator);
++
++                    return systemState;
++                }
++            }
++            catch (Exception e)
++            {
++                if (ExceptionHandling.IsCriticalException(e))
++                {
++                    throw;
++                }
++
++                // The deserialization process seems like it can throw just about 
++                // any exception imaginable.  Catch them all here.
++                // Not being able to deserialize the cache is not an error, but we let the user know anyway.
++                // Don't want to hold up processing just because we couldn't read the file.
++                log.LogWarningWithCodeFromResources("General.CouldNotReadStateFile", stateFile, e.Message);
++                return null;
++            }
++
++            return null;
++        }
++
+         /// <summary>
+         /// Serialize the contents of the class.
+         /// </summary>
+@@ -272,7 +398,24 @@ public void GetObjectData(SerializationInfo info, StreamingContext context)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(info, nameof(info));
+ 
+-            info.AddValue("fileState", instanceLocalFileStateCache);
++            var localFilesAsHashtable = new Hashtable();
++            foreach (var pair in instanceLocalFileStateCache)
++            {
++                localFilesAsHashtable.Add(pair.Key, pair.Value);
++            }
++
++            info.AddValue("fileState", localFilesAsHashtable);
++        }
++
++        public void Translate(ITranslator translator)
++        {
++            if (instanceLocalFileStateCache is null)
++                throw new NullReferenceException(nameof(instanceLocalFileStateCache));
++
++            translator.TranslateDictionary(
++                ref instanceLocalFileStateCache,
++                StringComparer.OrdinalIgnoreCase,
++                (ITranslator t) => new FileState(t));
+         }
+ 
+         /// <summary>
+@@ -378,10 +521,8 @@ private FileState GetFileState(string path)
+         private FileState ComputeFileStateFromCachesAndDisk(string path)
+         {
+             DateTime lastModified = GetAndCacheLastModified(path);
+-            FileState cachedInstanceFileState = (FileState)instanceLocalFileStateCache[path];
+-            bool isCachedInInstance = cachedInstanceFileState != null;
+-            bool isCachedInProcess =
+-                s_processWideFileStateCache.TryGetValue(path, out FileState cachedProcessFileState);
++            bool isCachedInInstance = instanceLocalFileStateCache.TryGetValue(path, out FileState cachedInstanceFileState);
++            bool isCachedInProcess = s_processWideFileStateCache.TryGetValue(path, out FileState cachedProcessFileState);
+             
+             bool isInstanceFileStateUpToDate = isCachedInInstance && lastModified == cachedInstanceFileState.LastModified;
+             bool isProcessFileStateUpToDate = isCachedInProcess && lastModified == cachedProcessFileState.LastModified;
+diff --git a/src/Tasks/TaskTranslatorHelpers.cs b/src/Tasks/TaskTranslatorHelpers.cs
+new file mode 100644
+index 00000000000..1d4b58a7ede
+--- /dev/null
++++ b/src/Tasks/TaskTranslatorHelpers.cs
+@@ -0,0 +1,35 @@
++using System;
++using System.Runtime.Versioning;
++using Microsoft.Build.BackEnd;
++
++namespace Microsoft.Build.Tasks
++{
++    internal static class TaskTranslatorHelpers
++    {
++        public static void Translate(this ITranslator translator, ref FrameworkName frameworkName)
++        {
++            if (!translator.TranslateNullable(frameworkName))
++                return;
++
++            string identifier = null;
++            Version version = null;
++            string profile = null;
++
++            if (translator.Mode == TranslationDirection.WriteToStream)
++            {
++                identifier = frameworkName.Identifier;
++                version = frameworkName.Version;
++                profile = frameworkName.Profile;
++            }
++
++            translator.Translate(ref identifier);
++            translator.Translate(ref version);
++            translator.Translate(ref profile);
++
++            if (translator.Mode == TranslationDirection.ReadFromStream)
++            {
++                frameworkName = new FrameworkName(identifier, version, profile);
++            }
++        }
++    }
++}

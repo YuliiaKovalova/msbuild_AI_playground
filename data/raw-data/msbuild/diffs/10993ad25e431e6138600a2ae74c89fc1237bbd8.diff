@@ -1,0 +1,594 @@
+diff --git a/documentation/specs/BuildCheck/Codes.md b/documentation/specs/BuildCheck/Codes.md
+index e9a4c04a20f..892e17a178a 100644
+--- a/documentation/specs/BuildCheck/Codes.md
++++ b/documentation/specs/BuildCheck/Codes.md
+@@ -12,6 +12,7 @@ Report codes are chosen to conform to suggested guidelines. Those guidelines are
+ | [BC0106](#bc0106---copytooutputdirectoryalways-should-be-avoided) | Warning | N/A | 9.0.200 | CopyToOutputDirectory='Always' should be avoided. |
+ | [BC0107](#bc0107---targetframework-and-targetframeworks-specified-together) | Warning | N/A | 9.0.200 | TargetFramework and TargetFrameworks specified together. |
+ | [BC0108](#bc0108---targetframework-or-targetframeworks-specified-in-non-sdk-style-project) | Warning | N/A | 9.0.300 | TargetFramework or TargetFrameworks specified in non-SDK style project. |
++| [BC0109](#bc0109---building-using-the-exec-task) | Warning | N/A | 9.0.300 | Building using the Exec task. |
+ | [BC0201](#bc0201---usage-of-undefined-property) | Warning | Project | 9.0.100 | Usage of undefined property. |
+ | [BC0202](#bc0202---property-first-declared-after-it-was-used) | Warning | Project | 9.0.100 | Property first declared after it was used. |
+ | [BC0203](#bc0203----property-declared-but-never-used) | None | Project | 9.0.100 | Property declared but never used. |
+@@ -137,6 +138,13 @@ dotnet build my-multi-target.csproj /p:TargetFramework=net9.0
+ 
+ Make sure the Target Framework is specified appropriately for your project.
+ 
++<a name="BC0109"></a>
++## BC0109 - Building using the Exec task.
++
++"The 'Exec' task should not be used to build projects."
++
++Building projects using the dotnet/msbuild/nuget CLI in the `Exec` task is not recommended, as it spawns a separate build process that the MSBuild engine cannot track. Please use the [MSBuild task](https://learn.microsoft.com/visualstudio/msbuild/msbuild-task) instead.
++
+ 
+ <a name="BC0201"></a>
+ ## BC0201 - Usage of undefined property.
+diff --git a/src/Build/BuildCheck/Checks/ExecCliBuildCheck.cs b/src/Build/BuildCheck/Checks/ExecCliBuildCheck.cs
+new file mode 100644
+index 00000000000..868827b24cc
+--- /dev/null
++++ b/src/Build/BuildCheck/Checks/ExecCliBuildCheck.cs
+@@ -0,0 +1,150 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++#if !FEATURE_MSIOREDIST
++using System.IO;
++#endif
++using Microsoft.Build.Shared;
++
++#if FEATURE_MSIOREDIST
++using Path = Microsoft.IO.Path;
++#endif
++
++namespace Microsoft.Build.Experimental.BuildCheck.Checks;
++
++internal sealed class ExecCliBuildCheck : Check
++{
++    public static CheckRule SupportedRule = new CheckRule(
++        "BC0109",
++        "ExecCliBuild",
++        ResourceUtilities.GetResourceString("BuildCheck_BC0109_Title")!,
++        ResourceUtilities.GetResourceString("BuildCheck_BC0109_MessageFmt")!,
++        new CheckConfiguration() { Severity = CheckResultSeverity.Warning });
++
++    private const string ExecTaskName = "Exec";
++    private const string CommandParameterName = "Command";
++
++    private static readonly char[] s_knownCommandSeparators = ['&', ';', '|'];
++
++    private static readonly string[] s_knownBuildCommands =
++    [
++        "dotnet build",
++        "dotnet clean",
++        "dotnet msbuild",
++        "dotnet restore",
++        "dotnet publish",
++        "dotnet pack",
++        "dotnet vstest",
++        "nuget restore",
++        "msbuild",
++        "dotnet test",
++        "dotnet run",
++    ];
++
++    public override string FriendlyName => "MSBuild.ExecCliBuildCheck";
++
++    internal override bool IsBuiltIn => true;
++
++    public override IReadOnlyList<CheckRule> SupportedRules { get; } = [SupportedRule];
++
++    public override void Initialize(ConfigurationContext configurationContext)
++    {
++        /* This is it - no custom configuration */
++    }
++
++    public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++    {
++        registrationContext.RegisterTaskInvocationAction(TaskInvocationAction);
++    }
++
++    private static void TaskInvocationAction(BuildCheckDataContext<TaskInvocationCheckData> context)
++    {
++        if (context.Data.TaskName == ExecTaskName
++            && context.Data.Parameters.TryGetValue(CommandParameterName, out TaskInvocationCheckData.TaskParameter? commandArgument))
++        {
++            var execCommandValue = commandArgument.Value?.ToString() ?? string.Empty;
++
++            var commandSpan = execCommandValue.AsSpan();
++            int start = 0;
++
++            while (start < commandSpan.Length)
++            {
++                var nextSeparatorIndex = commandSpan.Slice(start, commandSpan.Length - start).IndexOfAny(s_knownCommandSeparators);
++
++                if (nextSeparatorIndex == -1)
++                {
++                    if (TryGetMatchingKnownBuildCommand(commandSpan.Slice(start), out var knownBuildCommand))
++                    {
++                        context.ReportResult(BuildCheckResult.CreateBuiltIn(
++                            SupportedRule,
++                            context.Data.TaskInvocationLocation,
++                            context.Data.TaskName,
++                            Path.GetFileName(context.Data.ProjectFilePath),
++                            GetToolName(knownBuildCommand)));
++                    }
++
++                    break;
++                }
++                else
++                {
++                    var command = commandSpan.Slice(start, nextSeparatorIndex);
++
++                    if (TryGetMatchingKnownBuildCommand(command, out var knownBuildCommand))
++                    {
++                        context.ReportResult(BuildCheckResult.CreateBuiltIn(
++                            SupportedRule,
++                            context.Data.TaskInvocationLocation,
++                            context.Data.TaskName,
++                            Path.GetFileName(context.Data.ProjectFilePath),
++                            GetToolName(knownBuildCommand)));
++
++                        break;
++                    }
++
++                    start += nextSeparatorIndex + 1;
++                }
++            }
++        }
++    }
++
++    private static bool TryGetMatchingKnownBuildCommand(ReadOnlySpan<char> command, out string knownBuildCommand)
++    {
++        const int maxStackLimit = 1024;
++
++        Span<char> normalizedBuildCommand = command.Length <= maxStackLimit ? stackalloc char[command.Length] : new char[command.Length];
++        int normalizedCommandIndex = 0;
++
++        foreach (var c in command)
++        {
++            if (char.IsWhiteSpace(c) && (normalizedCommandIndex == 0 || char.IsWhiteSpace(normalizedBuildCommand[normalizedCommandIndex - 1])))
++            {
++                continue;
++            }
++
++            normalizedBuildCommand[normalizedCommandIndex++] = c;
++        }
++
++        foreach (var buildCommand in s_knownBuildCommands)
++        {
++            if (normalizedBuildCommand.StartsWith(buildCommand.AsSpan()))
++            {
++                knownBuildCommand = buildCommand;
++                return true;
++            }
++        }
++
++        knownBuildCommand = string.Empty;
++        return false;
++    }
++
++    private static string GetToolName(string knownBuildCommand)
++    {
++        int nextSpaceIndex = knownBuildCommand.IndexOf(' ');
++
++        return nextSpaceIndex == -1
++            ? knownBuildCommand
++            : knownBuildCommand.AsSpan().Slice(0, nextSpaceIndex).ToString();
++    }
++}
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 7100095f1b4..89998bad255 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -149,6 +149,7 @@ internal readonly record struct BuiltInCheckFactory(
+                 new BuiltInCheckFactory([PreferProjectReferenceCheck.SupportedRule.Id], PreferProjectReferenceCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<PreferProjectReferenceCheck>),
+                 new BuiltInCheckFactory([CopyAlwaysCheck.SupportedRule.Id], CopyAlwaysCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<CopyAlwaysCheck>),
+                 new BuiltInCheckFactory([DoubleWritesCheck.SupportedRule.Id], DoubleWritesCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<DoubleWritesCheck>),
++                new BuiltInCheckFactory([ExecCliBuildCheck.SupportedRule.Id], ExecCliBuildCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<ExecCliBuildCheck>),
+                 new BuiltInCheckFactory([NoEnvironmentVariablePropertyCheck.SupportedRule.Id], NoEnvironmentVariablePropertyCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<NoEnvironmentVariablePropertyCheck>),
+                 new BuiltInCheckFactory([EmbeddedResourceCheck.SupportedRule.Id], EmbeddedResourceCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<EmbeddedResourceCheck>),
+                 new BuiltInCheckFactory([TargetFrameworkConfusionCheck.SupportedRule.Id], TargetFrameworkConfusionCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<TargetFrameworkConfusionCheck>),
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 128cf7283c0..f36cdbcde75 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -2206,6 +2206,12 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>Project {0} specifies 'TargetFramework(s)' property '{1}', which does not use the .NET SDK. Those properties are not understood by projects that import C# targets directly.</value>
+     <comment>Terms in quotes are not to be translated.</comment>
+   </data>
++  <data name="BuildCheck_BC0109_Title" xml:space="preserve">
++    <value>The 'Exec' task should not be used to build a project.</value>
++  </data>
++  <data name="BuildCheck_BC0109_MessageFmt" xml:space="preserve">
++    <value>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</value>
++  </data>
+   <data name="BuildCheck_BC0201_Title" xml:space="preserve">
+     <value>A property that is accessed should be declared first.</value>
+   </data>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 5d95d9b15e5..a4ed911d08e 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">Vlastnosti TargetFramework a TargetFrameworks se nedodržují a neměly by se zadává v projektech, které nepoužívají sadu .NET SDK.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">K vlastnosti: {0} bylo přistupováno, ale nebyla nikdy inicializována.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 2cc67095e98..7fe8564cd54 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">Die Eigenschaften "TargetFramework" und "TargetFrameworks" werden nicht berücksichtigt und sollten nicht in Projekten angegeben werden, die nicht das .NET SDK verwenden.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Auf die Eigenschaft „{0}“ wurde zugegriffen, sie wurde jedoch nie initialisiert.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 7a8f4854d66..d6b69ebe981 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">Las propiedades "TargetFramework" y "TargetFrameworks" no se respetan y no deben especificarse en proyectos que no usen el SDK de .NET.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propiedad: se obtuvo acceso a "{0}", pero nunca se inicializó.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index aafdf22e15f..476f81982a5 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">Les propriétés 'TargetFramework' et 'TargetFrameworks' ne sont pas respectées et ne doivent pas être spécifiées dans les projets qui n’utilisent pas le SDK .NET.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propriété : « {0} » a été consultée, mais elle n'a jamais été initialisée.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 5e38412a12f..88de2f29361 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">Le proprietà 'TargetFramework' e 'TargetFrameworks' non vengono rispettate e non devono essere specificate nei progetti che non usano .NET SDK.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">È stato eseguito l'accesso alla proprietà '{0}', ma non è mai stata inizializzata.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index dda0d13a014..ac24fa3a8cc 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">'TargetFramework' プロパティと 'TargetFrameworks' プロパティは優先されないため、.NET SDK を使用しないプロジェクトでは指定しないでください。</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">プロパティ: '{0}' にアクセスしましたが、初期化されませんでした。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 03f95d108ff..604e05765c3 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">'TargetFramework' 및 'TargetFrameworks' 속성은 사용되지 않으며 .NET SDK를 사용하지 않는 프로젝트에서 지정해서는 안 됩니다.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">속성: '{0}'에 액세스했지만 초기화되지 않았습니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index b41218bfd21..c4b1e4e7950 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">Właściwości "TargetFramework" i "TargetFrameworks" nie są respektowane i nie należy ich określać w projektach, w których nie jest używany zestaw .NET SDK.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Właściwość: uzyskano dostęp do „{0}”, ale nigdy nie dokonano inicjacji.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index dd2bf9c6cf7..dac69426c0d 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">As propriedades 'TargetFramework' e 'TargetFrameworks' não são respeitadas e não devem ser especificadas em projetos que não usam o SDK do .NET.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propriedade: "{0}" foi acessada, mas nunca foi inicializada.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 7d7883cf5c6..7761ba40014 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">Свойства TargetFramework и TargetFrameworks не учитываются и не должны указываться в проектах, не использующих пакет SDK для .NET.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Свойство: к "{0}" получен доступ, но он не инициализирован.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 8bc03e8a1bc..2e698dd6995 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">'TargetFramework' ve 'TargetFrameworks' özellikleri dikkate alınmaz ve .NET SDK kullanmayan projelerde belirtilmeli.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">'{0}' özelliğine erişildi, ancak hiç başlatılmadı.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index dcc11e8f51b..f67cf71b15f 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">不考虑 “TargetFramework” 和 “TargetFrameworks” 属性，不应在不使用 .NET SDK 的项目中指定这些属性。</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">已访问属性“{0}”，但从未将其初始化过。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index beb75eae504..74f2f895537 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -221,6 +221,16 @@
+         <target state="translated">未遵守 『TargetFramework』 和 『TargetFrameworks』 屬性，且不應在未使用 .NET SDK 的專案中指定。</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_MessageFmt">
++        <source>Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</source>
++        <target state="new">Task {0} from project {1} builds a project using the {2} CLI. The MSBuild task should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0109_Title">
++        <source>The 'Exec' task should not be used to build a project.</source>
++        <target state="new">The 'Exec' task should not be used to build a project.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">已存取屬性: '{0}'，但從未初始化。</target>
+diff --git a/src/BuildCheck.UnitTests/ExecCliBuildCheck_Tests.cs b/src/BuildCheck.UnitTests/ExecCliBuildCheck_Tests.cs
+new file mode 100644
+index 00000000000..edbb0e6bdc9
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/ExecCliBuildCheck_Tests.cs
+@@ -0,0 +1,104 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System.Collections.Generic;
++using System.Runtime.InteropServices;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Experimental.BuildCheck.Checks;
++using Shouldly;
++using Xunit;
++
++namespace Microsoft.Build.BuildCheck.UnitTests
++{
++    public sealed class ExecCliBuildCheck_Tests
++    {
++        private const int MaxStackSizeWindows = 1024 * 1024; // 1 MB
++        private const int MaxStackSizeLinux = 1024 * 1024 * 8; // 8 MB
++
++        private readonly ExecCliBuildCheck _check;
++
++        private readonly MockBuildCheckRegistrationContext _registrationContext;
++
++        public static TheoryData<string?> BuildCommandTestData => new TheoryData<string?>(
++            "dotnet build",
++            "dotnet build&dotnet build",
++            "dotnet     build",
++            "dotnet clean",
++            "dotnet msbuild",
++            "dotnet restore",
++            "dotnet publish",
++            "dotnet pack",
++            "dotnet test",
++            "dotnet vstest",
++            "dotnet build -p:Configuration=Release",
++            "dotnet build /t:Restore;Clean",
++            "dotnet build&some command",
++            "some command&dotnet build&some other command",
++            "some command&dotnet build",
++            "some command&amp;dotnet build&amp;some other command",
++            "msbuild",
++            "msbuild /t:Build",
++            "msbuild --t:Restore;Clean",
++            "nuget restore",
++            "dotnet run --project project.SLN",
++            "dotnet run project.csproj",
++            "dotnet run project.proj",
++            "dotnet run",
++            string.Join(";", new string('a', 1025), "dotnet build", new string('a', 1025)),
++            string.Join(";", new string('a', RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? MaxStackSizeWindows * 2 : MaxStackSizeLinux * 2), "dotnet build"));
++
++        public static TheoryData<string?> NonBuildCommandTestData => new TheoryData<string?>(
++            "dotnet help",
++            "where dotnet",
++            "where msbuild",
++            "where nuget",
++            "dotnet bin/net472/project.dll",
++            string.Empty,
++            null,
++            new string('a', RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? MaxStackSizeWindows * 2 : MaxStackSizeLinux * 2));
++
++        public ExecCliBuildCheck_Tests()
++        {
++            _check = new ExecCliBuildCheck();
++            _registrationContext = new MockBuildCheckRegistrationContext();
++            _check.RegisterActions(_registrationContext);
++        }
++
++        [Theory]
++        [MemberData(nameof(BuildCommandTestData))]
++        public void ExecTask_WithCommandExecutingBuild_ShouldShowWarning(string? command)
++        {
++            _registrationContext.TriggerTaskInvocationAction(MakeTaskInvocationData("Exec", new Dictionary<string, TaskInvocationCheckData.TaskParameter>
++            {
++                { "Command", new TaskInvocationCheckData.TaskParameter(command, IsOutput: false) },
++            }));
++
++            _registrationContext.Results.Count.ShouldBe(1);
++            _registrationContext.Results[0].CheckRule.Id.ShouldBe("BC0109");
++        }
++
++        [Theory]
++        [MemberData(nameof(NonBuildCommandTestData))]
++        public void ExecTask_WithCommandNotExecutingBuild_ShouldNotShowWarning(string? command)
++        {
++            _registrationContext.TriggerTaskInvocationAction(MakeTaskInvocationData("Exec", new Dictionary<string, TaskInvocationCheckData.TaskParameter>
++            {
++                { "Command", new TaskInvocationCheckData.TaskParameter(command, IsOutput: false) },
++            }));
++
++            _registrationContext.Results.Count.ShouldBe(0);
++        }
++
++        private TaskInvocationCheckData MakeTaskInvocationData(string taskName, Dictionary<string, TaskInvocationCheckData.TaskParameter> parameters)
++        {
++            string projectFile = Framework.NativeMethods.IsWindows ? @"C:\fake\project.proj" : "/fake/project.proj";
++            return new TaskInvocationCheckData(
++                projectFile,
++                null,
++                Construction.ElementLocation.EmptyLocation,
++                taskName,
++                projectFile,
++                parameters);
++        }
++    }
++}

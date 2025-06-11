@@ -1,0 +1,95 @@
+{
+  "number": 8070,
+  "title": "Fix race condition with ProjectCacheService disposal and background initialization",
+  "body": "`ProjectCacheTests.MultiplePlugins` has been slightly flaky since its inception and throws a `IndexOutOfRangeException`. After (finally) investigating, I believe it's an actual race condition in the product.\r\n\r\nIn `ProjectCacheService.DisposeAsync`, there is the following snippet:\r\n\r\n```cs\r\nTask[] cleanupTasks = new Task[_projectCachePlugins.Count];\r\nint idx = 0;\r\nforeach (KeyValuePair<ProjectCacheDescriptor, Lazy<Task<ProjectCachePlugin>>> kvp in _projectCachePlugins)\r\n{\r\n    cleanupTasks[idx++] = Task.Run(async () => ...);\r\n}\r\n```\r\n\r\nAdditionally, `BuildManager` does the following:\r\n\r\n```cs\r\nTask.Run(() => _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token));\r\n```\r\n\r\nAnd `ProjectCacheService.InitializePluginsForGraph` may add to its `_projectCachePlugins`.\r\n\r\nSo my belief is that there is a race here where:\r\n1. `InitializePluginsForGraph` is kicked off in the background\r\n2. The build shuts down for any reason (not currently known why though), which disposes the `ProjectCacheService`\r\n3. `ProjectCacheService.DisposeAsync` sees `_projectCachePlugins.Count` with value 1, so the `cleanupTasks` array has length 1.\r\n4. `InitializePluginsForGraph` does more work in the other thread and ends up initializing and adding a second plugin to `_projectCachePlugins`\r\n5. Back in `ProjectCacheService.DisposeAsync`, `_projectCachePlugins` is iterated (now with 2 things in it) and overruns the `cleanupTasks` array!\r\n\r\nI haven't been able to confirm this completely due to it being a rare race condition and because of the UT issue fixed with #8069, but from a visual inspection it seems like it's an issue regardless.",
+  "state": "MERGED",
+  "createdAt": "2022-10-17T21:04:30Z",
+  "updatedAt": "2022-10-24T14:02:45Z",
+  "closedAt": "2022-10-24T14:02:45Z",
+  "mergedAt": "2022-10-24T14:02:45Z",
+  "additions": 3,
+  "deletions": 4,
+  "changedFiles": 2,
+  "headRefName": "fix-projectcacheservice-dispos-race",
+  "isDraft": false,
+  "author": {
+    "login": "dfederm"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": []
+  },
+  "labels": [
+    "merge-when-branch-open"
+  ],
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "oid": "56315ab6d302247f2561a22f683eff26e8cc2e72",
+          "message": "Fix race condition with ProjectCacheService disposal and background initialization",
+          "committedDate": "2022-10-17T21:23:28Z",
+          "author": {
+            "name": "David Federman",
+            "email": "dfederm@microsoft.com"
+          }
+        }
+      }
+    ]
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "Is there a case where the opposite race happens: shutdown is initiated, then initialization starts up (again) and adds to the currently-being-iterated `_projectCachePlugins`?",
+        "createdAt": "2022-10-18T14:12:53Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "> Is there a case where the opposite race happens: shutdown is initiated, then initialization starts up (again) and adds to the currently-being-iterated `_projectCachePlugins`?\r\n\r\nShouldn't be. Initialization happens when a graph build request is submitted and BuildManager should be managing that state well (or if not, there are bigger problems)",
+        "createdAt": "2022-10-18T14:37:38Z",
+        "author": {
+          "login": "dfederm"
+        }
+      }
+    ]
+  },
+  "reviewThreads": {
+    "nodes": [
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "I'm not really sure I like this. Maybe I should remove the `Task.Run` here and move it into `InitializePluginsForGraph` instead and have the `ProjectCacheService` manage the background task during its own disposal. That way `BuildManager` has 1 less thing to worry about...",
+              "createdAt": "2022-10-17T21:05:37Z",
+              "path": "src/Build/BackEnd/BuildManager/BuildManager.cs",
+              "diffHunk": "@@ -1847,7 +1852,7 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)\n             if (submission.BuildRequestData.GraphBuildOptions.Build)\n             {\n                 // Kick off project cache initialization frontloading\n-                Task.Run(() => _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token));\n+                _projectCacheServiceGraphInitialization = Task.Run(() => _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token));",
+              "author": {
+                "login": "dfederm"
+              }
+            },
+            {
+              "body": "Stupid question:\r\nWhy do we need to do Task.Run for initialization at all? I'd imagine the rest depends on it being initialized, right?",
+              "createdAt": "2022-10-17T21:11:05Z",
+              "path": "src/Build/BackEnd/BuildManager/BuildManager.cs",
+              "diffHunk": "@@ -1847,7 +1852,7 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)\n             if (submission.BuildRequestData.GraphBuildOptions.Build)\n             {\n                 // Kick off project cache initialization frontloading\n-                Task.Run(() => _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token));\n+                _projectCacheServiceGraphInitialization = Task.Run(() => _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token));",
+              "author": {
+                "login": "Forgind"
+              }
+            },
+            {
+              "body": "Yea, this might be an over-optimization. There's stuff that happens before the graph build starts (getting the target list for each node), but `InitializePluginsForGraph` itself does a bunch of fire-and-forget calls so it shouldn't really be blocking for long anyway.\r\n\r\nI think you convinced me to just remove the task for simplicity, and we can re-address it if it shows up as a perf problem later (unlikely).",
+              "createdAt": "2022-10-17T21:23:22Z",
+              "path": "src/Build/BackEnd/BuildManager/BuildManager.cs",
+              "diffHunk": "@@ -1847,7 +1852,7 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)\n             if (submission.BuildRequestData.GraphBuildOptions.Build)\n             {\n                 // Kick off project cache initialization frontloading\n-                Task.Run(() => _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token));\n+                _projectCacheServiceGraphInitialization = Task.Run(() => _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token));",
+              "author": {
+                "login": "dfederm"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

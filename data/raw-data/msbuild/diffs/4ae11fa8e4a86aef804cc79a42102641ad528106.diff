@@ -1,0 +1,129 @@
+diff --git a/eng/Versions.props b/eng/Versions.props
+index 366b5887234..b9463a72647 100644
+--- a/eng/Versions.props
++++ b/eng/Versions.props
+@@ -2,7 +2,7 @@
+ <!-- Copyright (c) .NET Foundation and contributors. All rights reserved. Licensed under the MIT license. See License.txt in the project root for full license information. -->
+ <Project>
+   <PropertyGroup>
+-    <VersionPrefix>17.12.2</VersionPrefix><DotNetFinalVersionKind>release</DotNetFinalVersionKind>
++    <VersionPrefix>17.12.3</VersionPrefix><DotNetFinalVersionKind>release</DotNetFinalVersionKind>
+     <PackageValidationBaselineVersion>17.11.4</PackageValidationBaselineVersion>
+     <AssemblyVersion>15.1.0.0</AssemblyVersion>
+     <PreReleaseVersionLabel>preview</PreReleaseVersionLabel>
+diff --git a/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs b/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
+index 00ee719f8d6..2111a5ee369 100644
+--- a/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
+@@ -1657,13 +1657,14 @@ public void CancelledBuildWithDelay40()
+             string contents = CleanupFileContents(@"
+ <Project xmlns='msbuildnamespace' ToolsVersion='msbuilddefaulttoolsversion'>
+  <Target Name='test'>
+-    <Exec Command='" + Helpers.GetSleepCommand(TimeSpan.FromSeconds(10)) + @"'/>
++    <Exec Command='" + Helpers.GetSleepCommand(TimeSpan.FromSeconds(20)) + @"'/>
+     <Message Text='[errormessage]'/>
+  </Target>
+ </Project>
+ ");
+             BuildRequestData data = GetBuildRequestData(contents, Array.Empty<string>(), MSBuildDefaultToolsVersion);
+             _buildManager.BeginBuild(_parameters);
++            Stopwatch sw = Stopwatch.StartNew();
+             BuildSubmission asyncResult = _buildManager.PendBuildRequest(data);
+             asyncResult.ExecuteAsync(null, null);
+ 
+@@ -1675,6 +1676,50 @@ public void CancelledBuildWithDelay40()
+ 
+             Assert.Equal(BuildResultCode.Failure, result.OverallResult); // "Build should have failed."
+             _logger.AssertLogDoesntContain("[errormessage]");
++            // The build should bail out immediately after executing CancelAllSubmissions, build stalling for a longer time
++            //  is very unexpected.
++            sw.Elapsed.ShouldBeLessThan(TimeSpan.FromSeconds(10));
++        }
++
++        /// <summary>
++        /// A canceled build which waits for the task to get started before canceling.  Because it is a 12.. task, we should
++        /// cancel the task and exit out after a short period wherein we wait for the task to exit cleanly.
++        ///
++        /// This test also exercises the possibility of CancelAllSubmissions being executed after EndBuild -
++        /// which can happen even if they are synchronously executed in expected order - the CancelAllSubmissions is internally
++        /// asynchronous and hence part of the execution can happen after EndBuild.
++        /// </summary>
++        [Fact]
++        public void CancelledBuildWithDelay40_WithThreatSwap()
++        {
++            string contents = CleanupFileContents(@"
++<Project xmlns='msbuildnamespace' ToolsVersion='msbuilddefaulttoolsversion'>
++ <Target Name='test'>
++    <Exec Command='" + Helpers.GetSleepCommand(TimeSpan.FromSeconds(20)) + @"'/>
++    <Message Text='[errormessage]'/>
++ </Target>
++</Project>
++");
++            BuildRequestData data = GetBuildRequestData(contents, Array.Empty<string>(), MSBuildDefaultToolsVersion);
++            _buildManager.BeginBuild(_parameters);
++            Stopwatch sw = Stopwatch.StartNew();
++            BuildSubmission asyncResult = _buildManager.PendBuildRequest(data);
++            asyncResult.ExecuteAsync(null, null);
++
++            Thread.Sleep(500);
++            // Simulate the case where CancelAllSubmissions is called after EndBuild or its internal queued task is swapped
++            //  and executed after EndBuild starts execution.
++            System.Threading.Tasks.Task.Delay(500).ContinueWith(t => _buildManager.CancelAllSubmissions());
++            _buildManager.EndBuild();
++
++            asyncResult.WaitHandle.WaitOne();
++            BuildResult result = asyncResult.BuildResult;
++
++            Assert.Equal(BuildResultCode.Failure, result.OverallResult); // "Build should have failed."
++            _logger.AssertLogDoesntContain("[errormessage]");
++            // The build should bail out immediately after executing CancelAllSubmissions, build stalling for a longer time
++            //  is very unexpected.
++            sw.Elapsed.ShouldBeLessThan(TimeSpan.FromSeconds(10));
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 96cada2d553..199c39ff7f6 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -789,15 +789,10 @@ void Callback(object? state)
+             {
+                 lock (_syncLock)
+                 {
+-                    if (_shuttingDown)
+-                    {
+-                        return;
+-                    }
+-
+-                    // If we are Idle, obviously there is nothing to cancel.  If we are waiting for the build to end, then presumably all requests have already completed
+-                    // and there is nothing left to cancel.  Putting this here eliminates the possibility of us racing with EndBuild to access the nodeManager before
+-                    // EndBuild sets it to null.
+-                    if (_buildManagerState != BuildManagerState.Building)
++                    // If the state is Idle - then there is yet or already nothing to cancel
++                    // If state is WaitingForBuildToComplete - we might be already waiting gracefully - but CancelAllSubmissions
++                    //  is a request for quick abort - so it's fine to resubmit the request
++                    if (_buildManagerState == BuildManagerState.Idle)
+                     {
+                         return;
+                     }
+@@ -2078,17 +2073,17 @@ private void ShutdownConnectedNodes(bool abort)
+             lock (_syncLock)
+             {
+                 _shuttingDown = true;
+-                _executionCancellationTokenSource!.Cancel();
++                _executionCancellationTokenSource?.Cancel();
+ 
+                 // If we are aborting, we will NOT reuse the nodes because their state may be compromised by attempts to shut down while the build is in-progress.
+-                _nodeManager!.ShutdownConnectedNodes(!abort && _buildParameters!.EnableNodeReuse);
++                _nodeManager?.ShutdownConnectedNodes(!abort && _buildParameters!.EnableNodeReuse);
+ 
+                 // if we are aborting, the task host will hear about it in time through the task building infrastructure;
+                 // so only shut down the task host nodes if we're shutting down tidily (in which case, it is assumed that all
+                 // tasks are finished building and thus that there's no risk of a race between the two shutdown pathways).
+                 if (!abort)
+                 {
+-                    _taskHostNodeManager!.ShutdownConnectedNodes(_buildParameters!.EnableNodeReuse);
++                    _taskHostNodeManager?.ShutdownConnectedNodes(_buildParameters!.EnableNodeReuse);
+                 }
+             }
+         }

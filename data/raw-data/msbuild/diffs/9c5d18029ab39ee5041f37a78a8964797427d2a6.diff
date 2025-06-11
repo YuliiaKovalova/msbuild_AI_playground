@@ -1,0 +1,2332 @@
+diff --git a/src/Build.UnitTests/Evaluation/UsedUninitializedProperties_Tests.cs b/src/Build.UnitTests/Evaluation/UsedUninitializedProperties_Tests.cs
+index 8ede8eec729..30ffe66374a 100644
+--- a/src/Build.UnitTests/Evaluation/UsedUninitializedProperties_Tests.cs
++++ b/src/Build.UnitTests/Evaluation/UsedUninitializedProperties_Tests.cs
+@@ -13,7 +13,7 @@ public sealed class UsedUninitializedProperties_Tests
+     [Fact]
+     public void Basics()
+     {
+-        UsedUninitializedProperties props = new();
++        PropertiesUsageTracker props = new();
+ 
+         Assert.False(props.TryGetPropertyElementLocation("Hello", out IElementLocation? elementLocation));
+         Assert.Null(elementLocation);
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/PropertyGroupIntrinsicTask.cs b/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/PropertyGroupIntrinsicTask.cs
+index 419ff97e0bd..bd333b01ec8 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/PropertyGroupIntrinsicTask.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/PropertyGroupIntrinsicTask.cs
+@@ -2,6 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Collections.Generic;
++using Microsoft.Build.BuildCheck.Infrastructure;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+@@ -78,7 +79,13 @@ internal override void ExecuteTask(Lookup lookup)
+                                 "CannotModifyReservedProperty",
+                                 property.Name);
+ 
+-                            string evaluatedValue = bucket.Expander.ExpandIntoStringLeaveEscaped(property.Value, ExpanderOptions.ExpandAll, property.Location);
++                            bucket.Expander.PropertiesUsageTracker.CurrentlyEvaluatingPropertyElementName = property.Name;
++                            bucket.Expander.PropertiesUsageTracker.PropertyReadContext =
++                                PropertyReadContext.PropertyEvaluation;
++
++
++                            string evaluatedValue = bucket.Expander.ExpandIntoStringLeaveEscaped(property.Value, ExpanderOptions.ExpandAll, property.Location, LoggingContext);
++                            bucket.Expander.PropertiesUsageTracker.CheckPreexistingUndefinedUsage(property, evaluatedValue, LoggingContext);
+ 
+                             if (LogTaskInputs && !LoggingContext.LoggingService.OnlyLogCriticalEvents)
+                             {
+@@ -86,6 +93,8 @@ internal override void ExecuteTask(Lookup lookup)
+                             }
+ 
+                             bucket.Lookup.SetProperty(ProjectPropertyInstance.Create(property.Name, evaluatedValue, property.Location, Project.IsImmutable));
++                            BuildCheckManagerProvider.GlobalBuildEngineDataConsumer.ProcessPropertyWrite(property.Name, string.IsNullOrEmpty(evaluatedValue), property.Location, LoggingContext?.BuildEventContext);
++                            bucket.Expander.PropertiesUsageTracker.ResetPropertyReadContext(false);
+                         }
+                     }
+                 }
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index 1a4693ba685..fb949e0c00d 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Globalization;
+ using System.IO;
+ using System.Linq;
+@@ -1225,7 +1226,8 @@ private async Task<BuildResult> BuildProject()
+             {
+                 buildCheckManager.EndProjectRequest(
+                     BuildCheckDataSource.BuildExecution,
+-                    _requestEntry.Request.ParentBuildEventContext);
++                    _requestEntry.Request.ParentBuildEventContext,
++                    _requestEntry.RequestConfiguration.ProjectFullPath);
+             }
+ 
+             BuildResult CopyTargetResultsFromProxyTargetsToRealTargets(BuildResult resultFromTargetBuilder)
+diff --git a/src/Build/BuildCheck/API/BuildCheckResult.cs b/src/Build/BuildCheck/API/BuildCheckResult.cs
+index 03a69e02939..183653767e2 100644
+--- a/src/Build/BuildCheck/API/BuildCheckResult.cs
++++ b/src/Build/BuildCheck/API/BuildCheckResult.cs
+@@ -5,6 +5,7 @@
+ using System.IO;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+@@ -16,12 +17,12 @@ namespace Microsoft.Build.Experimental.BuildCheck;
+ /// </summary>
+ public sealed class BuildCheckResult : IBuildCheckResult
+ {
+-    public static BuildCheckResult Create(BuildAnalyzerRule rule, ElementLocation location, params string[] messageArgs)
++    public static BuildCheckResult Create(BuildAnalyzerRule rule, IMsBuildElementLocation location, params string[] messageArgs)
+     {
+         return new BuildCheckResult(rule, location, messageArgs);
+     }
+ 
+-    public BuildCheckResult(BuildAnalyzerRule buildAnalyzerRule, ElementLocation location, string[] messageArgs)
++    public BuildCheckResult(BuildAnalyzerRule buildAnalyzerRule, IMsBuildElementLocation location, string[] messageArgs)
+     {
+         BuildAnalyzerRule = buildAnalyzerRule;
+         Location = location;
+@@ -42,7 +43,7 @@ internal BuildEventArgs ToEventArgs(BuildAnalyzerResultSeverity severity)
+     /// <summary>
+     /// Optional location of the finding (in near future we might need to support multiple locations).
+     /// </summary>
+-    public ElementLocation Location { get; }
++    public IMsBuildElementLocation Location { get; }
+ 
+     public string LocationString => Location.LocationString;
+ 
+diff --git a/src/Build/BuildCheck/API/IInternalBuildCheckRegistrationContext.cs b/src/Build/BuildCheck/API/IInternalBuildCheckRegistrationContext.cs
+new file mode 100644
+index 00000000000..7cc2dbb8416
+--- /dev/null
++++ b/src/Build/BuildCheck/API/IInternalBuildCheckRegistrationContext.cs
+@@ -0,0 +1,13 @@
++using System;
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++internal interface IInternalBuildCheckRegistrationContext : IBuildCheckRegistrationContext
++{
++    void RegisterPropertyReadAction(Action<BuildCheckDataContext<PropertyReadData>> propertyReadAction);
++
++    void RegisterPropertyWriteAction(Action<BuildCheckDataContext<PropertyWriteData>> propertyWriteAction);
++
++    void RegisterProjectProcessingDoneAction(Action<BuildCheckDataContext<ProjectProcessingDoneData>> propertyWriteAction);
++}
+\ No newline at end of file
+diff --git a/src/Build/BuildCheck/API/InternalBuildAnalyzer.cs b/src/Build/BuildCheck/API/InternalBuildAnalyzer.cs
+new file mode 100644
+index 00000000000..96b9d3dc2b8
+--- /dev/null
++++ b/src/Build/BuildCheck/API/InternalBuildAnalyzer.cs
+@@ -0,0 +1,18 @@
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++internal abstract class InternalBuildAnalyzer : BuildAnalyzer
++{
++    /// <summary>
++    /// 
++    /// </summary>
++    /// <param name="registrationContext"></param>
++    public abstract void RegisterInternalActions(IInternalBuildCheckRegistrationContext registrationContext);
++
++    /// <summary>
++    /// This is intentionally not implemented, as it is extended by <see cref="RegisterInternalActions"/>.
++    /// </summary>
++    /// <param name="registrationContext"></param>
++    public override void RegisterActions(IBuildCheckRegistrationContext registrationContext) { }
++}
+\ No newline at end of file
+diff --git a/src/Build/BuildCheck/Analyzers/PropertiesUsageAnalyzer.cs b/src/Build/BuildCheck/Analyzers/PropertiesUsageAnalyzer.cs
+new file mode 100644
+index 00000000000..9aad639c560
+--- /dev/null
++++ b/src/Build/BuildCheck/Analyzers/PropertiesUsageAnalyzer.cs
+@@ -0,0 +1,154 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Collections;
++using Microsoft.Build.Evaluation;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++internal class PropertiesUsageAnalyzer : InternalBuildAnalyzer
++{
++    private static readonly BuildAnalyzerRule _usedBeforeInitializedRule = new BuildAnalyzerRule("AB001", "PropertyUsedBeforeDeclared",
++        "A property that is accessed should be declared first.",
++        "Property: [{0}] was accessed, but it was never initialized.",
++        new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, IsEnabled = true, EvaluationAnalysisScope = EvaluationAnalysisScope.ProjectOnly });
++
++    private static readonly BuildAnalyzerRule _initializedAfterUsedRule = new BuildAnalyzerRule("AB002", "PropertyDeclaredAfterUsed",
++        "A property should be declared before it is first used.",
++        "Property: [{0}] first declared/initialized at [{1}] used before it was initialized.",
++        new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, IsEnabled = true, EvaluationAnalysisScope = EvaluationAnalysisScope.ProjectOnly });
++
++    private static readonly BuildAnalyzerRule _unusedPropertyRule = new BuildAnalyzerRule("AB003", "UnusedPropertyDeclared",
++        "A property that is not used should not be declared.",
++        "Property: [{0}] was declared/initialized, but it was never used.",
++        new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, IsEnabled = true, EvaluationAnalysisScope = EvaluationAnalysisScope.ProjectOnly });
++
++    internal static readonly IReadOnlyList<BuildAnalyzerRule> SupportedRulesList =[_usedBeforeInitializedRule, _initializedAfterUsedRule, _unusedPropertyRule];
++
++    public override string FriendlyName => "MSBuild.PropertiesUsageAnalyzer";
++
++    public override IReadOnlyList<BuildAnalyzerRule> SupportedRules => SupportedRulesList;
++
++    private const string _allowUninitPropsInConditionsKey = "AllowUninitializedPropertiesInConditions";
++    private bool _allowUninitPropsInConditions = false;
++    // TODO: Add scope to configuration visible by the analyzer - and reflect on it
++    public override void Initialize(ConfigurationContext configurationContext)
++    {
++        bool? allowUninitPropsInConditionsRule1 = null;
++        bool? allowUninitPropsInConditionsRule2 = null;
++
++        foreach (CustomConfigurationData customConfigurationData in configurationContext.CustomConfigurationData)
++        {
++            allowUninitPropsInConditionsRule1 =
++                GetAllowUninitPropsInConditionsConfig(customConfigurationData, _usedBeforeInitializedRule.Id);
++            allowUninitPropsInConditionsRule2 =
++                GetAllowUninitPropsInConditionsConfig(customConfigurationData, _initializedAfterUsedRule.Id);
++        }
++
++        if (allowUninitPropsInConditionsRule1.HasValue &&
++            allowUninitPropsInConditionsRule2.HasValue &&
++            allowUninitPropsInConditionsRule1 != allowUninitPropsInConditionsRule2)
++        {
++            throw new BuildCheckConfigurationException(
++                $"[{_usedBeforeInitializedRule.Id}] and [{_initializedAfterUsedRule.Id}] are not allowed to have differing configuration value for [{_allowUninitPropsInConditionsKey}]");
++        }
++
++        if (allowUninitPropsInConditionsRule1.HasValue || allowUninitPropsInConditionsRule2.HasValue)
++        {
++            _allowUninitPropsInConditions = allowUninitPropsInConditionsRule1 ?? allowUninitPropsInConditionsRule2 ?? false;
++        }
++    }
++
++    private static bool? GetAllowUninitPropsInConditionsConfig(CustomConfigurationData customConfigurationData,
++        string ruleId)
++    {
++        if (customConfigurationData.RuleId.Equals(ruleId, StringComparison.InvariantCultureIgnoreCase) &&
++            (customConfigurationData.ConfigurationData?.TryGetValue(_allowUninitPropsInConditionsKey, out string? configVal) ?? false))
++        {
++            return bool.Parse(configVal);
++        }
++
++        return null;
++    }
++
++    public override void RegisterInternalActions(IInternalBuildCheckRegistrationContext registrationContext)
++    {
++        registrationContext.RegisterPropertyReadAction(ProcessPropertyRead);
++        registrationContext.RegisterPropertyWriteAction(ProcessPropertyWrite);
++        registrationContext.RegisterProjectProcessingDoneAction(DoneWithProject);
++    }
++
++    private Dictionary<string, IMsBuildElementLocation?> _writenProperties = new Dictionary<string, IMsBuildElementLocation?>(MSBuildNameIgnoreCaseComparer.Default);
++    private HashSet<string> _readProperties = new HashSet<string>(MSBuildNameIgnoreCaseComparer.Default);
++    private Dictionary<string, IMsBuildElementLocation> _uninitializedReads = new Dictionary<string, IMsBuildElementLocation>(MSBuildNameIgnoreCaseComparer.Default);
++
++    private void ProcessPropertyWrite(BuildCheckDataContext<PropertyWriteData> context)
++    {
++        PropertyWriteData writeData = context.Data;
++
++        _writenProperties[writeData.PropertyName] = writeData.ElementLocation;
++
++        if (!writeData.IsEmpty && _uninitializedReads.TryGetValue(writeData.PropertyName, out IMsBuildElementLocation? uninitReadLocation))
++        {
++            _uninitializedReads.Remove(writeData.PropertyName);
++
++            context.ReportResult(BuildCheckResult.Create(
++                _initializedAfterUsedRule,
++                uninitReadLocation,
++                writeData.PropertyName, writeData.ElementLocation?.LocationString ?? string.Empty));
++        }
++    }
++
++    private void ProcessPropertyRead(BuildCheckDataContext<PropertyReadData> context)
++    {
++        PropertyReadData readData = context.Data;
++
++        if (readData.PropertyReadContext != PropertyReadContext.PropertyEvaluationSelf)
++        {
++            _readProperties.Add(readData.PropertyName);
++        }
++
++        if (readData.IsUninitialized &&
++            readData.PropertyReadContext != PropertyReadContext.PropertyEvaluationSelf &&
++            readData.PropertyReadContext != PropertyReadContext.ConditionEvaluationWithOneSideEmpty &&
++            (!_allowUninitPropsInConditions || readData.PropertyReadContext != PropertyReadContext.ConditionEvaluation))
++        {
++            _uninitializedReads[readData.PropertyName] = readData.ElementLocation;
++        }
++    }
++
++    private void DoneWithProject(BuildCheckDataContext<ProjectProcessingDoneData> context)
++    {
++        foreach (var propWithLocation in _writenProperties)
++        {
++            if (propWithLocation.Value != null && !_readProperties.Contains(propWithLocation.Key))
++            {
++                context.ReportResult(BuildCheckResult.Create(
++                    _unusedPropertyRule,
++                    propWithLocation.Value,
++                    propWithLocation.Key));
++            }
++        }
++
++        foreach (var uninitializedRead in _uninitializedReads)
++        {
++            context.ReportResult(BuildCheckResult.Create(
++                _usedBeforeInitializedRule,
++                uninitializedRead.Value,
++                uninitializedRead.Key));
++        }
++
++        _readProperties = new HashSet<string>(MSBuildNameIgnoreCaseComparer.Default);
++        _writenProperties = new Dictionary<string, IMsBuildElementLocation?>(MSBuildNameIgnoreCaseComparer.Default);
++        _uninitializedReads = new Dictionary<string, IMsBuildElementLocation>(MSBuildNameIgnoreCaseComparer.Default);
++    }
++}
++
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index 9995aef71b3..b81f8ced8e8 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -6,6 +6,7 @@
+ using System.Linq;
+ using System.Threading.Tasks;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCheck.Analyzers;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+ namespace Microsoft.Build.BuildCheck.Infrastructure;
+@@ -17,9 +18,21 @@ internal sealed class BuildCheckCentralContext
+ {
+     private record CallbackRegistry(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>>)> EvaluatedPropertiesActions,
+-        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ParsedItemsAnalysisData>>)> ParsedItemsActions)
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ParsedItemsAnalysisData>>)> ParsedItemsActions,
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<PropertyReadData>>)> PropertyReadActions,
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<PropertyWriteData>>)> PropertyWriteActions,
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ProjectProcessingDoneData>>)> ProjectProcessingDoneActions)
+     {
+-        public CallbackRegistry() : this([],[]) { }
++        public CallbackRegistry() : this([],[],[],[],[]) { }
++
++        internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
++        {
++            EvaluatedPropertiesActions.RemoveAll(a => a.Item1 == analyzer);
++            ParsedItemsActions.RemoveAll(a => a.Item1 == analyzer);
++            PropertyReadActions.RemoveAll(a => a.Item1 == analyzer);
++            PropertyWriteActions.RemoveAll(a => a.Item1 == analyzer);
++            ProjectProcessingDoneActions.RemoveAll(a => a.Item1 == analyzer);
++        }
+     }
+ 
+     // In a future we can have callbacks per project as well
+@@ -29,6 +42,8 @@ public CallbackRegistry() : this([],[]) { }
+     //  build event args. However - this needs to be done early on, when analyzers might not be known yet
+     internal bool HasEvaluatedPropertiesActions => _globalCallbacks.EvaluatedPropertiesActions.Any();
+     internal bool HasParsedItemsActions => _globalCallbacks.ParsedItemsActions.Any();
++    internal bool HasPropertyReadActions => _globalCallbacks.PropertyReadActions.Any();
++    internal bool HasPropertyWriteActions => _globalCallbacks.PropertyWriteActions.Any();
+ 
+     internal void RegisterEvaluatedPropertiesAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction)
+         // Here we might want to communicate to node that props need to be sent.
+@@ -38,6 +53,15 @@ internal void RegisterEvaluatedPropertiesAction(BuildAnalyzerWrapper analyzer, A
+     internal void RegisterParsedItemsAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<ParsedItemsAnalysisData>> parsedItemsAction)
+         => RegisterAction(analyzer, parsedItemsAction, _globalCallbacks.ParsedItemsActions);
+ 
++    internal void RegisterPropertyReadAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<PropertyReadData>> propertyReadAction)
++        => RegisterAction(analyzer, propertyReadAction, _globalCallbacks.PropertyReadActions);
++
++    internal void RegisterPropertyWriteAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<PropertyWriteData>> propertyWriteAction)
++        => RegisterAction(analyzer, propertyWriteAction, _globalCallbacks.PropertyWriteActions);
++
++    internal void RegisterProjectProcessingDoneAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<ProjectProcessingDoneData>> projectDoneAction)
++        => RegisterAction(analyzer, projectDoneAction, _globalCallbacks.ProjectProcessingDoneActions);
++
+     private void RegisterAction<T>(
+         BuildAnalyzerWrapper wrappedAnalyzer,
+         Action<BuildCheckDataContext<T>> handler,
+@@ -58,8 +82,7 @@ void WrappedHandler(BuildCheckDataContext<T> context)
+ 
+     internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
+     {
+-        _globalCallbacks.EvaluatedPropertiesActions.RemoveAll(a => a.Item1 == analyzer);
+-        _globalCallbacks.ParsedItemsActions.RemoveAll(a => a.Item1 == analyzer);
++        _globalCallbacks.DeregisterAnalyzer(analyzer);
+     }
+ 
+     internal void RunEvaluatedPropertiesActions(
+@@ -78,6 +101,30 @@ internal void RunParsedItemsActions(
+         => RunRegisteredActions(_globalCallbacks.ParsedItemsActions, parsedItemsAnalysisData,
+             loggingContext, resultHandler);
+ 
++    internal void RunPropertyReadActions(
++        PropertyReadData propertyReadDataData,
++        LoggingContext loggingContext,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.PropertyReadActions, propertyReadDataData,
++            loggingContext, resultHandler);
++
++    internal void RunPropertyWriteActions(
++        PropertyWriteData propertyWriteData,
++        LoggingContext loggingContext,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.PropertyWriteActions, propertyWriteData,
++            loggingContext, resultHandler);
++
++    internal void RunProjectProcessingDoneActions(
++        ProjectProcessingDoneData projectProcessingDoneData,
++        LoggingContext loggingContext,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.ProjectProcessingDoneActions, projectProcessingDoneData,
++            loggingContext, resultHandler);
++
+     private void RunRegisteredActions<T>(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<T>>)> registeredCallbacks,
+         T analysisData,
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
+index 29a0a8acf50..d67957f3124 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
+@@ -18,4 +18,8 @@ internal sealed class BuildCheckConfigurationException : Exception
+     public BuildCheckConfigurationException(string message) : base(message)
+     {
+     }
++
++    public BuildCheckConfigurationException(string message, Exception innerException) : base(message, innerException)
++    {
++    }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+index 19a4e3d6967..2566c51aa57 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+@@ -3,11 +3,12 @@
+ 
+ using System;
+ using System.Threading;
++using Microsoft.Build.BuildCheck.Analyzers;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+-internal sealed class BuildCheckRegistrationContext(BuildAnalyzerWrapper analyzerWrapper, BuildCheckCentralContext buildCheckCentralContext) : IBuildCheckRegistrationContext
++internal sealed class BuildCheckRegistrationContext(BuildAnalyzerWrapper analyzerWrapper, BuildCheckCentralContext buildCheckCentralContext) : IInternalBuildCheckRegistrationContext
+ {
+     public void RegisterEvaluatedPropertiesAction(Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction)
+     {
+@@ -18,4 +19,13 @@ public void RegisterParsedItemsAction(Action<BuildCheckDataContext<ParsedItemsAn
+     {
+         buildCheckCentralContext.RegisterParsedItemsAction(analyzerWrapper, parsedItemsAction);
+     }
++
++    public void RegisterPropertyReadAction(Action<BuildCheckDataContext<PropertyReadData>> propertyReadAction)
++        => buildCheckCentralContext.RegisterPropertyReadAction(analyzerWrapper, propertyReadAction);
++
++    public void RegisterPropertyWriteAction(Action<BuildCheckDataContext<PropertyWriteData>> propertyWriteAction)
++        => buildCheckCentralContext.RegisterPropertyWriteAction(analyzerWrapper, propertyWriteAction);
++
++    public void RegisterProjectProcessingDoneAction(Action<BuildCheckDataContext<ProjectProcessingDoneData>> projectDoneAction)
++        => buildCheckCentralContext.RegisterProjectProcessingDoneAction(analyzerWrapper, projectDoneAction);
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 3fadcac86b1..41fdbad2c6c 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -30,6 +30,9 @@ internal sealed class BuildCheckManagerProvider : IBuildCheckManagerProvider
+     internal static IBuildCheckManager GlobalInstance => s_globalInstance ?? throw new InvalidOperationException("BuildCheckManagerProvider not initialized");
+ 
+     public IBuildCheckManager Instance => GlobalInstance;
++	
++	public IBuildEngineDataConsumer BuildEngineDataConsumer => (IBuildEngineDataConsumer)GlobalInstance;
++    public static IBuildEngineDataConsumer? GlobalBuildEngineDataConsumer => (IBuildEngineDataConsumer?)s_globalInstance;
+ 
+     internal static IBuildComponent CreateComponent(BuildComponentType type)
+     {
+@@ -61,7 +64,7 @@ public void InitializeComponent(IBuildComponentHost host)
+ 
+     public void ShutdownComponent() => GlobalInstance.Shutdown();
+ 
+-    internal sealed class BuildCheckManager : IBuildCheckManager
++    private sealed class BuildCheckManager : IBuildCheckManager, IBuildEngineDataConsumer
+     {
+         private readonly TracingReporter _tracingReporter = new TracingReporter();
+         private readonly BuildCheckCentralContext _buildCheckCentralContext = new();
+@@ -127,15 +130,22 @@ public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData,
+ 
+         private static T Construct<T>() where T : new() => new();
+ 
+-        private static readonly (string[] ruleIds, bool defaultEnablement, BuildAnalyzerFactory factory)[][] s_builtInFactoriesPerDataSource =
+-        [
+-            // BuildCheckDataSource.EventArgs
++        private static readonly (string[] ruleIds, bool defaultEnablement, BuildAnalyzerFactory factory)[][]
++            s_builtInFactoriesPerDataSource =
+             [
+-                ([SharedOutputPathAnalyzer.SupportedRule.Id], SharedOutputPathAnalyzer.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<SharedOutputPathAnalyzer>)
+-            ],
+-            // BuildCheckDataSource.Execution
+-            []
+-        ];
++                // BuildCheckDataSource.EventArgs
++                [
++                    ([SharedOutputPathAnalyzer.SupportedRule.Id],
++                        SharedOutputPathAnalyzer.SupportedRule.DefaultConfiguration.IsEnabled ?? false,
++                        Construct<SharedOutputPathAnalyzer>)
++                ],
++                // BuildCheckDataSource.Execution
++                [
++                    (PropertiesUsageAnalyzer.SupportedRulesList.Select(r => r.Id).ToArray(),
++                        PropertiesUsageAnalyzer.SupportedRulesList.Any(r => r.DefaultConfiguration.IsEnabled ?? false),
++                        Construct<PropertiesUsageAnalyzer>)
++                ]
++            ];
+ 
+         private void RegisterBuiltInAnalyzers(BuildCheckDataSource buildCheckDataSource)
+         {
+@@ -243,7 +253,14 @@ private void SetupSingleAnalyzer(BuildAnalyzerFactoryContext analyzerFactoryCont
+                 // Create the wrapper and register to central context
+                 wrapper.StartNewProject(projectFullPath, configurations);
+                 var wrappedContext = new BuildCheckRegistrationContext(wrapper, _buildCheckCentralContext);
+-                analyzer.RegisterActions(wrappedContext);
++                if (analyzer is InternalBuildAnalyzer internalAnalyzer)
++                {
++                    internalAnalyzer.RegisterInternalActions(wrappedContext);
++                }
++                else
++                {
++                    analyzer.RegisterActions(wrappedContext);
++                }
+             }
+             else
+             {
+@@ -343,6 +360,12 @@ public void FinalizeProcessing(LoggingContext loggingContext)
+             loggingContext.LogBuildEvent(analyzerEventArg);
+         }
+ 
++        // TODO: those would not work properly in multi-threaded environment, with multiple projects being evaluated/executed at once
++        //  This should be handled together with the Provider singleton - all the calling paths should be inspected and the context propagated properly
++        private BuildEventContext? _executionEngineBuildEventContext;
++        private string? _executingEngineProjectFullPath;
++        private const string _defaultProjectFullPath = "Unknown_Project";
++		
+         public void StartProjectEvaluation(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext,
+             string fullPath)
+         {
+@@ -354,6 +377,12 @@ public void StartProjectEvaluation(BuildCheckDataSource buildCheckDataSource, Bu
+                 return;
+             }
+ 
++            if (buildCheckDataSource == BuildCheckDataSource.BuildExecution)
++            {
++                _executionEngineBuildEventContext = buildEventContext;
++                _executingEngineProjectFullPath = fullPath;
++            }
++
+             SetupAnalyzersForNewProject(fullPath, buildEventContext);
+         }
+ 
+@@ -372,8 +401,52 @@ public void StartProjectRequest(BuildCheckDataSource buildCheckDataSource, Build
+         {
+         }
+ 
+-        public void EndProjectRequest(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext)
++        public void EndProjectRequest(
++            BuildCheckDataSource buildCheckDataSource,
++            BuildEventContext buildEventContext,
++            string fullPath)
++        {
++            AnalyzerLoggingContext loggingContext = new(_loggingService, buildEventContext);
++            _buildEventsProcessor.ProcessProjectDone(loggingContext, fullPath);
++            _executionEngineBuildEventContext = null;
++            _executingEngineProjectFullPath = null;
++        }
++
++        public void ProcessPropertyRead(
++            string propertyName,
++            int startIndex,
++            int endIndex,
++            IMsBuildElementLocation elementLocation,
++            bool isUninitialized,
++            PropertyReadContext propertyReadContext,
++            BuildEventContext? buildEventContext)
++        {
++            if (!_buildCheckCentralContext.HasPropertyReadActions)
++            {
++                return;
++            }
++
++            AnalyzerLoggingContext loggingContext =
++                new(_loggingService, buildEventContext ?? _executionEngineBuildEventContext ?? BuildEventContext.Invalid);
++            _buildEventsProcessor.ProcessPropertyRead(_executingEngineProjectFullPath ?? _defaultProjectFullPath, propertyName, startIndex, endIndex, elementLocation,
++                isUninitialized, propertyReadContext, loggingContext);
++        }
++
++        public void ProcessPropertyWrite(
++            string propertyName,
++            bool isEmpty,
++            IMsBuildElementLocation? elementLocation,
++            BuildEventContext? buildEventContext)
+         {
++            if (!_buildCheckCentralContext.HasPropertyWriteActions)
++            {
++                return;
++            }
++
++            AnalyzerLoggingContext loggingContext =
++                new(_loggingService,
++                    buildEventContext ?? _executionEngineBuildEventContext ?? BuildEventContext.Invalid);
++            _buildEventsProcessor.ProcessPropertyWrite(_executingEngineProjectFullPath ?? _defaultProjectFullPath, propertyName, isEmpty, elementLocation, loggingContext);
+         }
+ 
+         public void Shutdown()
+@@ -387,7 +460,20 @@ private class BuildAnalyzerFactoryContext(
+             public BuildAnalyzerWrapperFactory Factory { get; init; } = configContext =>
+             {
+                 BuildAnalyzer ba = factory();
+-                ba.Initialize(configContext);
++                try
++                {
++                    ba.Initialize(configContext);
++                }
++                catch (BuildCheckConfigurationException)
++                {
++                    throw;
++                }
++                catch (Exception e)
++                {
++                    throw new BuildCheckConfigurationException(
++                        $"The analyzer '{ba.FriendlyName}' failed to initialize: {e.Message}", e);
++                }
++                
+                 return new BuildAnalyzerWrapper(ba);
+             };
+ 
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index 9514f0a7ca0..61940fe27da 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -83,4 +83,31 @@ private static void ReportResult(
+         eventArgs.BuildEventContext = loggingContext.BuildEventContext;
+         loggingContext.LogBuildEvent(eventArgs);
+     }
++
++    public void ProcessPropertyRead(string projectFullPath, string propertyName, int startIndex, int endIndex,
++        IMsBuildElementLocation elementLocation,
++        bool isUninitialized, PropertyReadContext propertyReadContext,
++        AnalyzerLoggingContext buildAnalysisContext)
++    {
++        PropertyReadData propertyReadData = new(projectFullPath,
++            propertyName.Substring(startIndex, endIndex - startIndex + 1), elementLocation, isUninitialized,
++            propertyReadContext);
++        _buildCheckCentralContext.RunPropertyReadActions(propertyReadData, buildAnalysisContext,
++            ReportResult);
++    }
++
++    public void ProcessPropertyWrite(string projectFullPath, string propertyName, bool isEmpty,
++        IMsBuildElementLocation? elementLocation,
++        AnalyzerLoggingContext buildAnalysisContext)
++    {
++        PropertyWriteData propertyWriteData = new(projectFullPath, propertyName, elementLocation, isEmpty);
++        _buildCheckCentralContext.RunPropertyWriteActions(propertyWriteData, buildAnalysisContext,
++            ReportResult);
++    }
++
++    public void ProcessProjectDone(AnalyzerLoggingContext buildAnalysisContext, string projectFullPath)
++    {
++        _buildCheckCentralContext.RunProjectProcessingDoneActions(new ProjectProcessingDoneData(projectFullPath),
++            buildAnalysisContext, ReportResult);
++    }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs b/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
+index 67c2155500e..dc4fcbce1e6 100644
+--- a/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
+@@ -14,7 +14,6 @@
+ 
+ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+-
+ // Let's flip form statics to instance, with exposed interface (so that we can easily swap implementations)
+ // Tracked via: https://github.com/dotnet/msbuild/issues/9828
+ internal static class ConfigurationProvider
+diff --git a/src/Build/BuildCheck/Infrastructure/CustomConfigurationData.cs b/src/Build/BuildCheck/Infrastructure/CustomConfigurationData.cs
+index d200d48ee66..9d8b9245e8b 100644
+--- a/src/Build/BuildCheck/Infrastructure/CustomConfigurationData.cs
++++ b/src/Build/BuildCheck/Infrastructure/CustomConfigurationData.cs
+@@ -30,7 +30,7 @@ public class CustomConfigurationData(string ruleId)
+     /// <summary>
+     /// Key-value pairs of unstructured data from .editorconfig file.
+     /// E.g. if in editorconfig file we'd have:
+-    /// [*.csrpoj]
++    /// [*.csproj]
+     /// build_analyzer.microsoft.BC0101.name_of_targets_to_restrict = "Build,CoreCompile,ResolveAssemblyReferences"
+     ///
+     /// the ConfigurationData would be:
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+index ca8803b99af..388a8a0eb75 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+@@ -6,9 +6,10 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BuildCheck.Acquisition;
+ using Microsoft.Build.BuildCheck.Logging;
++using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ 
+-namespace Microsoft.Build.Experimental.BuildCheck;
++namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+ /// <summary>
+ /// Enumerates the different data sources used in build check operations.
+@@ -58,7 +59,7 @@ void ProcessEvaluationFinishedEventArgs(
+ 
+     void StartProjectRequest(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext);
+ 
+-    void EndProjectRequest(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext);
++    void EndProjectRequest(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext, string fullPath);
+ 
+     void Shutdown();
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManagerProvider.cs
+index 6b8bdea6080..53ca936b807 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManagerProvider.cs
+@@ -14,4 +14,6 @@ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ internal interface IBuildCheckManagerProvider : IBuildComponent
+ {
+     IBuildCheckManager Instance { get; }
++	
++    IBuildEngineDataConsumer? BuildEngineDataConsumer { get; }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildEngineDataConsumer.cs b/src/Build/BuildCheck/Infrastructure/IBuildEngineDataConsumer.cs
+new file mode 100644
+index 00000000000..bc08de37023
+--- /dev/null
++++ b/src/Build/BuildCheck/Infrastructure/IBuildEngineDataConsumer.cs
+@@ -0,0 +1,47 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Evaluation;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCheck.Infrastructure;
++
++/// <summary>
++/// Consumer of the data from the build engine.
++/// Currently, this is used to send data for analysis to the BuildCheck.
++/// In the future we can multiplex the data to other consumers (e.g. copilot).
++/// </summary>
++internal interface IBuildEngineDataConsumer
++{
++    void ProcessPropertyRead(
++        string propertyName,
++        int startIndex,
++        int endIndex,
++        IMsBuildElementLocation elementLocation,
++        bool isUninitialized,
++        PropertyReadContext propertyReadContext,
++        BuildEventContext? buildEventContext);
++
++    /// <summary>
++    /// Signals that a property was written to.
++    /// </summary>
++    /// <param name="propertyName">Name of the property.</param>
++    /// <param name="isEmpty">Was any value written? (E.g. if we set propA with value propB, while propB is undefined - the isEmpty will be true)</param>
++    /// <param name="elementLocation">Location of the property write</param>
++    /// <param name="buildEventContext"></param>
++    void ProcessPropertyWrite(
++        string propertyName,
++        bool isEmpty,
++        IMsBuildElementLocation? elementLocation,
++        BuildEventContext? buildEventContext);
++
++    // TODO: We might want to move acquisition data processing into this interface as well
++    // void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData);
++}
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+index 4ba7579c0ba..1b0d6bf6f09 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+@@ -6,19 +6,22 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BuildCheck.Acquisition;
+ using Microsoft.Build.BuildCheck.Logging;
++using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+-internal class NullBuildCheckManager : IBuildCheckManager
++internal class NullBuildCheckManager : IBuildCheckManager, IBuildEngineDataConsumer
+ {
+     public void Shutdown()
+     {
+     }
+ 
+-    public void ProcessEvaluationFinishedEventArgs(
+-        AnalyzerLoggingContext buildAnalysisContext,
++    public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData) { }
++
++    public void ProcessEvaluationFinishedEventArgs(AnalyzerLoggingContext buildAnalysisContext,
+         ProjectEvaluationFinishedEventArgs projectEvaluationFinishedEventArgs)
+     {
+     }
+@@ -47,17 +50,15 @@ public void StartProjectRequest(BuildCheckDataSource buildCheckDataSource, Build
+     {
+     }
+ 
+-    public void EndProjectRequest(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext)
+-    {
+-    }
++    public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats() => new Dictionary<string, TimeSpan>();
+ 
+-    public void YieldProject(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext)
+-    {
+-    }
++    public void EndProjectRequest(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext, string fullPath)
++    { }
+ 
+-    public void ResumeProject(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext)
+-    {
+-    }
++    public void ProcessPropertyRead(string propertyName, int startIndex, int endIndex, IMsBuildElementLocation elementLocation,
++        bool isUninitialized, PropertyReadContext propertyReadContext, BuildEventContext? buildEventContext)
++    { }
+ 
+-    public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats() => new Dictionary<string, TimeSpan>();
++    public void ProcessPropertyWrite(string propertyName, bool isEmpty, IMsBuildElementLocation? elementLocation, BuildEventContext? buildEventContext)
++    { }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManagerProvider.cs
+index c6dcbd84f8d..a78a19c4679 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManagerProvider.cs
+@@ -13,7 +13,9 @@ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+ internal class NullBuildCheckManagerProvider : IBuildCheckManagerProvider
+ {
+-    public IBuildCheckManager Instance { get; } = new NullBuildCheckManager();
++    private readonly NullBuildCheckManager _instance = new NullBuildCheckManager();
++    public IBuildCheckManager Instance => _instance;
++    public IBuildEngineDataConsumer? BuildEngineDataConsumer => _instance;
+ 
+     public void InitializeComponent(IBuildComponentHost host) { }
+     public void ShutdownComponent() { }
+diff --git a/src/Build/BuildCheck/Logging/BuildAnalysisLoggingContextExtensions.cs b/src/Build/BuildCheck/Logging/BuildAnalysisLoggingContextExtensions.cs
+new file mode 100644
+index 00000000000..4951fd7e3c6
+--- /dev/null
++++ b/src/Build/BuildCheck/Logging/BuildAnalysisLoggingContextExtensions.cs
+@@ -0,0 +1,15 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace Microsoft.Build.BuildCheck.Logging;
++
++internal static class BuildAnalysisLoggingContextExtensions
++{
++    public static LoggingContext ToLoggingContext(this IBuildAnalysisLoggingContext loggingContext) =>
++        loggingContext as AnalyzerLoggingContext ??
++        throw new InvalidOperationException("The logging context is not an AnalyzerLoggingContext");
++}
+diff --git a/src/Build/BuildCheck/Logging/IBuildAnalysisLoggingContext.cs b/src/Build/BuildCheck/Logging/IBuildAnalysisLoggingContext.cs
+new file mode 100644
+index 00000000000..c7433a14eb9
+--- /dev/null
++++ b/src/Build/BuildCheck/Logging/IBuildAnalysisLoggingContext.cs
+@@ -0,0 +1,7 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Experimental.BuildCheck;
++
++public interface IBuildAnalysisLoggingContext
++{ }
+diff --git a/src/Build/BuildCheck/OM/ProjectProcessingDoneData.cs b/src/Build/BuildCheck/OM/ProjectProcessingDoneData.cs
+new file mode 100644
+index 00000000000..97e1428b0b1
+--- /dev/null
++++ b/src/Build/BuildCheck/OM/ProjectProcessingDoneData.cs
+@@ -0,0 +1,5 @@
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++internal class ProjectProcessingDoneData(string projectFilePath) : AnalysisData(projectFilePath);
+\ No newline at end of file
+diff --git a/src/Build/BuildCheck/OM/PropertyReadData.cs b/src/Build/BuildCheck/OM/PropertyReadData.cs
+new file mode 100644
+index 00000000000..a77ec9c29f7
+--- /dev/null
++++ b/src/Build/BuildCheck/OM/PropertyReadData.cs
+@@ -0,0 +1,37 @@
++using Microsoft.Build.Evaluation;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++/// <summary>
++/// Information about property being accessed - whether during evaluation or build.
++/// </summary>
++internal class PropertyReadData(
++    string projectFilePath,
++    string propertyName,
++    IMsBuildElementLocation elementLocation,
++    bool isUninitialized,
++    PropertyReadContext propertyReadContext)
++    : AnalysisData(projectFilePath)
++{
++    /// <summary>
++    /// Name of the property that was accessed.
++    /// </summary>
++    public string PropertyName { get; } = propertyName;
++
++    /// <summary>
++    /// Location of the property access.
++    /// </summary>
++    public IMsBuildElementLocation ElementLocation { get; } = elementLocation;
++
++    /// <summary>
++    /// Indicates whether the property was accessed before being initialized.
++    /// </summary>
++    public bool IsUninitialized { get; } = isUninitialized;
++
++    /// <summary>
++    /// Gets the context type in which the property was accessed.
++    /// </summary>
++    public PropertyReadContext PropertyReadContext { get; } = propertyReadContext;
++}
+\ No newline at end of file
+diff --git a/src/Build/BuildCheck/OM/PropertyWriteData.cs b/src/Build/BuildCheck/OM/PropertyWriteData.cs
+new file mode 100644
+index 00000000000..f58ddecc76d
+--- /dev/null
++++ b/src/Build/BuildCheck/OM/PropertyWriteData.cs
+@@ -0,0 +1,33 @@
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++/// <summary>
++/// Information about property being written to - either during evaluation phase
++///  or as part of property definition within the target.
++/// </summary>
++internal class PropertyWriteData(
++    string projectFilePath,
++    string propertyName,
++    IMsBuildElementLocation? elementLocation,
++    bool isEmpty)
++    : AnalysisData(projectFilePath)
++{
++    /// <summary>
++    /// Name of the property that was written to.
++    /// </summary>
++    public string PropertyName { get; } = propertyName;
++
++    /// <summary>
++    /// Location of the property write.
++    /// If the location is null, it means that the property doesn't come from xml, but rather other sources
++    ///  (environment variable, global property, toolset properties etc.).
++    /// </summary>
++    public IMsBuildElementLocation? ElementLocation { get; } = elementLocation;
++
++    /// <summary>
++    /// Was any value written? (E.g. if we set propA with value propB, while propB is undefined - the isEmpty will be true).
++    /// </summary>
++    public bool IsEmpty { get; } = isEmpty;
++}
+\ No newline at end of file
+diff --git a/src/Build/Construction/ProjectPropertyElement.cs b/src/Build/Construction/ProjectPropertyElement.cs
+index c9020db30ba..0c5ce4493b6 100644
+--- a/src/Build/Construction/ProjectPropertyElement.cs
++++ b/src/Build/Construction/ProjectPropertyElement.cs
+@@ -2,6 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Diagnostics;
++using Microsoft.Build.Execution;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.ObjectModelRemoting;
+ using Microsoft.Build.Shared;
+@@ -20,7 +21,7 @@ namespace Microsoft.Build.Construction
+     /// So the CM only represents Normal properties.
+     /// </remarks>
+     [DebuggerDisplay("{Name} Value={Value} Condition={Condition}")]
+-    public class ProjectPropertyElement : ProjectElement
++    public class ProjectPropertyElement : ProjectElement, IElementWithLocation
+     {
+         internal ProjectPropertyElementLink PropertyLink => (ProjectPropertyElementLink)Link;
+ 
+diff --git a/src/Build/Definition/Project.cs b/src/Build/Definition/Project.cs
+index 791c88c741c..baf4fa9a0e6 100644
+--- a/src/Build/Definition/Project.cs
++++ b/src/Build/Definition/Project.cs
+@@ -3732,7 +3732,8 @@ private void Reevaluate(
+                     evaluationContext.SdkResolverService,
+                     BuildEventContext.InvalidSubmissionId,
+                     evaluationContext,
+-                    _interactive);
++                    _interactive,
++                    buildCheckEnabled: false);
+ 
+                 ErrorUtilities.VerifyThrow(LastEvaluationId != BuildEventContext.InvalidEvaluationId, "Evaluation should produce an evaluation ID");
+ 
+@@ -4445,10 +4446,14 @@ public ProjectProperty SetProperty(string name, string evaluatedValueEscaped, bo
+                 Properties.Set(property);
+ 
+                 AddToAllEvaluatedPropertiesList(property);
+-
+                 return property;
+             }
+ 
++            ProjectProperty IEvaluatorData<ProjectProperty, ProjectItem, ProjectMetadata, ProjectItemDefinition>.
++                SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped,
++                    LoggingContext loggingContext) =>
++                SetProperty(propertyElement, evaluatedValueEscaped);
++
+             /// <summary>
+             /// Sets a property derived from Xml.
+             /// </summary>
+diff --git a/src/Build/Evaluation/ConditionEvaluator.cs b/src/Build/Evaluation/ConditionEvaluator.cs
+index 1d231597726..115b26aafca 100644
+--- a/src/Build/Evaluation/ConditionEvaluator.cs
++++ b/src/Build/Evaluation/ConditionEvaluator.cs
+@@ -282,6 +282,7 @@ internal static bool EvaluateConditionCollectingConditionedProperties<P, I>(
+                 fileSystem,
+                 projectRootElementCache);
+ 
++            expander.PropertiesUsageTracker.PropertyReadContext = PropertyReadContext.ConditionEvaluation;
+             // We are evaluating this expression now and it can cache some state for the duration,
+             // so we don't want multiple threads working on the same expression
+             lock (parsedExpression)
+@@ -301,6 +302,8 @@ internal static bool EvaluateConditionCollectingConditionedProperties<P, I>(
+                 }
+             }
+ 
++            expander.PropertiesUsageTracker.ResetPropertyReadContext();
++
+             return result;
+         }
+ 
+@@ -350,6 +353,8 @@ internal interface IConditionEvaluationState
+ 
+             ElementLocation ElementLocation { get; }
+ 
++            PropertiesUsageTracker PropertiesUsageTracker { get; }
++
+             /// <summary>
+             ///     Table of conditioned properties and their values.
+             ///     Used to populate configuration lists in some project systems.
+@@ -403,6 +408,8 @@ internal class ConditionEvaluationState<P, I> : IConditionEvaluationState
+ 
+             public ElementLocation ElementLocation { get; }
+ 
++            public PropertiesUsageTracker PropertiesUsageTracker => _expander.PropertiesUsageTracker;
++
+             public IFileSystem FileSystem { get; }
+ 
+             /// <summary>
+@@ -449,12 +456,8 @@ internal ConditionEvaluationState(
+             /// </summary>
+             public string ExpandIntoStringBreakEarly(string expression, LoggingContext? loggingContext = null)
+             {
+-                var originalValue = _expander.WarnForUninitializedProperties;
+-
+                 expression = _expander.ExpandIntoStringAndUnescape(expression, _expanderOptions | ExpanderOptions.BreakOnNotEmpty, ElementLocation, loggingContext);
+ 
+-                _expander.WarnForUninitializedProperties = originalValue;
+-
+                 return expression;
+             }
+ 
+@@ -465,12 +468,8 @@ public string ExpandIntoStringBreakEarly(string expression, LoggingContext? logg
+             /// <returns>A list of items.</returns>
+             public IList<TaskItem> ExpandIntoTaskItems(string expression)
+             {
+-                var originalValue = _expander.WarnForUninitializedProperties;
+-
+                 var items = _expander.ExpandIntoTaskItemsLeaveEscaped(expression, _expanderOptions, ElementLocation);
+ 
+-                _expander.WarnForUninitializedProperties = originalValue;
+-
+                 return items;
+             }
+ 
+@@ -482,12 +481,8 @@ public IList<TaskItem> ExpandIntoTaskItems(string expression)
+             /// <returns>The expanded string.</returns>
+             public string ExpandIntoString(string expression, LoggingContext? loggingContext = null)
+             {
+-                var originalValue = _expander.WarnForUninitializedProperties;
+-
+                 expression = _expander.ExpandIntoStringAndUnescape(expression, _expanderOptions, ElementLocation, loggingContext);
+ 
+-                _expander.WarnForUninitializedProperties = originalValue;
+-
+                 return expression;
+             }
+         }
+diff --git a/src/Build/Evaluation/Conditionals/MultipleComparisonExpressionNode.cs b/src/Build/Evaluation/Conditionals/MultipleComparisonExpressionNode.cs
+index 208794b3603..498644d279b 100644
+--- a/src/Build/Evaluation/Conditionals/MultipleComparisonExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/MultipleComparisonExpressionNode.cs
+@@ -51,6 +51,14 @@ internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState
+             // and we know which do, then we already have enough information to evaluate this expression.
+             // That means we don't have to fully expand a condition like " '@(X)' == '' "
+             // which is a performance advantage if @(X) is a huge item list.
++
++            // this is the possible case of '$(a)' == ''
++            if (string.IsNullOrEmpty(LeftChild.GetUnexpandedValue(state)) ||
++                string.IsNullOrEmpty(RightChild.GetUnexpandedValue(state)))
++            {
++                state.PropertiesUsageTracker.PropertyReadContext = PropertyReadContext.ConditionEvaluationWithOneSideEmpty;
++            }
++
+             bool leftEmpty = LeftChild.EvaluatesToEmpty(state, loggingContext);
+             bool rightEmpty = RightChild.EvaluatesToEmpty(state, loggingContext);
+             if (leftEmpty || rightEmpty)
+@@ -85,6 +93,9 @@ internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState
+ 
+             UpdateConditionedProperties(state);
+ 
++            // reset back the property read context (it's no longer a condition with one side empty)
++            state.PropertiesUsageTracker.PropertyReadContext = PropertyReadContext.ConditionEvaluation;
++
+             return Compare(leftExpandedValue, rightExpandedValue);
+         }
+ 
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 85447378533..7198a3a31f2 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -12,6 +12,7 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Components.Logging;
+ using Microsoft.Build.BackEnd.Components.RequestBuilder;
++using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
+@@ -209,6 +210,7 @@ private Evaluator(
+             EvaluationContext evaluationContext,
+             bool profileEvaluation,
+             bool interactive,
++            bool buildCheckEnabled,
+             ILoggingService loggingService,
+             BuildEventContext buildEventContext)
+         {
+@@ -224,7 +226,7 @@ private Evaluator(
+                 string.IsNullOrEmpty(projectRootElement.ProjectFileLocation.File) ? "(null)" : projectRootElement.ProjectFileLocation.File);
+ 
+             // If someone sets the 'MsBuildLogPropertyTracking' environment variable to a non-zero value, wrap property accesses for event reporting.
+-            if (Traits.Instance.LogPropertyTracking > 0)
++            if (buildCheckEnabled || Traits.Instance.LogPropertyTracking > 0)
+             {
+                 // Wrap the IEvaluatorData<> object passed in.
+                 data = new PropertyTrackingEvaluatorDataWrapper<P, I, M, D>(data, _evaluationLoggingContext, Traits.Instance.LogPropertyTracking);
+@@ -244,8 +246,6 @@ private Evaluator(
+ 
+             _expander = new Expander<P, I>(data, data, _evaluationContext, _evaluationLoggingContext);
+ 
+-            // This setting may change after the build has started, therefore if the user has not set the property to true on the build parameters we need to check to see if it is set to true on the environment variable.
+-            _expander.WarnForUninitializedProperties = BuildParameters.WarnOnUninitializedProperty || Traits.Instance.EscapeHatches.WarnOnUninitializedProperty;
+             _data = data;
+             _itemGroupElements = new List<ProjectItemGroupElement>();
+             _itemDefinitionGroupElements = new List<ProjectItemDefinitionGroupElement>();
+@@ -315,7 +315,8 @@ internal static void Evaluate(
+             ISdkResolverService sdkResolverService,
+             int submissionId,
+             EvaluationContext evaluationContext,
+-            bool interactive = false)
++            bool interactive = false,
++            bool buildCheckEnabled = false)
+         {
+             MSBuildEventSource.Log.EvaluateStart(root.ProjectFileLocation.File);
+             var profileEvaluation = (loadSettings & ProjectLoadSettings.ProfileEvaluation) != 0 || loggingService.IncludeEvaluationProfile;
+@@ -335,6 +336,7 @@ internal static void Evaluate(
+                 evaluationContext,
+                 profileEvaluation,
+                 interactive,
++                buildCheckEnabled,
+                 loggingService,
+                 buildEventContext);
+ 
+@@ -946,7 +948,7 @@ private void UpdateDefaultTargets(ProjectRootElement currentProjectOrImport)
+         {
+             if (_data.DefaultTargets == null)
+             {
+-                string expanded = _expander.ExpandIntoStringLeaveEscaped(currentProjectOrImport.DefaultTargets, ExpanderOptions.ExpandProperties, currentProjectOrImport.DefaultTargetsLocation);
++                string expanded = _expander.ExpandIntoStringLeaveEscaped(currentProjectOrImport.DefaultTargets, ExpanderOptions.ExpandProperties, currentProjectOrImport.DefaultTargetsLocation, _evaluationLoggingContext);
+ 
+                 if (expanded.Length > 0)
+                 {
+@@ -1285,90 +1287,23 @@ private void EvaluatePropertyElement(ProjectPropertyElement propertyElement)
+                     return;
+                 }
+ 
++                _expander.PropertiesUsageTracker.PropertyReadContext = PropertyReadContext.ConditionEvaluation;
+                 if (!EvaluateConditionCollectingConditionedProperties(propertyElement, ExpanderOptions.ExpandProperties, ParserOptions.AllowProperties))
+                 {
+                     return;
+                 }
+ 
++                _expander.PropertiesUsageTracker.PropertyReadContext = PropertyReadContext.PropertyEvaluation;
++
+                 // Set the name of the property we are currently evaluating so when we are checking to see if we want to add the property to the list of usedUninitialized properties we can not add the property if
+                 // it is the same as what we are setting the value on. Note: This needs to be set before we expand the property we are currently setting.
+-                _expander.UsedUninitializedProperties.CurrentlyEvaluatingPropertyElementName = propertyElement.Name;
++                _expander.PropertiesUsageTracker.CurrentlyEvaluatingPropertyElementName = propertyElement.Name;
+ 
+                 string evaluatedValue = _expander.ExpandIntoStringLeaveEscaped(propertyElement.Value, ExpanderOptions.ExpandProperties, propertyElement.Location, _evaluationLoggingContext);
+ 
+-                // If we are going to set a property to a value other than null or empty we need to check to see if it has been used
+-                // during evaluation.
+-                if (evaluatedValue.Length > 0 && _expander.WarnForUninitializedProperties)
+-                {
+-                    // Is the property we are currently setting in the list of properties which have been used but not initialized
+-                    IElementLocation elementWhichUsedProperty;
+-                    bool isPropertyInList = _expander.UsedUninitializedProperties.TryGetPropertyElementLocation(propertyElement.Name, out elementWhichUsedProperty);
+-
+-                    if (isPropertyInList)
+-                    {
+-                        // Once we are going to warn for a property once, remove it from the list so we do not add it again.
+-                        _expander.UsedUninitializedProperties.RemoveProperty(propertyElement.Name);
+-                        _evaluationLoggingContext.LogWarning(null, new BuildEventFileInfo(propertyElement.Location), "UsedUninitializedProperty", propertyElement.Name, elementWhichUsedProperty.LocationString);
+-                    }
+-                }
+-
+-                _expander.UsedUninitializedProperties.CurrentlyEvaluatingPropertyElementName = null;
+-
+-                if (Traits.Instance.LogPropertyTracking == 0)
+-                {
+-                    P predecessor = _data.GetProperty(propertyElement.Name);
+-                    P property = _data.SetProperty(propertyElement, evaluatedValue);
+-
+-                    if (predecessor != null)
+-                    {
+-                        LogPropertyReassignment(predecessor, property, propertyElement.Location.LocationString);
+-                    }
+-                }
+-                else
+-                {
+-                    _data.SetProperty(propertyElement, evaluatedValue);
+-                }
+-            }
+-        }
+-
+-        private void LogPropertyReassignment(P predecessor, P property, string location)
+-        {
+-            string newValue = property.EvaluatedValue;
+-            string oldValue = predecessor?.EvaluatedValue;
++                _expander.PropertiesUsageTracker.CheckPreexistingUndefinedUsage(propertyElement, evaluatedValue, _evaluationLoggingContext);
+ 
+-            if (string.Equals(property.Name, "MSBuildAllProjects", StringComparison.OrdinalIgnoreCase))
+-            {
+-                // There's a huge perf cost to logging this and it increases the binlog size significantly.
+-                // Meanwhile the usefulness of logging this is very low.
+-                return;
+-            }
+-
+-            if (newValue != oldValue)
+-            {
+-                if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_10))
+-                {
+-                    var args = new PropertyReassignmentEventArgs(
+-                        property.Name,
+-                        oldValue,
+-                        newValue,
+-                        location,
+-                        message: null)
+-                    {
+-                        BuildEventContext = _evaluationLoggingContext.BuildEventContext,
+-                    };
+-
+-                    _evaluationLoggingContext.LogBuildEvent(args);
+-                }
+-                else
+-                {
+-                    _evaluationLoggingContext.LogComment(
+-                        MessageImportance.Low,
+-                        "PropertyReassignment",
+-                        property.Name,
+-                        newValue,
+-                        oldValue,
+-                        location);
+-                }
++                _data.SetProperty(propertyElement, evaluatedValue, _evaluationLoggingContext);
+             }
+         }
+ 
+@@ -1422,7 +1357,7 @@ private void EvaluateItemDefinitionElement(ProjectItemDefinitionElement itemDefi
+                 {
+                     if (EvaluateCondition(metadataElement, ExpanderOptions.ExpandPropertiesAndMetadata, ParserOptions.AllowPropertiesAndCustomMetadata))
+                     {
+-                        string evaluatedValue = _expander.ExpandIntoStringLeaveEscaped(metadataElement.Value, ExpanderOptions.ExpandPropertiesAndCustomMetadata, itemDefinitionElement.Location);
++                        string evaluatedValue = _expander.ExpandIntoStringLeaveEscaped(metadataElement.Value, ExpanderOptions.ExpandPropertiesAndCustomMetadata, itemDefinitionElement.Location, _evaluationLoggingContext);
+ 
+                         M predecessor = itemDefinition.GetMetadata(metadataElement.Name);
+ 
+@@ -1816,7 +1751,7 @@ static bool HasProperty(string value, CompareInfo compareInfo) =>
+                         }
+ 
+                         static string EvaluateProperty(string value, IElementLocation location,
+-                            Expander<P, I> expander, SdkReferencePropertyExpansionMode mode)
++                            Expander<P, I> expander, SdkReferencePropertyExpansionMode mode, LoggingContext loggingContext)
+                         {
+                             if (value == null)
+                             {
+@@ -1830,7 +1765,7 @@ static string EvaluateProperty(string value, IElementLocation location,
+                                 case SdkReferencePropertyExpansionMode.ExpandUnescape:
+                                     return expander.ExpandIntoStringAndUnescape(value, Options, location);
+                                 case SdkReferencePropertyExpansionMode.ExpandLeaveEscaped:
+-                                    return expander.ExpandIntoStringLeaveEscaped(value, Options, location);
++                                    return expander.ExpandIntoStringLeaveEscaped(value, Options, location, loggingContext);
+                                 case SdkReferencePropertyExpansionMode.NoExpansion:
+                                 case SdkReferencePropertyExpansionMode.DefaultExpand:
+                                 default:
+@@ -1842,9 +1777,9 @@ static string EvaluateProperty(string value, IElementLocation location,
+                         IElementLocation sdkReferenceOrigin = importElement.SdkLocation;
+ 
+                         sdkReference = new SdkReference(
+-                            EvaluateProperty(sdkReference.Name, sdkReferenceOrigin, _expander, mode),
+-                            EvaluateProperty(sdkReference.Version, sdkReferenceOrigin, _expander, mode),
+-                            EvaluateProperty(sdkReference.MinimumVersion, sdkReferenceOrigin, _expander, mode));
++                            EvaluateProperty(sdkReference.Name, sdkReferenceOrigin, _expander, mode, _evaluationLoggingContext),
++                            EvaluateProperty(sdkReference.Version, sdkReferenceOrigin, _expander, mode, _evaluationLoggingContext),
++                            EvaluateProperty(sdkReference.MinimumVersion, sdkReferenceOrigin, _expander, mode, _evaluationLoggingContext));
+                     }
+                 }
+ 
+@@ -2550,7 +2485,7 @@ private void ThrowForImportedProjectWithSearchPathsNotFound(ProjectImportPathMat
+                 importExpandedWithDefaultPath =
+                     _expander.ExpandIntoStringLeaveEscaped(
+                         importElement.Project.Replace(searchPathMatch.MsBuildPropertyFormat, extensionsPathPropValue),
+-                        ExpanderOptions.ExpandProperties, importElement.ProjectLocation);
++                        ExpanderOptions.ExpandProperties, importElement.ProjectLocation, _evaluationLoggingContext);
+ 
+                 try
+                 {
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 84d485b7c59..4983bc52677 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -5,6 +5,7 @@
+ using System.Collections;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Diagnostics.CodeAnalysis;
+ using System.Globalization;
+ using System.IO;
+@@ -12,7 +13,9 @@
+ using System.Reflection;
+ using System.Runtime.CompilerServices;
+ using System.Text.RegularExpressions;
++using Microsoft.Build.BackEnd.Components.Logging;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCheck.Infrastructure;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation.Context;
+ using Microsoft.Build.Execution;
+@@ -22,6 +25,7 @@
+ using Microsoft.Build.Shared.FileSystem;
+ using Microsoft.NET.StringTools;
+ using Microsoft.Win32;
++using static Microsoft.Build.Evaluation.ToolsetElement;
+ using AvailableStaticMethods = Microsoft.Build.Internal.AvailableStaticMethods;
+ using ReservedPropertyNames = Microsoft.Build.Internal.ReservedPropertyNames;
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
+@@ -307,7 +311,7 @@ private void FlushFirstValueIfNeeded()
+         /// <summary>
+         /// Set of properties which are null during expansion.
+         /// </summary>
+-        private UsedUninitializedProperties _usedUninitializedProperties;
++        private PropertiesUsageTracker _propertiesUsageTracker;
+ 
+         private readonly IFileSystem _fileSystem;
+ 
+@@ -325,7 +329,7 @@ private void FlushFirstValueIfNeeded()
+         internal Expander(IPropertyProvider<P> properties, IFileSystem fileSystem)
+         {
+             _properties = properties;
+-            _usedUninitializedProperties = new UsedUninitializedProperties();
++            _propertiesUsageTracker = new PropertiesUsageTracker();
+             _fileSystem = fileSystem;
+         }
+ 
+@@ -336,7 +340,7 @@ internal Expander(IPropertyProvider<P> properties, IFileSystem fileSystem)
+         internal Expander(IPropertyProvider<P> properties, EvaluationContext evaluationContext)
+         {
+             _properties = properties;
+-            _usedUninitializedProperties = new UsedUninitializedProperties();
++            _propertiesUsageTracker = new PropertiesUsageTracker();
+             _fileSystem = evaluationContext.FileSystem;
+             EvaluationContext = evaluationContext;
+         }
+@@ -387,16 +391,6 @@ internal Expander(IPropertyProvider<P> properties, IItemProvider<I> items, IMeta
+             _metadata = metadata;
+         }
+ 
+-        /// <summary>
+-        /// Whether to warn when we set a property for the first time, after it was previously used.
+-        /// Default is false, unless MSBUILDWARNONUNINITIALIZEDPROPERTY is set.
+-        /// </summary>
+-        internal bool WarnForUninitializedProperties
+-        {
+-            get { return _usedUninitializedProperties.Warn; }
+-            set { _usedUninitializedProperties.Warn = value; }
+-        }
+-
+         /// <summary>
+         /// Accessor for the metadata.
+         /// Set temporarily during item metadata evaluation.
+@@ -411,10 +405,10 @@ internal IMetadataTable Metadata
+         /// If a property is expanded but evaluates to null then it is considered to be un-initialized.
+         /// We want to keep track of these properties so that we can warn if the property gets set later on.
+         /// </summary>
+-        internal UsedUninitializedProperties UsedUninitializedProperties
++        internal PropertiesUsageTracker PropertiesUsageTracker
+         {
+-            get { return _usedUninitializedProperties; }
+-            set { _usedUninitializedProperties = value; }
++            get { return _propertiesUsageTracker; }
++            set { _propertiesUsageTracker = value; }
+         }
+ 
+         /// <summary>
+@@ -467,7 +461,7 @@ internal string ExpandIntoStringLeaveEscaped(string expression, ExpanderOptions
+             ErrorUtilities.VerifyThrowInternalNull(elementLocation, nameof(elementLocation));
+ 
+             string result = MetadataExpander.ExpandMetadataLeaveEscaped(expression, _metadata, options, elementLocation, loggingContext);
+-            result = PropertyExpander<P>.ExpandPropertiesLeaveEscaped(result, _properties, options, elementLocation, _usedUninitializedProperties, _fileSystem, loggingContext);
++            result = PropertyExpander<P>.ExpandPropertiesLeaveEscaped(result, _properties, options, elementLocation, _propertiesUsageTracker, _fileSystem, loggingContext);
+             result = ItemExpander.ExpandItemVectorsIntoString<I>(this, result, _items, options, elementLocation);
+             result = FileUtilities.MaybeAdjustFilePath(result);
+ 
+@@ -488,7 +482,7 @@ internal object ExpandPropertiesLeaveTypedAndEscaped(string expression, Expander
+             ErrorUtilities.VerifyThrowInternalNull(elementLocation, nameof(elementLocation));
+ 
+             string metaExpanded = MetadataExpander.ExpandMetadataLeaveEscaped(expression, _metadata, options, elementLocation);
+-            return PropertyExpander<P>.ExpandPropertiesLeaveTypedAndEscaped(metaExpanded, _properties, options, elementLocation, _usedUninitializedProperties, _fileSystem);
++            return PropertyExpander<P>.ExpandPropertiesLeaveTypedAndEscaped(metaExpanded, _properties, options, elementLocation, _propertiesUsageTracker, _fileSystem);
+         }
+ 
+         /// <summary>
+@@ -536,7 +530,7 @@ internal IList<T> ExpandIntoItemsLeaveEscaped<T>(string expression, IItemFactory
+             ErrorUtilities.VerifyThrowInternalNull(elementLocation, nameof(elementLocation));
+ 
+             expression = MetadataExpander.ExpandMetadataLeaveEscaped(expression, _metadata, options, elementLocation);
+-            expression = PropertyExpander<P>.ExpandPropertiesLeaveEscaped(expression, _properties, options, elementLocation, _usedUninitializedProperties, _fileSystem);
++            expression = PropertyExpander<P>.ExpandPropertiesLeaveEscaped(expression, _properties, options, elementLocation, _propertiesUsageTracker, _fileSystem);
+             expression = FileUtilities.MaybeAdjustFilePath(expression);
+ 
+             List<T> result = new List<T>();
+@@ -1121,7 +1115,7 @@ internal static string ExpandPropertiesLeaveEscaped(
+                 IPropertyProvider<T> properties,
+                 ExpanderOptions options,
+                 IElementLocation elementLocation,
+-                UsedUninitializedProperties usedUninitializedProperties,
++                PropertiesUsageTracker propertiesUsageTracker,
+                 IFileSystem fileSystem,
+                 LoggingContext loggingContext = null)
+             {
+@@ -1132,7 +1126,7 @@ internal static string ExpandPropertiesLeaveEscaped(
+                             properties,
+                             options,
+                             elementLocation,
+-                            usedUninitializedProperties,
++                            propertiesUsageTracker,
+                             fileSystem,
+                             loggingContext));
+             }
+@@ -1159,7 +1153,7 @@ internal static object ExpandPropertiesLeaveTypedAndEscaped(
+                 IPropertyProvider<T> properties,
+                 ExpanderOptions options,
+                 IElementLocation elementLocation,
+-                UsedUninitializedProperties usedUninitializedProperties,
++                PropertiesUsageTracker propertiesUsageTracker,
+                 IFileSystem fileSystem,
+                 LoggingContext loggingContext = null)
+             {
+@@ -1270,13 +1264,13 @@ internal static object ExpandPropertiesLeaveTypedAndEscaped(
+                                 properties,
+                                 options,
+                                 elementLocation,
+-                                usedUninitializedProperties,
++                                propertiesUsageTracker,
+                                 fileSystem,
+                                 loggingContext);
+                         }
+                         else // This is a regular property
+                         {
+-                            propertyValue = LookupProperty(properties, expression, propertyStartIndex + 2, propertyEndIndex - 1, elementLocation, usedUninitializedProperties, loggingContext);
++                            propertyValue = LookupProperty(properties, expression, propertyStartIndex + 2, propertyEndIndex - 1, elementLocation, propertiesUsageTracker, loggingContext);
+                         }
+ 
+                         if (propertyValue != null)
+@@ -1319,7 +1313,7 @@ internal static object ExpandPropertyBody(
+                 IPropertyProvider<T> properties,
+                 ExpanderOptions options,
+                 IElementLocation elementLocation,
+-                UsedUninitializedProperties usedUninitializedProperties,
++                PropertiesUsageTracker propertiesUsageTracker,
+                 IFileSystem fileSystem,
+                 LoggingContext loggingContext)
+             {
+@@ -1351,7 +1345,7 @@ internal static object ExpandPropertyBody(
+                             propertyBody,
+                             elementLocation,
+                             propertyValue,
+-                            usedUninitializedProperties,
++                            propertiesUsageTracker,
+                             fileSystem,
+                             loggingContext);
+ 
+@@ -1381,7 +1375,7 @@ internal static object ExpandPropertyBody(
+                         }
+                         else
+                         {
+-                            propertyValue = LookupProperty(properties, propertyBody, 0, indexerStart - 1, elementLocation, usedUninitializedProperties);
++                            propertyValue = LookupProperty(properties, propertyBody, 0, indexerStart - 1, elementLocation, propertiesUsageTracker);
+                             propertyBody = propertyBody.Substring(indexerStart);
+ 
+                             // recurse so that the function representing the indexer can be executed on the property value
+@@ -1391,7 +1385,7 @@ internal static object ExpandPropertyBody(
+                                 properties,
+                                 options,
+                                 elementLocation,
+-                                usedUninitializedProperties,
++                                propertiesUsageTracker,
+                                 fileSystem,
+                                 loggingContext);
+                         }
+@@ -1410,7 +1404,7 @@ internal static object ExpandPropertyBody(
+                 // doesn't exist in the collection, and we're not executing a static function
+                 if (!String.IsNullOrEmpty(propertyName))
+                 {
+-                    propertyValue = LookupProperty(properties, propertyName, elementLocation, usedUninitializedProperties);
++                    propertyValue = LookupProperty(properties, propertyName, elementLocation, propertiesUsageTracker);
+                 }
+ 
+                 if (function != null)
+@@ -1517,21 +1511,26 @@ internal static string ConvertToString(object valueToConvert)
+             /// <summary>
+             /// Look up a simple property reference by the name of the property, e.g. "Foo" when expanding $(Foo).
+             /// </summary>
+-            private static object LookupProperty(IPropertyProvider<T> properties, string propertyName, IElementLocation elementLocation, UsedUninitializedProperties usedUninitializedProperties)
++            private static object LookupProperty(IPropertyProvider<T> properties, string propertyName, IElementLocation elementLocation, PropertiesUsageTracker propertiesUsageTracker)
+             {
+-                return LookupProperty(properties, propertyName, 0, propertyName.Length - 1, elementLocation, usedUninitializedProperties);
++                return LookupProperty(properties, propertyName, 0, propertyName.Length - 1, elementLocation, propertiesUsageTracker);
+             }
+ 
+             /// <summary>
+             /// Look up a simple property reference by the name of the property, e.g. "Foo" when expanding $(Foo).
+             /// </summary>
+-            private static object LookupProperty(IPropertyProvider<T> properties, string propertyName, int startIndex, int endIndex, IElementLocation elementLocation, UsedUninitializedProperties usedUninitializedProperties, LoggingContext loggingContext = null)
++            private static object LookupProperty(IPropertyProvider<T> properties, string propertyName, int startIndex, int endIndex, IElementLocation elementLocation, PropertiesUsageTracker propertiesUsageTracker, LoggingContext loggingContext = null)
+             {
+                 T property = properties.GetProperty(propertyName, startIndex, endIndex);
+ 
+                 object propertyValue;
+ 
+-                if (property == null && ((endIndex - startIndex) >= 7) && MSBuildNameIgnoreCaseComparer.Default.Equals("MSBuild", propertyName, startIndex, 7))
++                bool isArtifical = property == null && ((endIndex - startIndex) >= 7) &&
++                                   MSBuildNameIgnoreCaseComparer.Default.Equals("MSBuild", propertyName, startIndex, 7);
++
++                propertiesUsageTracker.TrackRead(propertyName, startIndex, endIndex, elementLocation, property == null, isArtifical, loggingContext);
++
++                if (isArtifical)
+                 {
+                     // It could be one of the MSBuildThisFileXXXX properties,
+                     // whose values vary according to the file they are in.
+@@ -1546,24 +1545,6 @@ private static object LookupProperty(IPropertyProvider<T> properties, string pro
+                 }
+                 else if (property == null)
+                 {
+-                    // We have evaluated a property to null. We now need to see if we need to add it to the list of properties which are used before they have been initialized
+-                    //
+-                    // We also do not want to add the property to the list if the environment variable is not set, also we do not want to add the property to the list if we are currently
+-                    // evaluating a condition because a common pattern for msbuild projects is to see if the property evaluates to empty and then set a value as this would cause a considerable number of false positives.   <A Condition="'$(A)' == ''">default</A>
+-                    //
+-                    // Another pattern used is where a property concatenates with other values,  <a>$(a);something</a> however we do not want to add the a element to the list because again this would make a number of
+-                    // false positives. Therefore we check to see what element we are currently evaluating and if it is the same as our property we do not add the property to the list.
+-                    if (usedUninitializedProperties.Warn && usedUninitializedProperties.CurrentlyEvaluatingPropertyElementName != null)
+-                    {
+-                        // Check to see if the property name does not match the property we are currently evaluating, note the property we are currently evaluating in the element name, this means no $( or )
+-                        if (!MSBuildNameIgnoreCaseComparer.Default.Equals(usedUninitializedProperties.CurrentlyEvaluatingPropertyElementName, propertyName, startIndex, endIndex - startIndex + 1))
+-                        {
+-                            usedUninitializedProperties.TryAdd(
+-                                propertyName: propertyName.Substring(startIndex, endIndex - startIndex + 1),
+-                                elementLocation);
+-                        }
+-                    }
+-
+                     propertyValue = String.Empty;
+                 }
+                 else
+@@ -2755,7 +2736,7 @@ internal static IEnumerable<KeyValuePair<string, S>> ExecuteStringFunction(
+                             arguments,
+                             BindingFlags.Public | BindingFlags.InvokeMethod,
+                             string.Empty,
+-                            expander.UsedUninitializedProperties,
++                            expander.PropertiesUsageTracker,
+                             expander._fileSystem,
+                             expander._loggingContext);
+ 
+@@ -3187,7 +3168,7 @@ private struct FunctionBuilder<T>
+             /// <summary>
+             /// List of properties which have been used but have not been initialized yet.
+             /// </summary>
+-            public UsedUninitializedProperties UsedUninitializedProperties { get; set; }
++            public PropertiesUsageTracker PropertiesUsageTracker { get; set; }
+ 
+             internal readonly Function<T> Build()
+             {
+@@ -3199,7 +3180,7 @@ internal readonly Function<T> Build()
+                     Arguments,
+                     BindingFlags,
+                     Remainder,
+-                    UsedUninitializedProperties,
++                    PropertiesUsageTracker,
+                     FileSystem,
+                     LoggingContext);
+             }
+@@ -3251,7 +3232,7 @@ internal class Function<T>
+             /// <summary>
+             /// List of properties which have been used but have not been initialized yet.
+             /// </summary>
+-            private readonly UsedUninitializedProperties _usedUninitializedProperties;
++            private PropertiesUsageTracker _propertiesUsageTracker;
+ 
+             private readonly IFileSystem _fileSystem;
+ 
+@@ -3268,7 +3249,7 @@ internal Function(
+                 string[] arguments,
+                 BindingFlags bindingFlags,
+                 string remainder,
+-                UsedUninitializedProperties usedUninitializedProperties,
++                PropertiesUsageTracker propertiesUsageTracker,
+                 IFileSystem fileSystem,
+                 LoggingContext loggingContext)
+             {
+@@ -3287,7 +3268,7 @@ internal Function(
+                 _receiverType = receiverType;
+                 _bindingFlags = bindingFlags;
+                 _remainder = remainder;
+-                _usedUninitializedProperties = usedUninitializedProperties;
++                _propertiesUsageTracker = propertiesUsageTracker;
+                 _fileSystem = fileSystem;
+                 _loggingContext = loggingContext;
+             }
+@@ -3311,7 +3292,7 @@ internal static Function<T> ExtractPropertyFunction(
+                 string expressionFunction,
+                 IElementLocation elementLocation,
+                 object propertyValue,
+-                UsedUninitializedProperties usedUnInitializedProperties,
++                PropertiesUsageTracker usedUnInitializedPropertiesUsageTracker,
+                 IFileSystem fileSystem,
+                 LoggingContext loggingContext)
+             {
+@@ -3335,7 +3316,7 @@ internal static Function<T> ExtractPropertyFunction(
+                 ProjectErrorUtilities.VerifyThrowInvalidProject(!expressionRoot.IsEmpty, elementLocation, "InvalidFunctionPropertyExpression", expressionFunction, String.Empty);
+ 
+                 functionBuilder.Expression = expressionFunction;
+-                functionBuilder.UsedUninitializedProperties = usedUnInitializedProperties;
++                functionBuilder.PropertiesUsageTracker = usedUnInitializedPropertiesUsageTracker;
+ 
+                 // This is a static method call
+                 // A static method is the content that follows the last "::", the rest being the type
+@@ -3487,7 +3468,7 @@ internal object Execute(object objectInstance, IPropertyProvider<T> properties,
+                             properties,
+                             options,
+                             elementLocation,
+-                            _usedUninitializedProperties,
++                            _propertiesUsageTracker,
+                             _fileSystem);
+ 
+                         if (argument is string argumentValue)
+@@ -3621,7 +3602,7 @@ internal object Execute(object objectInstance, IPropertyProvider<T> properties,
+                         properties,
+                         options,
+                         elementLocation,
+-                        _usedUninitializedProperties,
++                        _propertiesUsageTracker,
+                         _fileSystem,
+                         _loggingContext);
+                 }
+@@ -5493,13 +5474,73 @@ private object LateBindExecute(Exception ex, BindingFlags bindingFlags, object o
+     /// <summary>
+     /// This class wraps information about properties which have been used before they are initialized.
+     /// </summary>
+-    internal sealed class UsedUninitializedProperties
++    internal sealed class PropertiesUsageTracker
+     {
++        /// <summary>
++        /// Whether to warn when we set a property for the first time, after it was previously used.
++        /// Default is false, unless MSBUILDWARNONUNINITIALIZEDPROPERTY is set.
++        /// </summary>
++        // This setting may change after the build has started, therefore if the user has not set the property to true on the build parameters we need to check to see if it is set to true on the environment variable.
++        private bool _warnForUninitializedProperties = BuildParameters.WarnOnUninitializedProperty || Traits.Instance.EscapeHatches.WarnOnUninitializedProperty;
++
+         /// <summary>
+         /// Lazily allocated collection of properties and the element which used them.
+         /// </summary>
+         private Dictionary<string, IElementLocation>? _properties;
+ 
++        internal void TrackRead(string propertyName, int startIndex, int endIndex, IElementLocation elementLocation, bool isUninitialized, bool isArtificial, LoggingContext? loggingContext = null)
++        {
++            if (isArtificial)
++            {
++                return;
++            }
++
++            // TODO: This might get executed even before the logging service and BuildComponentCollections
++            //  are initialized (for the toolset initialization)
++            BuildCheckManagerProvider.GlobalBuildEngineDataConsumer?.ProcessPropertyRead(
++                propertyName, startIndex, endIndex,
++                elementLocation, isUninitialized, GetPropertyReadContext(propertyName, startIndex, endIndex),
++                loggingContext?.BuildEventContext);
++
++            if (!isUninitialized)
++            {
++                return;
++            }
++
++            // We have evaluated a property to null. We now need to see if we need to add it to the list of properties which are used before they have been initialized
++            //
++            // We also do not want to add the property to the list if the environment variable is not set, also we do not want to add the property to the list if we are currently
++            // evaluating a condition because a common pattern for msbuild projects is to see if the property evaluates to empty and then set a value as this would cause a considerable number of false positives.   <A Condition="'$(A)' == ''">default</A>
++            //
++            // Another pattern used is where a property concatenates with other values,  <a>$(a);something</a> however we do not want to add the a element to the list because again this would make a number of
++            // false positives. Therefore we check to see what element we are currently evaluating and if it is the same as our property we do not add the property to the list.
++
++            // here handle null probably (or otherwise execution)
++            if (_warnForUninitializedProperties && CurrentlyEvaluatingPropertyElementName != null)
++            {
++                // Check to see if the property name does not match the property we are currently evaluating, note the property we are currently evaluating in the element name, this means no $( or )
++                if (!MSBuildNameIgnoreCaseComparer.Default.Equals(CurrentlyEvaluatingPropertyElementName, propertyName, startIndex, endIndex - startIndex + 1))
++                {
++                    TryAdd(
++                        propertyName: propertyName.Substring(startIndex, endIndex - startIndex + 1),
++                        elementLocation);
++                }
++            }
++        }
++
++        private PropertyReadContext GetPropertyReadContext(string propertyName, int startIndex, int endIndex)
++        {
++            if (PropertyReadContext == PropertyReadContext.PropertyEvaluation &&
++                !string.IsNullOrEmpty(CurrentlyEvaluatingPropertyElementName) &&
++                MSBuildNameIgnoreCaseComparer.Default.Equals(CurrentlyEvaluatingPropertyElementName, propertyName,
++                    startIndex, endIndex - startIndex + 1))
++            {
++                return PropertyReadContext.PropertyEvaluationSelf;
++            }
++
++            return PropertyReadContext;
++        }
++
+         internal void TryAdd(string propertyName, IElementLocation elementLocation)
+         {
+             if (_properties is null)
+@@ -5531,22 +5572,66 @@ internal void RemoveProperty(string propertyName)
+         }
+ 
+         /// <summary>
+-        ///  Are we currently supposed to warn if we used an uninitialized property.
++        ///  What is the currently evaluating property element, this is so that we do not add a un initialized property if we are evaluating that property.
+         /// </summary>
+-        internal bool Warn
++        internal string? CurrentlyEvaluatingPropertyElementName
+         {
+             get;
+             set;
+         }
+ 
+-        /// <summary>
+-        ///  What is the currently evaluating property element, this is so that we do not add a un initialized property if we are evaluating that property.
+-        /// </summary>
+-        internal string? CurrentlyEvaluatingPropertyElementName
++        internal void CheckPreexistingUndefinedUsage(IElementWithLocation propertyElement, string evaluatedValue, LoggingContext loggingContext)
+         {
+-            get;
+-            set;
++            // If we are going to set a property to a value other than null or empty we need to check to see if it has been used
++            // during evaluation.
++            if (evaluatedValue.Length > 0 && _warnForUninitializedProperties)
++            {
++                // Is the property we are currently setting in the list of properties which have been used but not initialized
++                IElementLocation? elementWhichUsedProperty;
++                bool isPropertyInList = TryGetPropertyElementLocation(propertyElement.Name, out elementWhichUsedProperty);
++
++                if (isPropertyInList)
++                {
++                    // Once we are going to warn for a property once, remove it from the list so we do not add it again.
++                    RemoveProperty(propertyElement.Name);
++                    loggingContext.LogWarning(null, new BuildEventFileInfo(propertyElement.Location), "UsedUninitializedProperty", propertyElement.Name, elementWhichUsedProperty?.LocationString);
++                }
++            }
++
++            CurrentlyEvaluatingPropertyElementName = null;
++            PropertyReadContext = PropertyReadContext.Other;
++        }
++
++        private PropertyReadContext _propertyReadContext;
++        private PropertyReadContext _previousPropertyReadContext = PropertyReadContext.Other;
++        internal PropertyReadContext PropertyReadContext
++        {
++            private get => _propertyReadContext;
++            set
++            {
++                _previousPropertyReadContext = _propertyReadContext;
++                _propertyReadContext = value;
++            }
+         }
++
++        internal void ResetPropertyReadContext(bool popPrevious = true)
++        {
++            _propertyReadContext = popPrevious ? _previousPropertyReadContext : PropertyReadContext.Other;
++            _previousPropertyReadContext = PropertyReadContext.Other;
++        }
++    }
++
++    /// <summary>
++    /// Type of the context in which a property is read.
++    /// </summary>
++    internal enum PropertyReadContext
++    {
++        // we are not interested in distinguishing the item read etc.
++        Other,
++        ConditionEvaluation,
++        ConditionEvaluationWithOneSideEmpty,
++        PropertyEvaluation,
++        PropertyEvaluationSelf,
+     }
+ 
+     internal static class IntrinsicFunctionOverload
+diff --git a/src/Build/Evaluation/IEvaluatorData.cs b/src/Build/Evaluation/IEvaluatorData.cs
+index 4d5b2ea8e98..3d21ae23edd 100644
+--- a/src/Build/Evaluation/IEvaluatorData.cs
++++ b/src/Build/Evaluation/IEvaluatorData.cs
+@@ -272,7 +272,7 @@ List<ProjectItemElement> EvaluatedItemElements
+         /// <summary>
+         /// Sets a property which comes from the Xml.
+         /// </summary>
+-        P SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped);
++        P SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped, BackEnd.Logging.LoggingContext loggingContext = null);
+ 
+         /// <summary>
+         /// Retrieves an existing target, if any.
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.EvaluatorData.cs b/src/Build/Evaluation/LazyItemEvaluator.EvaluatorData.cs
+index 79cd844c167..cf78951e6d0 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.EvaluatorData.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.EvaluatorData.cs
+@@ -306,9 +306,9 @@ public void RecordImportWithDuplicates(ProjectImportElement importElement, Proje
+                 _wrappedData.RecordImportWithDuplicates(importElement, import, versionEvaluated);
+             }
+ 
+-            public P SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped)
++            public P SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped, LoggingContext loggingContext = null)
+             {
+-                return _wrappedData.SetProperty(propertyElement, evaluatedValueEscaped);
++                return _wrappedData.SetProperty(propertyElement, evaluatedValueEscaped, loggingContext);
+             }
+ 
+             public P SetProperty(string name, string evaluatedValueEscaped, bool isGlobalProperty, bool mayBeReserved, bool isEnvironmentVariable = false, LoggingContext loggingContext = null)
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.IncludeOperation.cs b/src/Build/Evaluation/LazyItemEvaluator.IncludeOperation.cs
+index d40ea3145fa..1b3c34ce1eb 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.IncludeOperation.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.IncludeOperation.cs
+@@ -46,7 +46,7 @@ protected override ImmutableArray<I> SelectItems(OrderedItemDataCollection.Build
+                     // STEP 4: Evaluate, split, expand and subtract any Exclude
+                     foreach (string exclude in _excludes)
+                     {
+-                        string excludeExpanded = _expander.ExpandIntoStringLeaveEscaped(exclude, ExpanderOptions.ExpandPropertiesAndItems, _itemElement.ExcludeLocation);
++                        string excludeExpanded = _expander.ExpandIntoStringLeaveEscaped(exclude, ExpanderOptions.ExpandPropertiesAndItems, _itemElement.ExcludeLocation, _lazyEvaluator?._loggingContext);
+                         var excludeSplits = ExpressionShredder.SplitSemiColonSeparatedList(excludeExpanded);
+                         excludePatterns.AddRange(excludeSplits);
+                     }
+@@ -109,14 +109,14 @@ protected override ImmutableArray<I> SelectItems(OrderedItemDataCollection.Build
+                                 MSBuildEventSource.Log.ExpandGlobStart(_rootDirectory ?? string.Empty, glob, string.Join(", ", excludePatternsForGlobs));
+                             }
+ 
+-                            using (_lazyEvaluator._evaluationProfiler.TrackGlob(_rootDirectory, glob, excludePatternsForGlobs))
++                            using (_lazyEvaluator?._evaluationProfiler.TrackGlob(_rootDirectory, glob, excludePatternsForGlobs))
+                             {
+                                 includeSplitFilesEscaped = EngineFileUtilities.GetFileListEscaped(
+                                     _rootDirectory,
+                                     glob,
+                                     excludePatternsForGlobs,
+                                     fileMatcher: FileMatcher,
+-                                    loggingMechanism: _lazyEvaluator._loggingContext,
++                                    loggingMechanism: _lazyEvaluator?._loggingContext,
+                                     includeLocation: _itemElement.IncludeLocation,
+                                     excludeLocation: _itemElement.ExcludeLocation);
+                             }
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs b/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
+index 6bf5b325d63..a4343537bad 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
+@@ -210,7 +210,7 @@ protected void DecorateItemsWithMetadata(IEnumerable<ItemBatchingContext> itemBa
+                                     continue;
+                                 }
+ 
+-                                string evaluatedValue = _expander.ExpandIntoStringLeaveEscaped(metadataElement.Value, metadataExpansionOptions, metadataElement.Location);
++                                string evaluatedValue = _expander.ExpandIntoStringLeaveEscaped(metadataElement.Value, metadataExpansionOptions, metadataElement.Location, _lazyEvaluator?._loggingContext);
+ 
+                                 itemContext.OperationItem.SetMetadata(metadataElement, FileUtilities.MaybeAdjustFilePath(evaluatedValue, metadataElement.ContainingProject.DirectoryPath));
+                             }
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.cs b/src/Build/Evaluation/LazyItemEvaluator.cs
+index bb298ee7662..7479b6942d3 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.cs
+@@ -563,7 +563,7 @@ private IncludeOperation BuildIncludeOperation(string rootDirectory, ProjectItem
+             {
+                 // Expand properties here, because a property may have a value which is an item reference (ie "@(Bar)"), and
+                 //  if so we need to add the right item reference
+-                string evaluatedExclude = _expander.ExpandIntoStringLeaveEscaped(itemElement.Exclude, ExpanderOptions.ExpandProperties, itemElement.ExcludeLocation);
++                string evaluatedExclude = _expander.ExpandIntoStringLeaveEscaped(itemElement.Exclude, ExpanderOptions.ExpandProperties, itemElement.ExcludeLocation, _loggingContext);
+ 
+                 if (evaluatedExclude.Length > 0)
+                 {
+@@ -592,7 +592,7 @@ private RemoveOperation BuildRemoveOperation(string rootDirectory, ProjectItemEl
+             // Process MatchOnMetadata
+             if (itemElement.MatchOnMetadata.Length > 0)
+             {
+-                string evaluatedmatchOnMetadata = _expander.ExpandIntoStringLeaveEscaped(itemElement.MatchOnMetadata, ExpanderOptions.ExpandProperties, itemElement.MatchOnMetadataLocation);
++                string evaluatedmatchOnMetadata = _expander.ExpandIntoStringLeaveEscaped(itemElement.MatchOnMetadata, ExpanderOptions.ExpandProperties, itemElement.MatchOnMetadataLocation, _loggingContext);
+ 
+                 if (evaluatedmatchOnMetadata.Length > 0)
+                 {
+@@ -601,7 +601,7 @@ private RemoveOperation BuildRemoveOperation(string rootDirectory, ProjectItemEl
+                     foreach (var matchOnMetadataSplit in matchOnMetadataSplits)
+                     {
+                         AddItemReferences(matchOnMetadataSplit, operationBuilder, itemElement.MatchOnMetadataLocation);
+-                        string metadataExpanded = _expander.ExpandIntoStringLeaveEscaped(matchOnMetadataSplit, ExpanderOptions.ExpandPropertiesAndItems, itemElement.MatchOnMetadataLocation);
++                        string metadataExpanded = _expander.ExpandIntoStringLeaveEscaped(matchOnMetadataSplit, ExpanderOptions.ExpandPropertiesAndItems, itemElement.MatchOnMetadataLocation, _loggingContext);
+                         var metadataSplits = ExpressionShredder.SplitSemiColonSeparatedList(metadataExpanded);
+                         operationBuilder.MatchOnMetadata.AddRange(metadataSplits);
+                     }
+@@ -650,7 +650,8 @@ private static IEnumerable<string> GetExpandedMetadataValuesAndConditions(IColle
+                 yield return expander.ExpandIntoStringLeaveEscaped(
+                     metadatumElement.Condition,
+                     expanderOptions,
+-                    metadatumElement.ConditionLocation);
++                    metadatumElement.ConditionLocation,
++                    loggingContext);
+             }
+         }
+ 
+diff --git a/src/Build/Evaluation/PropertyTrackingEvaluatorDataWrapper.cs b/src/Build/Evaluation/PropertyTrackingEvaluatorDataWrapper.cs
+index 51117c2d7c1..b69fce97af1 100644
+--- a/src/Build/Evaluation/PropertyTrackingEvaluatorDataWrapper.cs
++++ b/src/Build/Evaluation/PropertyTrackingEvaluatorDataWrapper.cs
+@@ -5,6 +5,7 @@
+ using System.Collections.Generic;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Components.Logging;
++using Microsoft.Build.BuildCheck.Infrastructure;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Evaluation.Context;
+@@ -13,8 +14,6 @@
+ using Microsoft.Build.Shared;
+ using SdkResult = Microsoft.Build.BackEnd.SdkResolution.SdkResult;
+ 
+-#nullable disable
+-
+ namespace Microsoft.Build.Evaluation
+ {
+     /// <summary>
+@@ -79,16 +78,17 @@ public P GetProperty(string name, int startIndex, int endIndex)
+         /// <summary>
+         /// Sets a property which does not come from the Xml.
+         /// </summary>
+-        public P SetProperty(string name, string evaluatedValueEscaped, bool isGlobalProperty, bool mayBeReserved, bool isEnvironmentVariable = false, BackEnd.Logging.LoggingContext loggingContext = null)
++        public P SetProperty(string name, string evaluatedValueEscaped, bool isGlobalProperty, bool mayBeReserved, bool isEnvironmentVariable = false, BackEnd.Logging.LoggingContext? loggingContext = null)
+         {
+-            P originalProperty = _wrapped.GetProperty(name);
++            P? originalProperty = _wrapped.GetProperty(name);
+             P newProperty = _wrapped.SetProperty(name, evaluatedValueEscaped, isGlobalProperty, mayBeReserved, isEnvironmentVariable, loggingContext);
+ 
+             this.TrackPropertyWrite(
+                 originalProperty,
+                 newProperty,
+-                string.Empty,
+-                this.DeterminePropertySource(isGlobalProperty, mayBeReserved, isEnvironmentVariable));
++                null,
++                this.DeterminePropertySource(isGlobalProperty, mayBeReserved, isEnvironmentVariable),
++                loggingContext);
+ 
+             return newProperty;
+         }
+@@ -100,19 +100,21 @@ public P SetProperty(string name, string evaluatedValueEscaped, bool isGlobalPro
+         /// project file, and whose conditions evaluated to true.
+         /// If there are none above this is null.
+         /// </summary>
+-        public P SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped)
++        public P SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped, BackEnd.Logging.LoggingContext? loggingContext = null)
+         {
+-            P originalProperty = _wrapped.GetProperty(propertyElement.Name);
+-            P newProperty = _wrapped.SetProperty(propertyElement, evaluatedValueEscaped);
++            P? originalProperty = _wrapped.GetProperty(propertyElement.Name);
++            P newProperty = _wrapped.SetProperty(propertyElement, evaluatedValueEscaped, loggingContext);
+ 
+             this.TrackPropertyWrite(
+                 originalProperty,
+                 newProperty,
+-                propertyElement.Location.LocationString,
+-                PropertySource.Xml);
++                propertyElement.Location,
++                PropertySource.Xml,
++                loggingContext);
+ 
+             return newProperty;
+         }
++
+         #endregion
+ 
+         #region IEvaluatorData<> members that are forwarded directly to wrapped object.
+@@ -220,10 +222,12 @@ private void TrackUninitializedPropertyRead(string name)
+             _evaluationLoggingContext.LogBuildEvent(args);
+         }
+ 
+-        private void TrackPropertyWrite(P predecessor, P property, string location, PropertySource source)
++        private void TrackPropertyWrite(P? predecessor, P property, IElementLocation? location, PropertySource source, BackEnd.Logging.LoggingContext? loggingContext = null)
+         {
+             string name = property.Name;
+ 
++            BuildCheckManagerProvider.GlobalBuildEngineDataConsumer?.ProcessPropertyWrite(property.Name, string.IsNullOrEmpty(property.EscapedValue), location, loggingContext?.BuildEventContext);
++
+             // If this property was an environment variable but no longer is, track it.
+             if (_wrapped.EnvironmentVariablePropertiesDictionary.Contains(name) && source != PropertySource.EnvironmentVariable)
+             {
+@@ -238,7 +242,7 @@ private void TrackPropertyWrite(P predecessor, P property, string location, Prop
+             else
+             {
+                 // There was a previous value, and it might have been changed. Track that.
+-                TrackPropertyReassignment(predecessor, property, location);
++                TrackPropertyReassignment(predecessor, property, location?.LocationString);
+             }
+         }
+ 
+@@ -270,10 +274,12 @@ private void TrackPropertyInitialValueSet(P property, PropertySource source)
+         /// <param name="predecessor">The property's preceding state. Null if none.</param>
+         /// <param name="property">The property's current state.</param>
+         /// <param name="location">The location of this property's reassignment.</param>
+-        private void TrackPropertyReassignment(P predecessor, P property, string location)
++        private void TrackPropertyReassignment(P? predecessor, P property, string? location)
+         {
+             if ((_settings & PropertyTrackingSetting.PropertyReassignment) != PropertyTrackingSetting.PropertyReassignment)
+             {
++                LogPropertyReassignment(predecessor, property, location);
++
+                 return;
+             }
+ 
+@@ -285,7 +291,7 @@ private void TrackPropertyReassignment(P predecessor, P property, string locatio
+             }
+ 
+             string newValue = property.EvaluatedValue;
+-            string oldValue = predecessor.EvaluatedValue;
++            string? oldValue = predecessor?.EvaluatedValue;
+             if (newValue == oldValue)
+             {
+                 return;
+@@ -302,6 +308,47 @@ private void TrackPropertyReassignment(P predecessor, P property, string locatio
+             _evaluationLoggingContext.LogBuildEvent(args);
+         }
+ 
++        private void LogPropertyReassignment(P? predecessor, P property, string? location)
++        {
++            string newValue = property.EvaluatedValue;
++            string? oldValue = predecessor?.EvaluatedValue;
++
++            if (string.Equals(property.Name, "MSBuildAllProjects", StringComparison.OrdinalIgnoreCase))
++            {
++                // There's a huge perf cost to logging this and it increases the binlog size significantly.
++                // Meanwhile the usefulness of logging this is very low.
++                return;
++            }
++
++            if (newValue != oldValue)
++            {
++                if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_10))
++                {
++                    var args = new PropertyReassignmentEventArgs(
++                        property.Name,
++                        oldValue,
++                        newValue,
++                        location,
++                        message: null)
++                    {
++                        BuildEventContext = _evaluationLoggingContext.BuildEventContext,
++                    };
++
++                    _evaluationLoggingContext.LogBuildEvent(args);
++                }
++                else
++                {
++                    _evaluationLoggingContext.LogComment(
++                        MessageImportance.Low,
++                        "PropertyReassignment",
++                        property.Name,
++                        newValue,
++                        oldValue,
++                        location);
++                }
++            }
++        }
++
+         /// <summary>
+         /// Determines the source of a property given the variables SetProperty arguments provided. This logic follows what's in <see cref="Evaluator{P,I,M,D}"/>.
+         /// </summary>
+diff --git a/src/Build/Instance/ProjectInstance.cs b/src/Build/Instance/ProjectInstance.cs
+index 32a408a5ca4..68c39e341c1 100644
+--- a/src/Build/Instance/ProjectInstance.cs
++++ b/src/Build/Instance/ProjectInstance.cs
+@@ -1677,7 +1677,7 @@ ProjectPropertyInstance IEvaluatorData<ProjectPropertyInstance, ProjectItemInsta
+         /// Predecessor is discarded as it is a design time only artefact.
+         /// Only called during evaluation, so does not check for immutability.
+         /// </summary>
+-        ProjectPropertyInstance IEvaluatorData<ProjectPropertyInstance, ProjectItemInstance, ProjectMetadataInstance, ProjectItemDefinitionInstance>.SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped)
++        ProjectPropertyInstance IEvaluatorData<ProjectPropertyInstance, ProjectItemInstance, ProjectMetadataInstance, ProjectItemDefinitionInstance>.SetProperty(ProjectPropertyElement propertyElement, string evaluatedValueEscaped, LoggingContext loggingContext)
+         {
+             // Mutability not verified as this is being populated during evaluation
+             ProjectPropertyInstance property = ProjectPropertyInstance.Create(propertyElement.Name, evaluatedValueEscaped, false /* may not be reserved */, _isImmutable);
+@@ -3018,7 +3018,8 @@ private void Initialize(
+                 sdkResolverService ?? evaluationContext.SdkResolverService, /* Use override ISdkResolverService if specified */
+                 submissionId,
+                 evaluationContext,
+-                interactive: buildParameters.Interactive);
++                interactive: buildParameters.Interactive,
++                buildCheckEnabled: buildParameters.IsBuildCheckEnabled);
+ 
+             ErrorUtilities.VerifyThrow(EvaluationId != BuildEventContext.InvalidEvaluationId, "Evaluation should produce an evaluation ID");
+         }
+diff --git a/src/Build/Instance/ProjectPropertyGroupTaskPropertyInstance.cs b/src/Build/Instance/ProjectPropertyGroupTaskPropertyInstance.cs
+index 6eb9b3f1972..4182f9949cc 100644
+--- a/src/Build/Instance/ProjectPropertyGroupTaskPropertyInstance.cs
++++ b/src/Build/Instance/ProjectPropertyGroupTaskPropertyInstance.cs
+@@ -10,12 +10,20 @@
+ 
+ namespace Microsoft.Build.Execution
+ {
++
++    internal interface IElementWithLocation
++    {
++        string Name { get; }
++        string Value { get; }
++        ElementLocation Location { get; }
++    }
++
+     /// <summary>
+     /// Wraps an unevaluated property under an propertygroup in a target.
+     /// Immutable.
+     /// </summary>
+     [DebuggerDisplay("{_name}={Value} Condition={_condition}")]
+-    public class ProjectPropertyGroupTaskPropertyInstance : ITranslatable
++    public class ProjectPropertyGroupTaskPropertyInstance : ITranslatable, IElementWithLocation
+     {
+         /// <summary>
+         /// Name of the property
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index f9528b3b6d8..869d117f1c0 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -1,4 +1,4 @@
+-<Project Sdk="Microsoft.NET.Sdk">
++﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <Import Project="..\Shared\FileSystemSources.proj" />
+   <Import Project="..\Shared\DebuggingSources.proj" />
+@@ -159,7 +159,14 @@
+     <Compile Include="BuildCheck\Acquisition\AnalyzerAcquisitionData.cs" />
+     <Compile Include="BuildCheck\Acquisition\BuildCheckAcquisitionModule.cs" />
+     <Compile Include="BuildCheck\Acquisition\IBuildCheckAcquisitionModule.cs" />
++    <Compile Include="BuildCheck\API\IInternalBuildCheckRegistrationContext.cs" />
++    <Compile Include="BuildCheck\API\InternalBuildAnalyzer.cs" />
++    <Compile Include="BuildCheck\Infrastructure\IBuildEngineDataConsumer.cs" />
++    <Compile Include="BuildCheck\OM\ProjectProcessingDoneData.cs" />
++    <Compile Include="BuildCheck\OM\PropertyReadData.cs" />
++    <Compile Include="BuildCheck\OM\PropertyWriteData.cs" />
+     <Compile Include="BuildCheck\Analyzers\SharedOutputPathAnalyzer.cs" />
++    <Compile Include="BuildCheck\Analyzers\PropertiesUsageAnalyzer.cs" />
+     <Compile Include="BuildCheck\Infrastructure\BuildCheckConfigurationException.cs" />
+     <Compile Include="BuildCheck\Infrastructure\BuildCheckForwardingLogger.cs" />
+     <Compile Include="BuildCheck\Infrastructure\BuildEventsProcessor.cs" />
+@@ -185,6 +192,7 @@
+     <Compile Include="BuildCheck\Infrastructure\CustomConfigurationData.cs" />
+     <Compile Include="BuildCheck\API\IBuildCheckRegistrationContext.cs" />
+     <Compile Include="BuildCheck\Infrastructure\IBuildCheckManager.cs" />
++    <Compile Include="BuildCheck\Logging\IBuildAnalysisLoggingContext.cs" />
+     <Compile Include="BuildCheck\Logging\IBuildAnalysisLoggingContextFactory.cs" />
+     <Compile Include="BuildCheck\OM\EvaluatedPropertiesAnalysisData.cs" />
+     <Compile Include="BuildCheck\OM\ParsedItemsAnalysisData.cs" />
+@@ -199,6 +207,7 @@
+     <Compile Include="FileAccess\RequestedAccess.cs" />
+     <Compile Include="BuildCheck\Logging\AnalyzerLoggingContext.cs" />
+     <Compile Include="BuildCheck\Logging\AnalyzerLoggingContextFactory.cs" />
++    <Compile Include="BuildCheck\Logging\BuildAnalysisLoggingContextExtensions.cs" />
+     <Compile Include="Utilities\ReaderWriterLockSlimExtensions.cs" />
+     <Compile Include="BackEnd\Node\ConsoleOutput.cs" />
+     <Compile Include="BackEnd\Node\PartialBuildTelemetry.cs" />
+diff --git a/src/BuildCheck.UnitTests/AssemblyInfo.cs b/src/BuildCheck.UnitTests/AssemblyInfo.cs
+index 3b5d7bbb185..5b383e24105 100644
+--- a/src/BuildCheck.UnitTests/AssemblyInfo.cs
++++ b/src/BuildCheck.UnitTests/AssemblyInfo.cs
+@@ -2,3 +2,13 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ global using NativeMethodsShared = Microsoft.Build.Framework.NativeMethods;
++
++namespace Microsoft.Build.UnitTests.Shared;
++
++[System.AttributeUsage(System.AttributeTargets.Assembly)]
++internal sealed class BootstrapLocationAttribute(string bootstrapRoot, string bootstrapMsbuildBinaryLocation)
++    : System.Attribute
++{
++    public string BootstrapRoot { get; } = bootstrapRoot;
++    public string BootstrapMsbuildBinaryLocation { get; } = bootstrapMsbuildBinaryLocation;
++}
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 9351612060f..5ce368035c9 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -7,6 +7,7 @@
+ using System.Linq;
+ using System.Reflection;
+ using System.Text;
++using System.Text.RegularExpressions;
+ using System.Threading.Tasks;
+ using Microsoft.Build.UnitTests;
+ using Microsoft.Build.UnitTests.Shared;
+@@ -29,6 +30,60 @@ public EndToEndTests(ITestOutputHelper output)
+ 
+     public void Dispose() => _env.Dispose();
+ 
++    [Fact]
++    public void PropertiesUsageAnalyzerTest()
++    {
++        using TestEnvironment env = TestEnvironment.Create();
++        string contents = """
++                              <Project DefaultTargets="PrintEnvVar">
++
++                              <PropertyGroup>
++                              <!--
++                              <MyProp1>value-of-prop1</MyProp1>
++                              <MyProp2>$(MyProp1)</MyProp2>
++                              <MyProp3>blah</MyProp3>
++                              -->
++                              </PropertyGroup>
++                              
++                              
++                              <PropertyGroup Condition="'$(MyProp12)' == ''">
++                                <MyProp13>$(MyProp11)</MyProp13>
++                              </PropertyGroup>
++                              
++                              
++                              <!--
++                              <ItemGroup>
++                                <a Include="$(nonexistent)" />
++                              </ItemGroup>
++                              -->
++
++                              <Target Name="PrintEnvVar">
++                              <Message Text="MyPropT2 has value $(MyPropT2)" Importance="High" Condition="'$(MyPropT2)' == ''" />
++                              <PropertyGroup>
++                              <MyPropT2>$(MyPropT2);xxx</MyPropT2>
++                              </PropertyGroup>
++                              </Target>
++
++                              </Project>
++                              """;
++        TransientTestFolder logFolder = env.CreateFolder(createFolder: true);
++        TransientTestFile projectFile = env.CreateFile(logFolder, "myProj.proj", contents);
++
++        string output = RunnerUtilities.ExecBootstrapedMSBuild($"{projectFile.Path} -analyze", out bool success);
++        _env.Output.WriteLine(output);
++        _env.Output.WriteLine("=========================");
++        success.ShouldBeTrue(output);
++
++        output.ShouldContain("AB001: Property: [MyProp11]");
++        output.ShouldContain("AB002: Property: [MyPropT2]");
++        output.ShouldContain("AB003: Property: [MyProp13]");
++
++        // each finding should be found just once - but reported twice, due to summary
++        Regex.Matches(output, "AB001: Property").Count.ShouldBe(2);
++        Regex.Matches(output, "AB002: Property").Count.ShouldBe(2);
++        Regex.Matches(output, "AB003: Property").Count.ShouldBe(2);
++    }
++
+     [Theory]
+     [InlineData(true, true)]
+     [InlineData(false, true)]
+diff --git a/src/Shared/IElementLocation.cs b/src/Shared/IElementLocation.cs
+index 6353e3d17fb..f9058dce4db 100644
+--- a/src/Shared/IElementLocation.cs
++++ b/src/Shared/IElementLocation.cs
+@@ -7,15 +7,16 @@
+ 
+ namespace Microsoft.Build.Shared
+ {
++    internal interface IElementLocation : IMsBuildElementLocation, ITranslatable { }
++
+     /// <summary>
+     /// Represents the location information for error reporting purposes.  This is normally used to
+     /// associate a run-time error with the original XML.
+     /// This is not used for arbitrary errors from tasks, which store location in a BuildXXXXEventArgs.
+     /// All implementations should be IMMUTABLE.
+-    /// This is not public because the current implementation only provides correct data for unedited projects.
+-    /// DO NOT make it public without considering a solution to this problem.
++    /// Any editing of the project XML through the MSBuild API's will invalidate locations in that XML until the XML is reloaded.
+     /// </summary>
+-    internal interface IElementLocation : ITranslatable
++    public interface IMsBuildElementLocation
+     {
+         /// <summary>
+         /// The file from which this particular element originated.  It may

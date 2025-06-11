@@ -1,0 +1,603 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index c4a9d2c9523..76a05de32d6 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -25,6 +25,7 @@
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Experimental.ProjectCache;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Framework.Telemetry;
+ using Microsoft.Build.Graph;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Logging;
+@@ -456,7 +457,7 @@ public void BeginBuild(BuildParameters parameters)
+                         _nodeManager?.ShutdownAllNodes();
+                         _taskHostNodeManager?.ShutdownAllNodes();
+                     }
+-               }
++                }
+             }
+ 
+             _previousLowPriority = parameters.LowPriority;
+@@ -470,6 +471,14 @@ public void BeginBuild(BuildParameters parameters)
+ 
+                 MSBuildEventSource.Log.BuildStart();
+ 
++                // Initiate build telemetry data
++                DateTime now = DateTime.UtcNow;
++                KnownTelemetry.BuildTelemetry ??= new()
++                {
++                    StartAt = now,
++                };
++                KnownTelemetry.BuildTelemetry.InnerStartAt = now;
++
+                 if (BuildParameters.DumpOpportunisticInternStats)
+                 {
+                     Strings.EnableDiagnostics();
+@@ -796,6 +805,13 @@ public BuildSubmission PendBuildRequest(BuildRequestData requestData)
+                 VerifyStateInternal(BuildManagerState.Building);
+ 
+                 var newSubmission = new BuildSubmission(this, GetNextSubmissionId(), requestData, _buildParameters.LegacyThreadingSemantics);
++
++                if (KnownTelemetry.BuildTelemetry != null)
++                {
++                    KnownTelemetry.BuildTelemetry.Project ??= requestData.ProjectFullPath;
++                    KnownTelemetry.BuildTelemetry.Target ??= string.Join(",", requestData.TargetNames);
++                }
++
+                 _buildSubmissions.Add(newSubmission.SubmissionId, newSubmission);
+                 _noActiveSubmissionsEvent.Reset();
+                 return newSubmission;
+@@ -817,6 +833,13 @@ public GraphBuildSubmission PendBuildRequest(GraphBuildRequestData requestData)
+                 VerifyStateInternal(BuildManagerState.Building);
+ 
+                 var newSubmission = new GraphBuildSubmission(this, GetNextSubmissionId(), requestData);
++
++                if (KnownTelemetry.BuildTelemetry != null)
++                {
++                    KnownTelemetry.BuildTelemetry.Project ??= requestData.ProjectGraphEntryPoints.FirstOrDefault().ProjectFile;
++                    KnownTelemetry.BuildTelemetry.Target ??= string.Join(",", requestData.TargetNames);
++                }
++
+                 _graphBuildSubmissions.Add(newSubmission.SubmissionId, newSubmission);
+                 _noActiveSubmissionsEvent.Reset();
+                 return newSubmission;
+@@ -965,6 +988,36 @@ public void EndBuild()
+                         }
+ 
+                         loggingService.LogBuildFinished(_overallBuildSuccess);
++
++                        if (KnownTelemetry.BuildTelemetry != null)
++                        {
++                            KnownTelemetry.BuildTelemetry.FinishedAt = DateTime.UtcNow;
++                            KnownTelemetry.BuildTelemetry.Success = _overallBuildSuccess;
++                            KnownTelemetry.BuildTelemetry.Version = ProjectCollection.Version;
++                            KnownTelemetry.BuildTelemetry.DisplayVersion = ProjectCollection.DisplayVersion;
++                            KnownTelemetry.BuildTelemetry.FrameworkName = NativeMethodsShared.FrameworkName;
++                            NativeMethodsShared.GetOSNameForExtensionsPath();
++
++                            string host = null;
++                            if (BuildEnvironmentState.s_runningInVisualStudio)
++                            {
++                                host = "VS";
++                            }
++                            else if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILD_HOST_NAME")))
++                            {
++                                host = Environment.GetEnvironmentVariable("MSBUILD_HOST_NAME");
++                            }
++                            else if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("VSCODE_CWD")) || Environment.GetEnvironmentVariable("TERM_PROGRAM") == "vscode")
++                            {
++                                host = "VSCode";
++                            }
++                            KnownTelemetry.BuildTelemetry.Host = host;
++
++                            KnownTelemetry.BuildTelemetry.UpdateEventProperties();
++                            loggingService.LogTelemetry(buildEventContext: null, KnownTelemetry.BuildTelemetry.EventName, KnownTelemetry.BuildTelemetry.Properties);
++                            // Clean telemetry which makes it ready for next build submission.
++                            KnownTelemetry.BuildTelemetry = null;
++                        }
+                     }
+ 
+                     ShutdownLoggingService(loggingService);
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index b2329da56b5..08c3b156233 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -15,6 +15,7 @@
+ using Microsoft.Build.Eventing;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Framework.Telemetry;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+ 
+@@ -152,6 +153,10 @@ public MSBuildClientExitResult Execute(CancellationToken cancellationToken)
+ 
+             // Start server it if is not running.
+             bool serverIsAlreadyRunning = ServerNamedMutex.WasOpen(serverRunningMutexName);
++            if (KnownTelemetry.BuildTelemetry != null)
++            {
++                KnownTelemetry.BuildTelemetry.InitialServerState = serverIsAlreadyRunning ? "hot" : "cold";
++            }
+             if (!serverIsAlreadyRunning)
+             {
+                 CommunicationsUtilities.Trace("Server was not running. Starting server now.");
+@@ -432,13 +437,23 @@ private ServerNodeBuildCommand GetServerNodeBuildCommand()
+             // We remove env variable used to invoke MSBuild server as that might be equal to 1, so we do not get an infinite recursion here. 
+             envVars[Traits.UseMSBuildServerEnvVarName] = "0";
+ 
++            Debug.Assert(KnownTelemetry.BuildTelemetry == null || KnownTelemetry.BuildTelemetry.StartAt.HasValue, "BuildTelemetry.StartAt was not initialized!");
++
++            PartialBuildTelemetry? partialBuildTelemetry = KnownTelemetry.BuildTelemetry == null
++                ? null
++                : new PartialBuildTelemetry(
++                    startedAt: KnownTelemetry.BuildTelemetry.StartAt.GetValueOrDefault(),
++                    initialServerState: KnownTelemetry.BuildTelemetry.InitialServerState,
++                    serverFallbackReason: KnownTelemetry.BuildTelemetry.ServerFallbackReason);
++
+             return new ServerNodeBuildCommand(
+                         _commandLine,
+                         startupDirectory: Directory.GetCurrentDirectory(),
+                         buildProcessEnvironment: envVars,
+                         CultureInfo.CurrentCulture,
+                         CultureInfo.CurrentUICulture,
+-                        _consoleConfiguration!);
++                        _consoleConfiguration!,
++                        partialBuildTelemetry);
+         }
+ 
+         private ServerNodeHandshake GetHandshake()
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index 6a0b4c94242..dadbaba7765 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -6,12 +6,13 @@
+ using System.Collections.Concurrent;
+ using System.IO;
+ using System.Threading;
++using System.Threading.Tasks;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Internal;
+-using System.Threading.Tasks;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Framework.Telemetry;
+ 
+ namespace Microsoft.Build.Experimental
+ {
+@@ -332,6 +333,18 @@ private void HandleServerNodeBuildCommand(ServerNodeBuildCommand command)
+             // Configure console configuration so Loggers can change their behavior based on Target (client) Console properties.
+             ConsoleConfiguration.Provider = command.ConsoleConfiguration;
+ 
++            // Initiate build telemetry
++            if (KnownTelemetry.BuildTelemetry == null)
++            {
++                KnownTelemetry.BuildTelemetry = new BuildTelemetry();
++            }
++            if (command.PartialBuildTelemetry != null)
++            {
++                KnownTelemetry.BuildTelemetry.StartAt = command.PartialBuildTelemetry.StartedAt;
++                KnownTelemetry.BuildTelemetry.InitialServerState = command.PartialBuildTelemetry.InitialServerState;
++                KnownTelemetry.BuildTelemetry.ServerFallbackReason = command.PartialBuildTelemetry.ServerFallbackReason;
++            }
++
+             // Also try our best to increase chance custom Loggers which use Console static members will work as expected.
+             try
+             {
+diff --git a/src/Build/BackEnd/Node/PartialBuildTelemetry.cs b/src/Build/BackEnd/Node/PartialBuildTelemetry.cs
+new file mode 100644
+index 00000000000..b9960a0e752
+--- /dev/null
++++ b/src/Build/BackEnd/Node/PartialBuildTelemetry.cs
+@@ -0,0 +1,51 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++
++namespace Microsoft.Build.BackEnd;
++
++/// <summary>
++/// Part of BuildTelemetry which is collected on client and needs to be sent to server,
++/// so server can log BuildTelemetry once it is finished.
++/// </summary>
++internal sealed class PartialBuildTelemetry : ITranslatable
++{
++    private DateTime _startedAt = default;
++    private string? _initialServerState = default;
++    private string? _serverFallbackReason = default;
++
++    public PartialBuildTelemetry(DateTime startedAt, string? initialServerState, string? serverFallbackReason)
++    {
++        _startedAt = startedAt;
++        _initialServerState = initialServerState;
++        _serverFallbackReason = serverFallbackReason;
++    }
++
++    /// <summary>
++    /// Constructor for deserialization
++    /// </summary>
++    private PartialBuildTelemetry()
++    {
++    }
++
++    public DateTime? StartedAt => _startedAt;
++
++    public string? InitialServerState => _initialServerState;
++
++    public string? ServerFallbackReason => _serverFallbackReason;
++
++    public void Translate(ITranslator translator)
++    {
++        translator.Translate(ref _startedAt);
++        translator.Translate(ref _initialServerState);
++        translator.Translate(ref _serverFallbackReason);
++    }
++
++    internal static PartialBuildTelemetry FactoryForDeserialization(ITranslator translator)
++    {
++        PartialBuildTelemetry partialTelemetryData = new();
++        partialTelemetryData.Translate(translator);
++        return partialTelemetryData;
++    }
++}
+diff --git a/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs b/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs
+index 32c551b78a8..589d3f9670b 100644
+--- a/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs
++++ b/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs
+@@ -24,6 +24,7 @@ internal sealed class ServerNodeBuildCommand : INodePacket
+         private CultureInfo _culture = default!;
+         private CultureInfo _uiCulture = default!;
+         private TargetConsoleConfiguration _consoleConfiguration = default!;
++        private PartialBuildTelemetry? _partialBuildTelemetry = default;
+ 
+         /// <summary>
+         /// Retrieves the packet type.
+@@ -64,6 +65,12 @@ internal sealed class ServerNodeBuildCommand : INodePacket
+         /// </summary>
+         public TargetConsoleConfiguration ConsoleConfiguration => _consoleConfiguration;
+ 
++        /// <summary>
++        /// Part of BuildTelemetry which is collected on client and needs to be sent to server,
++        /// so server can log BuildTelemetry once it is finished.
++        /// </summary>
++        public PartialBuildTelemetry? PartialBuildTelemetry => _partialBuildTelemetry;
++
+         /// <summary>
+         /// Private constructor for deserialization
+         /// </summary>
+@@ -80,7 +87,8 @@ public ServerNodeBuildCommand(
+             string startupDirectory,
+             Dictionary<string, string> buildProcessEnvironment,
+             CultureInfo culture, CultureInfo uiCulture,
+-            TargetConsoleConfiguration consoleConfiguration)
++            TargetConsoleConfiguration consoleConfiguration,
++            PartialBuildTelemetry? partialBuildTelemetry)
+         {
+             ErrorUtilities.VerifyThrowInternalNull(consoleConfiguration, nameof(consoleConfiguration));
+ 
+@@ -90,6 +98,7 @@ public ServerNodeBuildCommand(
+             _culture = culture;
+             _uiCulture = uiCulture;
+             _consoleConfiguration = consoleConfiguration;
++            _partialBuildTelemetry = partialBuildTelemetry;
+         }
+ 
+         /// <summary>
+@@ -104,6 +113,7 @@ public void Translate(ITranslator translator)
+             translator.TranslateCulture(ref _culture);
+             translator.TranslateCulture(ref _uiCulture);
+             translator.Translate(ref _consoleConfiguration, TargetConsoleConfiguration.FactoryForDeserialization);
++            translator.Translate(ref _partialBuildTelemetry, PartialBuildTelemetry.FactoryForDeserialization);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 2c37f964cfc..dee57aeff4c 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -159,6 +159,7 @@
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+     <Compile Include="FileSystem\*.cs" />
+     <Compile Include="BackEnd\Node\ConsoleOutput.cs" />
++    <Compile Include="BackEnd\Node\PartialBuildTelemetry.cs" />
+     <Compile Include="BackEnd\Node\ServerNamedMutex.cs" />
+     <Compile Include="BackEnd\Node\ServerNodeBuildCancel.cs" />
+     <Compile Include="BackEnd\Node\ServerNodeBuildCommand.cs" />
+diff --git a/src/Framework/NativeMethods.cs b/src/Framework/NativeMethods.cs
+index 2d3a9027b88..d0c29652824 100644
+--- a/src/Framework/NativeMethods.cs
++++ b/src/Framework/NativeMethods.cs
+@@ -758,6 +758,24 @@ internal static string OSName
+         get { return IsWindows ? "Windows_NT" : "Unix"; }
+     }
+ 
++    /// <summary>
++    /// Framework named as presented to users (for example in version info).
++    /// </summary>
++    internal static string FrameworkName
++    {
++        get
++        {
++#if RUNTIME_TYPE_NETCORE
++            const string frameworkName = ".NET";
++#elif MONO
++            const string frameworkName = "Mono";
++#else
++            const string frameworkName = ".NET Framework";
++#endif
++            return frameworkName;
++        }
++    }
++
+     /// <summary>
+     /// OS name that can be used for the msbuildExtensionsPathSearchPaths element
+     /// for a toolset
+diff --git a/src/Framework/Telemetry/BuildTelemetry.cs b/src/Framework/Telemetry/BuildTelemetry.cs
+new file mode 100644
+index 00000000000..ae45670e6ea
+--- /dev/null
++++ b/src/Framework/Telemetry/BuildTelemetry.cs
+@@ -0,0 +1,135 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++using System.Globalization;
++
++namespace Microsoft.Build.Framework.Telemetry
++{
++    /// <summary>
++    /// Telemetry of build.
++    /// </summary>
++    internal class BuildTelemetry : TelemetryBase
++    {
++        public override string EventName => "msbuild/build";
++
++        /// <summary>
++        /// Time at which build have started.
++        /// </summary>
++        /// <remarks>
++        /// It is time when build started, not when BuildManager start executing build.
++        /// For example in case of MSBuild Server it is time before we connected or launched MSBuild Server.
++        /// </remarks>
++        public DateTime? StartAt { get; set; }
++
++        /// <summary>
++        /// Time at which inner build have started.
++        /// </summary>
++        /// <remarks>
++        /// It is time when build internally started, i.e. when BuildManager starts it.
++        /// In case of MSBuild Server it is time when Server starts build.
++        /// </remarks>
++        public DateTime? InnerStartAt { get; set; }
++
++        /// <summary>
++        /// Time at which build have finished.
++        /// </summary>
++        public DateTime? FinishedAt { get; set; }
++
++        /// <summary>
++        /// Overall build success.
++        /// </summary>
++        public bool? Success { get; set; }
++
++        /// <summary>
++        /// Build Target.
++        /// </summary>
++        public string? Target { get; set; }
++
++        /// <summary>
++        /// MSBuild server fallback reason.
++        /// Either "ServerBusy", "ConnectionError" or null (no fallback).
++        /// </summary>
++        public string? ServerFallbackReason { get; set; }
++
++        /// <summary>
++        /// Version of MSBuild.
++        /// </summary>
++        public Version? Version { get; set; }
++
++        /// <summary>
++        /// Display version of the Engine suitable for display to a user.
++        /// </summary>
++        public string? DisplayVersion { get; set; }
++
++        /// <summary>
++        /// Path to project file.
++        /// </summary>
++        public string? Project { get; set; }
++
++        /// <summary>
++        /// Host in which MSBuild build was executed.
++        /// For example: "VS", "VSCode", "Azure DevOps", "GitHub Action", "CLI", ...
++        /// </summary>
++        public string? Host { get; set; }
++
++        /// <summary>
++        /// State of MSBuild server process before this build.
++        /// One of 'cold', 'hot', null (if not run as server)
++        /// </summary>
++        public string? InitialServerState { get; set; }
++
++        /// <summary>
++        /// Framework name suitable for display to a user.
++        /// </summary>
++        public string? FrameworkName { get; set; }
++
++        public override void UpdateEventProperties()
++        {
++            if (StartAt.HasValue && FinishedAt.HasValue)
++            {
++                Properties["BuildDurationInMilliseconds"] = (FinishedAt.Value - StartAt.Value).TotalMilliseconds.ToString(CultureInfo.InvariantCulture);
++            }
++            if (InnerStartAt.HasValue && FinishedAt.HasValue)
++            {
++                Properties["InnerBuildDurationInMilliseconds"] = (FinishedAt.Value - InnerStartAt.Value).TotalMilliseconds.ToString(CultureInfo.InvariantCulture);
++            }
++            if (Success.HasValue)
++            {
++                Properties["BuildSuccess"] = Success.HasValue.ToString(CultureInfo.InvariantCulture);
++            }
++            if (Target != null)
++            {
++                Properties["BuildTarget"] = Target;
++            }
++            if (ServerFallbackReason != null)
++            {
++                Properties["ServerFallbackReason"] = ServerFallbackReason;
++            }
++            if (Version != null)
++            {
++                Properties["BuildEngineVersion"] = Version.ToString();
++            }
++            if (DisplayVersion != null)
++            {
++                Properties["BuildEngineDisplayVersion"] = DisplayVersion;
++            }
++            if (Project != null)
++            {
++                Properties["ProjectPath"] = Project;
++            }
++            if (Host != null)
++            {
++                Properties["BuildEngineHost"] = Host;
++            }
++            if (InitialServerState != null)
++            {
++                Properties["InitialMSBuildServerState"] = InitialServerState;
++            }
++            if (FrameworkName != null)
++            {
++                Properties["BuildEngineFrameworkName"] = FrameworkName;
++            }
++        }
++    }
++}
+diff --git a/src/Framework/Telemetry/KnownTelemetry.cs b/src/Framework/Telemetry/KnownTelemetry.cs
+new file mode 100644
+index 00000000000..5f32304d7e6
+--- /dev/null
++++ b/src/Framework/Telemetry/KnownTelemetry.cs
+@@ -0,0 +1,17 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++namespace Microsoft.Build.Framework.Telemetry;
++
++/// <summary>
++/// Static class to help access and modify known telemetries.
++/// </summary>
++internal static class KnownTelemetry
++{
++    /// <summary>
++    /// Telemetry for build.
++    /// If null Telemetry is not supposed to be emitted.
++    /// After telemetry is emitted, sender shall null it.
++    /// </summary>
++    public static BuildTelemetry? BuildTelemetry { get; set; }
++}
+diff --git a/src/Framework/Telemetry/TelemetryBase.cs b/src/Framework/Telemetry/TelemetryBase.cs
+new file mode 100644
+index 00000000000..26348f1ea4f
+--- /dev/null
++++ b/src/Framework/Telemetry/TelemetryBase.cs
+@@ -0,0 +1,24 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System.Collections.Generic;
++
++namespace Microsoft.Build.Framework.Telemetry;
++
++internal abstract class TelemetryBase
++{
++    /// <summary>
++    /// Gets or sets the name of the event.
++    /// </summary>
++    public abstract string EventName { get; }
++
++    /// <summary>
++    /// Gets or sets a list of properties associated with the event.
++    /// </summary>
++    public IDictionary<string, string> Properties { get; set; } = new Dictionary<string, string>();
++
++    /// <summary>
++    /// Translate all derived type members into properties which will be used to build <see cref="TelemetryEventArgs"/>.
++    /// </summary>
++    public abstract void UpdateEventProperties();
++}
+diff --git a/src/MSBuild/MSBuildClientApp.cs b/src/MSBuild/MSBuildClientApp.cs
+index b5187d198a1..e09490ac72d 100644
+--- a/src/MSBuild/MSBuildClientApp.cs
++++ b/src/MSBuild/MSBuildClientApp.cs
+@@ -5,6 +5,7 @@
+ using Microsoft.Build.Shared;
+ using System.Threading;
+ using Microsoft.Build.Experimental;
++using Microsoft.Build.Framework.Telemetry;
+ 
+ #if RUNTIME_TYPE_NETCORE || MONO
+ using System.IO;
+@@ -76,6 +77,11 @@ public static MSBuildApp.ExitType Execute(
+             if (exitResult.MSBuildClientExitType == MSBuildClientExitType.ServerBusy ||
+                 exitResult.MSBuildClientExitType == MSBuildClientExitType.ConnectionError)
+             {
++                if (KnownTelemetry.BuildTelemetry != null)
++                {
++                    KnownTelemetry.BuildTelemetry.ServerFallbackReason = exitResult.MSBuildClientExitType.ToString();
++                }
++
+                 // Server is busy, fallback to old behavior.
+                 return MSBuildApp.Execute(commandLine);
+             }
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index b3ff12d4a35..d69a6e34c6f 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -36,6 +36,7 @@
+ using BinaryLogger = Microsoft.Build.Logging.BinaryLogger;
+ using Microsoft.Build.Shared.Debugging;
+ using Microsoft.Build.Experimental;
++using Microsoft.Build.Framework.Telemetry;
+ 
+ #nullable disable
+ 
+@@ -215,6 +216,9 @@ string[] args
+ #endif
+             )
+         {
++            // Initialize new build telemetry and record start of this build.
++            KnownTelemetry.BuildTelemetry = new BuildTelemetry { StartAt = DateTime.UtcNow };
++
+             using PerformanceLogEventListener eventListener = PerformanceLogEventListener.Create();
+ 
+             if (Environment.GetEnvironmentVariable("MSBUILDDUMPPROCESSCOUNTERS") == "1")
+@@ -525,6 +529,9 @@ string[] commandLine
+ #endif
+             )
+         {
++            // Initialize new build telemetry and record start of this build, if not initialized already
++            KnownTelemetry.BuildTelemetry ??= new BuildTelemetry { StartAt = DateTime.UtcNow };
++
+             // Indicate to the engine that it can toss extraneous file content
+             // when it loads microsoft.*.targets. We can't do this in the general case,
+             // because tasks in the build can (and occasionally do) load MSBuild format files
+@@ -3757,15 +3764,7 @@ private static void ThrowInvalidToolsVersionInitializationException(IEnumerable<
+         /// </summary>
+         private static void DisplayVersionMessage()
+         {
+-#if RUNTIME_TYPE_NETCORE
+-            const string frameworkName = ".NET";
+-#elif MONO
+-            const string frameworkName = "Mono";
+-#else
+-            const string frameworkName = ".NET Framework";
+-#endif
+-
+-            Console.WriteLine(ResourceUtilities.FormatResourceStringStripCodeAndKeyword("MSBuildVersionMessage", ProjectCollection.DisplayVersion, frameworkName));
++            Console.WriteLine(ResourceUtilities.FormatResourceStringStripCodeAndKeyword("MSBuildVersionMessage", ProjectCollection.DisplayVersion, NativeMethods.FrameworkName));
+         }
+ 
+         /// <summary>

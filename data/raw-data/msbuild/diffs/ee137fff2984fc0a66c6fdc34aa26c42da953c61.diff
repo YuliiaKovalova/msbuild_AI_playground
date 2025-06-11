@@ -1,0 +1,238 @@
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index ea83af6fb56..a37fa0c8fa4 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -196,7 +196,6 @@
+     <Compile Include="CommandLineBuilderExtension.cs" />
+     <Compile Include="ResourceHandling\*.cs" />
+     <Compile Include="GetCompatiblePlatform.cs" />
+-    <Compile Include="PopulateSupportedArchitectures.cs" />
+     <Compile Include="SetRidAgnosticValueForProjects.cs" />
+     <Compile Include="BuildCacheDisposeWrapper.cs" />
+     <Compile Include="DownloadFile.cs" />
+diff --git a/src/Tasks/Microsoft.Common.CurrentVersion.targets b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+index 6a43a538eac..7435f7ba168 100644
+--- a/src/Tasks/Microsoft.Common.CurrentVersion.targets
++++ b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+@@ -864,9 +864,9 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+            Text="NoWin32Manifest and PreferNativeArm64 options are mutually exclusive. Please disable one of those."
+             />
+ 
+-    <Warning Condition=" '$(PreferNativeArm64)' == 'true' and '$(PlatformName)' != 'AnyCPU' "
++    <Warning Condition=" '$(PreferNativeArm64)' == 'true' and '$(Platform)' != 'AnyCPU' "
+              Code="MSB9903"
+-             Text="When PreferNativeArm64 is enabled, ensure that the Target Platform is set to Any CPU."
++             Text="When PreferNativeArm64 is enabled, ensure that the Platform is set to Any CPU."
+              />
+     <!--
+       Log an error if the user set MSBuildProjectExtensionsPath in the body of a project. In an SDK style project
+@@ -4225,23 +4225,24 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+   in the existing Application Manifest.
+ 
+     [IN]
+-    $(ApplicationManifest) - path to Application Manifest if exists.
++    @(AppConfigWithTargetPath) - Path to Application Manifest if exists.
+     $(IntermediateOutputPath) - Path to the intermediate output directory.
+ 
+     [OUT]
+-    $(Win32Manifest) - path to manifest file with generated or updated content.
++    $(AppConfigWithTargetPath) - path to manifest file with generated or updated content.
+ -->
+ 
+   <Target
+     Name="_SetPreferNativeArm64Win32ManifestProperties"
+-    Condition="''$(Platform)' == 'AnyCPU' and '@(PreferNativeArm64)'=='true' '@(Prefer32Bit)'!='true' @(NoWin32Manifest)'!='true' "
+-    Outputs="@(Win32Manifest)">
++    Inputs="@(AppConfigWithTargetPath)"
++    Condition=" '$(Platform)'=='AnyCPU' and '$(PreferNativeArm64)'=='true' and '$(Prefer32Bit)'!='true' and '$(NoWin32Manifest)'!='true' "
++    Outputs="@(AppConfigWithTargetPath)">
+ 
+     <PopulateSupportedArchitectures
+-        ApplicationManifestPath="@(ApplicationManifest)"
++        ApplicationManifestPath="@(AppConfigWithTargetPath)"
+         OutputPath="$(IntermediateOutputPath)">
+ 
+-     <Output TaskParameter="ManifestPath" ItemName="Win32Manifest"/>
++     <Output TaskParameter="ManifestPath" ItemName="AppConfigWithTargetPath"/>
+     </PopulateSupportedArchitectures>
+   
+   </Target>
+diff --git a/src/Tasks/PopulateSupportedArchitectures.cs b/src/Tasks/PopulateSupportedArchitectures.cs
+index 6ca282ed3ab..3d3d875be68 100644
+--- a/src/Tasks/PopulateSupportedArchitectures.cs
++++ b/src/Tasks/PopulateSupportedArchitectures.cs
+@@ -2,6 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
++using System.Diagnostics;
+ using System.IO;
+ using System.Runtime.Versioning;
+ using System.Text;
+@@ -32,8 +33,14 @@ public sealed class PopulateSupportedArchitectures : TaskExtension
+         private string _outputPath = string.Empty;
+         private string _generatedManifestFullPath = string.Empty;
+ 
++        /// <summary>
++        /// Path to the existing application manifest.
++        /// </summary>
+         public string? ApplicationManifestPath { get; set; }
+ 
++        /// <summary>
++        /// Intermediate output path.
++        /// </summary>
+         [Required]
+         public string OutputPath
+         {
+@@ -41,6 +48,9 @@ public string OutputPath
+             set => _outputPath = value ?? throw new ArgumentNullException(nameof(OutputPath));
+         }
+ 
++        /// <summary>
++        /// Returns path to the generated manifest.
++        /// </summary>
+         [Output]
+         public string ManifestPath
+         {
+@@ -50,27 +60,28 @@ public string ManifestPath
+ 
+         public override bool Execute()
+         {
+-            bool success = false;
+-
++            Debugger.Launch();
+             if (!string.IsNullOrEmpty(PathToManifest))
+             {
+                 XmlDocument document = LoadManifest(PathToManifest);
+                 XmlNamespaceManager xmlNamespaceManager = XmlNamespaces.GetNamespaceManager(document.NameTable);
+ 
+-                if (!string.IsNullOrEmpty(ApplicationManifestPath) && !IsExistingManifestValid(document, xmlNamespaceManager))
++                ManifestValidationResult validationResult = ValidateManifest(document, xmlNamespaceManager);
++
++                switch (validationResult)
+                 {
+-                    return false;
++                    case ManifestValidationResult.Success:
++                        PopulateSupportedArchitecturesElement(document, xmlNamespaceManager);
++                        SaveManifest(document);
++                        return true;
++                    case ManifestValidationResult.SupportedArchitecturesExists:
++                        return true;
++                    default:
++                        return false;
+                 }
+-
+-                PopulateSupportedArchitecturesElement(document, xmlNamespaceManager);
+-
+-                _generatedManifestFullPath = Path.Combine(OutputPath, Path.GetFileName(PathToManifest));
+-                SaveManifest(document, _generatedManifestFullPath);
+-
+-                success = true;
+             }
+ 
+-            return success;
++            return false;
+         }
+ 
+         private XmlDocument LoadManifest(string path)
+@@ -85,33 +96,43 @@ private XmlDocument LoadManifest(string path)
+             return document;
+         }
+ 
+-        private void SaveManifest(XmlDocument document, string outputFilePath)
++        private void SaveManifest(XmlDocument document)
+         {
+-            using (XmlWriter xmlWriter = XmlWriter.Create(outputFilePath, new XmlWriterSettings { Indent = true, Encoding = Encoding.UTF8 }))
++            ManifestPath = Path.Combine(OutputPath, Path.GetFileName(PathToManifest));
++
++            using (XmlWriter xmlWriter = XmlWriter.Create(ManifestPath, new XmlWriterSettings { Indent = true, Encoding = Encoding.UTF8 }))
+             {
+                 document.Save(xmlWriter);
+             }
+         }
+ 
+-        private bool IsExistingManifestValid(XmlDocument document, XmlNamespaceManager xmlNamespaceManager)
++        private ManifestValidationResult ValidateManifest(XmlDocument document, XmlNamespaceManager xmlNamespaceManager)
+         {
+-            bool isValid = false;
++            if (string.IsNullOrEmpty(ApplicationManifestPath))
++            {
++                return ManifestValidationResult.Success;
++            }
+ 
+             XmlNode? assemblyNode = document.SelectSingleNode(XPaths.assemblyElement, xmlNamespaceManager);
+             if (assemblyNode != null)
+             {
+                 XmlNode? supportedArchitecturesNode = assemblyNode.SelectSingleNode($"//*[local-name()='{supportedArchitectures}']", xmlNamespaceManager);
+-                if (supportedArchitecturesNode != null && !String.Equals(supportedArchitecturesNode.InnerText.Trim(), SupportedArchitecturesValue, StringComparison.OrdinalIgnoreCase))
++                if (supportedArchitecturesNode != null)
+                 {
+-                    Log.LogErrorWithCodeFromResources("PopulateSupportedArchitectures.InvalidValueInSupportedArchitectures", supportedArchitecturesNode.InnerText);
++                    if (!string.Equals(supportedArchitecturesNode.InnerText.Trim(), SupportedArchitecturesValue, StringComparison.OrdinalIgnoreCase))
++                    {
++                        Log.LogErrorWithCodeFromResources("PopulateSupportedArchitectures.InvalidValueInSupportedArchitectures", supportedArchitecturesNode.InnerText);
++
++                        return ManifestValidationResult.Failure;
++                    }
+ 
+-                    return isValid;
++                    return ManifestValidationResult.SupportedArchitecturesExists;
+                 }
+ 
+-                isValid = true;
++                return ManifestValidationResult.Success;
+             }
+ 
+-            return isValid;
++            return ManifestValidationResult.Failure;
+         }
+ 
+         private string PathToManifest => string.IsNullOrEmpty(ApplicationManifestPath) || !File.Exists(ApplicationManifestPath)
+@@ -120,17 +141,17 @@ private bool IsExistingManifestValid(XmlDocument document, XmlNamespaceManager x
+ 
+         private void PopulateSupportedArchitecturesElement(XmlDocument document, XmlNamespaceManager xmlNamespaceManager)
+         {
+-            XmlNode? assemblyNode = document.SelectSingleNode(XPaths.assemblyElement, xmlNamespaceManager)
++            XmlNode assemblyNode = document.SelectSingleNode(XPaths.assemblyElement, xmlNamespaceManager)
+                 ?? throw new InvalidOperationException(ResourceUtilities.GetResourceString("PopulateSupportedArchitectures.AssemblyNodeIsMissed"));
+ 
+-            XmlNode appNode = GetOrCreateXmlElement(document , xmlNamespaceManager, "application", asmv3Prefix, XmlNamespaces.asmv3);
++            XmlElement appNode = GetOrCreateXmlElement(document , xmlNamespaceManager, "application", asmv3Prefix, XmlNamespaces.asmv3);
+             XmlElement winSettingsNode = GetOrCreateXmlElement(document, xmlNamespaceManager, windowsSettings, asmv3Prefix, XmlNamespaces.asmv3);
+             if (string.IsNullOrEmpty(winSettingsNode.GetAttribute(XMakeAttributes.xmlns)))
+             {
+                 winSettingsNode.SetAttribute(XMakeAttributes.xmlns, WindowsSettingsNamespace);
+             }
+ 
+-            XmlNode supportedArchitecturesNode = GetOrCreateXmlElement(document, xmlNamespaceManager, supportedArchitectures, namespaceURI: WindowsSettingsNamespace);
++            XmlElement supportedArchitecturesNode = GetOrCreateXmlElement(document, xmlNamespaceManager, supportedArchitectures, namespaceURI: WindowsSettingsNamespace);
+             supportedArchitecturesNode.InnerText = SupportedArchitecturesValue;
+             winSettingsNode.AppendChild(supportedArchitecturesNode);
+             appNode.AppendChild(winSettingsNode);
+@@ -154,5 +175,26 @@ private XmlElement GetOrCreateXmlElement(XmlDocument document, XmlNamespaceManag
+                 ? document.CreateElement(prefix, localName, namespaceURI)
+                 : document.CreateElement(localName, namespaceURI);
+         }
++
++        /// <summary>
++        /// Represents the result of validating an application manifest.
++        /// </summary>
++        private enum ManifestValidationResult
++        {
++            /// <summary>
++            /// The manifest validation was successful.
++            /// </summary>
++            Success = 1,
++
++            /// <summary>
++            /// The manifest validation failed.
++            /// </summary>
++            Failure,
++
++            /// <summary>
++            /// The supported architectures exist in the manifest with the expected value.
++            /// </summary>
++            SupportedArchitecturesExists,
++        }
+     }
+ }

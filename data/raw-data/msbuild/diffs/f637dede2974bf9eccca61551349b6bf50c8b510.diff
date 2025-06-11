@@ -1,0 +1,215 @@
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index d9ca747fc60..a74524bc64e 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -5,6 +5,7 @@
+ using System.Collections.Generic;
+ using System.Linq;
+ using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+@@ -15,10 +16,12 @@ internal sealed class BuildCheckCentralContext
+ {
+     private readonly IConfigurationProvider _configurationProvider;
+ 
+-    public BuildCheckCentralContext(IConfigurationProvider configurationProvider, Action<ICheckContext> removeThrottledChecks)
++    public BuildCheckCentralContext(
++        IConfigurationProvider configurationProvider,
++        Action<List<CheckWrapper>?, ICheckContext> removeCheck)
+     {
+         _configurationProvider = configurationProvider;
+-        _removeThrottledChecks = removeThrottledChecks;
++        _removeChecks = removeCheck;
+     }
+ 
+     private record CallbackRegistry(
+@@ -50,7 +53,8 @@ internal void DeregisterCheck(CheckWrapper check)
+ 
+     // In a future we can have callbacks per project as well
+     private readonly CallbackRegistry _globalCallbacks = new();
+-    private readonly Action<ICheckContext> _removeThrottledChecks;
++    private readonly Action<List<CheckWrapper>?, ICheckContext> _removeChecks;
++
+ 
+     // This we can potentially use to subscribe for receiving evaluated props in the
+     //  build event args. However - this needs to be done early on, when checks might not be known yet
+@@ -189,6 +193,7 @@ private void RunRegisteredActions<T>(
+     where T : CheckData
+     {
+         string projectFullPath = checkData.ProjectFilePath;
++        List<CheckWrapper>? checksToRemove = null;
+ 
+         foreach (var checkCallback in registeredCallbacks)
+         {
+@@ -219,7 +224,6 @@ private void RunRegisteredActions<T>(
+             // Here we might want to check the configPerRule[0].EvaluationsCheckScope - if the input data supports that
+             // The decision and implementation depends on the outcome of the investigation tracked in:
+             // https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=57851137
+-
+             BuildCheckDataContext<T> context = new BuildCheckDataContext<T>(
+                 checkCallback.Item1,
+                 checkContext,
+@@ -227,9 +231,24 @@ private void RunRegisteredActions<T>(
+                 resultHandler,
+                 checkData);
+ 
+-            checkCallback.Item2(context);
++            try
++            {
++                checkCallback.Item2(context);
++            }
++            catch (Exception e)
++            {
++                checkContext.DispatchAsWarningFromText(
++                    null,
++                    null,
++                    null,
++                    new BuildEventFileInfo(projectFullPath),
++                    $"The check '{checkCallback.Item1.Check.FriendlyName}' threw an exception while executing a registered action with message: {e.Message}");
++
++                checksToRemove = checksToRemove ?? new List<CheckWrapper>();
++                checksToRemove.Add(checkCallback.Item1);
++            }
+         }
+ 
+-        _removeThrottledChecks(checkContext);
++        _removeChecks(checksToRemove, checkContext);
+     }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 1ebd4c20522..d49135c3b19 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -74,7 +74,7 @@ internal BuildCheckManager()
+         {
+             _checkRegistry = new List<CheckFactoryContext>();
+             _acquisitionModule = new BuildCheckAcquisitionModule();
+-            _buildCheckCentralContext = new(_configurationProvider, RemoveThrottledChecks);
++            _buildCheckCentralContext = new(_configurationProvider, RemoveChecksAfterExecutedActions);
+             _buildEventsProcessor = new(_buildCheckCentralContext);
+         }
+ 
+@@ -272,7 +272,15 @@ private void SetupSingleCheck(CheckFactoryContext checkFactoryContext, string pr
+                 // Create the wrapper and register to central context
+                 wrapper.StartNewProject(projectFullPath, configurations, userEditorConfigs);
+                 var wrappedContext = new CheckRegistrationContext(wrapper, _buildCheckCentralContext);
+-                check.RegisterActions(wrappedContext);
++                try
++                {
++                    check.RegisterActions(wrappedContext);
++                }
++                catch (Exception e)
++                {
++                    string message = $"The check '{check.FriendlyName}' failed to register actions with the following message: '{e.Message}'";
++                    throw new BuildCheckConfigurationException(message, e);
++                }
+             }
+             else
+             {
+@@ -331,12 +339,25 @@ private void RemoveInvalidChecks(List<CheckFactoryContext> checksToRemove, IChec
+             }
+         }
+ 
+-        public void RemoveThrottledChecks(ICheckContext checkContext)
++        public void RemoveChecksAfterExecutedActions(List<CheckWrapper>? checksToRemove, ICheckContext checkContext)
+         {
+-            foreach (var checkToRemove in _checkRegistry.FindAll(c => c.MaterializedCheck?.IsThrottled ?? false))
++            if (checksToRemove is not null)
+             {
+-                checkContext.DispatchAsCommentFromText(MessageImportance.Normal, $"Dismounting check '{checkToRemove.FriendlyName}'. The check has exceeded the maximum number of results allowed. Any additional results will not be displayed.");
+-                RemoveCheck(checkToRemove);
++                foreach (CheckWrapper check in checksToRemove)
++                {
++                    var checkFactory = _checkRegistry.Find(c => c.MaterializedCheck == check);
++                    if (checkFactory is not null)
++                    {
++                        checkContext.DispatchAsCommentFromText(MessageImportance.High, $"Dismounting check '{check.Check.FriendlyName}'. The check has thrown an unhandled exception while executing registered actions.");
++                        RemoveCheck(checkFactory);
++                    }
++                }
++            }
++
++            foreach (var throttledCheck in _checkRegistry.FindAll(c => c.MaterializedCheck?.IsThrottled ?? false))
++            {
++                checkContext.DispatchAsCommentFromText(MessageImportance.Normal, $"Dismounting check '{throttledCheck.FriendlyName}'. The check has exceeded the maximum number of results allowed. Any additional results will not be displayed.");
++                RemoveCheck(throttledCheck);
+             }
+         }
+ 
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index eaee6543cec..75827457e7f 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -514,13 +514,11 @@ public void CustomCheckTest_WithEditorConfig(string checkCandidate, string ruleI
+         }
+     }
+ 
+-    [Theory(Skip = "https://github.com/dotnet/msbuild/issues/10702")]
+-    [InlineData("X01236", "Something went wrong initializing")]
+-    // These tests are for failure one different points, will be addressed in a different PR
+-    // https://github.com/dotnet/msbuild/issues/10522
+-    // [InlineData("X01237", "message")]
+-    // [InlineData("X01238", "message")]
+-    public void CustomChecksFailGracefully(string ruleId, string expectedMessage)
++    [Theory]
++    [InlineData("X01236", "ErrorOnInitializeCheck", "Something went wrong initializing")]
++    [InlineData("X01237", "ErrorOnRegisteredAction", "something went wrong when executing registered action")]
++    [InlineData("X01238", "ErrorWhenRegisteringActions", "something went wrong when registering actions")]
++    public void CustomChecksFailGracefully(string ruleId, string friendlyName, string expectedMessage)
+     {
+         using (var env = TestEnvironment.Create())
+         {
+@@ -541,6 +539,7 @@ public void CustomChecksFailGracefully(string ruleId, string expectedMessage)
+             success.ShouldBeTrue();
+             projectCheckBuildLog.ShouldContain(expectedMessage);
+             projectCheckBuildLog.ShouldNotContain("This check should have been disabled");
++            projectCheckBuildLog.ShouldContain($"Dismounting check '{friendlyName}'");
+ 
+             // Cleanup
+             File.Delete(editorConfigName);
+diff --git a/src/BuildCheck.UnitTests/TestAssets/ErrorCustomCheck/ErrorOnRegisteredAction.cs b/src/BuildCheck.UnitTests/TestAssets/ErrorCustomCheck/ErrorOnRegisteredAction.cs
+index 1593dc9b997..3dc02bb7cca 100644
+--- a/src/BuildCheck.UnitTests/TestAssets/ErrorCustomCheck/ErrorOnRegisteredAction.cs
++++ b/src/BuildCheck.UnitTests/TestAssets/ErrorCustomCheck/ErrorOnRegisteredAction.cs
+@@ -17,7 +17,7 @@ public sealed class ErrorOnRegisteredAction : Check
+             "Message format: {0}",
+             new CheckConfiguration());
+ 
+-        public override string FriendlyName => "ErrorOnEvaluatedPropertiesCheck";
++        public override string FriendlyName => "ErrorOnRegisteredAction";
+ 
+         public override IReadOnlyList<CheckRule> SupportedRules { get; } = new List<CheckRule>() { SupportedRule };
+ 
+@@ -33,7 +33,7 @@ public override void RegisterActions(IBuildCheckRegistrationContext registration
+ 
+         private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesCheckData> context)
+         {
+-            throw new Exception("something went wrong");
++            throw new Exception("something went wrong when executing registered action");
+         }
+     }
+ }
+diff --git a/src/BuildCheck.UnitTests/TestAssets/ErrorCustomCheck/ErrorWhenRegisteringActions.cs b/src/BuildCheck.UnitTests/TestAssets/ErrorCustomCheck/ErrorWhenRegisteringActions.cs
+index 9b3f5f0cf05..a7967dce1cb 100644
+--- a/src/BuildCheck.UnitTests/TestAssets/ErrorCustomCheck/ErrorWhenRegisteringActions.cs
++++ b/src/BuildCheck.UnitTests/TestAssets/ErrorCustomCheck/ErrorWhenRegisteringActions.cs
+@@ -17,7 +17,7 @@ public sealed class ErrorWhenRegisteringActions : Check
+             "Message format: {0}",
+             new CheckConfiguration());
+ 
+-        public override string FriendlyName => "ErrorOnEvaluatedPropertiesCheck";
++        public override string FriendlyName => "ErrorWhenRegisteringActions";
+ 
+         public override IReadOnlyList<CheckRule> SupportedRules { get; } = new List<CheckRule>() { SupportedRule };
+ 
+@@ -29,7 +29,7 @@ public override void Initialize(ConfigurationContext configurationContext)
+         public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
+         {
+             registrationContext.RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction);
+-            throw new Exception("something went wrong");
++            throw new Exception("something went wrong when registering actions");
+         }
+ 
+         private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesCheckData> context)

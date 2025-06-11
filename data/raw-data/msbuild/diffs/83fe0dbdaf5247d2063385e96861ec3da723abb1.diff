@@ -1,0 +1,781 @@
+diff --git a/src/Build.OM.UnitTests/Definition/ProjectItem_Tests.cs b/src/Build.OM.UnitTests/Definition/ProjectItem_Tests.cs
+index 2b5e52f187e..53e990b4bfd 100644
+--- a/src/Build.OM.UnitTests/Definition/ProjectItem_Tests.cs
++++ b/src/Build.OM.UnitTests/Definition/ProjectItem_Tests.cs
+@@ -756,6 +756,34 @@ public void IncludeWithWildcardShouldNotPreserveUserSlashesInFixedDirectoryPart(
+             TestIncludeExclude(projectContents, inputFiles, expectedInclude, includeString, "");
+         }
+ 
++        /// <summary>
++        /// Project getter that renames an item to a wildcard that results in drive enumeration exception.
++        /// </summary>
++        [Fact]
++        public void ProjectGetterResultingInDriveEnumerationException()
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                env.SetEnvironmentVariable("MsBuildCheckWildcardDriveEnumeration", "1");
++                Project project = new Project();
++                Assert.Throws<InvalidProjectFileException>(() => { ProjectItem item = project.AddItem("i", "\\**\\*.log")[0]; });
++            }
++        }
++
++        /// <summary>
++        /// Project getter that renames an item to a wildcard that results in logging a warning for attempted drive enumeration.
++        /// </summary>
++        [Fact]
++        public void ProjectGetterResultingInDriveEnumerationWarning()
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                env.SetEnvironmentVariable("MsBuildCheckWildcardDriveEnumeration", "0");
++                Project project = new Project();
++                ProjectItem item = project.AddItem("i", "\\**\\*.log")[0];
++            }
++        }
++
+         /// <summary>
+         /// Throws exception when an included wildcard evaluates to a drive enumeration.
+         /// </summary>
+@@ -798,6 +826,35 @@ public void ImportEvaluationResultingInDriveEnumeration()
+             }
+         }
+ 
++        /// <summary>
++        /// Logs warning when an imported wildcard evaluates to a drive enumeration.
++        /// </summary>
++        [Fact]
++        public void ImportEvaluationResultingInLogDriveEnumeration()
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                env.SetEnvironmentVariable("MsBuildCheckWildcardDriveEnumeration", "0");
++                string content =
++                @"<Project xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
++                    <Import Project=""$(Microsoft_WindowsAzure_EngSys)\**\*"" />
++                  </Project>
++                ";
++
++                var testFile = env.CreateFile(env.CreateFolder(), "a.csproj", content);
++                ProjectOptions options = new ProjectOptions();
++                options.ProjectCollection = new ProjectCollection();
++
++                MockLogger collectionLogger = new MockLogger();
++                options.ProjectCollection.RegisterLogger(collectionLogger);
++
++                ProjectInstance.FromFile(testFile.Path, options); // Issue: Unauthorized access exception
++
++                Assert.Equal(1, collectionLogger.WarningCount);
++                options.ProjectCollection.UnregisterAllLoggers();
++            }
++        }
++
+         private static void TestIncludeExcludeWithDifferentSlashes(string projectContents, string includeString, string excludeString, string[] inputFiles, string[] expectedInclude, bool makeExpectedIncludeAbsolute = false)
+         {
+             Action<string, string> runTest = (include, exclude) =>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs b/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
+index 9d3aef593f6..643cd2b3f93 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
+@@ -431,11 +431,16 @@ ISet<string> removeMetadata
+                         // The expression is not of the form "@(X)". Treat as string
+ 
+                         // Pass the non wildcard expanded excludes here to fix https://github.com/Microsoft/msbuild/issues/2621
+-                        string[] includeSplitFiles = EngineFileUtilities.GetFileListEscaped(
++                        (string[] includeSplitFiles, FileMatcher.SearchAction action) = EngineFileUtilities.GetFileListEscaped(
+                             Project.Directory,
+                             includeSplit,
+                             excludes);
+ 
++                        if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                        {
++                            LoggingContext.LogWarning($"Drive enumeration was detected during wildcard expansion, for the Include attribute, which relied on the file spec {includeSplit}.");
++                        }
++
+                         foreach (string includeSplitFile in includeSplitFiles)
+                         {
+                             items.Add(new ProjectItemInstance(
+@@ -462,7 +467,11 @@ ISet<string> removeMetadata
+             {
+                 try
+                 {
+-                    string[] excludeSplitFiles = EngineFileUtilities.GetFileListUnescaped(Project.Directory, excludeSplit);
++                    (string[] excludeSplitFiles, FileMatcher.SearchAction action) = EngineFileUtilities.GetFileListUnescaped(Project.Directory, excludeSplit);
++                    if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                    {
++                        LoggingContext.LogWarning($"Drive enumeration was detected during wildcard expansion for Exclude attribute with the filespec {excludeSplit}.");
++                    }
+ 
+                     foreach (string excludeSplitFile in excludeSplitFiles)
+                     {
+@@ -554,7 +563,11 @@ Expander<ProjectPropertyInstance, ProjectItemInstance> expander
+                     // Don't unescape wildcards just yet - if there were any escaped, the caller wants to treat them
+                     // as literals. Everything else is safe to unescape at this point, since we're only matching
+                     // against the file system.
+-                    string[] fileList = EngineFileUtilities.GetFileListEscaped(Project.Directory, piece);
++                    (string[] fileList, FileMatcher.SearchAction action) = EngineFileUtilities.GetFileListEscaped(Project.Directory, piece);
++                    if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                    {
++                        LoggingContext.LogWarning($"Drive enumeration was detected during wildcard expansion, for the Exclude attribute, which relied on the file spec {piece}.");
++                    }
+ 
+                     foreach (string file in fileList)
+                     {
+diff --git a/src/Build/Definition/Project.cs b/src/Build/Definition/Project.cs
+index 661397bad26..d8a59104e6f 100644
+--- a/src/Build/Definition/Project.cs
++++ b/src/Build/Definition/Project.cs
+@@ -3477,7 +3477,11 @@ public string ExpandItemIncludeBestEffortLeaveEscaped(ProjectItemElement renamed
+ 
+                 var itemFactory = new ProjectItemFactory(Owner, renamedItemElement);
+ 
+-                List<ProjectItem> items = Evaluator<ProjectProperty, ProjectItem, ProjectMetadata, ProjectItemDefinition>.CreateItemsFromInclude(DirectoryPath, renamedItemElement, itemFactory, renamedItemElement.Include, _data.Expander);
++                (List<ProjectItem> items, FileMatcher.SearchAction action, string fileSpecEscaped) = Evaluator<ProjectProperty, ProjectItem, ProjectMetadata, ProjectItemDefinition>.CreateItemsFromInclude(DirectoryPath, renamedItemElement, itemFactory, renamedItemElement.Include, _data.Expander);
++                if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                {
++                    LoggingService.LogWarning(s_buildEventContext, "", new BuildEventFileInfo(FullPath), "InvalidAttributeValue", EscapingUtilities.UnescapeAll(fileSpecEscaped), XMakeAttributes.include, XMakeElements.itemGroup);
++                }
+ 
+                 if (items.Count != 1)
+                 {
+@@ -3537,7 +3541,11 @@ private List<ProjectItem> AddItemHelper(ProjectItemElement itemElement, string u
+             {
+                 var itemFactory = new ProjectItemFactory(Owner, itemElement);
+ 
+-                List<ProjectItem> items = Evaluator<ProjectProperty, ProjectItem, ProjectMetadata, ProjectItemDefinition>.CreateItemsFromInclude(DirectoryPath, itemElement, itemFactory, unevaluatedInclude, _data.Expander);
++                (List<ProjectItem> items, FileMatcher.SearchAction action, string fileSpecEscaped) = Evaluator<ProjectProperty, ProjectItem, ProjectMetadata, ProjectItemDefinition>.CreateItemsFromInclude(DirectoryPath, itemElement, itemFactory, unevaluatedInclude, _data.Expander);
++                if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                {
++                    LoggingService.LogWarning(s_buildEventContext, "", new BuildEventFileInfo(FullPath), "InvalidAttributeValue", EscapingUtilities.UnescapeAll(fileSpecEscaped), XMakeAttributes.include, XMakeElements.itemGroup);
++                }
+ 
+                 foreach (ProjectItem item in items)
+                 {
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index de0cfa63212..0c8e78b1607 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -341,12 +341,14 @@ internal static void Evaluate(
+         /// Helper that creates a list of ProjectItem's given an unevaluated Include and a ProjectRootElement.
+         /// Used by both Evaluator.EvaluateItemElement and by Project.AddItem.
+         /// </summary>
+-        internal static List<I> CreateItemsFromInclude(string rootDirectory, ProjectItemElement itemElement, IItemFactory<I, I> itemFactory, string unevaluatedIncludeEscaped, Expander<P, I> expander)
++        internal static (List<I>, FileMatcher.SearchAction, string) CreateItemsFromInclude(string rootDirectory, ProjectItemElement itemElement, IItemFactory<I, I> itemFactory, string unevaluatedIncludeEscaped, Expander<P, I> expander)
+         {
+             ErrorUtilities.VerifyThrowArgumentLength(unevaluatedIncludeEscaped, nameof(unevaluatedIncludeEscaped));
+ 
+             List<I> items = new List<I>();
+             itemFactory.ItemElement = itemElement;
++            FileMatcher.SearchAction action = FileMatcher.SearchAction.None;
++            string fileSpecEscaped = string.Empty;
+ 
+             // STEP 1: Expand properties in Include
+             string evaluatedIncludeEscaped = expander.ExpandIntoStringLeaveEscaped(unevaluatedIncludeEscaped, ExpanderOptions.ExpandProperties, itemElement.IncludeLocation);
+@@ -375,7 +377,11 @@ internal static List<I> CreateItemsFromInclude(string rootDirectory, ProjectItem
+                         // The expression is not of the form "@(X)". Treat as string
+                         try
+                         {
+-                            string[] includeSplitFilesEscaped = EngineFileUtilities.GetFileListEscaped(rootDirectory, includeSplitEscaped, excludeSpecsEscaped: null, forceEvaluate: false, fileMatcher: expander.EvaluationContext?.FileMatcher);
++                            (string[] includeSplitFilesEscaped, action) = EngineFileUtilities.GetFileListEscaped(rootDirectory, includeSplitEscaped, excludeSpecsEscaped: null, forceEvaluate: false, fileMatcher: expander.EvaluationContext?.FileMatcher);
++                            if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                            {
++                                fileSpecEscaped = includeSplitEscaped;
++                            }
+ 
+                             if (includeSplitFilesEscaped.Length > 0)
+                             {
+@@ -393,7 +399,7 @@ internal static List<I> CreateItemsFromInclude(string rootDirectory, ProjectItem
+                 }
+             }
+ 
+-            return items;
++            return (items, action, fileSpecEscaped);
+         }
+ 
+         /// <summary>
+@@ -2049,7 +2055,11 @@ private LoadImportsResult ExpandAndLoadImportsFromUnescapedImportExpression(stri
+                     }
+ 
+                     // Expand the wildcards and provide an alphabetical order list of import statements.
+-                    importFilesEscaped = EngineFileUtilities.GetFileListEscaped(directoryOfImportingFile, importExpressionEscapedItem, forceEvaluate: true, fileMatcher: _evaluationContext.FileMatcher);
++                    (importFilesEscaped, FileMatcher.SearchAction action) = EngineFileUtilities.GetFileListEscaped(directoryOfImportingFile, importExpressionEscapedItem, forceEvaluate: true, fileMatcher: _evaluationContext.FileMatcher);
++                    if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                    {
++                        _evaluationLoggingContext.LogWarning("InvalidAttributeValue", EscapingUtilities.UnescapeAll(importExpressionEscapedItem), XMakeAttributes.project, XMakeElements.import);
++                    }
+                 }
+                 catch (DriveEnumerationWildcardException ex)
+                 {
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 9d085f9a326..ec62e48c499 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -2244,10 +2244,12 @@ internal static IEnumerable<Pair<string, S>> GetItemPairEnumerable(IEnumerable<S
+                             string[] fileListEscaped = null;
+                             try
+                             {
+-                                fileListEscaped = EngineFileUtilities.GetFileListEscaped(
++                                (fileListEscaped, FileMatcher.SearchAction action) = EngineFileUtilities.GetFileListEscaped(
+                                      item.ProjectDirectory,
+                                      item.EvaluatedIncludeEscaped,
+                                      forceEvaluate: true);
++
++                                // TODO: Log warning if return value is LogDriveEnumerationWildcard
+                             }
+                             catch (DriveEnumerationWildcardException ex)
+                             {
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.IncludeOperation.cs b/src/Build/Evaluation/LazyItemEvaluator.IncludeOperation.cs
+index b7147d02737..8fd82e449b2 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.IncludeOperation.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.IncludeOperation.cs
+@@ -116,7 +116,11 @@ protected override ImmutableList<I> SelectItems(OrderedItemDataCollection.Builde
+                             {
+                                 using (_lazyEvaluator._evaluationProfiler.TrackGlob(_rootDirectory, glob, excludePatternsForGlobs))
+                                 {
+-                                    includeSplitFilesEscaped = EngineFileUtilities.GetFileListEscaped(_rootDirectory, glob, excludePatternsForGlobs, fileMatcher: FileMatcher);
++                                    (includeSplitFilesEscaped, FileMatcher.SearchAction action) = EngineFileUtilities.GetFileListEscaped(_rootDirectory, glob, excludePatternsForGlobs, fileMatcher: FileMatcher);
++                                    if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                                    {
++                                        _lazyEvaluator._loggingContext.LogWarning("InvalidAttributeValue", EscapingUtilities.UnescapeAll(glob), XMakeAttributes.include, XMakeElements.itemGroup);
++                                    }
+                                 }
+ 
+                                 if (MSBuildEventSource.Log.IsEnabled())
+diff --git a/src/Build/Utilities/EngineFileUtilities.cs b/src/Build/Utilities/EngineFileUtilities.cs
+index 2f53f2b6a71..9033588f3bc 100644
+--- a/src/Build/Utilities/EngineFileUtilities.cs
++++ b/src/Build/Utilities/EngineFileUtilities.cs
+@@ -48,7 +48,7 @@ internal static void CaptureLazyWildcardRegexes()
+         /// <param name="directoryEscaped">The directory to evaluate, escaped.</param>
+         /// <param name="filespecEscaped">The filespec to evaluate, escaped.</param>
+         /// <returns>Array of file paths, unescaped.</returns>
+-        internal static string[] GetFileListUnescaped
++        internal static (string[], FileMatcher.SearchAction) GetFileListUnescaped
+             (
+             string directoryEscaped,
+             string filespecEscaped
+@@ -73,7 +73,7 @@ string filespecEscaped
+         /// <param name="forceEvaluate">Whether to force file glob expansion when eager expansion is turned off</param>
+         /// <param name="fileMatcher"></param>
+         /// <returns>Array of file paths, escaped.</returns>
+-        internal static string[] GetFileListEscaped
++        internal static (string[], FileMatcher.SearchAction) GetFileListEscaped
+             (
+             string directoryEscaped,
+             string filespecEscaped,
+@@ -116,7 +116,7 @@ internal static bool FilespecHasWildcards(string filespecEscaped)
+         /// <param name="excludeSpecsEscaped">The exclude specification, escaped.</param>
+         /// <param name="fileMatcher"></param>
+         /// <returns>Array of file paths.</returns>
+-        private static string[] GetFileList
++        private static (string[], FileMatcher.SearchAction) GetFileList
+             (
+             string directoryEscaped,
+             string filespecEscaped,
+@@ -129,6 +129,7 @@ FileMatcher fileMatcher
+             ErrorUtilities.VerifyThrowInternalLength(filespecEscaped, nameof(filespecEscaped));
+ 
+             string[] fileList;
++            FileMatcher.SearchAction action = FileMatcher.SearchAction.None;
+ 
+             if (!FilespecHasWildcards(filespecEscaped) ||
+                 FilespecMatchesLazyWildcard(filespecEscaped, forceEvaluateWildCards))
+@@ -153,7 +154,7 @@ FileMatcher fileMatcher
+                 // as a relative path, we will get back a bunch of relative paths.
+                 // If the filespec started out as an absolute path, we will get
+                 // back a bunch of absolute paths.
+-                fileList = fileMatcher.GetFiles(directoryUnescaped, filespecUnescaped, excludeSpecsUnescaped);
++                (fileList, action) = fileMatcher.GetFiles(directoryUnescaped, filespecUnescaped, excludeSpecsUnescaped);
+ 
+                 ErrorUtilities.VerifyThrow(fileList != null, "We must have a list of files here, even if it's empty.");
+ 
+@@ -176,7 +177,7 @@ FileMatcher fileMatcher
+                 }
+             }
+ 
+-            return fileList;
++            return (fileList, action);
+         }
+ 
+         private static bool FilespecMatchesLazyWildcard(string filespecEscaped, bool forceEvaluateWildCards)
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index 66cc20cf7fb..5342a0b2a89 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -43,7 +43,7 @@ public Traits()
+         /// </summary>
+         public readonly bool UseLazyWildCardEvaluation = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MsBuildSkipEagerWildCardEvaluationRegexes"));
+         public readonly bool LogExpandedWildcards = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILDLOGEXPANDEDWILDCARDS"));
+-        public readonly bool ThrowOnWildcardDriveEnumeration = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MsBuildCheckWildcardDriveEnumeration"));
++        public readonly bool ThrowOnWildcardDriveEnumeration = Environment.GetEnvironmentVariable("MsBuildCheckWildcardDriveEnumeration") == "1";
+ 
+         /// <summary>
+         /// Cache file existence for the entire process
+diff --git a/src/Shared/FileMatcher.cs b/src/Shared/FileMatcher.cs
+index ec13897bab0..8bf441c77fe 100644
+--- a/src/Shared/FileMatcher.cs
++++ b/src/Shared/FileMatcher.cs
+@@ -1942,7 +1942,7 @@ public TaskOptions(int maxTasks)
+         /// <param name="filespecUnescaped">Get files that match the given file spec.</param>
+         /// <param name="excludeSpecsUnescaped">Exclude files that match this file spec.</param>
+         /// <returns>The array of files.</returns>
+-        internal string[] GetFiles
++        internal (string[], SearchAction) GetFiles
+             (
+             string projectDirectoryUnescaped,
+             string filespecUnescaped,
+@@ -1952,7 +1952,7 @@ internal string[] GetFiles
+             // For performance. Short-circuit iff there is no wildcard.
+             if (!HasWildcards(filespecUnescaped))
+             {
+-                return CreateArrayWithSingleItemIfNotExcluded(filespecUnescaped, excludeSpecsUnescaped);
++                return (CreateArrayWithSingleItemIfNotExcluded(filespecUnescaped, excludeSpecsUnescaped), SearchAction.None);
+             }
+ 
+             if (_cachedGlobExpansions == null)
+@@ -1966,6 +1966,8 @@ internal string[] GetFiles
+             var enumerationKey = ComputeFileEnumerationCacheKey(projectDirectoryUnescaped, filespecUnescaped, excludeSpecsUnescaped);
+ 
+             IReadOnlyList<string> files;
++            string[] getFilesList;
++            SearchAction action = SearchAction.None;
+             if (!_cachedGlobExpansions.TryGetValue(enumerationKey, out files))
+             {
+                 // avoid parallel evaluations of the same wildcard by using a unique lock for each wildcard
+@@ -1974,14 +1976,14 @@ internal string[] GetFiles
+                 {
+                     if (!_cachedGlobExpansions.TryGetValue(enumerationKey, out files))
+                     {
+-                        files =
+-                            _cachedGlobExpansions.GetOrAdd(
+-                                enumerationKey,
+-                                (_) =>
+-                                    GetFilesImplementation(
++                        (getFilesList, action) = GetFilesImplementation(
+                                         projectDirectoryUnescaped,
+                                         filespecUnescaped,
+-                                        excludeSpecsUnescaped));
++                                        excludeSpecsUnescaped);
++
++                        files = _cachedGlobExpansions.GetOrAdd(
++                                enumerationKey,
++                                getFilesList);
+                     }
+                 }
+             }
+@@ -1989,7 +1991,7 @@ internal string[] GetFiles
+             // Copy the file enumerations to prevent outside modifications of the cache (e.g. sorting, escaping) and to maintain the original method contract that a new array is created on each call.
+             var filesToReturn = files.ToArray();
+ 
+-            return filesToReturn;
++            return (filesToReturn, action);
+         }
+ 
+         private static string ComputeFileEnumerationCacheKey(string projectDirectoryUnescaped, string filespecUnescaped, List<string> excludes)
+@@ -2067,12 +2069,14 @@ private static string ComputeFileEnumerationCacheKey(string projectDirectoryUnes
+             }
+         }
+ 
+-        enum SearchAction
++        public enum SearchAction
+         {
++            None,
+             RunSearch,
+             ReturnFileSpec,
+             ReturnEmptyList,
+-            ReturnDriveEnumerationWildcard
++            ReturnThrowOnDriveEnumerationWildcard,
++            ReturnLogDriveEnumerationWildcard
+         }
+ 
+         private SearchAction GetFileSearchData(
+@@ -2137,18 +2141,23 @@ out bool isLegalFileSpec
+             }
+ 
+             /*
+-             * If the fixed directory part contains the drive or simply '/', and the drive enumeration wildcard is set, then an
+-             * exception should be thrown.
++             * If the fixed directory part contains the drive or simply '/', and the drive enumeration wildcard is set, then
++             * this should either be logged or an exception should be thrown.
+              */
+             int fixedDirectoryPartLength = fixedDirectoryPart.Length;
++            bool logDriveEnumerationWildcard = false;
+             if (fixedDirectoryPartLength > 0 && wildcardDirectoryPart.Length >= 2)
+             {
+                 if (FileUtilities.IsAnySlash(fixedDirectoryPart[fixedDirectoryPartLength - 1]) && // ex: /**
+                     wildcardDirectoryPart[0] == '*' &&
+-                    wildcardDirectoryPart[1] == '*' &&
+-                    Traits.Instance.ThrowOnWildcardDriveEnumeration)
++                    wildcardDirectoryPart[1] == '*')
+                 {
+-                    return SearchAction.ReturnDriveEnumerationWildcard;
++                    if (Traits.Instance.ThrowOnWildcardDriveEnumeration)
++                    {
++                        return SearchAction.ReturnThrowOnDriveEnumerationWildcard;
++                    }
++
++                    logDriveEnumerationWildcard = true;
+                 }
+             }
+ 
+@@ -2200,6 +2209,11 @@ out bool isLegalFileSpec
+             result.BaseDirectory = Normalize(fixedDirectoryPart);
+             result.RemainingWildcardDirectory = Normalize(wildcardDirectoryPart);
+ 
++            if (logDriveEnumerationWildcard)
++            {
++                return SearchAction.ReturnLogDriveEnumerationWildcard;
++            }
++
+             return SearchAction.RunSearch;
+         }
+ 
+@@ -2336,7 +2350,7 @@ private static string[] CreateArrayWithSingleItemIfNotExcluded(string filespecUn
+         /// <param name="filespecUnescaped">Get files that match the given file spec.</param>
+         /// <param name="excludeSpecsUnescaped">Exclude files that match this file spec.</param>
+         /// <returns>The array of files.</returns>
+-        private string[] GetFilesImplementation(
++        private (string[], SearchAction) GetFilesImplementation(
+             string projectDirectoryUnescaped,
+             string filespecUnescaped,
+             List<string> excludeSpecsUnescaped)
+@@ -2351,17 +2365,17 @@ private string[] GetFilesImplementation(
+ 
+             if (action == SearchAction.ReturnEmptyList)
+             {
+-                return Array.Empty<string>();
++                return (Array.Empty<string>(), action);
+             }
+             else if (action == SearchAction.ReturnFileSpec)
+             {
+-                return CreateArrayWithSingleItemIfNotExcluded(filespecUnescaped, excludeSpecsUnescaped);
++                return (CreateArrayWithSingleItemIfNotExcluded(filespecUnescaped, excludeSpecsUnescaped), action);
+             }
+-            else if (action == SearchAction.ReturnDriveEnumerationWildcard)
++            else if (action == SearchAction.ReturnThrowOnDriveEnumerationWildcard)
+             {
+                 throw new DriveEnumerationWildcardException(projectDirectoryUnescaped, filespecUnescaped);
+             }
+-            else if (action != SearchAction.RunSearch)
++            else if ((action != SearchAction.RunSearch) && (action != SearchAction.ReturnLogDriveEnumerationWildcard))
+             {
+                 // This means the enum value wasn't valid (or a new one was added without updating code correctly)
+                 throw new NotSupportedException(action.ToString());
+@@ -2552,12 +2566,17 @@ private string[] GetFilesImplementation(
+             // Catch exceptions that are thrown inside the Parallel.ForEach
+             catch (AggregateException ex) when (InnerExceptionsAreAllIoRelated(ex))
+             {
+-                return CreateArrayWithSingleItemIfNotExcluded(filespecUnescaped, excludeSpecsUnescaped);
++                // Flatten to get exceptions than are thrown inside a nested Parallel.ForEach
++                if (ex.Flatten().InnerExceptions.All(ExceptionHandling.IsIoRelatedException))
++                {
++                    return (CreateArrayWithSingleItemIfNotExcluded(filespecUnescaped, excludeSpecsUnescaped), action);
++                }
++                throw;
+             }
+             catch (Exception ex) when (ExceptionHandling.IsIoRelatedException(ex))
+             {
+                 // Assume it's not meant to be a path
+-                return CreateArrayWithSingleItemIfNotExcluded(filespecUnescaped, excludeSpecsUnescaped);
++                return (CreateArrayWithSingleItemIfNotExcluded(filespecUnescaped, excludeSpecsUnescaped), action);
+             }
+ 
+             /*
+@@ -2567,7 +2586,7 @@ private string[] GetFilesImplementation(
+                 ? listOfFiles.SelectMany(list => list).Where(f => !resultsToExclude.Contains(f)).ToArray()
+                 : listOfFiles.SelectMany(list => list).ToArray();
+ 
+-            return files;
++            return (files, action);
+         }
+ 
+         private bool InnerExceptionsAreAllIoRelated(AggregateException ex)
+diff --git a/src/Shared/UnitTests/FileMatcher_Tests.cs b/src/Shared/UnitTests/FileMatcher_Tests.cs
+index e3b06422812..c6c031bec49 100644
+--- a/src/Shared/UnitTests/FileMatcher_Tests.cs
++++ b/src/Shared/UnitTests/FileMatcher_Tests.cs
+@@ -62,7 +62,7 @@ public void GetFilesPatternMatching(string pattern, int expectedMatchCount)
+                 File.WriteAllBytes(Path.Combine(testFolder.Path, file), new byte[1]);
+             }
+ 
+-            string[] fileMatches = FileMatcher.Default.GetFiles(testFolder.Path, pattern);
++            string[] fileMatches = FileMatcher.Default.GetFiles(testFolder.Path, pattern).Item1;
+ 
+             fileMatches.Length.ShouldBe(expectedMatchCount, $"Matches: '{String.Join("', '", fileMatches)}'");
+         }
+@@ -83,7 +83,7 @@ public void GetFilesComplexGlobbingMatching(GetFilesComplexGlobbingMatchingInfo
+ 
+             void VerifyImpl(FileMatcher fileMatcher, string include, string[] excludes, bool shouldHaveNoMatches = false, string customMessage = null)
+             {
+-                string[] matchedFiles = fileMatcher.GetFiles(testFolder.Path, include, excludes?.ToList());
++                string[] matchedFiles = fileMatcher.GetFiles(testFolder.Path, include, excludes?.ToList()).Item1;
+ 
+                 if (shouldHaveNoMatches)
+                 {
+@@ -1256,7 +1256,7 @@ public void IllegalTooLongPathOptOutWave17_0()
+                 BuildEnvironmentHelper.ResetInstance_ForUnitTestsOnly();
+ 
+                 string longString = new string('X', 500) + "*"; // need a wildcard to do anything
+-                string[] result = FileMatcher.Default.GetFiles(@"c:\", longString);
++                string[] result = FileMatcher.Default.GetFiles(@"c:\", longString).Item1;
+ 
+                 Assert.Equal(longString, result[0]); // Does not throw
+                 ChangeWaves.ResetStateForTests();
+@@ -1298,7 +1298,7 @@ public void Regress367780_CrashOnStarDotDot()
+             Directory.CreateDirectory(workingPath);
+             Directory.CreateDirectory(workingPathSubfolder);
+ 
+-            files = FileMatcher.Default.GetFiles(workingPath, offendingPattern);
++            files = FileMatcher.Default.GetFiles(workingPath, offendingPattern).Item1;
+         }
+ 
+         [Fact]
+@@ -1310,7 +1310,7 @@ public void Regress141071_StarStarSlashStarStarIsLiteral()
+ 
+             Directory.CreateDirectory(workingPath);
+             File.WriteAllText(fileName, "Hello there.");
+-            var files = FileMatcher.Default.GetFiles(workingPath, offendingPattern);
++            var files = FileMatcher.Default.GetFiles(workingPath, offendingPattern).Item1;
+ 
+             string result = String.Join(", ", files);
+             Console.WriteLine(result);
+@@ -1330,7 +1330,7 @@ public void Regress14090_TrailingDotMatchesNoExtension()
+             Directory.CreateDirectory(workingPath);
+             Directory.CreateDirectory(workingPathSubdir);
+             File.AppendAllText(workingPathSubdirBing, "y");
+-            var files = FileMatcher.Default.GetFiles(workingPath, offendingPattern);
++            var files = FileMatcher.Default.GetFiles(workingPath, offendingPattern).Item1;
+ 
+             string result = String.Join(", ", files);
+             Console.WriteLine(result);
+@@ -1355,15 +1355,15 @@ public void FileEnumerationCacheTakesExcludesIntoAccount()
+ 
+                     var testProject = env.CreateTestProjectWithFiles(string.Empty, new[] {"a.cs", "b.cs", "c.cs"});
+ 
+-                    var files = FileMatcher.Default.GetFiles(testProject.TestRoot, "**/*.cs");
++                    var files = FileMatcher.Default.GetFiles(testProject.TestRoot, "**/*.cs").Item1;
+                     Array.Sort(files);
+                     Assert.Equal(new []{"a.cs", "b.cs", "c.cs"}, files);
+ 
+-                    files = FileMatcher.Default.GetFiles(testProject.TestRoot, "**/*.cs", new List<string> {"a.cs"});
++                    files = FileMatcher.Default.GetFiles(testProject.TestRoot, "**/*.cs", new List<string>{"a.cs"}).Item1;
+                     Array.Sort(files);
+                     Assert.Equal(new[] {"b.cs", "c.cs" }, files);
+ 
+-                    files = FileMatcher.Default.GetFiles(testProject.TestRoot, "**/*.cs", new List<string> {"a.cs", "c.cs"});
++                    files = FileMatcher.Default.GetFiles(testProject.TestRoot, "**/*.cs", new List<string>{"a.cs", "c.cs"}).Item1;
+                     Array.Sort(files);
+                     Assert.Equal(new[] {"b.cs" }, files);
+                 }
+@@ -2398,7 +2398,7 @@ private static void MatchDriver(string filespec, string[] excludeFilespecs, stri
+                 String.Empty, /* we don't need project directory as we use mock filesystem */
+                 filespec,
+                 excludeFilespecs?.ToList()
+-            );
++            ).Item1;
+ 
+             Func<string[], string[]> normalizeAllFunc = (paths => normalizeAllPaths ? paths.Select(MockFileSystem.Normalize).ToArray() : paths);
+             Func<string[], string[]> normalizeMatching = (paths => normalizeExpectedMatchingFiles ? paths.Select(MockFileSystem.Normalize).ToArray() : paths);
+diff --git a/src/Tasks.UnitTests/CreateItem_Tests.cs b/src/Tasks.UnitTests/CreateItem_Tests.cs
+index e0f4c454e11..62d420dd530 100644
+--- a/src/Tasks.UnitTests/CreateItem_Tests.cs
++++ b/src/Tasks.UnitTests/CreateItem_Tests.cs
+@@ -315,6 +315,57 @@ public void CreateItemEvaluationResultingInWildcardDriveEnumeration()
+             buildResult.OverallResult.ShouldBe(BuildResultCode.Failure);
+             buildResult["TestTarget"].Exception?.Message.ShouldContain("this resulted in an attempted drive enumeration");
+         }
++
++        /// <summary>
++        /// Logs warning when encountering wildcard drive enumeration during task item creation.
++        /// </summary>
++        [Fact]
++        public void CreateItemEvaluationResultingInLogWildcardDriveEnumeration()
++        {
++            using var env = TestEnvironment.Create(_testOutput);
++            env.SetEnvironmentVariable("MsBuildCheckWildcardDriveEnumeration", "0");
++
++            string content =
++                @"<Project xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
++                    <Target Name =""TestTarget"" Returns=""@(Text)"">
++                      <CreateItem Include=""\**\*.txt"">
++                        <Output TaskParameter=""Include"" ItemName=""Text""/>
++                      </CreateItem>
++                    </Target>
++                  </Project>
++                ";
++
++            var testFile = env.CreateFile(env.CreateFolder(), "a.csproj", content);
++            var p = ProjectInstance.FromFile(testFile.Path, new ProjectOptions());
++
++            BuildManager buildManager = BuildManager.DefaultBuildManager;
++            BuildRequestData data = new BuildRequestData(p, new[] { "TestTarget" });
++            BuildParameters parameters = new BuildParameters();
++            BuildResult buildResult = buildManager.Build(parameters, data); // Issue: Results in unauthorized access exception
++            buildResult.OverallResult.ShouldBe(BuildResultCode.Success);
++        }
++
++        /// <summary>
++        /// Logs warning when encountering wildcard drive enumeration during task item creation.
++        /// </summary>
++        [Fact]
++        public void WildcardDriveEnumerationTaskItemLogsWarning()
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                env.SetEnvironmentVariable("MsBuildCheckWildcardDriveEnumeration", "0");
++                CreateItem t = new CreateItem();
++                MockEngine engine = new MockEngine();
++
++                t.BuildEngine = engine;
++                t.Include = new ITaskItem[] { new TaskItem(@"\**") }; // Issue: Results in unauthorized access exception
++
++                bool succeeded = t.Execute();
++
++                Assert.True(succeeded);
++                Assert.Equal(1, engine.Warnings);
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/Tasks/CreateItem.cs b/src/Tasks/CreateItem.cs
+index 094d43529b5..0112a8c0e71 100644
+--- a/src/Tasks/CreateItem.cs
++++ b/src/Tasks/CreateItem.cs
+@@ -61,8 +61,19 @@ public override bool Execute()
+             }
+ 
+             // Expand wild cards.
+-            Include = ExpandWildcards(Include);
+-            Exclude = ExpandWildcards(Exclude);
++            (Include, FileMatcher.SearchAction includeAction, string includeFileSpec) = ExpandWildcards(Include);
++            (Exclude, FileMatcher.SearchAction excludeAction, string excludeFileSpec) = ExpandWildcards(Exclude);
++
++            // Log potential drive enumeration glob anomalies when applicable.
++            if (includeAction == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++            {
++                Log.LogWarning($"Drive enumeration was detected during wildcard expansion in CreateItem for Include attribute with the filespec {includeFileSpec}");
++            }
++
++            if (excludeAction == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++            {
++                Log.LogWarning($"Drive enumeration was detected during wildcard expansion in CreateItem for Exclude attribute with the filespec {excludeFileSpec}");
++            }
+ 
+             // Simple case:  no additional attribute to add and no Exclude.  In this case the
+             // ouptuts are simply the inputs.
+@@ -131,14 +142,16 @@ private List<ITaskItem> CreateOutputItems(Dictionary<string, string> metadataTab
+         /// <summary>
+         /// Expand wildcards in the item list.
+         /// </summary>
+-        private static ITaskItem[] ExpandWildcards(ITaskItem[] expand)
++        private static (ITaskItem[], FileMatcher.SearchAction, string) ExpandWildcards(ITaskItem[] expand)
+         {
+             if (expand == null)
+             {
+-                return null;
++                return (null, FileMatcher.SearchAction.None, string.Empty);
+             }
+             else
+             {
++                FileMatcher.SearchAction logDriveEnumerationAction = FileMatcher.SearchAction.None;
++                string logDriveEnumerationFileSpec = string.Empty;
+                 var expanded = new List<ITaskItem>();
+                 foreach (ITaskItem i in expand)
+                 {
+@@ -146,7 +159,13 @@ private static ITaskItem[] ExpandWildcards(ITaskItem[] expand)
+                     {
+                         try
+                         {
+-                            string[] files = FileMatcher.Default.GetFiles(null /* use current directory */, i.ItemSpec);
++                            (string[] files, FileMatcher.SearchAction action) = FileMatcher.Default.GetFiles(null /* use current directory */, i.ItemSpec);
++                            if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                            {
++                                logDriveEnumerationAction = action;
++                                logDriveEnumerationFileSpec = i.ItemSpec;
++                            }
++
+                             foreach (string file in files)
+                             {
+                                 TaskItem newItem = new TaskItem(i) { ItemSpec = file };
+@@ -174,7 +193,7 @@ private static ITaskItem[] ExpandWildcards(ITaskItem[] expand)
+                         expanded.Add(i);
+                     }
+                 }
+-                return expanded.ToArray();
++                return (expanded.ToArray(), logDriveEnumerationAction, logDriveEnumerationFileSpec);
+             }
+         }
+ 
+diff --git a/src/Utilities/TrackedDependencies/CanonicalTrackedInputFiles.cs b/src/Utilities/TrackedDependencies/CanonicalTrackedInputFiles.cs
+index 99c1745f803..68059971d3d 100644
+--- a/src/Utilities/TrackedDependencies/CanonicalTrackedInputFiles.cs
++++ b/src/Utilities/TrackedDependencies/CanonicalTrackedInputFiles.cs
+@@ -151,7 +151,7 @@ private void InternalConstruct(ITask ownerTask, ITaskItem[] tlogFiles, ITaskItem
+                 };
+             }
+ 
+-            _tlogFiles = TrackedDependencies.ExpandWildcards(tlogFiles);
++            _tlogFiles = TrackedDependencies.ExpandWildcards(tlogFiles, _log);
+             _tlogAvailable = TrackedDependencies.ItemsExist(_tlogFiles);
+             _sourceFiles = sourceFiles;
+             _outputs = outputs;
+diff --git a/src/Utilities/TrackedDependencies/CanonicalTrackedOutputFiles.cs b/src/Utilities/TrackedDependencies/CanonicalTrackedOutputFiles.cs
+index 2ccbbce8f3b..e68acf7208f 100644
+--- a/src/Utilities/TrackedDependencies/CanonicalTrackedOutputFiles.cs
++++ b/src/Utilities/TrackedDependencies/CanonicalTrackedOutputFiles.cs
+@@ -79,7 +79,7 @@ private void InternalConstruct(ITask ownerTask, ITaskItem[] tlogFiles, bool cons
+                 };
+             }
+ 
+-            _tlogFiles = TrackedDependencies.ExpandWildcards(tlogFiles);
++            _tlogFiles = TrackedDependencies.ExpandWildcards(tlogFiles, _log);
+             _tlogAvailable = TrackedDependencies.ItemsExist(_tlogFiles);
+             DependencyTable = new Dictionary<string, Dictionary<string, DateTime>>(StringComparer.OrdinalIgnoreCase);
+             if (_tlogFiles != null && constructOutputsFromTLogs)
+diff --git a/src/Utilities/TrackedDependencies/FlatTrackingData.cs b/src/Utilities/TrackedDependencies/FlatTrackingData.cs
+index 1c6529ac55d..864722d290a 100644
+--- a/src/Utilities/TrackedDependencies/FlatTrackingData.cs
++++ b/src/Utilities/TrackedDependencies/FlatTrackingData.cs
+@@ -268,11 +268,11 @@ private void InternalConstruct(ITask ownerTask, ITaskItem[] tlogFilesLocal, ITas
+                 };
+             }
+ 
+-            ITaskItem[] expandedTlogFiles = TrackedDependencies.ExpandWildcards(tlogFilesLocal);
++            ITaskItem[] expandedTlogFiles = TrackedDependencies.ExpandWildcards(tlogFilesLocal, _log);
+ 
+             if (tlogFilesToIgnore != null)
+             {
+-                ITaskItem[] expandedTlogFilesToIgnore = TrackedDependencies.ExpandWildcards(tlogFilesToIgnore);
++                ITaskItem[] expandedTlogFilesToIgnore = TrackedDependencies.ExpandWildcards(tlogFilesToIgnore, _log);
+ 
+                 if (expandedTlogFilesToIgnore.Length > 0)
+                 {
+diff --git a/src/Utilities/TrackedDependencies/TrackedDependencies.cs b/src/Utilities/TrackedDependencies/TrackedDependencies.cs
+index 045381088cf..d1ff53f0708 100644
+--- a/src/Utilities/TrackedDependencies/TrackedDependencies.cs
++++ b/src/Utilities/TrackedDependencies/TrackedDependencies.cs
+@@ -22,8 +22,9 @@ public static class TrackedDependencies
+         /// Expand wildcards in the item list.
+         /// </summary>
+         /// <param name="expand"></param>
++        /// <param name="log"></param>
+         /// <returns>Array of items expanded</returns>
+-        public static ITaskItem[] ExpandWildcards(ITaskItem[] expand)
++        public static ITaskItem[] ExpandWildcards(ITaskItem[] expand, TaskLoggingHelper log)
+         {
+             if (expand == null)
+             {
+@@ -50,7 +51,11 @@ public static ITaskItem[] ExpandWildcards(ITaskItem[] expand)
+                         }
+                         else
+                         {
+-                            files = FileMatcher.Default.GetFiles(null, item.ItemSpec);
++                            (files, FileMatcher.SearchAction action) = FileMatcher.Default.GetFiles(null, item.ItemSpec);
++                            if (action == FileMatcher.SearchAction.ReturnLogDriveEnumerationWildcard)
++                            {
++                                log.LogWarning($"Drive enumeration was attempted while assisting with tracking dependencies during wildcard expansion, which relied on the item spec {item.ItemSpec}.");
++                            }
+                         }
+ 
+                         foreach (string file in files)

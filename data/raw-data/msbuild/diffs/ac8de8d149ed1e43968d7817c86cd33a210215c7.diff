@@ -1,0 +1,131 @@
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index 720d09800a9..2f08099b333 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -241,22 +241,25 @@ internal partial class LoggingService : ILoggingService, INodePacketHandler, IBu
+         /// Queue for asynchronous event processing.
+         /// </summary>
+         private ConcurrentQueue<object> _eventQueue;
++
+         /// <summary>
+-        /// Auto reset event raised when message is consumed from queue.
++        /// Event set when message is consumed from queue.
+         /// </summary>
+-        private AutoResetEvent _dequeueEvent;
++        private ManualResetEventSlim _dequeueEvent;
+         /// <summary>
+-        /// Auto reset event raised when queue become empty.
++        /// Event set when queue become empty.
+         /// </summary>
+-        private AutoResetEvent _emptyQueueEvent;
++        private ManualResetEventSlim _emptyQueueEvent;
+         /// <summary>
+-        /// Auto reset event raised when message is added into queue.
++        /// Even set when message is added into queue.
+         /// </summary>
+-        private AutoResetEvent _enqueueEvent;
++        private ManualResetEventSlim _enqueueEvent;
++
+         /// <summary>
+         /// CTS for stopping logging event processing.
+         /// </summary>
+         private CancellationTokenSource _loggingEventProcessingCancellation;
++
+         /// <summary>
+         /// Task which pump/process messages from <see cref="_eventQueue"/>
+         /// </summary>
+@@ -1182,7 +1185,8 @@ internal virtual void ProcessLoggingEvent(object buildEvent)
+                 while (_eventQueue.Count >= _queueCapacity)
+                 {
+                     // Block and wait for dequeue event.
+-                    _dequeueEvent.WaitOne();
++                    _dequeueEvent.Wait();
++                    _dequeueEvent.Reset();
+                 }
+ 
+                 _eventQueue.Enqueue(buildEvent);
+@@ -1205,10 +1209,14 @@ internal virtual void ProcessLoggingEvent(object buildEvent)
+         /// </summary>
+         public void WaitForLoggingToProcessEvents()
+         {
+-            while (_eventQueue != null && !_eventQueue.IsEmpty)
++            while (_eventQueue?.IsEmpty == false)
+             {
+-                _emptyQueueEvent.WaitOne();
++                _emptyQueueEvent?.Wait();
+             }
++            // To avoid race condition when last message has been removed from queue but
++            //   not yet fully processed (handled by loggers), we need to make sure _emptyQueueEvent
++            //   is set as it is guaranteed to be in set state no sooner than after event has been processed.
++            _emptyQueueEvent?.Wait();
+         }
+ 
+         /// <summary>
+@@ -1257,9 +1265,9 @@ private static int GetWarningsAsErrorOrMessageKey(BuildEventArgs buildEventArgs)
+         private void StartLoggingEventProcessing()
+         {
+             _eventQueue = new ConcurrentQueue<object>();
+-            _dequeueEvent = new AutoResetEvent(false);
+-            _emptyQueueEvent = new AutoResetEvent(false);
+-            _enqueueEvent = new AutoResetEvent(false);
++            _dequeueEvent = new ManualResetEventSlim(false);
++            _emptyQueueEvent = new ManualResetEventSlim(false);
++            _enqueueEvent = new ManualResetEventSlim(false);
+             _loggingEventProcessingCancellation = new CancellationTokenSource();
+ 
+             _loggingEventProcessingThread = new Thread(LoggingEventProc);
+@@ -1270,15 +1278,13 @@ private void StartLoggingEventProcessing()
+             void LoggingEventProc()
+             {
+                 var completeAdding = _loggingEventProcessingCancellation.Token;
++                WaitHandle[] waitHandlesForNextEvent = { completeAdding.WaitHandle, _enqueueEvent.WaitHandle };
+ 
+                 do
+                 {
+-                    // We peak message first in order to not have _eventQueue.IsEmpty before we actually process event
+-                    //   as this could be interpreted like "every message has been already processed" otherwise.
+-                    if (_eventQueue.TryPeek(out object ev))
++                    if (_eventQueue.TryDequeue(out object ev))
+                     {
+                         LoggingEventProcessor(ev);
+-                        _eventQueue.TryDequeue(out _);
+                         _dequeueEvent.Set();
+                     }
+                     else
+@@ -1286,7 +1292,13 @@ void LoggingEventProc()
+                         _emptyQueueEvent.Set();
+ 
+                         // Wait for next event, or finish.
+-                        if (!completeAdding.IsCancellationRequested && _eventQueue.IsEmpty) WaitHandle.WaitAny(new[] { completeAdding.WaitHandle, _enqueueEvent });
++                        if (!completeAdding.IsCancellationRequested && _eventQueue.IsEmpty)
++                        {
++                            WaitHandle.WaitAny(waitHandlesForNextEvent);
++                        }
++
++                        _enqueueEvent.Reset();
++                        _emptyQueueEvent.Reset();
+                     }
+                 } while (!_eventQueue.IsEmpty || !completeAdding.IsCancellationRequested);
+ 
+@@ -1319,7 +1331,7 @@ private void CleanLoggingEventProcessing()
+         /// </summary>
+         private void TerminateLoggingEventProcessing()
+         {
+-            // Capture pump task in local variable as cancelling event processing is nulling _loggingEventProcessingPump.
++            // Capture pump task in local variable as cancelling event processing is nulling _loggingEventProcessingThread.
+             var pumpTask = _loggingEventProcessingThread;
+             _loggingEventProcessingCancellation.Cancel();
+             pumpTask.Join();
+diff --git a/src/Build/Definition/ProjectCollection.cs b/src/Build/Definition/ProjectCollection.cs
+index 03d936f715f..32f9b37fe68 100644
+--- a/src/Build/Definition/ProjectCollection.cs
++++ b/src/Build/Definition/ProjectCollection.cs
+@@ -451,7 +451,7 @@ public static ProjectCollection GlobalProjectCollection
+ 
+                     if (Interlocked.CompareExchange(ref s_globalProjectCollection, local, null) != null)
+                     {
+-                        // Other thread had beat us to it, lets dispose this project collection
++                        // Other thread beat us to it; dispose of this project collection
+                         local.Dispose();
+                     }
+                 }

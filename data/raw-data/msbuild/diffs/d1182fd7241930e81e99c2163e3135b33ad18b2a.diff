@@ -1,0 +1,170 @@
+diff --git a/src/MSBuild/TerminalLogger/Project.cs b/src/MSBuild/TerminalLogger/Project.cs
+index 1a29554b90e..27da2e6b7c2 100644
+--- a/src/MSBuild/TerminalLogger/Project.cs
++++ b/src/MSBuild/TerminalLogger/Project.cs
+@@ -15,6 +15,7 @@ namespace Microsoft.Build.Logging.TerminalLogger;
+ /// <summary>
+ /// Represents a project being built.
+ /// </summary>
++[DebuggerDisplay("{OutputPath}({TargetFramework})")]
+ internal sealed class Project
+ {
+     /// <summary>
+diff --git a/src/MSBuild/TerminalLogger/TerminalLogger.cs b/src/MSBuild/TerminalLogger/TerminalLogger.cs
+index 4b5a84204ba..86e65f1e3e5 100644
+--- a/src/MSBuild/TerminalLogger/TerminalLogger.cs
++++ b/src/MSBuild/TerminalLogger/TerminalLogger.cs
+@@ -187,7 +187,8 @@ public ProjectContext(BuildEventContext context)
+             "TASKSTARTEDEVENT",
+             "HIGHMESSAGEEVENT",
+             "WARNINGEVENT",
+-            "ERROREVENT"
++            "ERROREVENT",
++            "PROJECTEVALUATIONFINISHEDEVENT"
+     };
+ 
+     /// <summary>
+@@ -363,6 +364,59 @@ private bool TryApplyShowCommandLineParameter(string? parameterValue)
+         return true;
+     }
+ 
++    private string? TryGetValue(System.Collections.IEnumerable? source, string key)
++    {
++        if (source is null)
++        {
++            return null;
++        }
++        if (source is IEnumerable<ProjectPropertyInstance> properties)
++        {
++            return properties.FirstOrDefault(p => p.Name.Equals(key, StringComparison.OrdinalIgnoreCase))?.EvaluatedValue;
++        }
++        else if (source is IEnumerable<DictionaryEntry> dictionaryEntries)
++        {
++            var v = dictionaryEntries.FirstOrDefault(p => (string)p.Key == key);
++            return v.Value as string;
++        }
++        else if (source is IEnumerable<KeyValuePair<string, string>> kvps)
++        {
++            return kvps.FirstOrDefault(p => p.Key.Equals(key, StringComparison.OrdinalIgnoreCase)).Value;
++        }
++        else
++        {
++            throw new InvalidOperationException($"Unexpected type {source.GetType()} in properties");
++        }
++    }
++
++    private string? DetectTFM(System.Collections.IEnumerable? globalProperties, System.Collections.IEnumerable? properties)
++    {
++        if (TryGetValue(globalProperties, "TargetFramework") is string targetFramework)
++        {
++            return targetFramework;
++        }
++        else if (TryGetValue(properties, "TargetFramework") is string targetFrameworkString)
++        {
++            return targetFrameworkString;
++        }
++        return null;
++    }
++
++    private Project? CreateProject(BuildEventContext? context, System.Collections.IEnumerable? globalProperties, System.Collections.IEnumerable? properties)
++    {
++        if (context is not null)
++        {
++            var projectContext = new ProjectContext(context);
++            if (!_projects.TryGetValue(projectContext, out Project? project))
++            {
++                string? tfm = DetectTFM(globalProperties, properties);
++                project = new(tfm, CreateStopwatch?.Invoke());
++                _projects.Add(projectContext, project);
++            }
++            return project;
++        }
++        return null;
++    }
+ 
+     /// <inheritdoc/>
+     public void Shutdown()
+@@ -478,6 +532,14 @@ private void StatusEventRaised(object sender, BuildStatusEventArgs e)
+         {
+             RenderImmediateMessage(e.Message!);
+         }
++        else if (e is ProjectEvaluationFinishedEventArgs evalFinished
++            && evalFinished.BuildEventContext is not null)
++        {
++            if (CreateProject(evalFinished.BuildEventContext, evalFinished.GlobalProperties, evalFinished.Properties) is Project project)
++            {
++                TryDetectGenerateFullPaths(evalFinished, project);
++            }
++        }
+     }
+ 
+     /// <summary>
+@@ -491,17 +553,10 @@ private void ProjectStarted(object sender, ProjectStartedEventArgs e)
+             return;
+         }
+ 
++        CreateProject(e.BuildEventContext, e.Properties, e.GlobalProperties);
+         ProjectContext c = new ProjectContext(buildEventContext);
+-
+         if (_restoreContext is null)
+         {
+-            if (e.GlobalProperties?.TryGetValue("TargetFramework", out string? targetFramework) != true)
+-            {
+-                targetFramework = null;
+-            }
+-            Project project = new(targetFramework, CreateStopwatch?.Invoke());
+-            _projects[c] = project;
+-
+             // First ever restore in the build is starting.
+             if (e.TargetNames == "Restore" && !_restoreFinished)
+             {
+@@ -509,30 +564,20 @@ private void ProjectStarted(object sender, ProjectStartedEventArgs e)
+                 int nodeIndex = NodeIndexForContext(buildEventContext);
+                 _nodes[nodeIndex] = new NodeStatus(e.ProjectFile!, null, "Restore", _projects[c].Stopwatch);
+             }
+-
+-            TryDetectGenerateFullPaths(e, project);
+         }
+     }
+ 
+-    private void TryDetectGenerateFullPaths(ProjectStartedEventArgs e, Project project)
++    private void TryDetectGenerateFullPaths(ProjectEvaluationFinishedEventArgs e, Project project)
+     {
+-        if (e.GlobalProperties is not null
+-            && e.GlobalProperties.TryGetValue("GenerateFullPaths", out string? generateFullPaths)
+-            && bool.TryParse(generateFullPaths, out bool generateFullPathsValue))
++        if (TryGetValue(e.GlobalProperties, "GenerateFullPaths") is string generateFullPathsGPString
++            && bool.TryParse(generateFullPathsGPString, out bool generateFullPathsValue))
+         {
+             project.GenerateFullPaths = generateFullPathsValue;
+         }
+-        else if (e.Properties is not null)
++        else if (TryGetValue(e.Properties, "GenerateFullPaths") is string generateFullPathsPString
++            && bool.TryParse(generateFullPathsPString, out bool generateFullPathsPropertyValue))
+         {
+-            foreach (DictionaryEntry property in e.Properties)
+-            {
+-                if (property.Key is "GenerateFullPaths" &&
+-                    property.Value is string generateFullPathsString
+-                    && bool.TryParse(generateFullPathsString, out bool generateFullPathsPropertyValue))
+-                {
+-                    project.GenerateFullPaths = generateFullPathsPropertyValue;
+-                }
+-            }
++            project.GenerateFullPaths = generateFullPathsPropertyValue;
+         }
+     }
+ 
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 8411c5408ba..a1947ab56e4 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -4023,7 +4023,7 @@ private static void ProcessTerminalLogger(bool noConsoleLogger,
+                 else
+                 {
+                     // For performance, register this logger using the forwarding logger mechanism.
+-                    DistributedLoggerRecord forwardingLoggerRecord = CreateForwardingLoggerRecord(logger, string.Join(";", TerminalLogger.ConfigurableForwardingLoggerParameters), LoggerVerbosity.Quiet);
++                    DistributedLoggerRecord forwardingLoggerRecord = CreateForwardingLoggerRecord(logger, string.Join(";", [.. TerminalLogger.ConfigurableForwardingLoggerParameters, "verbosity=diagnostic"]), LoggerVerbosity.Quiet);
+                     distributedLoggerRecords.Add(forwardingLoggerRecord);
+                 }
+             }

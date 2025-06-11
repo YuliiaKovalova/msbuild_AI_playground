@@ -1,0 +1,119 @@
+{
+  "number": 6944,
+  "title": "Ability for Tasks (such as NuGet) to display progress, have fine-grained cursor position control",
+  "body": "As some of you know, I work on NuGet client. For Microsoft's annual hackathon, I was investigating this NuGet issue: https://github.com/NuGet/Home/issues/4346. It's about adding progress indicators, similar to what docker, npm, and others have.\r\n\r\nI think in order to provide a \"good\" progress bar, or spinner, I need to be able to control the cursor position, including synchronous \"blocking\" when a log message is being output in order to allow me to clear any existing progress message (in case the progress message is longer than the log message being written), and then re-write the progress message, so the progress message is always on the last line.\r\n\r\nHowever, in my testing, when I have a task using `TaskLoggingHelper`, when I call the `Log*` methods, the method returns before the message is written to the console. Therefore, trying to use `Console.SetCursorPosition(0, Console.CursorTop)`, calling `Log.LogMessage(...)`, and then `Console.Write(...)` to write my progress status doesn't work, as MSBuild's console logger usually (but not always) writes the console log after my progress status.\r\n\r\n<details>\r\n<summary>See code sample</summary>\r\n<p>\r\n\r\nHere's a code sample for a Task that can be run to demonstrate the issue. Try running it with different verbosities (`-v:q`, `-v:n`).\r\nSorry that the code is quite convoluted for a sample. I was trying to be \"kind of\" realistic for production code, while still being relatively minimalistic for a sample.\r\n\r\n```csharp\r\nusing Microsoft.Build.Framework;\r\nusing Microsoft.Build.Utilities;\r\nusing System;\r\nusing System.ComponentModel;\r\nusing System.Threading.Tasks;\r\nusing Task = System.Threading.Tasks.Task;\r\n\r\nnamespace LoggingTest\r\n{\r\n    public class CustomTask : Microsoft.Build.Utilities.Task\r\n    {\r\n        public override bool Execute()\r\n        {\r\n            return ExecuteAsync().Result;\r\n        }\r\n\r\n        public async Task<bool> ExecuteAsync()\r\n        {\r\n            IMyLogger logger = new MSBuildLogger(Log);\r\n            ConsoleProgressLogger? progressLogger = null;\r\n            if (!Console.IsOutputRedirected)\r\n            {\r\n                progressLogger = new ConsoleProgressLogger(logger);\r\n                logger = progressLogger;\r\n            }\r\n\r\n            var worker = new Worker(10, logger);\r\n\r\n            if (progressLogger != null)\r\n            {\r\n                progressLogger.SetWorker(worker);\r\n                progressLogger.WriteMessage();\r\n            }\r\n\r\n            await worker.Run();\r\n\r\n            return !Log.HasLoggedErrors;\r\n        }\r\n\r\n        private class Worker : INotifyPropertyChanged\r\n        {\r\n            private readonly IMyLogger _logger;\r\n\r\n            public int TotalWork { get; }\r\n            private int _finishedWork;\r\n\r\n            public event PropertyChangedEventHandler PropertyChanged;\r\n\r\n            public int FinishedWork\r\n            {\r\n                get => _finishedWork;\r\n                private set\r\n                {\r\n                    if (_finishedWork != value)\r\n                    {\r\n                        _finishedWork = value;\r\n                        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(FinishedWork)));\r\n                    }\r\n                }\r\n            }\r\n\r\n            public Worker(int totalWork, IMyLogger logger)\r\n            {\r\n                TotalWork = totalWork;\r\n                _logger = logger;\r\n            }\r\n\r\n            public async Task Run()\r\n            {\r\n                for (int i = 1; i <= 10; i++)\r\n                {\r\n                    _logger.Log(LoggerVerbosity.Normal, \"Starting thing \" + i);\r\n                    await Task.Delay(500);\r\n                    _logger.Log(LoggerVerbosity.Minimal, \"Finished thing \" + i);\r\n                    FinishedWork++;\r\n                }\r\n            }\r\n        }\r\n\r\n        private interface IMyLogger\r\n        {\r\n            void Log(LoggerVerbosity verbosity, string message);\r\n        }\r\n\r\n        private class MSBuildLogger : IMyLogger\r\n        {\r\n            TaskLoggingHelper _logger;\r\n\r\n            public MSBuildLogger(TaskLoggingHelper logger)\r\n            {\r\n                _logger = logger ?? throw new ArgumentNullException(nameof(logger));\r\n            }\r\n\r\n            public void Log(LoggerVerbosity verbosity, string message)\r\n            {\r\n                switch (verbosity)\r\n                {\r\n                    case LoggerVerbosity.Normal:\r\n                        _logger.LogMessage(MessageImportance.Normal, message);\r\n                        break;\r\n\r\n                    case LoggerVerbosity.Minimal:\r\n                        _logger.LogMessage(MessageImportance.High, message);\r\n                        break;\r\n\r\n                    default:\r\n                        throw new NotImplementedException();\r\n                }\r\n            }\r\n        }\r\n\r\n        private class ConsoleProgressLogger : IMyLogger\r\n        {\r\n            private readonly IMyLogger _inner;\r\n            private Worker _worker;\r\n            private string _message;\r\n\r\n            public ConsoleProgressLogger(IMyLogger inner)\r\n            {\r\n                _inner = inner ?? throw new ArgumentNullException(nameof(inner));\r\n            }\r\n\r\n            public void SetWorker(Worker worker)\r\n            {\r\n                if (_worker != null)\r\n                {\r\n                    throw new InvalidOperationException();\r\n                }\r\n\r\n                _worker = worker ?? throw new ArgumentNullException(nameof(worker));\r\n                _worker.PropertyChanged += OnPropertyChanged;\r\n            }\r\n\r\n            public void WriteMessage()\r\n            {\r\n                _message = $\"Finished {_worker.FinishedWork}/{_worker.TotalWork}\";\r\n                // Set cursor to start of line, and write message without new line, so we can update it if it changes.\r\n                // We know the new message will be the same, or longer length as the old message, so no need to clear it.\r\n                Console.SetCursorPosition(0, Console.CursorTop);\r\n                Console.Write(_message);\r\n            }\r\n\r\n            private void OnPropertyChanged(object sender, PropertyChangedEventArgs eventArgs)\r\n            {\r\n                WriteMessage();\r\n            }\r\n\r\n            public void Log(LoggerVerbosity verbosity, string message)\r\n            {\r\n                // Cursor is currently at the end of the progress message line, so set it to the beginning of the line\r\n                Console.SetCursorPosition(0, Console.CursorTop);\r\n\r\n                // If the logged message is shorter than the current progress message, we need to clear the progress message, so it doesn't pollute the line\r\n                if (message.Length < _message.Length)\r\n                {\r\n                    Console.Write(new string(' ', _message.Length));\r\n                    Console.SetCursorPosition(0, Console.CursorTop);\r\n                }\r\n\r\n                // Let MSBuild log the line, which will include the new line\r\n                _inner.Log(verbosity, message);\r\n\r\n                // Write back the progress message, so it's always on the last line.\r\n                Console.Write(_message);\r\n            }\r\n        }\r\n    }\r\n}\r\n```\r\n\r\n</p>\r\n</details>\r\n\r\n\r\nI can't think of any way to use existing APIs to improve NuGet's restore task to have similar progress feedback that customers of similar tools from other ecosysems are used to.",
+  "state": "OPEN",
+  "createdAt": "2021-10-12T21:37:32Z",
+  "updatedAt": "2024-12-17T16:04:00Z",
+  "closedAt": null,
+  "author": {
+    "login": "zivkan"
+  },
+  "milestone": {
+    "title": "Backlog"
+  },
+  "assignees": {
+    "nodes": [
+      {
+        "login": "rainersigwald"
+      },
+      {
+        "login": "zivkan"
+      }
+    ]
+  },
+  "labels": [
+    "Area: Engine",
+    "Area: Logging",
+    "triaged",
+    "Area: Terminal Logger"
+  ],
+  "comments": {
+    "nodes": [
+      {
+        "body": "FWIW, here's a video/gif of my sample running at different verbosity. You can see how I don't have control to remove the progress message before the log messages are written, so only the `-v:q` run works as intended. Also one of the lines in the `-v:m` run has \"corrupted\" output, because moving the cursor position and writing output wasn't synchronised, so the line wasn't cleared when a short message was written.\r\n\r\n![msbuild progress](https://user-images.githubusercontent.com/5030577/137033792-a08c2e41-4601-44bf-abde-8cfe7d6d08a0.gif)\r\n\r\nedit: in fact, in the `-v:m` run, the output is just wrong, because it's supposed to show all 10 of the finished messages. The inability to syncronise cursor movement and output messages has this weird timing bug.",
+        "createdAt": "2021-10-12T21:51:26Z",
+        "author": {
+          "login": "zivkan"
+        }
+      },
+      {
+        "body": "Perhaps this could interoperate with the Windows Terminal progress bar feature <https://github.com/microsoft/terminal/issues/3004>.",
+        "createdAt": "2021-10-14T06:18:46Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "> Perhaps this could interoperate with the Windows Terminal progress bar feature [microsoft/terminal#3004](https://github.com/microsoft/terminal/issues/3004).\r\n\r\nWe're gonna do this for the new `-terminalLogger`: https://github.com/dotnet/msbuild/issues/8878.",
+        "createdAt": "2023-06-13T19:21:46Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Prior art on semi-general progress reporting: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workDoneProgress",
+        "createdAt": "2023-06-13T19:22:11Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "We are also looking forward to this as we are seeing some dotnet commands like `dotnet restore` that can take several dozens of minutes on a slow connection and we are not able to get a progress on what is happening (as per https://github.com/NuGet/Home/issues/4346 issue)\r\n\r\nIf this can help, I can write a proposal and make a PR for this?",
+        "createdAt": "2023-11-23T17:29:16Z",
+        "author": {
+          "login": "xoofx"
+        }
+      },
+      {
+        "body": "For bookkeeping: we've split this up into \r\n\r\n1. API to report fine-grained progress from a task (this issue)\r\n2. API to support more sophisticated console output (https://github.com/dotnet/msbuild/issues/9378).\r\n\r\n@xoofx we'll get back to you by ~tomorrow about whether anyone on our team has planned to work on this in the short term.",
+        "createdAt": "2023-11-27T15:22:48Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "@xoofx Nobody is already working on it, please feel free to work up a design!\r\n\r\nTo be super clear about expectations, it's probably a 17.10 timeline thing, and we'll have to coordinate with NuGet to get them to adopt the API after it exists, so this'll be the first step--but a necessary one!",
+        "createdAt": "2023-11-30T17:40:39Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "If we want another test case I'd love for [Container Layer upload in SDK Containers](https://github.com/dotnet/sdk/blob/4a01c8d993a8bb425fa40c7e9b94928179d78c7d/src/Containers/Microsoft.NET.Build.Containers/Tasks/CreateNewImage.cs#L193-L228) to prove out the API and Implementation.",
+        "createdAt": "2023-11-30T17:44:18Z",
+        "author": {
+          "login": "baronfel"
+        }
+      },
+      {
+        "body": "Something that recently came up in a discussion: we'll need to think about _throttling_ the progress messages, because the easiest use of the API will be something like \"update progress every time there's something new in the active state\" (e.g. \"running test Test1\", \"running test Test2, 1 failed test\", \"running test Test3, 1 failed test\") . . . but we don't need all of that in the TL output or in the binlog.",
+        "createdAt": "2024-02-02T16:57:04Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "One thought I had for that was that the binlog (and even the current console logger) would just display whatever the 'final' result was, some kind of summary event that says that \"operation X completed in Y time with Z final summary\". More thoughts to come later today.",
+        "createdAt": "2024-02-02T16:59:53Z",
+        "author": {
+          "login": "baronfel"
+        }
+      },
+      {
+        "body": "A bit delayed, made a tiny spec here to serve as the basis of discussion: https://gist.github.com/baronfel/c41cf19737532af0c1c07f8bff08a646",
+        "createdAt": "2024-03-20T16:55:01Z",
+        "author": {
+          "login": "baronfel"
+        }
+      },
+      {
+        "body": "Another use case - the [`DownloadFile`](https://github.com/dotnet/arcade/blob/5d8abb43f355edc287d57907967224a0ac5ebb9f/src/Microsoft.DotNet.Arcade.Sdk/src/DownloadFile.cs#L16) Task from Arcade - this downloads hundred+ MB files and can take a while for those of us not near to Redmond.",
+        "createdAt": "2024-03-22T17:28:03Z",
+        "author": {
+          "login": "baronfel"
+        }
+      }
+    ]
+  }
+}

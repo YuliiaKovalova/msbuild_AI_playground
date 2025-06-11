@@ -1,0 +1,985 @@
+diff --git a/documentation/specs/event-source.md b/documentation/specs/event-source.md
+index 18936da2249..9e96c8516c3 100644
+--- a/documentation/specs/event-source.md
++++ b/documentation/specs/event-source.md
+@@ -11,6 +11,7 @@ EventSource is primarily used to profile code. For MSBuild specifically, a major
+ | Build | Sets up a BuildManager to receive build requests. |
+ | BuildProject | Builds a project file. |
+ | CachedSdkResolverServiceResolveSdk | The caching SDK resolver service is resolving an SDK. |
++| CreateLoadedType | Creates a LoadedType object from an assembly loaded via MetadataLoadContext. |
+ | CopyUpToDate | Checks whether the Copy task needs to execute. |
+ | Evaluate | Evaluates a project, running several other parts of MSBuild in the process. |
+ | EvaluateCondition | Checks whether a condition is true and removes false conditionals. |
+diff --git a/eng/Packages.props b/eng/Packages.props
+index 4208a911570..55e8eb4b24b 100644
+--- a/eng/Packages.props
++++ b/eng/Packages.props
+@@ -20,7 +20,8 @@
+     <PackageReference Update="System.Configuration.ConfigurationManager" Version="4.7.0" />
+     <PackageReference Update="System.Net.Http" Version="4.3.4" />
+     <PackageReference Update="System.Memory" Version="4.5.4" />
+-    <PackageReference Update="System.Reflection.Metadata" Version="1.6.0" />
++    <PackageReference Update="System.Reflection.Metadata" Version="5.0.0" />
++    <PackageReference Update="System.Reflection.MetadataLoadContext" Version="5.0.0" />
+     <PackageReference Update="System.Resources.Extensions" Version="$(SystemResourcesExtensionsPackageVersion)" />
+     <PackageReference Update="System.Runtime.CompilerServices.Unsafe" Version="$(SystemRuntimeCompilerServicesUnsafeVersion)" />
+     <PackageReference Update="System.Security.Permissions" Version="4.7.0" />
+diff --git a/src/Build.UnitTests/BackEnd/AssemblyTaskFactory_Tests.cs b/src/Build.UnitTests/BackEnd/AssemblyTaskFactory_Tests.cs
+index ffd6ed0068e..a7ffe38e44f 100644
+--- a/src/Build.UnitTests/BackEnd/AssemblyTaskFactory_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/AssemblyTaskFactory_Tests.cs
+@@ -220,7 +220,7 @@ public void CreatableByTaskFactoryMismatchedIdentity()
+         public void VerifyGetTaskParameters()
+         {
+             TaskPropertyInfo[] propertyInfos = _taskFactory.GetTaskParameters();
+-            LoadedType comparisonType = new LoadedType(typeof(TaskToTestFactories), _loadInfo);
++            LoadedType comparisonType = new LoadedType(typeof(TaskToTestFactories), _loadInfo, typeof(TaskToTestFactories).GetTypeInfo().Assembly);
+             PropertyInfo[] comparisonInfo = comparisonType.Type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
+             Assert.Equal(comparisonInfo.Length, propertyInfos.Length);
+ 
+diff --git a/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs b/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
+index 9f3cd6388b1..66f29308551 100644
+--- a/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
+@@ -1161,7 +1161,7 @@ private void InitializeHost(bool throwOnExecute)
+ #else
+             AssemblyLoadInfo loadInfo = AssemblyLoadInfo.Create(typeof(TaskBuilderTestTask.TaskBuilderTestTaskFactory).GetTypeInfo().FullName, null);
+ #endif
+-            LoadedType loadedType = new LoadedType(typeof(TaskBuilderTestTask.TaskBuilderTestTaskFactory), loadInfo);
++            LoadedType loadedType = new LoadedType(typeof(TaskBuilderTestTask.TaskBuilderTestTaskFactory), loadInfo, typeof(TaskBuilderTestTask.TaskBuilderTestTaskFactory).GetTypeInfo().Assembly);
+ 
+             TaskBuilderTestTask.TaskBuilderTestTaskFactory taskFactory = new TaskBuilderTestTask.TaskBuilderTestTaskFactory();
+             taskFactory.ThrowOnExecute = throwOnExecute;
+diff --git a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+index cdb1553f181..f3b18d6a93e 100644
+--- a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
++++ b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+@@ -23,6 +23,7 @@
+ 
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
+ using Task = System.Threading.Tasks.Task;
++using System.Linq;
+ 
+ #nullable disable
+ 
+@@ -256,12 +257,12 @@ void ITaskExecutionHost.InitializeForTask(IBuildEngine2 buildEngine, TargetLoggi
+ 
+             TaskRequirements requirements = TaskRequirements.None;
+ 
+-            if (_taskFactoryWrapper.TaskFactoryLoadedType.HasSTAThreadAttribute())
++            if (_taskFactoryWrapper.TaskFactoryLoadedType.HasSTAThreadAttribute)
+             {
+                 requirements |= TaskRequirements.RequireSTAThread;
+             }
+ 
+-            if (_taskFactoryWrapper.TaskFactoryLoadedType.HasLoadInSeparateAppDomainAttribute())
++            if (_taskFactoryWrapper.TaskFactoryLoadedType.HasLoadInSeparateAppDomainAttribute)
+             {
+                 requirements |= TaskRequirements.RequireSeparateAppDomain;
+ 
+@@ -399,6 +400,14 @@ bool ITaskExecutionHost.GatherTaskOutputs(string parameterName, ElementLocation
+             try
+             {
+                 TaskPropertyInfo parameter = _taskFactoryWrapper.GetProperty(parameterName);
++                foreach (TaskPropertyInfo prop in _taskFactoryWrapper.TaskFactoryLoadedType.Properties)
++                {
++                    if (prop.Name.Equals(parameterName, StringComparison.OrdinalIgnoreCase))
++                    {
++                        parameter = prop;
++                        break;
++                    }
++                }
+ 
+                 // flag an error if we find a parameter that has no .NET property equivalent
+                 ProjectErrorUtilities.VerifyThrowInvalidProject
+@@ -420,17 +429,14 @@ bool ITaskExecutionHost.GatherTaskOutputs(string parameterName, ElementLocation
+                     _taskName
+                 );
+ 
+-                // grab the outputs from the task's designated output parameter (which is a .NET property)
+-                Type type = parameter.PropertyType;
+-
+                 EnsureParameterInitialized(parameter, _batchBucket.Lookup);
+ 
+-                if (TaskParameterTypeVerifier.IsAssignableToITask(type))
++                if (parameter.IsAssignableToITask)
+                 {
+                     ITaskItem[] outputs = GetItemOutputs(parameter);
+                     GatherTaskItemOutputs(outputTargetIsItem, outputTargetName, outputs, parameterLocation, parameter);
+                 }
+-                else if (TaskParameterTypeVerifier.IsValueTypeOutputParameter(type))
++                else if (parameter.IsValueTypeOutputParameter)
+                 {
+                     string[] outputs = GetValueOutputs(parameter);
+                     GatherArrayStringAndValueOutputs(outputTargetIsItem, outputTargetName, outputs, parameterLocation, parameter);
+@@ -897,12 +903,14 @@ private TaskFactoryWrapper FindTaskInRegistry(IDictionary<string, string> taskId
+                 // Map to an intrinsic task, if necessary.
+                 if (String.Equals(returnClass.TaskFactory.TaskType.FullName, "Microsoft.Build.Tasks.MSBuild", StringComparison.OrdinalIgnoreCase))
+                 {
+-                    returnClass = new TaskFactoryWrapper(new IntrinsicTaskFactory(typeof(MSBuild)), new LoadedType(typeof(MSBuild), AssemblyLoadInfo.Create(typeof(TaskExecutionHost).GetTypeInfo().Assembly.FullName, null)), _taskName, null);
++                    Assembly taskExecutionHostAssembly = typeof(TaskExecutionHost).GetTypeInfo().Assembly;
++                    returnClass = new TaskFactoryWrapper(new IntrinsicTaskFactory(typeof(MSBuild)), new LoadedType(typeof(MSBuild), AssemblyLoadInfo.Create(taskExecutionHostAssembly.FullName, null), taskExecutionHostAssembly), _taskName, null);
+                     _intrinsicTasks[_taskName] = returnClass;
+                 }
+                 else if (String.Equals(returnClass.TaskFactory.TaskType.FullName, "Microsoft.Build.Tasks.CallTarget", StringComparison.OrdinalIgnoreCase))
+                 {
+-                    returnClass = new TaskFactoryWrapper(new IntrinsicTaskFactory(typeof(CallTarget)), new LoadedType(typeof(CallTarget), AssemblyLoadInfo.Create(typeof(TaskExecutionHost).GetTypeInfo().Assembly.FullName, null)), _taskName, null);
++                    Assembly taskExecutionHostAssembly = typeof(TaskExecutionHost).GetTypeInfo().Assembly;
++                    returnClass = new TaskFactoryWrapper(new IntrinsicTaskFactory(typeof(CallTarget)), new LoadedType(typeof(CallTarget), AssemblyLoadInfo.Create(taskExecutionHostAssembly.FullName, null), taskExecutionHostAssembly), _taskName, null);
+                     _intrinsicTasks[_taskName] = returnClass;
+                 }
+             }
+@@ -1008,12 +1016,43 @@ out bool parameterSet
+             try
+             {
+                 // check if the task has a .NET property corresponding to the parameter
+-                TaskPropertyInfo parameter = _taskFactoryWrapper.GetProperty(parameterName);
++                LoadedType loadedType = _taskFactoryWrapper.TaskFactoryLoadedType;
++                int indexOfParameter = -1;
++                for (int i = 0; i < loadedType.Properties.Length; i++)
++                {
++                    if (loadedType.Properties[i].Name.Equals(parameterName))
++                    {
++                        indexOfParameter = i;
++                        break;
++                    }
++                }
+ 
+-                if (parameter != null)
++                // For most tasks, finding the parameter in our list of known properties is equivalent to
++                // saying the task was properly invoked, as far as this parameter is concerned. However,
++                // that is not true for CodeTaskFactories like RoslynCodeTaskFactory. In that case, they
++                // will often have a list of parameters under the UsingTask declaration. Fortunately, if
++                // your TaskFactory is RoslynCodeTaskFactory, it isn't TaskHostFactory, which means the
++                // types are fully loaded at this stage, and we can access them as we had in the past.
++                TaskPropertyInfo parameter = null;
++                Type parameterType = null;
++                if (indexOfParameter != -1)
++                {
++                    parameter = loadedType.Properties[indexOfParameter];
++                    parameterType = Type.GetType(
++                        loadedType.PropertyAssemblyQualifiedNames?[indexOfParameter] ??
++                        parameter.PropertyType.AssemblyQualifiedName);
++                }
++                else
+                 {
+-                    Type parameterType = parameter.PropertyType;
++                    parameter = _taskFactoryWrapper.GetProperty(parameterName);
++                    if (parameter != null)
++                    {
++                        parameterType = Type.GetType(parameter.PropertyType.AssemblyQualifiedName);
++                    }
++                }
+ 
++                if (parameter != null)
++                {
+                     EnsureParameterInitialized(parameter, _batchBucket.Lookup);
+ 
+                     // try to set the parameter
+@@ -1068,30 +1107,15 @@ out parameterSet
+                 else
+                 {
+                     // flag an error if we find a parameter that has no .NET property equivalent
+-                    if (_taskFactoryWrapper.TaskFactoryLoadedType.LoadedAssembly is null)
+-                    {
+-                        _taskLoggingContext.LogError
+-                            (
+-                            new BuildEventFileInfo( parameterLocation ),
+-                            "UnexpectedTaskAttribute",
+-                            parameterName,
+-                            _taskName,
+-                            _taskFactoryWrapper.TaskFactoryLoadedType.Type.Assembly.FullName,
+-                            _taskFactoryWrapper.TaskFactoryLoadedType.Type.Assembly.Location
+-                            );
+-                    }
+-                    else
+-                    {
+-                        _taskLoggingContext.LogError
+-                            (
+-                            new BuildEventFileInfo( parameterLocation ),
+-                            "UnexpectedTaskAttribute",
+-                            parameterName,
+-                            _taskName,
+-                            _taskFactoryWrapper.TaskFactoryLoadedType.LoadedAssembly.FullName,
+-                            _taskFactoryWrapper.TaskFactoryLoadedType.LoadedAssembly.Location
+-                            );
+-                    }
++                    _taskLoggingContext.LogError
++                        (
++                        new BuildEventFileInfo( parameterLocation ),
++                        "UnexpectedTaskAttribute",
++                        parameterName,
++                        _taskName,
++                        _taskFactoryWrapper.TaskFactoryLoadedType.LoadedAssemblyName.FullName,
++                        _taskFactoryWrapper.TaskFactoryLoadedType.Path
++                        );
+                 }
+             }
+             catch (AmbiguousMatchException)
+diff --git a/src/Build/Instance/ReflectableTaskPropertyInfo.cs b/src/Build/Instance/ReflectableTaskPropertyInfo.cs
+index 571ba866933..66c846646dc 100644
+--- a/src/Build/Instance/ReflectableTaskPropertyInfo.cs
++++ b/src/Build/Instance/ReflectableTaskPropertyInfo.cs
+@@ -52,6 +52,22 @@ internal ReflectableTaskPropertyInfo(PropertyInfo propertyInfo)
+             _propertyInfo = propertyInfo;
+         }
+ 
++        /// <summary>
++        /// Initializes a new <see cref="ReflectableTaskPropertyInfo"/> with three precomputed parameters. This is specifically
++        /// used with MetadataLoadContext, as these parameters cannot be computed for the property type passed in directly but
++        /// rather the relevant base type.
++        /// </summary>
++        internal ReflectableTaskPropertyInfo(PropertyInfo propertyInfo, bool output, bool required, bool isAssignableToITaskItemType)
++            : base(
++            propertyInfo.Name,
++            propertyInfo.PropertyType,
++            output,
++            required)
++        {
++            _propertyInfo = propertyInfo;
++            IsAssignableToITask = isAssignableToITaskItemType;
++        }
++
+         /// <summary>
+         /// Gets or sets the reflection-produced PropertyInfo.
+         /// </summary>
+diff --git a/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs b/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
+index 37433613a00..bc191a256a9 100644
+--- a/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
++++ b/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Linq;
+ using System.Reflection;
+ #if FEATURE_APPDOMAIN
+ using System.Threading.Tasks;
+@@ -149,14 +150,7 @@ public bool Initialize(string taskName, IDictionary<string, string> factoryIdent
+         /// </summary>
+         public TaskPropertyInfo[] GetTaskParameters()
+         {
+-            PropertyInfo[] infos = _loadedType.Type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
+-            var propertyInfos = new TaskPropertyInfo[infos.Length];
+-            for (int i = 0; i < infos.Length; i++)
+-            {
+-                propertyInfos[i] = new ReflectableTaskPropertyInfo(infos[i]);
+-            }
+-
+-            return propertyInfos;
++            return _loadedType.Properties;
+         }
+ 
+         /// <summary>
+@@ -279,7 +273,7 @@ string taskProjectFile
+             {
+                 ErrorUtilities.VerifyThrowArgumentLength(taskName, nameof(taskName));
+                 _taskName = taskName;
+-                _loadedType = _typeLoader.Load(taskName, loadInfo);
++                _loadedType = _typeLoader.Load(taskName, loadInfo, _taskHostFactoryExplicitlyRequested);
+                 ProjectErrorUtilities.VerifyThrowInvalidProject(_loadedType != null, elementLocation, "TaskLoadFailure", taskName, loadInfo.AssemblyLocation, String.Empty);
+             }
+             catch (TargetInvocationException e)
+diff --git a/src/Build/Instance/TaskRegistry.cs b/src/Build/Instance/TaskRegistry.cs
+index c7169a09dad..458c6956422 100644
+--- a/src/Build/Instance/TaskRegistry.cs
++++ b/src/Build/Instance/TaskRegistry.cs
+@@ -436,7 +436,7 @@ ElementLocation elementLocation
+                         targetLoggingContext.LogComment(MessageImportance.Low, "TaskFoundFromFactory", taskName, taskFactory.Name);
+                     }
+ 
+-                    if (taskFactory.TaskFactoryLoadedType.HasSTAThreadAttribute())
++                    if (taskFactory.TaskFactoryLoadedType.HasSTAThreadAttribute)
+                     {
+                         targetLoggingContext.LogComment(MessageImportance.Low, "TaskNeedsSTA", taskName);
+                     }
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index db86e8cbc7a..0101a829b26 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -35,6 +35,7 @@
+     <PackageReference Include="System.Text.Json" />
+ 
+     <PackageReference Include="System.Reflection.Metadata" Condition="'$(MonoBuild)' == 'true'" />
++    <PackageReference Include="System.Reflection.MetadataLoadContext" />
+ 
+     <PackageReference Include="Microsoft.IO.Redist" Condition="'$(FeatureMSIORedist)' == 'true'" />
+   </ItemGroup>
+diff --git a/src/Framework/MSBuildEventSource.cs b/src/Framework/MSBuildEventSource.cs
+index b4e335f7849..09b2b8b363d 100644
+--- a/src/Framework/MSBuildEventSource.cs
++++ b/src/Framework/MSBuildEventSource.cs
+@@ -599,6 +599,18 @@ public void OutOfProcSdkResolverServiceRequestSdkPathFromMainNodeStop(int submis
+             WriteEvent(80, submissionId, sdkName, solutionPath, projectPath, success, wasResultCached);
+         }
+ 
++        [Event(81, Keywords = Keywords.All)]
++        public void CreateLoadedTypeStart(string assemblyName)
++        {
++            WriteEvent(81, assemblyName);
++        }
++
++        [Event(82, Keywords = Keywords.All)]
++        public void CreateLoadedTypeStop(string assemblyName)
++        {
++            WriteEvent(82, assemblyName);
++        }
++
+         #endregion
+     }
+ }
+diff --git a/src/Framework/TaskPropertyInfo.cs b/src/Framework/TaskPropertyInfo.cs
+index 449354b5e43..3d06ce4d747 100644
+--- a/src/Framework/TaskPropertyInfo.cs
++++ b/src/Framework/TaskPropertyInfo.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using System;
++using System.Reflection;
+ 
+ #nullable disable
+ 
+@@ -26,6 +27,9 @@ public TaskPropertyInfo(string name, Type typeOfParameter, bool output, bool req
+             PropertyType = typeOfParameter;
+             Output = output;
+             Required = required;
++            Type elementType = typeOfParameter.IsArray ? typeOfParameter.GetElementType() : typeOfParameter;
++            IsValueTypeOutputParameter = elementType.GetTypeInfo().IsValueType || elementType.FullName.Equals("System.String");
++            IsAssignableToITask = typeof(ITaskItem).IsAssignableFrom(elementType);
+         }
+ 
+         /// <summary>
+@@ -62,5 +66,8 @@ public TaskPropertyInfo(string name, Type typeOfParameter, bool output, bool req
+         /// Whether the Log and LogItemMetadata properties have been assigned already.
+         /// </summary>
+         internal bool Initialized = false;
++
++        internal bool IsValueTypeOutputParameter { get; private set; }
++        internal bool IsAssignableToITask { get; set; }
+     }
+ }
+diff --git a/src/MSBuild/MSBuild.csproj b/src/MSBuild/MSBuild.csproj
+index 9ea8cc2fcf8..d430c89fa7f 100644
+--- a/src/MSBuild/MSBuild.csproj
++++ b/src/MSBuild/MSBuild.csproj
+@@ -76,6 +76,7 @@
+       <Link>FileUtilities.cs</Link>
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+     </Compile>
++    <Compile Include="..\Build\Instance\ReflectableTaskPropertyInfo.cs" />
+     <Compile Include="..\Shared\FileUtilitiesRegex.cs">
+       <Link>FileUtilitiesRegex.cs</Link>
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+diff --git a/src/MSBuild/OutOfProcTaskAppDomainWrapperBase.cs b/src/MSBuild/OutOfProcTaskAppDomainWrapperBase.cs
+index adb4e7931cc..10655f84b09 100644
+--- a/src/MSBuild/OutOfProcTaskAppDomainWrapperBase.cs
++++ b/src/MSBuild/OutOfProcTaskAppDomainWrapperBase.cs
+@@ -115,7 +115,7 @@ IDictionary<string, TaskParameter> taskParams
+             try
+             {
+                 TypeLoader typeLoader = new TypeLoader(TaskLoader.IsTaskClass);
+-                taskType = typeLoader.Load(taskName, AssemblyLoadInfo.Create(null, taskLocation));
++                taskType = typeLoader.Load(taskName, AssemblyLoadInfo.Create(null, taskLocation), false);
+             }
+             catch (Exception e) when (!ExceptionHandling.IsCriticalException(e))
+             {
+@@ -133,7 +133,7 @@ IDictionary<string, TaskParameter> taskParams
+             }
+ 
+             OutOfProcTaskHostTaskResult taskResult;
+-            if (taskType.HasSTAThreadAttribute())
++            if (taskType.HasSTAThreadAttribute)
+             {
+ #if FEATURE_APARTMENT_STATE
+                 taskResult = InstantiateAndExecuteTaskInSTAThread(oopTaskHostNode, taskType, taskName, taskLocation, taskFile, taskLine, taskColumn,
+diff --git a/src/MSBuildTaskHost/TypeLoader.cs b/src/MSBuildTaskHost/TypeLoader.cs
+index 5b4833472c4..8b749fe1d72 100644
+--- a/src/MSBuildTaskHost/TypeLoader.cs
++++ b/src/MSBuildTaskHost/TypeLoader.cs
+@@ -126,11 +126,13 @@ internal static bool IsPartialTypeNameMatch(string typeName1, string typeName2)
+         /// Loads the specified type if it exists in the given assembly. If the type name is fully qualified, then a match (if
+         /// any) is unambiguous; otherwise, if there are multiple types with the same name in different namespaces, the first type
+         /// found will be returned.
++        /// The unusued bool is to match the signature of the Shared copy of TypeLoader.
+         /// </summary>
+         internal LoadedType Load
+         (
+             string typeName,
+-            AssemblyLoadInfo assembly
++            AssemblyLoadInfo assembly,
++            bool _
+         )
+         {
+             return GetLoadedType(s_cacheOfLoadedTypesByFilter, typeName, assembly);
+@@ -284,7 +286,7 @@ internal LoadedType GetLoadedTypeByTypeName(string typeName)
+                     return null;
+                 });
+ 
+-                return type != null ? new LoadedType(type, _assemblyLoadInfo, _loadedAssembly) : null;
++                return type != null ? new LoadedType(type, _assemblyLoadInfo, _loadedAssembly ?? type.Assembly) : null;
+             }
+ 
+             /// <summary>
+diff --git a/src/Package/MSBuild.VSSetup/files.swr b/src/Package/MSBuild.VSSetup/files.swr
+index 793a3d5be1c..c5d09184c62 100644
+--- a/src/Package/MSBuild.VSSetup/files.swr
++++ b/src/Package/MSBuild.VSSetup/files.swr
+@@ -40,6 +40,8 @@ folder InstallDir:\MSBuild\Current\Bin
+   file source=$(TaskHostBinPath)MSBuildTaskHost.exe.config
+   file source=$(X86BinPath)System.Buffers.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+   file source=$(X86BinPath)System.Memory.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
++  file source=$(X86BinPath)System.Reflection.Metadata.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
++  file source=$(X86BinPath)System.Reflection.MetadataLoadContext.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+   file source=$(X86BinPath)System.Text.Json.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+   file source=$(X86BinPath)Microsoft.Bcl.AsyncInterfaces.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+   file source=$(X86BinPath)System.Text.Encodings.Web.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+@@ -185,6 +187,8 @@ folder InstallDir:\MSBuild\Current\Bin\amd64
+   file source=$(X86BinPath)Microsoft.Build.Utilities.Core.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)System.Buffers.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)System.Memory.dll vs.file.ngenArchitecture=all
++  file source=$(X86BinPath)System.Reflection.Metadata.dll vs.file.ngenArchitecture=all
++  file source=$(X86BinPath)System.Reflection.MetadataLoadContext.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)System.Text.Json.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)Microsoft.Bcl.AsyncInterfaces.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)Microsoft.IO.Redist.dll vs.file.ngenArchitecture=all
+diff --git a/src/Shared/LoadedType.cs b/src/Shared/LoadedType.cs
+index eeae7eb79ab..a929313f47d 100644
+--- a/src/Shared/LoadedType.cs
++++ b/src/Shared/LoadedType.cs
+@@ -2,7 +2,11 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using System;
++using System.Collections.Generic;
++using System.Linq;
+ using System.Reflection;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ 
+ #nullable disable
+@@ -15,15 +19,7 @@ namespace Microsoft.Build.Shared
+     /// </summary>
+     internal sealed class LoadedType
+     {
+-        #region Constructors
+-
+-        /// <summary>
+-        /// Creates an instance of this class for the given type.
+-        /// </summary>
+-        internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo)
+-            : this(type, assemblyLoadInfo, null)
+-        {
+-        }
++        #region Constructor
+ 
+         /// <summary>
+         /// Creates an instance of this class for the given type.
+@@ -31,75 +27,141 @@ internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo)
+         /// <param name="type">The Type to be loaded</param>
+         /// <param name="assemblyLoadInfo">Information used to load the assembly</param>
+         /// <param name="loadedAssembly">The assembly which has been loaded, if any</param>
+-        internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo, Assembly loadedAssembly)
++        /// <param name="loadedViaMetadataLoadContext">Whether this type was loaded via MetadataLoadContext</param>
++        internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo, Assembly loadedAssembly, bool loadedViaMetadataLoadContext = false)
+         {
+             ErrorUtilities.VerifyThrow(type != null, "We must have the type.");
+             ErrorUtilities.VerifyThrow(assemblyLoadInfo != null, "We must have the assembly the type was loaded from.");
++            ErrorUtilities.VerifyThrow(loadedAssembly is not null, "The assembly should always be loaded even if only by MetadataLoadContext.");
++
++            Type = type;
++            Assembly = assemblyLoadInfo;
++
++            HasSTAThreadAttribute = CheckForHardcodedSTARequirement();
++            LoadedAssemblyName = loadedAssembly.GetName();
++            Path = loadedAssembly.Location;
++            LoadedAssembly = loadedAssembly;
++
++#if !NET35
++            // Properties set in this block aren't used by TaskHosts. Properties below are only used on the NodeProvider side to get information about the
++            // properties and reflect over them without needing them to be fully loaded, so it also isn't need for TaskHosts.
++            // MetadataLoadContext-loaded Type objects don't support testing for inherited attributes, so we manually walk the BaseType chain.
++            Type t = type;
++            while (t is not null)
++            {
++                if (CustomAttributeData.GetCustomAttributes(t).Any(attr => attr.AttributeType.Name.Equals(nameof(LoadInSeparateAppDomainAttribute))))
++                {
++                    HasLoadInSeparateAppDomainAttribute = true;
++                }
++
++                if (CustomAttributeData.GetCustomAttributes(t).Any(attr => attr.AttributeType.Name.Equals(nameof(RunInSTAAttribute))))
++                {
++                    HasSTAThreadAttribute = true;
++                }
++
++                if (t.IsMarshalByRef)
++                {
++                    IsMarshalByRef = true;
++                }
++
++                t = t.BaseType;
++            }
++
++            PropertyInfo[] props = type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
++            Properties = new ReflectableTaskPropertyInfo[props.Length];
++            if (loadedViaMetadataLoadContext)
++            {
++                PropertyAssemblyQualifiedNames = new string[props.Length];
++            }
+ 
+-            _type = type;
+-            _assembly = assemblyLoadInfo;
+-            _loadedAssembly = loadedAssembly;
++            for (int i = 0; i < props.Length; i++)
++            {
++                bool outputAttribute = false;
++                bool requiredAttribute = false;
++                foreach (CustomAttributeData attr in CustomAttributeData.GetCustomAttributes(props[i]))
++                {
++                    if (attr.AttributeType.Name.Equals(nameof(OutputAttribute)))
++                    {
++                        outputAttribute = true;
++                    }
++                    else if (attr.AttributeType.Name.Equals(nameof(RequiredAttribute)))
++                    {
++                        requiredAttribute = true;
++                    }
++                }
++
++                bool isAssignableToITask = false;
++
++                // Check whether it's assignable to ITaskItem or ITaskItem[]. Simplify to just checking for ITaskItem.
++                Type pt = props[i].PropertyType;
++                if (pt.IsArray)
++                {
++                    pt = pt.GetElementType();
++                }
++
++                // Microsoft.Build.Framework.ITaskItem is different when loaded normally versus via MetadataLoadContext. This is the only reliable way to see
++                // whether this property derives from ITaskItem.
++                while (pt is not null)
++                {
++                    if (pt.FullName.Equals("Microsoft.Build.Framework.ITaskItem"))
++                    {
++                        isAssignableToITask = true;
++                        break;
++                    }
++                    else
++                    {
++                        pt = pt.BaseType;
++                    }
++                }
+ 
+-            CheckForHardcodedSTARequirement();
+-            HasLoadInSeparateAppDomainAttribute();
+-            HasSTAThreadAttribute();
++                Properties[i] = new ReflectableTaskPropertyInfo(props[i], outputAttribute, requiredAttribute, isAssignableToITask);
++                if (loadedViaMetadataLoadContext)
++                {
++                    PropertyAssemblyQualifiedNames[i] = Properties[i].PropertyType.AssemblyQualifiedName;
++                }
++            }
++#endif
+         }
+ 
+ 
+         #endregion
+ 
+-        #region Methods
+         /// <summary>
+         /// Gets whether there's a LoadInSeparateAppDomain attribute on this type.
+-        /// Caches the result - since it can't change during the build.
+         /// </summary>
+-        /// <returns></returns>
+-        public bool HasLoadInSeparateAppDomainAttribute()
+-        {
+-            if (_hasLoadInSeparateAppDomainAttribute == null)
+-            {
+-                _hasLoadInSeparateAppDomainAttribute = this.Type.GetTypeInfo().IsDefined(typeof(LoadInSeparateAppDomainAttribute), true /* inherited */);
+-            }
+-
+-            return (bool)_hasLoadInSeparateAppDomainAttribute;
+-        }
++        public bool HasLoadInSeparateAppDomainAttribute { get; }
+ 
+         /// <summary>
+         /// Gets whether there's a STAThread attribute on the Execute method of this type.
+-        /// Caches the result - since it can't change during the build.
+         /// </summary>
+-        /// <returns></returns>
+-        public bool HasSTAThreadAttribute()
+-        {
+-            if (_hasSTAThreadAttribute == null)
+-            {
+-                _hasSTAThreadAttribute = this.Type.GetTypeInfo().IsDefined(typeof(RunInSTAAttribute), true /* inherited */);
+-            }
+-
+-            return (bool)_hasSTAThreadAttribute;
+-        }
++        public bool HasSTAThreadAttribute { get; }
+ 
+-        #endregion
++        /// <summary>
++        /// Gets whether this type implements MarshalByRefObject.
++        /// </summary>
++        public bool IsMarshalByRef { get; }
+ 
+         /// <summary>
+         /// Determines if the task has a hardcoded requirement for STA thread usage.
+         /// </summary>
+-        private void CheckForHardcodedSTARequirement()
++        private bool CheckForHardcodedSTARequirement()
+         {
+             // Special hard-coded attributes for certain legacy tasks which need to run as STA because they were written before
+             // we changed to running all tasks in MTA.
+-            if (String.Equals("Microsoft.Build.Tasks.Xaml.PartialClassGenerationTask", _type.FullName, StringComparison.OrdinalIgnoreCase))
++            if (String.Equals("Microsoft.Build.Tasks.Xaml.PartialClassGenerationTask", Type.FullName, StringComparison.OrdinalIgnoreCase))
+             {
+-                AssemblyName assemblyName = _type.GetTypeInfo().Assembly.GetName();
++                AssemblyName assemblyName = Type.GetTypeInfo().Assembly.GetName();
+                 Version lastVersionToForce = new Version(3, 5);
+                 if (assemblyName.Version.CompareTo(lastVersionToForce) > 0)
+                 {
+                     if (String.Equals(assemblyName.Name, "PresentationBuildTasks", StringComparison.OrdinalIgnoreCase))
+                     {
+-                        _hasSTAThreadAttribute = true;
++                        return true;
+                     }
+                 }
+             }
++
++            return false;
+         }
+ 
+         #region Properties
+@@ -108,55 +170,33 @@ private void CheckForHardcodedSTARequirement()
+         /// Gets the type that was loaded from an assembly.
+         /// </summary>
+         /// <value>The loaded type.</value>
+-        internal Type Type
+-        {
+-            get
+-            {
+-                return _type;
+-            }
+-        }
++        internal Type Type { get; private set; }
++
++        internal AssemblyName LoadedAssemblyName { get; private set; }
++
++        internal string Path { get; private set; }
+ 
+         /// <summary>
+         /// If we loaded an assembly for this type.
+         /// We use this information to help created AppDomains to resolve types that it could not load successfully
+         /// </summary>
+-        internal Assembly LoadedAssembly
+-        {
+-            get
+-            {
+-                return _loadedAssembly;
+-            }
+-        }
++        internal Assembly LoadedAssembly { get; private set; }
++
++#if !NET35
++        internal ReflectableTaskPropertyInfo[] Properties { get; private set; }
++#endif
++
++        /// <summary>
++        /// Assembly-qualified names for properties. Only has a value if this type was loaded using MetadataLoadContext.
++        /// </summary>
++        internal string[] PropertyAssemblyQualifiedNames { get; private set; }
+ 
+         /// <summary>
+         /// Gets the assembly the type was loaded from.
+         /// </summary>
+         /// <value>The assembly info for the loaded type.</value>
+-        internal AssemblyLoadInfo Assembly
+-        {
+-            get
+-            {
+-                return _assembly;
+-            }
+-        }
++        internal AssemblyLoadInfo Assembly { get; private set; }
+ 
+         #endregion
+-
+-        // the type that was loaded
+-        private Type _type;
+-        // the assembly the type was loaded from
+-        private AssemblyLoadInfo _assembly;
+-
+-        // whether the loadinseparateappdomain attribute is applied to this type
+-        private bool? _hasLoadInSeparateAppDomainAttribute;
+-
+-        // whether the STAThread attribute is applied to this type
+-        private bool? _hasSTAThreadAttribute;
+-
+-        /// <summary>
+-        /// Assembly, if any, that we loaded for this type.
+-        /// We use this information to help created AppDomains to resolve types that it could not load successfully
+-        /// </summary>
+-        private Assembly _loadedAssembly;
+     }
+ }
+diff --git a/src/Shared/TaskLoader.cs b/src/Shared/TaskLoader.cs
+index 0ab62f70203..f66497dc018 100644
+--- a/src/Shared/TaskLoader.cs
++++ b/src/Shared/TaskLoader.cs
+@@ -53,7 +53,7 @@ internal static ITask CreateTask(LoadedType loadedType, string taskName, string
+             )
+         {
+ #if FEATURE_APPDOMAIN
+-            bool separateAppDomain = loadedType.HasLoadInSeparateAppDomainAttribute();
++            bool separateAppDomain = loadedType.HasLoadInSeparateAppDomainAttribute;
+             s_resolverLoadedType = null;
+             taskAppDomain = null;
+             ITask taskInstanceInOtherAppDomain = null;
+@@ -64,7 +64,7 @@ internal static ITask CreateTask(LoadedType loadedType, string taskName, string
+ #if FEATURE_APPDOMAIN
+                 if (separateAppDomain)
+                 {
+-                    if (!loadedType.Type.GetTypeInfo().IsMarshalByRef)
++                    if (!loadedType.IsMarshalByRef)
+                     {
+                         logError
+                         (
+@@ -107,7 +107,7 @@ internal static ITask CreateTask(LoadedType loadedType, string taskName, string
+ 
+                         if (loadedType.LoadedAssembly != null)
+                         {
+-                            taskAppDomain.Load(loadedType.LoadedAssembly.GetName());
++                            taskAppDomain.Load(loadedType.LoadedAssemblyName);
+                         }
+ 
+                         // Hook up last minute dumping of any exceptions 
+@@ -176,13 +176,9 @@ internal static ITask CreateTask(LoadedType loadedType, string taskName, string
+         /// </summary>
+         internal static Assembly AssemblyResolver(object sender, ResolveEventArgs args)
+         {
+-            if ((s_resolverLoadedType?.LoadedAssembly != null))
++            if (args.Name.Equals(s_resolverLoadedType.LoadedAssemblyName.FullName, StringComparison.OrdinalIgnoreCase))
+             {
+-                // Match the name being requested by the resolver with the FullName of the assembly we have loaded
+-                if (args.Name.Equals(s_resolverLoadedType.LoadedAssembly.FullName, StringComparison.Ordinal))
+-                {
+-                    return s_resolverLoadedType.LoadedAssembly;
+-                }
++                return s_resolverLoadedType.LoadedAssembly ?? Assembly.Load(s_resolverLoadedType.Path);
+             }
+ 
+             return null;
+diff --git a/src/Shared/TypeLoader.cs b/src/Shared/TypeLoader.cs
+index fe5ea680c49..aef3e22dd7f 100644
+--- a/src/Shared/TypeLoader.cs
++++ b/src/Shared/TypeLoader.cs
+@@ -5,10 +5,14 @@
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Diagnostics;
+-using System.Diagnostics.CodeAnalysis;
+ using System.IO;
+ using System.Reflection;
++using System.Runtime.InteropServices;
++#if !NETFRAMEWORK
++using System.Runtime.Loader;
++#endif
+ using System.Threading;
++using Microsoft.Build.Eventing;
+ 
+ #nullable disable
+ 
+@@ -41,6 +45,8 @@ internal class TypeLoader
+         /// </summary>
+         private Func<Type, object, bool> _isDesiredType;
+ 
++        private static MetadataLoadContext _context;
++
+         /// <summary>
+         /// Constructor.
+         /// </summary>
+@@ -139,26 +145,20 @@ internal static bool IsPartialTypeNameMatch(string typeName1, string typeName2)
+         /// <returns></returns>
+         private static Assembly LoadAssembly(AssemblyLoadInfo assemblyLoadInfo)
+         {
+-            Assembly loadedAssembly = null;
+-
+             try
+             {
+                 if (assemblyLoadInfo.AssemblyName != null)
+                 {
+-#if !FEATURE_ASSEMBLYLOADCONTEXT
+-                    loadedAssembly = Assembly.Load(assemblyLoadInfo.AssemblyName);
+-#else
+-                    loadedAssembly = Assembly.Load(new AssemblyName(assemblyLoadInfo.AssemblyName));
+-#endif
++                    return Assembly.Load(assemblyLoadInfo.AssemblyName);
+                 }
+                 else
+                 {
+ #if !FEATURE_ASSEMBLYLOADCONTEXT
+-                    loadedAssembly = Assembly.UnsafeLoadFrom(assemblyLoadInfo.AssemblyFile);
++                    return Assembly.UnsafeLoadFrom(assemblyLoadInfo.AssemblyFile);
+ #else
+-                    var baseDir = Path.GetDirectoryName(assemblyLoadInfo.AssemblyFile);
++                    string baseDir = Path.GetDirectoryName(assemblyLoadInfo.AssemblyFile);
+                     s_coreClrAssemblyLoader.AddDependencyLocation(baseDir);
+-                    loadedAssembly = s_coreClrAssemblyLoader.LoadFromPath(assemblyLoadInfo.AssemblyFile);
++                    return s_coreClrAssemblyLoader.LoadFromPath(assemblyLoadInfo.AssemblyFile);
+ #endif
+                 }
+             }
+@@ -169,8 +169,33 @@ private static Assembly LoadAssembly(AssemblyLoadInfo assemblyLoadInfo)
+                 // NOTE: don't use ErrorUtilities.VerifyThrowFileExists() here because that will hit the disk again
+                 throw new FileNotFoundException(null, assemblyLoadInfo.AssemblyLocation, e);
+             }
++        }
++
++        private static Assembly LoadAssemblyUsingMetadataLoadContext(AssemblyLoadInfo assemblyLoadInfo)
++        {
++            string path = assemblyLoadInfo.AssemblyFile;
++
++            if (path is null)
++            {
++#if NETFRAMEWORK
++                AppDomainSetup setup = AppDomain.CurrentDomain.SetupInformation;
++                setup.LoaderOptimization = LoaderOptimization.SingleDomain;
++                AppDomain appDomain = AppDomain.CreateDomain("appDomainToFindPath", null, setup);
++                path = appDomain.Load(new AssemblyName(assemblyLoadInfo.AssemblyName)).Location;
++                AppDomain.Unload(appDomain);
++#else
++                AssemblyLoadContext alc = new("loadContextToFindPath", true);
++                path = alc.LoadFromAssemblyName(new AssemblyName(assemblyLoadInfo.AssemblyName)).Location;
++                alc.Unload();
++#endif
++            }
+ 
+-            return loadedAssembly;
++            string[] runtimePaths = Directory.GetFiles(RuntimeEnvironment.GetRuntimeDirectory(), "*.dll");
++            List<string> localPaths = new(Directory.GetFiles(Path.GetDirectoryName(path), "*.dll"));
++            localPaths.AddRange(runtimePaths);
++
++            _context = new(new PathAssemblyResolver(localPaths));
++            return _context.LoadFromAssemblyPath(path);
+         }
+ 
+         /// <summary>
+@@ -181,10 +206,11 @@ private static Assembly LoadAssembly(AssemblyLoadInfo assemblyLoadInfo)
+         internal LoadedType Load
+         (
+             string typeName,
+-            AssemblyLoadInfo assembly
++            AssemblyLoadInfo assembly,
++            bool useTaskHost = false
+         )
+         {
+-            return GetLoadedType(s_cacheOfLoadedTypesByFilter, typeName, assembly);
++            return GetLoadedType(s_cacheOfLoadedTypesByFilter, typeName, assembly, useTaskHost);
+         }
+ 
+         /// <summary>
+@@ -199,7 +225,7 @@ internal LoadedType ReflectionOnlyLoad
+             AssemblyLoadInfo assembly
+         )
+         {
+-            return GetLoadedType(s_cacheOfReflectionOnlyLoadedTypesByFilter, typeName, assembly);
++            return GetLoadedType(s_cacheOfReflectionOnlyLoadedTypesByFilter, typeName, assembly, useTaskHost: false);
+         }
+ 
+         /// <summary>
+@@ -207,7 +233,7 @@ AssemblyLoadInfo assembly
+         /// any) is unambiguous; otherwise, if there are multiple types with the same name in different namespaces, the first type
+         /// found will be returned.
+         /// </summary>
+-        private LoadedType GetLoadedType(ConcurrentDictionary<Func<Type, object, bool>, ConcurrentDictionary<AssemblyLoadInfo, AssemblyInfoToLoadedTypes>> cache, string typeName, AssemblyLoadInfo assembly)
++        private LoadedType GetLoadedType(ConcurrentDictionary<Func<Type, object, bool>, ConcurrentDictionary<AssemblyLoadInfo, AssemblyInfoToLoadedTypes>> cache, string typeName, AssemblyLoadInfo assembly, bool useTaskHost)
+         {
+             // A given type filter have been used on a number of assemblies, Based on the type filter we will get another dictionary which 
+             // will map a specific AssemblyLoadInfo to a AssemblyInfoToLoadedTypes class which knows how to find a typeName in a given assembly.
+@@ -218,7 +244,7 @@ private LoadedType GetLoadedType(ConcurrentDictionary<Func<Type, object, bool>,
+             AssemblyInfoToLoadedTypes typeNameToType =
+                 loadInfoToType.GetOrAdd(assembly, (_) => new AssemblyInfoToLoadedTypes(_isDesiredType, _));
+ 
+-            return typeNameToType.GetLoadedTypeByTypeName(typeName);
++            return typeNameToType.GetLoadedTypeByTypeName(typeName, useTaskHost);
+         }
+ 
+         /// <summary>
+@@ -256,6 +282,8 @@ private class AssemblyInfoToLoadedTypes
+             /// </summary>
+             private Dictionary<string, Type> _publicTypeNameToType;
+ 
++            private ConcurrentDictionary<string, LoadedType> _publicTypeNameToLoadedType;
++
+             /// <summary>
+             /// Have we scanned the public types for this assembly yet.
+             /// </summary>
+@@ -278,19 +306,24 @@ internal AssemblyInfoToLoadedTypes(Func<Type, object, bool> typeFilter, Assembly
+ 
+                 _isDesiredType = typeFilter;
+                 _assemblyLoadInfo = loadInfo;
+-                _typeNameToType = new ConcurrentDictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
++                _typeNameToType = new(StringComparer.OrdinalIgnoreCase);
+                 _publicTypeNameToType = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
++                _publicTypeNameToLoadedType = new(StringComparer.OrdinalIgnoreCase);
+             }
+ 
+             /// <summary>
+             /// Determine if a given type name is in the assembly or not. Return null if the type is not in the assembly
+             /// </summary>
+-            internal LoadedType GetLoadedTypeByTypeName(string typeName)
++            internal LoadedType GetLoadedTypeByTypeName(string typeName, bool useTaskHost)
+             {
+                 ErrorUtilities.VerifyThrowArgumentNull(typeName, nameof(typeName));
+ 
+-                // Only one thread should be doing operations on this instance of the object at a time.
++                if (useTaskHost)
++                {
++                    return GetLoadedTypeFromTypeNameUsingMetadataLoadContext(typeName);
++                }
+ 
++                // Only one thread should be doing operations on this instance of the object at a time.
+                 Type type = _typeNameToType.GetOrAdd(typeName, (key) =>
+                 {
+                     if ((_assemblyLoadInfo.AssemblyName != null) && (typeName.Length > 0))
+@@ -336,14 +369,35 @@ internal LoadedType GetLoadedTypeByTypeName(string typeName)
+                     return null;
+                 });
+ 
+-                return type != null ? new LoadedType(type, _assemblyLoadInfo, _loadedAssembly) : null;
++                return type != null ? new LoadedType(type, _assemblyLoadInfo, _loadedAssembly ?? type.Assembly, loadedViaMetadataLoadContext: false) : null;
++            }
++
++            private LoadedType GetLoadedTypeFromTypeNameUsingMetadataLoadContext(string typeName)
++            {
++                return _publicTypeNameToLoadedType.GetOrAdd(typeName, typeName =>
++                {
++                    Assembly loadedAssembly = LoadAssemblyUsingMetadataLoadContext(_assemblyLoadInfo);
++                    foreach (Type publicType in loadedAssembly.GetExportedTypes())
++                    {
++                        if (_isDesiredType(publicType, null) && (typeName.Length == 0 || TypeLoader.IsPartialTypeNameMatch(publicType.FullName, typeName)))
++                        {
++                            MSBuildEventSource.Log.CreateLoadedTypeStart(loadedAssembly.FullName);
++                            LoadedType loadedType = new(publicType, _assemblyLoadInfo, loadedAssembly, loadedViaMetadataLoadContext: true);
++                            _context?.Dispose();
++                            _context = null;
++                            MSBuildEventSource.Log.CreateLoadedTypeStop(loadedAssembly.FullName);
++                            return loadedType;
++                        }
++                    }
++
++                    return null;
++                });
+             }
+ 
+             /// <summary>
+             /// Scan the assembly pointed to by the assemblyLoadInfo for public types. We will use these public types to do partial name matching on 
+             /// to find tasks, loggers, and task factories.
+             /// </summary>
+-            [SuppressMessage("Microsoft.Reliability", "CA2001:AvoidCallingProblematicMethods", MessageId = "System.Reflection.Assembly.LoadFrom", Justification = "Necessary in this case.")]
+             private void ScanAssemblyForPublicTypes()
+             {
+                 // we need to search the assembly for the type...

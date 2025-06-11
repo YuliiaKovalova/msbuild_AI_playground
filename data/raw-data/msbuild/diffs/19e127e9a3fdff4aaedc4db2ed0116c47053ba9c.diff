@@ -1,0 +1,149 @@
+diff --git a/src/Tasks/AssemblyDependency/ReferenceTable.cs b/src/Tasks/AssemblyDependency/ReferenceTable.cs
+index e023707d985..45b5cae20e2 100644
+--- a/src/Tasks/AssemblyDependency/ReferenceTable.cs
++++ b/src/Tasks/AssemblyDependency/ReferenceTable.cs
+@@ -961,8 +961,8 @@ private void FindSatellites(
+                     return;
+                 }
+ 
+-                string[] subDirectories = _getDirectories(reference.DirectoryName, "*");
+-                string sateliteFilename = subDirectories.Length > 0
++                IEnumerable<string> subDirectories = _getDirectories(reference.DirectoryName, "*");
++                string satelliteFilename = subDirectories.Any()
+                     ? reference.FileNameWithoutExtension + ".resources.dll"
+                     : string.Empty;
+ 
+@@ -973,11 +973,11 @@ private void FindSatellites(
+ 
+                     if (CultureInfoCache.IsValidCultureString(cultureName))
+                     {
+-                        string satelliteAssembly = Path.Combine(subDirectory, sateliteFilename);
++                        string satelliteAssembly = Path.Combine(subDirectory, satelliteFilename);
+                         if (_fileExists(satelliteAssembly))
+                         {
+                             // This is valid satellite assembly.
+-                            reference.AddSatelliteFile(Path.Combine(cultureName, sateliteFilename));
++                            reference.AddSatelliteFile(Path.Combine(cultureName, satelliteFilename));
+                         }
+                     }
+                 }
+@@ -2773,6 +2773,7 @@ private ITaskItem SetItemMetadata(List<ITaskItem> relatedItems, List<ITaskItem>
+                 ITaskItem item = new TaskItem(Path.Combine(reference.DirectoryName, serializationAssemblyFile));
+                 // Clone metadata.
+                 referenceItem.CopyMetadataTo(item);
++                MSBuildEventSource.Log.TaskItemCopyMetadataToStart();
+ 
+                 // Add the serialization assembly item.
+                 serializationAssemblyItems.Add(item);
+diff --git a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+index 2c3e3779d45..435362d53b5 100644
+--- a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
++++ b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+@@ -15,6 +15,7 @@
+ using Microsoft.Build.Eventing;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
++using Microsoft.Build.Shared.FileSystem;
+ using Microsoft.Build.Tasks.AssemblyDependency;
+ using Microsoft.Build.Utilities;
+ 
+@@ -3199,7 +3200,12 @@ public override bool Execute()
+             return Execute(
+                 p => FileUtilities.FileExistsNoThrow(p),
+                 p => FileUtilities.DirectoryExistsNoThrow(p),
++#if NETFRAMEWORK
++                (p, searchPattern) => FileSystems.Default.EnumerateDirectories(p, searchPattern),
++#else
+                 (p, searchPattern) => Directory.GetDirectories(p, searchPattern),
++#endif
++                //
+                 p => AssemblyNameExtension.GetAssemblyNameEx(p),
+                 (string path, ConcurrentDictionary<string, AssemblyMetadata> assemblyMetadataCache, out AssemblyNameExtension[] dependencies, out string[] scatterFiles, out FrameworkNameVersioning frameworkName)
+                     => AssemblyInformation.GetAssemblyMetadata(path, assemblyMetadataCache, out dependencies, out scatterFiles, out frameworkName),
+@@ -3219,6 +3225,6 @@ public override bool Execute()
+                 p => ReferenceTable.ReadMachineTypeFromPEHeader(p));
+         }
+ 
+-        #endregion
++#endregion
+     }
+ }
+diff --git a/src/Tasks/Delegate.cs b/src/Tasks/Delegate.cs
+index b315d29426b..eb5f8614c14 100644
+--- a/src/Tasks/Delegate.cs
++++ b/src/Tasks/Delegate.cs
+@@ -14,13 +14,13 @@
+ namespace Microsoft.Build.Tasks
+ {
+     /// <summary>
+-    /// File.GetAttributes delegate
++    /// File.GetAttributes delegate.
+     /// </summary>
+     /// <param name="path">The path get attributes for.</param>
+     internal delegate FileAttributes GetAttributes(string path);
+ 
+     /// <summary>
+-    /// File SetAttributes delegate
++    /// File SetAttributes delegate.
+     /// </summary>
+     /// <param name="path">The path to set attributes for.</param>
+     /// <param name="attributes">The actual file attributes.</param>
+@@ -37,12 +37,12 @@ namespace Microsoft.Build.Tasks
+     internal delegate void SetLastWriteTime(string path, DateTime timestamp);
+ 
+     /// <summary>
+-    /// GetDirectories delegate
++    /// GetDirectories delegate.
+     /// </summary>
+     /// <param name="path">The path to get directories for.</param>
+     /// <param name="pattern">The pattern to search for.</param>
+     /// <returns>An array of directories.</returns>
+-    internal delegate string[] GetDirectories(string path, string pattern);
++    internal delegate IEnumerable<string> GetDirectories(string path, string pattern);
+ 
+     /// <summary>
+     /// CopyFile delegate
+diff --git a/src/Tasks/SystemState.cs b/src/Tasks/SystemState.cs
+index dd09094f7d1..c3981c90595 100644
+--- a/src/Tasks/SystemState.cs
++++ b/src/Tasks/SystemState.cs
+@@ -10,6 +10,7 @@
+ using System.Linq;
+ using System.Runtime.Versioning;
+ using Microsoft.Build.BackEnd;
++using Microsoft.Build.Eventing;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Tasks.AssemblyDependency;
+@@ -65,7 +66,7 @@ internal sealed class SystemState : StateFileBase, ITranslatable
+         /// is only considered good for the lifetime of the task (or whatever) that owns
+         /// this instance.
+         /// </summary>
+-        private Dictionary<string, string[]> instanceLocalDirectories = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
++        private Dictionary<string, IEnumerable<string>> instanceLocalDirectories = new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+ 
+         /// <summary>
+         /// Additional level of caching kept at the process level.
+@@ -631,18 +632,18 @@ internal void SerializePrecomputedCache(string stateFile, TaskLoggingHelper log)
+         /// </summary>
+         /// <param name="path"></param>
+         /// <param name="pattern"></param>
+-        /// <returns></returns>
+-        private string[] GetDirectories(string path, string pattern)
++        /// <returns>The list of directories from the specified path.</returns>
++        private IEnumerable<string> GetDirectories(string path, string pattern)
+         {
+             // Only cache the *. pattern. This is by far the most common pattern
+             // and generalized caching would require a call to Path.Combine which
+             // is a string-copy.
+             if (pattern == "*")
+             {
+-                instanceLocalDirectories.TryGetValue(path, out string[] cached);
++                instanceLocalDirectories.TryGetValue(path, out IEnumerable<string> cached);
+                 if (cached == null)
+                 {
+-                    string[] directories = getDirectories(path, pattern);
++                    IEnumerable<string> directories = getDirectories(path, pattern);
+                     instanceLocalDirectories[path] = directories;
+                     return directories;
+                 }

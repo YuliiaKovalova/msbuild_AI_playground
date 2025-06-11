@@ -1,0 +1,220 @@
+diff --git a/src/Build.UnitTests/BackEnd/MockHost.cs b/src/Build.UnitTests/BackEnd/MockHost.cs
+index 4b8f3b07286..649c7488669 100644
+--- a/src/Build.UnitTests/BackEnd/MockHost.cs
++++ b/src/Build.UnitTests/BackEnd/MockHost.cs
+@@ -5,6 +5,7 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BackEnd.SdkResolution;
++using Microsoft.Build.BuildCop.Infrastructure;
+ using Microsoft.Build.Engine.UnitTests.BackEnd;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+@@ -61,6 +62,8 @@ internal sealed class MockHost : MockLoggingService, IBuildComponentHost, IBuild
+ 
+         private ISdkResolverService _sdkResolverService;
+ 
++        private IBuildCopManagerProvider _buildCopManagerProvider;
++
+         #region SystemParameterFields
+ 
+         #endregion;
+@@ -126,6 +129,9 @@ public MockHost(BuildParameters buildParameters, ConfigCache overrideConfigCache
+ 
+             _sdkResolverService = new MockSdkResolverService();
+             ((IBuildComponent)_sdkResolverService).InitializeComponent(this);
++
++            _buildCopManagerProvider = new NullBuildCopManagerProvider();
++            ((IBuildComponent)_buildCopManagerProvider).InitializeComponent(this);
+         }
+ 
+         /// <summary>
+@@ -194,6 +200,7 @@ public IBuildComponent GetComponent(BuildComponentType type)
+                 BuildComponentType.ResultsCache => (IBuildComponent)_resultsCache,
+                 BuildComponentType.RequestBuilder => (IBuildComponent)_requestBuilder,
+                 BuildComponentType.SdkResolverService => (IBuildComponent)_sdkResolverService,
++                BuildComponentType.BuildCop => (IBuildComponent)_buildCopManagerProvider,
+                 _ => throw new ArgumentException("Unexpected type " + type),
+             };
+         }
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index aa8310d26a7..135e311eb8f 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -2975,12 +2975,12 @@ private ILoggingService CreateLoggingService(
+             loggingService.WarningsNotAsErrors = warningsNotAsErrors;
+             loggingService.WarningsAsMessages = warningsAsMessages;
+ 
+-            var buildCopManagerProvider =
+-                ((IBuildComponentHost)this).GetComponent(BuildComponentType.BuildCop) as BuildCopManagerProvider;
+-            buildCopManagerProvider!.Instance.SetDataSource(BuildCopDataSource.EventArgs);
+-
+             if (((IBuildComponentHost)this).BuildParameters.IsBuildCopEnabled)
+             {
++                var buildCopManagerProvider =
++                    ((IBuildComponentHost)this).GetComponent(BuildComponentType.BuildCop) as IBuildCopManagerProvider;
++                buildCopManagerProvider!.Instance.SetDataSource(BuildCopDataSource.EventArgs);
++
+                 loggers = (loggers ?? Enumerable.Empty<ILogger>()).Concat(new[]
+                 {
+                     new BuildCopConnectorLogger(new AnalyzerLoggingContextFactory(loggingService), buildCopManagerProvider.Instance)
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+index 6b880af201a..4932f0c2293 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+@@ -283,7 +283,7 @@ public void CleanupForBuild()
+                         throw new AggregateException(deactivateExceptions);
+                     }
+ 
+-                    var buildCopManager = (_componentHost.GetComponent(BuildComponentType.BuildCop) as BuildCopManagerProvider)!.Instance;
++                    var buildCopManager = (_componentHost.GetComponent(BuildComponentType.BuildCop) as IBuildCopManagerProvider)!.Instance;
+                     buildCopManager.FinalizeProcessing(_nodeLoggingContext);
+                 },
+                 isLastTask: true);
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index e3bd9f69f58..ce2f4a1e79e 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -1120,7 +1120,7 @@ private async Task<BuildResult> BuildProject()
+         {
+             // We consider this the entrypoint for the project build for purposes of BuildCop processing 
+ 
+-            var buildCopManager = (_componentHost.GetComponent(BuildComponentType.BuildCop) as BuildCopManagerProvider)!.Instance;
++            var buildCopManager = (_componentHost.GetComponent(BuildComponentType.BuildCop) as IBuildCopManagerProvider)!.Instance;
+             buildCopManager.SetDataSource(BuildCopDataSource.BuildExecution);
+ 
+             ErrorUtilities.VerifyThrow(_targetBuilder != null, "Target builder is null");
+diff --git a/src/Build/BuildCop/Infrastructure/BuildCopManagerProvider.cs b/src/Build/BuildCop/Infrastructure/BuildCopManagerProvider.cs
+index ada79d28df3..67c7027e61e 100644
+--- a/src/Build/BuildCop/Infrastructure/BuildCopManagerProvider.cs
++++ b/src/Build/BuildCop/Infrastructure/BuildCopManagerProvider.cs
+@@ -9,6 +9,7 @@
+ using System.IO;
+ using System.Linq;
+ using System.Runtime.ConstrainedExecution;
++using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Components.Caching;
+ using Microsoft.Build.BackEnd.Logging;
+@@ -27,13 +28,16 @@ namespace Microsoft.Build.BuildCop.Infrastructure;
+ internal delegate BuildAnalyzer BuildAnalyzerFactory();
+ internal delegate BuildAnalyzerWrapper BuildAnalyzerWrapperFactory(ConfigurationContext configurationContext);
+ 
+-internal sealed class BuildCopManagerProvider : IBuildComponent
++/// <summary>
++/// The central manager for the BuildCop - this is the integration point with MSBuild infrastructure.
++/// </summary>
++internal sealed class BuildCopManagerProvider : IBuildCopManagerProvider
+ {
+-    private static bool s_isInitialized = false;
++    private static int s_isInitialized = 0;
+     private static IBuildCopManager s_globalInstance = new NullBuildCopManager();
+-    internal static IBuildCopManager GlobalInstance => s_isInitialized ? s_globalInstance : throw new InvalidOperationException("BuildCopManagerProvider not initialized");
++    internal static IBuildCopManager GlobalInstance => s_isInitialized != 0 ? s_globalInstance : throw new InvalidOperationException("BuildCopManagerProvider not initialized");
+ 
+-    internal IBuildCopManager Instance => GlobalInstance;
++    public IBuildCopManager Instance => GlobalInstance;
+ 
+     internal static IBuildComponent CreateComponent(BuildComponentType type)
+     {
+@@ -45,13 +49,11 @@ public void InitializeComponent(IBuildComponentHost host)
+     {
+         ErrorUtilities.VerifyThrow(host != null, "BuildComponentHost was null");
+ 
+-        if (s_isInitialized)
++        if (Interlocked.CompareExchange(ref s_isInitialized, 1, 0) == 1)
+         {
+-            // TODO: change to interlocked
++            // Already initialized
+             return;
+-            // throw new InvalidOperationException("BuildCopManagerProvider is already initialized");
+         }
+-        s_isInitialized = true;
+ 
+         if (host!.BuildParameters.IsBuildCopEnabled)
+         {
+diff --git a/src/Build/BuildCop/Infrastructure/IBuildCopManager.cs b/src/Build/BuildCop/Infrastructure/IBuildCopManager.cs
+index 9d5d8c89f5a..2082c82f286 100644
+--- a/src/Build/BuildCop/Infrastructure/IBuildCopManager.cs
++++ b/src/Build/BuildCop/Infrastructure/IBuildCopManager.cs
+@@ -11,7 +11,6 @@
+ using Microsoft.Build.BuildCop.Acquisition;
+ using Microsoft.Build.BuildCop.Infrastructure;
+ using Microsoft.Build.Framework;
+-using static Microsoft.Build.BuildCop.Infrastructure.BuildCopManagerProvider;
+ 
+ namespace Microsoft.Build.Experimental.BuildCop;
+ 
+@@ -23,6 +22,9 @@ internal enum BuildCopDataSource
+     ValuesCount = BuildExecution + 1
+ }
+ 
++/// <summary>
++/// The central manager for the BuildCop - this is the integration point with MSBuild infrastructure.
++/// </summary>
+ internal interface IBuildCopManager
+ {
+     void ProcessEvaluationFinishedEventArgs(
+diff --git a/src/Build/BuildCop/Infrastructure/IBuildCopManagerProvider.cs b/src/Build/BuildCop/Infrastructure/IBuildCopManagerProvider.cs
+new file mode 100644
+index 00000000000..a58bc5ae321
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/IBuildCopManagerProvider.cs
+@@ -0,0 +1,17 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Experimental.BuildCop;
++
++namespace Microsoft.Build.BuildCop.Infrastructure;
++
++internal interface IBuildCopManagerProvider : IBuildComponent
++{
++    IBuildCopManager Instance { get; }
++}
+diff --git a/src/Build/BuildCop/Infrastructure/NullBuildCopManagerProvider.cs b/src/Build/BuildCop/Infrastructure/NullBuildCopManagerProvider.cs
+new file mode 100644
+index 00000000000..3aaf8708347
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/NullBuildCopManagerProvider.cs
+@@ -0,0 +1,20 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Experimental.BuildCop;
++
++namespace Microsoft.Build.BuildCop.Infrastructure;
++
++internal class NullBuildCopManagerProvider : IBuildCopManagerProvider
++{
++    public IBuildCopManager Instance { get; } = new NullBuildCopManager();
++
++    public void InitializeComponent(IBuildComponentHost host) { }
++    public void ShutdownComponent() { }
++}
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 024368af5f9..3eb6f37c3a1 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -158,7 +158,9 @@
+     <Compile Include="BuildCop\Analyzers\SharedOutputPathAnalyzer.cs" />
+     <Compile Include="BuildCop\Infrastructure\BuildCopConfigurationException.cs" />
+     <Compile Include="BuildCop\Infrastructure\BuildEventsProcessor.cs" />
++    <Compile Include="BuildCop\Infrastructure\IBuildCopManagerProvider.cs" />
+     <Compile Include="BuildCop\Infrastructure\NullBuildCopManager.cs" />
++    <Compile Include="BuildCop\Infrastructure\NullBuildCopManagerProvider.cs" />
+     <Compile Include="BuildCop\Infrastructure\TracingReporter.cs" />
+     <Compile Include="BuildCop\OM\BuildAnalysisContext.cs" />
+     <Compile Include="BuildCop\API\BuildAnalyzer.cs" />

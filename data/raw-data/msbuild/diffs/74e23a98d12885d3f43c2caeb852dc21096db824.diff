@@ -1,0 +1,607 @@
+diff --git a/src/Build/BuildCheck/Analyzers/DoubleWritesAnalyzer.cs b/src/Build/BuildCheck/Analyzers/DoubleWritesAnalyzer.cs
+new file mode 100644
+index 00000000000..e5fc6b22cfd
+--- /dev/null
++++ b/src/Build/BuildCheck/Analyzers/DoubleWritesAnalyzer.cs
+@@ -0,0 +1,127 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Collections.Immutable;
++using System.Diagnostics;
++using System.IO;
++using System.Linq;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Experimental.BuildCheck;
++using static Microsoft.Build.Experimental.BuildCheck.TaskInvocationAnalysisData;
++
++#if FEATURE_MSIOREDIST
++using Path = Microsoft.IO.Path;
++#endif
++
++namespace Microsoft.Build.Experimental.BuildCheck.Analyzers;
++
++internal sealed class DoubleWritesAnalyzer : BuildAnalyzer
++{
++    public static BuildAnalyzerRule SupportedRule = new BuildAnalyzerRule("BC0102", "DoubleWrites",
++        "Two tasks should not write the same file",
++        "Tasks {0} and {1} from projects {2} and {3} write the same file: {4}.",
++        new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, IsEnabled = true });
++
++    public override string FriendlyName => "MSBuild.DoubleWritesAnalyzer";
++
++    public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } = [SupportedRule];
++
++    public override void Initialize(ConfigurationContext configurationContext)
++    {
++        /* This is it - no custom configuration */
++    }
++
++    public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++    {
++        registrationContext.RegisterTaskInvocationAction(TaskInvocationAction);
++    }
++
++    /// <summary>
++    /// Contains the first project file + task that wrote the given file during the build.
++    /// </summary>
++    private readonly Dictionary<string, (string projectFilePath, string taskName)> _filesWritten = new(StringComparer.CurrentCultureIgnoreCase);
++
++    private void TaskInvocationAction(BuildCheckDataContext<TaskInvocationAnalysisData> context)
++    {
++        // This analyzer uses a hard-coded list of tasks known to write files.
++        switch (context.Data.TaskName)
++        {
++            case "Csc":
++            case "Vbc":
++            case "Fsc": AnalyzeCompilerTask(context); break;
++            case "Copy": AnalyzeCopyTask(context); break;
++        }
++    }
++
++    private void AnalyzeCompilerTask(BuildCheckDataContext<TaskInvocationAnalysisData> context)
++    {
++        var taskParameters = context.Data.Parameters;
++
++        // Compiler tasks have several parameters representing files being written.
++        AnalyzeParameter("OutputAssembly");
++        AnalyzeParameter("OutputRefAssembly");
++        AnalyzeParameter("DocumentationFile");
++        AnalyzeParameter("PdbFile");
++
++        void AnalyzeParameter(string parameterName)
++        {
++            if (taskParameters.TryGetValue(parameterName, out TaskParameter? taskParameter))
++            {
++                string outputPath = taskParameter.EnumerateStringValues().FirstOrDefault() ?? "";
++                AnalyzeWrite(context, outputPath);
++            }
++        }
++    }
++
++    private void AnalyzeCopyTask(BuildCheckDataContext<TaskInvocationAnalysisData> context)
++    {
++        var taskParameters = context.Data.Parameters;
++
++        // The destination is specified as either DestinationFolder or DestinationFiles.
++        if (taskParameters.TryGetValue("SourceFiles", out TaskParameter? sourceFiles) &&
++            taskParameters.TryGetValue("DestinationFolder", out TaskParameter? destinationFolder))
++        {
++            string destinationFolderPath = destinationFolder.EnumerateStringValues().FirstOrDefault() ?? "";
++            foreach (string sourceFilePath in sourceFiles.EnumerateStringValues())
++            {
++                AnalyzeWrite(context, Path.Combine(destinationFolderPath, Path.GetFileName(sourceFilePath)));
++            }
++        }
++        else if (taskParameters.TryGetValue("DestinationFiles", out TaskParameter? destinationFiles))
++        {
++            foreach (string destinationFilePath in destinationFiles.EnumerateStringValues())
++            {
++                AnalyzeWrite(context, destinationFilePath);
++            }
++        }
++    }
++
++    private void AnalyzeWrite(BuildCheckDataContext<TaskInvocationAnalysisData> context, string fileBeingWritten)
++    {
++        if (!string.IsNullOrEmpty(fileBeingWritten))
++        {
++            // Absolutize the path. Note that if a path used during a build is relative, it is relative to the directory
++            // of the project being built, regardless of the project/import in which it occurs.
++            fileBeingWritten = Path.GetFullPath(fileBeingWritten, context.Data.ProjectFileDirectory);
++
++            if (_filesWritten.TryGetValue(fileBeingWritten, out (string projectFilePath, string taskName) existingEntry))
++            {
++                context.ReportResult(BuildCheckResult.Create(
++                    SupportedRule,
++                    context.Data.TaskInvocationLocation,
++                    context.Data.TaskName,
++                    existingEntry.taskName,
++                    Path.GetFileName(context.Data.ProjectFilePath),
++                    Path.GetFileName(existingEntry.projectFilePath),
++                    fileBeingWritten));
++            }
++            else
++            {
++                _filesWritten.Add(fileBeingWritten, (context.Data.ProjectFilePath, context.Data.TaskName));
++            }
++        }
++   }
++}
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index f76b6434356..945990a102b 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -133,7 +133,8 @@ private static readonly (string[] ruleIds, bool defaultEnablement, BuildAnalyzer
+         [
+             // BuildCheckDataSource.EventArgs
+             [
+-                ([SharedOutputPathAnalyzer.SupportedRule.Id], SharedOutputPathAnalyzer.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<SharedOutputPathAnalyzer>)
++                ([SharedOutputPathAnalyzer.SupportedRule.Id], SharedOutputPathAnalyzer.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<SharedOutputPathAnalyzer>),
++                ([DoubleWritesAnalyzer.SupportedRule.Id], DoubleWritesAnalyzer.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<DoubleWritesAnalyzer>),
+             ],
+             // BuildCheckDataSource.Execution
+             []
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index aa804067b60..e9a5f9e8aa2 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -38,13 +38,23 @@ private struct ExecutingTaskData
+         public Dictionary<string, TaskInvocationAnalysisData.TaskParameter> TaskParameters;
+     }
+ 
++    /// <summary>
++    /// Uniquely identifies a task.
++    /// </summary>
++    private record struct TaskKey(int ProjectContextId, int TargetId, int TaskId)
++    {
++        public TaskKey(BuildEventContext context)
++            : this(context.ProjectContextId, context.TargetId, context.TaskId)
++        { }
++    }
++
+     private readonly SimpleProjectRootElementCache _cache = new SimpleProjectRootElementCache();
+     private readonly BuildCheckCentralContext _buildCheckCentralContext = buildCheckCentralContext;
+ 
+     /// <summary>
+     /// Keeps track of in-flight tasks. Keyed by task ID as passed in <see cref="BuildEventContext.TaskId"/>.
+     /// </summary>
+-    private readonly Dictionary<int, ExecutingTaskData> _tasksBeingExecuted = [];
++    private readonly Dictionary<TaskKey, ExecutingTaskData> _tasksBeingExecuted = [];
+ 
+     // This requires MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION set to 1
+     internal void ProcessEvaluationFinishedEventArgs(
+@@ -105,7 +115,7 @@ internal void ProcessTaskStartedEventArgs(
+                     parameters: taskParameters),
+             };
+ 
+-            _tasksBeingExecuted.Add(taskStartedEventArgs.BuildEventContext.TaskId, taskData);
++            _tasksBeingExecuted.Add(new TaskKey(taskStartedEventArgs.BuildEventContext), taskData);
+         }
+     }
+ 
+@@ -119,12 +129,15 @@ internal void ProcessTaskFinishedEventArgs(
+             return;
+         }
+ 
+-        if (taskFinishedEventArgs.BuildEventContext is not null &&
+-            _tasksBeingExecuted.TryGetValue(taskFinishedEventArgs.BuildEventContext.TaskId, out ExecutingTaskData taskData))
++        if (taskFinishedEventArgs?.BuildEventContext is not null)
+         {
+-            // All task parameters have been recorded by now so remove the task from the dictionary and fire the registered build check actions.
+-            _tasksBeingExecuted.Remove(taskFinishedEventArgs.BuildEventContext.TaskId);
+-            _buildCheckCentralContext.RunTaskInvocationActions(taskData.AnalysisData, buildAnalysisContext, ReportResult);
++            TaskKey taskKey = new TaskKey(taskFinishedEventArgs.BuildEventContext);
++            if (_tasksBeingExecuted.TryGetValue(taskKey, out ExecutingTaskData taskData))
++            {
++                // All task parameters have been recorded by now so remove the task from the dictionary and fire the registered build check actions.
++                _tasksBeingExecuted.Remove(taskKey);
++                _buildCheckCentralContext.RunTaskInvocationActions(taskData.AnalysisData, buildAnalysisContext, ReportResult);
++            }
+         }
+     }
+ 
+@@ -147,7 +160,7 @@ internal void ProcessTaskParameterEventArgs(
+         }
+ 
+         if (taskParameterEventArgs.BuildEventContext is not null &&
+-            _tasksBeingExecuted.TryGetValue(taskParameterEventArgs.BuildEventContext.TaskId, out ExecutingTaskData taskData))
++            _tasksBeingExecuted.TryGetValue(new TaskKey(taskParameterEventArgs.BuildEventContext), out ExecutingTaskData taskData))
+         {
+             // Add the parameter name and value to the matching entry in _tasksBeingExecuted. Parameters come typed as IList
+             // but it's more natural to pass them as scalar values so we unwrap one-element lists.
+@@ -187,7 +200,11 @@ private static void ReportResult(
+         }
+ 
+         BuildEventArgs eventArgs = result.ToEventArgs(config.Severity);
+-        eventArgs.BuildEventContext = loggingContext.BuildEventContext;
++
++        // TODO: This is a workaround for https://github.com/dotnet/msbuild/issues/10176
++        // eventArgs.BuildEventContext = loggingContext.BuildEventContext;
++        eventArgs.BuildEventContext = BuildEventContext.Invalid;
++
+         loggingContext.LogBuildEvent(eventArgs);
+     }
+ }
+diff --git a/src/Build/BuildCheck/OM/BuildCheckDataContext.cs b/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
+index f0623e4a822..b47f510e165 100644
+--- a/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
++++ b/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
+@@ -10,6 +10,7 @@
+ using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Experimental;
+ using Microsoft.Build.Framework;
++using System.IO;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+@@ -19,10 +20,18 @@ namespace Microsoft.Build.Experimental.BuildCheck;
+ /// <param name="projectFilePath">Currently built project.</param>
+ public abstract class AnalysisData(string projectFilePath)
+ {
++    private string? _projectFileDirectory;
++
+     /// <summary>
+     /// Full path to the project file being built.
+     /// </summary>
+     public string ProjectFilePath { get; } = projectFilePath;
++
++    /// <summary>
++    /// Directory path of the file being built (the containing directory of <see cref="ProjectFilePath"/>).
++    /// </summary>
++    public string ProjectFileDirectory =>
++        _projectFileDirectory ??= Path.GetDirectoryName(ProjectFilePath)!;
+ }
+ 
+ /// <summary>
+diff --git a/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs b/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
+index 86598ada553..fdaf92aa510 100644
+--- a/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
++++ b/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
+@@ -6,6 +6,7 @@
+ using System.Linq;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
++using Microsoft.Build.Framework;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+@@ -64,7 +65,46 @@ public sealed class TaskInvocationAnalysisData : AnalysisData
+     /// in task parameters: <see cref="Framework.ITaskItem"/>, <see cref="Framework.ITaskItem"/>[],
+     /// bool, string, or anything else convertible to/from string.</param>
+     /// <param name="IsOutput">True for output parameters, false for input parameters.</param>
+-    public record class TaskParameter(object? Value, bool IsOutput);
++    public record class TaskParameter(object? Value, bool IsOutput)
++    {
++        /// <summary>
++        /// Enumerates all values passed in this parameter. E.g. for Param="@(Compile)", this will return
++        /// all Compile items.
++        /// </summary>
++        public IEnumerable<object> EnumerateValues()
++        {
++            if (Value is System.Collections.IList list)
++            {
++                foreach (object obj in list)
++                {
++                    yield return obj;
++                }
++            }
++            else if (Value is object obj)
++            {
++                yield return obj;
++            }
++        }
++
++        /// <summary>
++        /// Enumerates all values passed in this parameter, converted to strings. E.g. for Param="@(Compile)",
++        /// this will return all Compile item specs.
++        /// </summary>
++        public IEnumerable<string> EnumerateStringValues()
++        {
++            foreach (object obj in EnumerateValues())
++            {
++                if (obj is ITaskItem taskItem)
++                {
++                    yield return taskItem.ItemSpec;
++                }
++                else
++                {
++                    yield return obj.ToString() ?? "";
++                }
++            }
++        }
++    }
+ 
+     internal TaskInvocationAnalysisData(
+         string projectFilePath,
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index d71ce74084b..aeedba3e4c2 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -159,6 +159,7 @@
+     <Compile Include="BuildCheck\Acquisition\BuildCheckAcquisitionModule.cs" />
+     <Compile Include="BuildCheck\Acquisition\IBuildCheckAcquisitionModule.cs" />
+     <Compile Include="BuildCheck\Analyzers\SharedOutputPathAnalyzer.cs" />
++    <Compile Include="BuildCheck\Analyzers\DoubleWritesAnalyzer.cs" />
+     <Compile Include="BuildCheck\Infrastructure\BuildCheckConfigurationException.cs" />
+     <Compile Include="BuildCheck\Infrastructure\BuildCheckForwardingLogger.cs" />
+     <Compile Include="BuildCheck\Infrastructure\BuildEventsProcessor.cs" />
+diff --git a/src/BuildCheck.UnitTests/DoubleWritesAnalyzer_Tests.cs b/src/BuildCheck.UnitTests/DoubleWritesAnalyzer_Tests.cs
+new file mode 100644
+index 00000000000..fd1b601af06
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/DoubleWritesAnalyzer_Tests.cs
+@@ -0,0 +1,109 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Experimental.BuildCheck.Analyzers;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
++using Shouldly;
++using Xunit;
++
++namespace Microsoft.Build.BuildCheck.UnitTests
++{
++    public sealed class DoubleWritesAnalyzer_Tests
++    {
++        private sealed class MockBuildCheckRegistrationContext : IBuildCheckRegistrationContext
++        {
++            private event Action<BuildCheckDataContext<TaskInvocationAnalysisData>>? _taskInvocationAction;
++
++            public List<BuildCheckResult> Results { get; } = new();
++
++            public void RegisterEvaluatedPropertiesAction(Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction) => throw new NotImplementedException();
++            public void RegisterParsedItemsAction(Action<BuildCheckDataContext<ParsedItemsAnalysisData>> parsedItemsAction) => throw new NotImplementedException();
++
++            public void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction)
++                => _taskInvocationAction += taskInvocationAction;
++
++            public void TriggerTaskInvocationAction(TaskInvocationAnalysisData data)
++            {
++                if (_taskInvocationAction is not null)
++                {
++                    BuildCheckDataContext<TaskInvocationAnalysisData> context = new BuildCheckDataContext<TaskInvocationAnalysisData>(
++                        null!,
++                        null!,
++                        null!,
++                        ResultHandler,
++                        data);
++                    _taskInvocationAction(context);
++                }
++            }
++
++            private void ResultHandler(BuildAnalyzerWrapper wrapper, LoggingContext context, BuildAnalyzerConfigurationInternal[] configs, BuildCheckResult result)
++                => Results.Add(result);
++        }
++
++        private readonly DoubleWritesAnalyzer _analyzer;
++
++        private readonly MockBuildCheckRegistrationContext _registrationContext;
++
++        public DoubleWritesAnalyzer_Tests()
++        {
++            _analyzer = new DoubleWritesAnalyzer();
++            _registrationContext = new MockBuildCheckRegistrationContext();
++            _analyzer.RegisterActions(_registrationContext);
++        }
++
++        private TaskInvocationAnalysisData MakeTaskInvocationData(string taskName, Dictionary<string, TaskInvocationAnalysisData.TaskParameter> parameters)
++        {
++            string projectFile = NativeMethodsShared.IsWindows ? @"C:\fake\project.proj" : "/fake/project.proj";
++            return new TaskInvocationAnalysisData(
++                projectFile,
++                Construction.ElementLocation.EmptyLocation,
++                taskName,
++                projectFile,
++                parameters);
++        }
++
++        [Fact]
++        public void TestCopyTask()
++        {
++            _registrationContext.TriggerTaskInvocationAction(MakeTaskInvocationData("Copy", new Dictionary<string, TaskInvocationAnalysisData.TaskParameter>
++                {
++                    { "SourceFiles", new TaskInvocationAnalysisData.TaskParameter("source1", IsOutput: false) },
++                    { "DestinationFolder", new TaskInvocationAnalysisData.TaskParameter("outdir", IsOutput: false) },
++                }));
++            _registrationContext.TriggerTaskInvocationAction(MakeTaskInvocationData("Copy", new Dictionary<string, TaskInvocationAnalysisData.TaskParameter>
++                {
++                    { "SourceFiles", new TaskInvocationAnalysisData.TaskParameter("source1", IsOutput: false) },
++                    { "DestinationFiles", new TaskInvocationAnalysisData.TaskParameter(Path.Combine("outdir", "source1"), IsOutput: false) },
++                }));
++
++            _registrationContext.Results.Count.ShouldBe(1);
++            _registrationContext.Results[0].BuildAnalyzerRule.Id.ShouldBe("BC0102");
++        }
++
++        [Theory]
++        [InlineData("Csc")]
++        [InlineData("Vbc")]
++        [InlineData("Fsc")]
++        public void TestCompilerTask(string taskName)
++        {
++            for (int i = 0; i < 2; i++)
++            {
++                _registrationContext.TriggerTaskInvocationAction(MakeTaskInvocationData(taskName, new Dictionary<string, TaskInvocationAnalysisData.TaskParameter>
++                    {
++                        { "OutputAssembly", new TaskInvocationAnalysisData.TaskParameter("out.dll", IsOutput: false) },
++                        { "OutputRefAssembly", new TaskInvocationAnalysisData.TaskParameter("out_ref.dll", IsOutput: false) },
++                        { "DocumentationFile", new TaskInvocationAnalysisData.TaskParameter("out.xml", IsOutput: false) },
++                        { "PdbFile", new TaskInvocationAnalysisData.TaskParameter("out.pdb", IsOutput: false) },
++                    }));
++            }
++
++            _registrationContext.Results.Count.ShouldBe(4);
++            _registrationContext.Results.ForEach(result => result.BuildAnalyzerRule.Id.ShouldBe("BC0102"));
++        }
++    }
++}
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 02db03c83dd..98d53d0e384 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -37,26 +37,27 @@ public EndToEndTests(ITestOutputHelper output)
+     [InlineData(false, false)]
+     public void SampleAnalyzerIntegrationTest(bool buildInOutOfProcessNode, bool analysisRequested)
+     {
++        TransientTestFolder workFolder = _env.CreateFolder(createFolder: true);
++        TransientTestFile testFile = _env.CreateFile(workFolder, "somefile");
++
+         string contents = $"""
+             <Project Sdk="Microsoft.NET.Sdk" DefaultTargets="Hello">
+                 
+                 <PropertyGroup>
+-                <OutputType>Exe</OutputType>
+-                <TargetFramework>net8.0</TargetFramework>
+-                <ImplicitUsings>enable</ImplicitUsings>
+-                <Nullable>enable</Nullable>
++                    <OutputType>Exe</OutputType>
++                    <TargetFramework>net8.0</TargetFramework>
++                    <ImplicitUsings>enable</ImplicitUsings>
++                    <Nullable>enable</Nullable>
+                 </PropertyGroup>
+                   
+                 <PropertyGroup Condition="$(Test) == true">
+-                <TestProperty>Test</TestProperty>
++                    <TestProperty>Test</TestProperty>
+                 </PropertyGroup>
+                  
+-                <ItemGroup>
+-                <ProjectReference Include=".\FooBar-Copy.csproj" />
+-                </ItemGroup>
+-                  
+                 <Target Name="Hello">
+-                <Message Importance="High" Condition="$(Test2) == true" Text="XYZABC" />
++                    <Message Importance="High" Condition="$(Test2) == true" Text="XYZABC" />
++                    <Copy SourceFiles="{testFile.Path}" DestinationFolder="{workFolder.Path}" />
++                    <MSBuild Projects=".\FooBar-Copy.csproj" Targets="Hello" />
+                 </Target>
+                 
+             </Project>
+@@ -65,27 +66,27 @@ public void SampleAnalyzerIntegrationTest(bool buildInOutOfProcessNode, bool ana
+         string contents2 = $"""
+             <Project Sdk="Microsoft.NET.Sdk">
+                 <PropertyGroup>
+-                <OutputType>Exe</OutputType>
+-                <TargetFramework>net8.0</TargetFramework>
+-                <ImplicitUsings>enable</ImplicitUsings>
+-                <Nullable>enable</Nullable>
++                    <OutputType>Exe</OutputType>
++                    <TargetFramework>net8.0</TargetFramework>
++                    <ImplicitUsings>enable</ImplicitUsings>
++                    <Nullable>enable</Nullable>
+                 </PropertyGroup>
+                                  
+                 <PropertyGroup Condition="$(Test) == true">
+-                <TestProperty>Test</TestProperty>
++                    <TestProperty>Test</TestProperty>
+                 </PropertyGroup>
+                                 
+                 <ItemGroup>
+-                <Reference Include="bin/foo.dll" />
++                    <Reference Include="bin/foo.dll" />
+                 </ItemGroup>
+                                 
+                 <Target Name="Hello">
+-                <Message Importance="High" Condition="$(Test2) == true" Text="XYZABC" />
++                    <Message Importance="High" Condition="$(Test2) == true" Text="XYZABC" />
++                    <Copy SourceFiles="{testFile.Path}" DestinationFolder="{workFolder.Path}" />
+                 </Target>
+                                
+             </Project>
+             """;
+-        TransientTestFolder workFolder = _env.CreateFolder(createFolder: true);
+         TransientTestFile projectFile = _env.CreateFile(workFolder, "FooBar.csproj", contents);
+         TransientTestFile projectFile2 = _env.CreateFile(workFolder, "FooBar-Copy.csproj", contents2);
+ 
+@@ -97,6 +98,9 @@ public void SampleAnalyzerIntegrationTest(bool buildInOutOfProcessNode, bool ana
+             build_check.BC0101.IsEnabled=true
+             build_check.BC0101.Severity=warning
+ 
++            build_check.BC0102.IsEnabled=true
++            build_check.BC0102.Severity=warning
++
+             build_check.COND0543.IsEnabled=false
+             build_check.COND0543.Severity=Error
+             build_check.COND0543.EvaluationAnalysisScope=AnalyzedProjectOnly
+@@ -117,14 +121,16 @@ public void SampleAnalyzerIntegrationTest(bool buildInOutOfProcessNode, bool ana
+             (analysisRequested ? " -analyze" : string.Empty), out bool success, false, _env.Output, timeoutMilliseconds: 120_000);
+         _env.Output.WriteLine(output);
+         success.ShouldBeTrue();
+-        // The conflicting outputs warning appears - but only if analysis was requested
++        // The analyzer warnings should appear - but only if analysis was requested.
+         if (analysisRequested)
+         {
+             output.ShouldContain("BC0101");
++            output.ShouldContain("BC0102");
+         }
+         else
+         {
+             output.ShouldNotContain("BC0101");
++            output.ShouldNotContain("BC0102");
+         }
+     }
+ 
+diff --git a/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs b/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
+index 67d7cf784ef..e0600fc657c 100644
+--- a/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
++++ b/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
+@@ -4,11 +4,13 @@
+ using System;
+ using System.Collections;
+ using System.Collections.Generic;
++using System.Linq;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.UnitTests;
++using Microsoft.Build.Utilities;
+ using Shouldly;
+ using Xunit;
+ using static Microsoft.Build.Experimental.BuildCheck.Infrastructure.BuildCheckManagerProvider;
+@@ -144,5 +146,36 @@ public void ReportsComplexTaskParameters(string outputElement)
+             data.Parameters["CombinedPaths"].IsOutput.ShouldBe(true);
+             data.Parameters["CombinedPaths"].Value.ShouldNotBeNull();
+         }
++
++        [Fact]
++        public void TaskParameterEnumeratesValues()
++        {
++            var parameter1 = MakeParameter("string");
++            parameter1.EnumerateValues().SequenceEqual(["string"]).ShouldBeTrue();
++            parameter1.EnumerateStringValues().SequenceEqual(["string"]).ShouldBeTrue();
++
++            var parameter2 = MakeParameter(true);
++            parameter2.EnumerateValues().SequenceEqual([true]);
++            parameter2.EnumerateStringValues().SequenceEqual(["True"]).ShouldBeTrue();
++
++            var item1 = new TaskItem("item1");
++            var parameter3 = MakeParameter(item1);
++            parameter3.EnumerateValues().SequenceEqual([item1]).ShouldBeTrue();
++            parameter3.EnumerateStringValues().SequenceEqual(["item1"]).ShouldBeTrue();
++
++            var array1 = new object[] { "string1", "string2" };
++            var parameter4 = MakeParameter(array1);
++            parameter4.EnumerateValues().SequenceEqual(array1).ShouldBeTrue();
++            parameter4.EnumerateStringValues().SequenceEqual(array1).ShouldBeTrue();
++
++            var item2 = new TaskItem("item2");
++            var array2 = new ITaskItem[] { item1, item2 };
++            var parameter5 = MakeParameter(array2);
++            parameter5.EnumerateValues().SequenceEqual(array2).ShouldBeTrue();
++            parameter5.EnumerateStringValues().SequenceEqual(["item1", "item2"]).ShouldBeTrue();
++
++            static TaskInvocationAnalysisData.TaskParameter MakeParameter(object value)
++                => new TaskInvocationAnalysisData.TaskParameter(value, IsOutput: false);
++        }
+     }
+ }

@@ -1,0 +1,144 @@
+diff --git a/src/MSBuild.UnitTests/TerminalLogger_Tests.cs b/src/MSBuild.UnitTests/TerminalLogger_Tests.cs
+index 0a66b25576b..6502940e137 100644
+--- a/src/MSBuild.UnitTests/TerminalLogger_Tests.cs
++++ b/src/MSBuild.UnitTests/TerminalLogger_Tests.cs
+@@ -6,17 +6,20 @@
+ using System.Collections.Generic;
+ using System.Globalization;
+ using System.IO;
++using System.Text;
+ using System.Text.RegularExpressions;
+ using System.Threading;
+ using System.Threading.Tasks;
+-
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Logging;
+ using Microsoft.Build.Logging.TerminalLogger;
+-
++using Microsoft.Build.UnitTests.Shared;
++using Shouldly;
+ using VerifyTests;
+ using VerifyXunit;
+ using Xunit;
+-
+ using static VerifyXunit.Verifier;
+ 
+ namespace Microsoft.Build.UnitTests
+@@ -236,10 +239,10 @@ public Task PrintBuildSummary_Failed()
+         [Fact]
+         public Task PrintBuildSummary_FailedWithErrors()
+         {
+-           InvokeLoggerCallbacksForSimpleProject(succeeded: false, () =>
+-           {
+-               ErrorRaised?.Invoke(_eventSender, MakeErrorEventArgs("Error!"));
+-           });
++            InvokeLoggerCallbacksForSimpleProject(succeeded: false, () =>
++            {
++                ErrorRaised?.Invoke(_eventSender, MakeErrorEventArgs("Error!"));
++            });
+ 
+             return Verify(_outputWriter.ToString(), _settings).UniqueForOSPlatform();
+         }
+@@ -285,5 +288,68 @@ public async Task DisplayNodesOverwritesWithNewTargetFramework()
+ 
+             await Verify(_outputWriter.ToString(), _settings).UniqueForOSPlatform();
+         }
++
++        [Fact]
++        public void TestTerminalLoggerTogetherWithOtherLoggers()
++        {
++            using (TestEnvironment env = TestEnvironment.Create())
++            { 
++                env.SetEnvironmentVariable("MSBUILDTESTINGFORCETERMINALLOGGERUSE", "1");
++                string contents = @"
++<Project>
++    <ItemGroup>
++        <Compile Include=""MyItem1.cs"" />
++    </ItemGroup>
++    <PropertyGroup>
++        <MyProp1>MyProperty1</MyProp1>
++    </PropertyGroup>
++    <Target Name = ""Build"">
++        <Message Text = ""Build target is executing."" Importance = ""High"" />
++    </Target>
++</Project>";
++                TransientTestFolder logFolder = env.CreateFolder(createFolder: true);
++                TransientTestFile projectFile = env.CreateFile(logFolder, "myProj.proj", contents);
++
++                BinaryLogger loggerWithTL = new();
++                string logFileWithTL = env.ExpectFile(".binlog").Path;
++                loggerWithTL.Parameters = logFileWithTL;
++
++                BinaryLogger loggerWithoutTL = new();
++                string logFileWithoutTL = env.ExpectFile(".binlog").Path;
++                loggerWithoutTL.Parameters = logFileWithoutTL;
++
++                // Execute MSBuild with binary, file and terminal loggers
++                RunnerUtilities.ExecMSBuild($"{projectFile.Path} /m /bl:{logFileWithTL} -flp:logfile={Path.Combine(logFolder.Path, "logFileWithTL.log")};verbosity=diagnostic -tl", out bool success);
++                success.ShouldBeTrue();
++
++                // Execute MSBuild with binary and file loggers
++                RunnerUtilities.ExecMSBuild($"{projectFile.Path} /m /bl:{logFileWithoutTL} -flp:logfile={Path.Combine(logFolder.Path, "logFileWithoutTL.log")};verbosity=diagnostic", out success);
++                success.ShouldBeTrue();
++
++                // Read the binary log and replay into mockLogger
++                var mockLogFromPlaybackWithTL = new MockLogger();
++                var binaryLogReaderWithTL = new BinaryLogReplayEventSource();
++                mockLogFromPlaybackWithTL.Initialize(binaryLogReaderWithTL);
++
++                var mockLogFromPlaybackWithoutTL = new MockLogger();
++                var binaryLogReaderWithoutTL = new BinaryLogReplayEventSource();
++                mockLogFromPlaybackWithoutTL.Initialize(binaryLogReaderWithoutTL);
++
++                binaryLogReaderWithTL.Replay(logFileWithTL);
++                binaryLogReaderWithoutTL.Replay(logFileWithoutTL);
++
++                // Check that amount of events, warnings, errors is equal in both cases. Presence of other loggers should not change behavior
++                mockLogFromPlaybackWithoutTL.Errors.Count.ShouldBe(mockLogFromPlaybackWithTL.Errors.Count);
++                mockLogFromPlaybackWithoutTL.Warnings.Count.ShouldBe(mockLogFromPlaybackWithTL.Warnings.Count);
++                mockLogFromPlaybackWithoutTL.AllBuildEvents.Count.ShouldBe(mockLogFromPlaybackWithTL.AllBuildEvents.Count);
++
++                // Check presence of some items and properties
++                mockLogFromPlaybackWithoutTL.EvaluationFinishedEvents.FindAll(x => (x.Items != null)).Count.ShouldBe(1);
++                mockLogFromPlaybackWithTL.EvaluationFinishedEvents.FindAll(x => (x.Items != null)).Count.ShouldBe(1);
++
++                mockLogFromPlaybackWithoutTL.EvaluationFinishedEvents.FindAll(x => (x.Properties != null)).Count.ShouldBe(1);
++                mockLogFromPlaybackWithTL.EvaluationFinishedEvents.FindAll(x => (x.Properties != null)).Count.ShouldBe(1);
++            }
++        }
+     }
+ }
+diff --git a/src/MSBuild/TerminalLogger/TerminalLogger.cs b/src/MSBuild/TerminalLogger/TerminalLogger.cs
+index 409c114c0da..f14ef09e3ce 100644
+--- a/src/MSBuild/TerminalLogger/TerminalLogger.cs
++++ b/src/MSBuild/TerminalLogger/TerminalLogger.cs
+@@ -211,6 +211,11 @@ public void Initialize(IEventSource eventSource)
+         eventSource.MessageRaised += MessageRaised;
+         eventSource.WarningRaised += WarningRaised;
+         eventSource.ErrorRaised += ErrorRaised;
++
++        if (eventSource is IEventSource4 eventSource4)
++        {
++            eventSource4.IncludeEvaluationPropertiesAndItems();
++        }
+     }
+ 
+     /// <inheritdoc/>
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 9097ee42210..9fc45b1884f 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -2570,6 +2570,11 @@ private static bool ProcessTerminalLoggerConfiguration(CommandLineSwitches comma
+ 
+             static bool DoesEnvironmentSupportTerminalLogger()
+             {
++                if (Environment.GetEnvironmentVariable("MSBUILDTESTINGFORCETERMINALLOGGERUSE") == "1")
++                {
++                    return true;
++                }
++
+                 (var acceptAnsiColorCodes, var outputIsScreen, s_originalConsoleMode) = NativeMethodsShared.QueryIsScreenAndTryEnableAnsiColorCodes();
+ 
+                 if (!outputIsScreen)

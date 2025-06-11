@@ -1,0 +1,693 @@
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index 8425237d1f3..d218064f004 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -271,8 +271,15 @@ private static void AssertBinlogsHaveEqualContent(string firstPath, string secon
+             reader1.ArchiveFileEncountered += arg
+                 => AddArchiveFile(embedFiles1, arg);
+ 
+-            reader2.ArchiveFileEncountered += arg
+-                => AddArchiveFile(embedFiles2, arg);
++            // This would be standard subscribe:
++            // reader2.ArchiveFileEncountered += arg
++            //    => AddArchiveFile(embedFiles2, arg);
++
++            // We however use the AddArchiveFileFromStringHandler - to exercise it
++            // and to assert it's equality with ArchiveFileEncountered handler
++            string currentFileName = null;
++            reader2.ArchiveFileEncountered +=
++                ((Action<StringReadEventArgs>)AddArchiveFileFromStringHandler).ToArchiveFileHandler();
+ 
+             int i = 0;
+             while (reader1.Read() is { } ev1)
+@@ -296,6 +303,18 @@ void AddArchiveFile(Dictionary<string, string> files, ArchiveFileEventArgs arg)
+                 files.Add(embedFile.FullPath, content);
+                 arg.SetResult(embedFile.FullPath, content);
+             }
++
++            void AddArchiveFileFromStringHandler(StringReadEventArgs args)
++            {
++                if (currentFileName == null)
++                {
++                    currentFileName = args.OriginalString;
++                    return;
++                }
++
++                embedFiles2.Add(currentFileName, args.OriginalString);
++                currentFileName = null;
++            }
+         }
+ 
+         [Fact]
+diff --git a/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs b/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
+index 2d6003a389c..36f59dbce2f 100644
+--- a/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
++++ b/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
+@@ -1057,6 +1057,65 @@ public void ForwardCompatibleRead_HandleMismatchedFormatOfEvent()
+             readerErrors.Count.ShouldBe(1);
+             readerErrors[0].errorType.ShouldBe(ReaderErrorType.UnknownFormatOfEventData);
+             readerErrors[0].recordKind.ShouldBe(BinaryLogRecordKind.Error);
++            readerErrors[0].error.ShouldContain("FormatException");
++
++            deserializedEvent.Should().BeEquivalentTo(finished);
++
++            // There is nothing else in the stream
++            memoryStream.Position.Should().Be(length);
++        }
++
++        [Fact]
++        public void ForwardCompatibleRead_HandleRemovalOfDataFromEventDefinition()
++        {
++            // BuildErrorEventArgs error = new("Subcategory", "Code", "File", 1, 2, 3, 4, "Message", "HelpKeyword", "SenderName");
++            BuildErrorEventArgs error = new(null, null, null, 1, 2, 3, 4, null, null, null);
++            BuildFinishedEventArgs finished = new("Message", "HelpKeyword", true);
++
++            var memoryStream = new MemoryStream();
++            var binaryWriter = new BinaryWriter(memoryStream);
++            var binaryReader = new BinaryReader(memoryStream);
++            var buildEventArgsWriter = new BuildEventArgsWriter(binaryWriter);
++
++            buildEventArgsWriter.Write(error);
++
++            int positionAfterFirstEvent = (int)memoryStream.Position;
++            memoryStream.Position = 0;
++            // event type
++            Microsoft.Build.Shared.BinaryReaderExtensions.Read7BitEncodedInt(binaryReader);
++            int eventSizePos = (int)memoryStream.Position;
++            int eventSize = Microsoft.Build.Shared.BinaryReaderExtensions.Read7BitEncodedInt(binaryReader);
++            int positionAfterFirstEventSize = (int)memoryStream.Position;
++            memoryStream.Position = eventSizePos;
++            // simulate there are 4 bytes less in the future version of the event - while our reader expects those
++            Microsoft.Build.Shared.BinaryWriterExtensions.Write7BitEncodedInt(binaryWriter, eventSize - 4);
++            memoryStream.Position.ShouldBe(positionAfterFirstEventSize, "The event size need to be overwritten in place - without overwriting any bytes after the size info");
++            // remove the 4 bytes - so that actual size of event is inline with it's written size.
++            memoryStream.Position = positionAfterFirstEvent - 4;
++
++            buildEventArgsWriter.Write(finished);
++
++            // Remember num of bytes written - we should read them all.
++            long length = memoryStream.Length;
++            // Now move back to the beginning of the stream and start reading.
++            memoryStream.Position = 0;
++
++            using var buildEventArgsReader = new BuildEventArgsReader(binaryReader, BinaryLogger.FileFormatVersion)
++            {
++                SkipUnknownEvents = true
++            };
++
++            List<(ReaderErrorType errorType, BinaryLogRecordKind recordKind, string error)> readerErrors = new();
++            buildEventArgsReader.OnRecoverableReadError += (t, et, e) => readerErrors.Add((t, et, e));
++
++            var deserializedEvent = buildEventArgsReader.Read();
++
++            readerErrors.Count.ShouldBe(1);
++            readerErrors[0].errorType.ShouldBe(ReaderErrorType.UnknownFormatOfEventData);
++            readerErrors[0].recordKind.ShouldBe(BinaryLogRecordKind.Error);
++            // Expect StreamChunkOverReadException or EndOfStreamException - based on the implementation
++            //  of indicating attempt to overread in the TransparentReadStream.
++            readerErrors[0].error.ShouldContain("StreamChunkOverReadException");
+ 
+             deserializedEvent.Should().BeEquivalentTo(finished);
+ 
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index 28fbc25ae22..db85543653c 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -221,14 +221,19 @@ public void Dispose()
+                 {
+                     result = ReadBuildEventArgs(recordKind);
+                 }
+-                catch (Exception e) when (e is InvalidDataException dataException ||
+-                                          e is FormatException formatException ||
+-                                          e is StreamChunkOverReadException overReadException)
++                catch (Exception e) when (
++                    // We throw this on mismatches in metadata (name-value list, strings index).
++                    e is InvalidDataException ||
++                    // Thrown when BinaryReader is unable to deserialize binary data into expected type.
++                    e is FormatException ||
++                    // Following 2 are thrown when we attempt to read more bytes than what is in the next event chunk.
++                    e is StreamChunkOverReadException ||
++                    e is EndOfStreamException)
+                 {
+                     hasError = true;
+                     string error =
+                         ResourceUtilities.FormatResourceStringStripCodeAndKeyword("Binlog_ReaderMismatchedRead",
+-                            recordNumber, serializedEventLength, e.Message) + (_skipUnknownEvents
++                            recordNumber, serializedEventLength, e.GetType(), e.Message) + (_skipUnknownEvents
+                             ? " " + ResourceUtilities.GetResourceString("Binlog_ReaderSkippingRecord")
+                             : string.Empty);
+ 
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 450782c697b..a4b47640554 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -2029,9 +2029,9 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>Skipping the record.</value>
+   </data>
+   <data name="Binlog_ReaderMismatchedRead" xml:space="preserve">
+-    <value>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</value>
++    <value>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</value>
+     <comment>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </comment>
+   </data>
+   <data name="Binlog_ReaderUnknownType" xml:space="preserve">
+@@ -2059,7 +2059,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>Stream must be readable.</value>
+   </data>
+   <data name="Binlog_StreamUtils_OverRead" xml:space="preserve">
+-    <value>"Attempt to read {0} bytes, when only {1} are allowed to be read.</value>
++    <value>Attempt to read {0} bytes, when only {1} are allowed to be read.</value>
+     <comment>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </comment>
+@@ -2074,7 +2074,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>Writing is not supported.</value>
+   </data>
+   <data name="Binlog_StreamUtils_UnsupportedSkipOffset" xml:space="preserve">
+-    <value>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</value>
++    <value>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</value>
+     <comment>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </comment>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 5853168dd14..53ce292bf2b 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index d003e7ba4c8..fbbca67469e 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index c5c3d84ca9f..7079ce4ebdc 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 8c6f1ab83b5..7708dacc3b2 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index da6f69c264d..05381e061a4 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 1f36992445e..c234fa53fad 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 1824e77ef5d..43c944f4ced 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 2020bb8debe..3b40011cbfa 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 44692088722..bb60bd2c319 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 2be702fa978..29d529b9051 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 54cb48f0e9e..bea7658233e 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 4909b0f8e6a..bca9a1aba44 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index bcae4b02063..8822f29c44b 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -61,10 +61,10 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (error: {2}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
+         <note>
+-      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception message string.
++      LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderSkippingRecord">
+@@ -107,8 +107,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>"Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">"Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
++        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
++        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+         <note>
+       LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+     </note>
+@@ -119,8 +119,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_UnsupportedSkipOffset">
+-        <source>"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
+-        <target state="new">"Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
++        <source>Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</source>
++        <target state="new">Attempt to skip {0} bytes, only non-negative offset up to int.MaxValue is allowed.</target>
+         <note>
+       LOCALIZATION: {0} is integer number denoting number of bytes. 'int.MaxValue' should not be translated.
+     </note>

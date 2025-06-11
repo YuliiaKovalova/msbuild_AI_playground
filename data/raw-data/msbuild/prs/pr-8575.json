@@ -1,0 +1,173 @@
+{
+  "number": 8575,
+  "title": "Use AutoResetEvent as oppose to ManualResetEventSlim",
+  "body": "## Summary\r\n\r\nCustomer, mainly internal like XStore, with huge repos, using `msbuild /graph /bl` on  powerful development and build computers, might experience 15x plus regression in evaluation time.\r\n\r\nIt has been identified as performance bug in our logging event pub/sub mechanism. When ingest queue reaches its bound, at .net472 `ManualResetEventSlim` causes way too many thread.Yields flooding the system with thread context switches.\r\nThis hypothesis has been verified by PerfMon perfcounter `System.ContextSwitches`.\r\n\r\nAlhougt counterintuitive, `AutoResetEvent` , `ManualResetEvent` or even `SpinLocking` produced better behavior and with those the issue no longer reproduce.\r\n\r\n## Customer Impact\r\nIn case of XStore it was about 7 minutes in build time.\r\n\r\n## Regression?\r\nYes, introduced in VS 17.4.\r\n\r\n## Testing\r\nManual validation by @rokonec and automated tests. Using local repro to verify changes has fixed it.\r\n\r\n## Risk\r\nLow\r\n\r\n## Note\r\nIt effect only VS MSBuild.exe. In dotnet build `ManualResetEventSlim` works better.\r\n",
+  "state": "MERGED",
+  "createdAt": "2023-03-17T16:27:54Z",
+  "updatedAt": "2023-03-21T20:29:45Z",
+  "closedAt": "2023-03-21T20:29:39Z",
+  "mergedAt": "2023-03-21T20:29:39Z",
+  "additions": 11,
+  "deletions": 13,
+  "changedFiles": 2,
+  "headRefName": "rokonec/8574-lock-contention-logging-service",
+  "isDraft": false,
+  "author": {
+    "login": "rokonec"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": [
+      {
+        "login": "rokonec"
+      }
+    ]
+  },
+  "labels": [
+    "Area: Performance",
+    "Servicing-approved"
+  ],
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "oid": "d5b312c30bd7c6b6254c4f25bf9ed1a007876162",
+          "message": "Changing from slim events to kernel events",
+          "committedDate": "2023-03-20T19:20:27Z",
+          "author": {
+            "name": "Roman Konecny",
+            "email": "rokonecn@microsoft.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "4113d2959ac33fb4567745ff22cb7723c332208b",
+          "message": "Bumping version",
+          "committedDate": "2023-03-20T19:45:11Z",
+          "author": {
+            "name": "Roman Konecny",
+            "email": "rokonecn@microsoft.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "b7dac5300974aa62a9a6d558e6dc34746a551a8f",
+          "message": "Merge branch 'vs17.4' into rokonec/8574-lock-contention-logging-service",
+          "committedDate": "2023-03-20T19:46:40Z",
+          "author": {
+            "name": "Roman Konecny",
+            "email": "rokonecn@microsoft.com"
+          }
+        }
+      }
+    ]
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "@stephentoub  does this surprise you?",
+        "createdAt": "2023-03-17T16:54:10Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "ManualResetEventSlim spins by default prior to falling back to a kernel-based blocking wait.  AutoResetEvent is just a thin wrapper for a kernel sync primitive, so there's no spinning before it in managed world.  If you want to disable that spinning with MRES, just pass 0 as the second argument to its ctor, e.g. make these https://github.com/dotnet/msbuild/pull/8575/files#diff-4e77c665c92becc2499e6b1ee5e7b673df485cba054b8c0ce31cd4974c9bbe70L1266-L1268 use `new ManualResetEventSlim(false, 0)` instead of `new ManualResetEventSlim(false)`.",
+        "createdAt": "2023-03-17T17:00:08Z",
+        "author": {
+          "login": "stephentoub"
+        }
+      },
+      {
+        "body": "So i guess the spinning here implies that the lock is typically held for significant period of time, so spinning is just waste.\n\n@rokonec Maybe try the other ctor on MRES?\n\nI wonder if, separate to this change, there is scope to reduce the time spent holding the lock.",
+        "createdAt": "2023-03-17T17:22:33Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "@stephentoub @danmoseley For context this isn't a \"lock\" per se but rather a sort of throttle. This is an implementation of async logging where writers fill a buffer and 1 consumer drains the queue on a long-running background thread. Once the buffer fills, additional writers need to wait for there to be capacity.\r\n\r\nMy recommendation to @rokonec would be to use a bounded [Channel](https://devblogs.microsoft.com/dotnet/an-introduction-to-system-threading-channels/) since it seems to fit this scenario much better (previously this code used an `ActionBlock` instead of the current impl), and I would guess Channels have this scenario well-optimized and possibly continue to optimize in the future.\r\n\r\nSomething along the line of\r\n```cs\r\n// Initialization\r\n            var channelOptions = new BoundedChannelOptions(maxMessagesToBuffer)\r\n            {\r\n                // If full, block\r\n                FullMode = BoundedChannelFullMode.Wait,\r\n \r\n                // Enable single-reader optimizations\r\n                SingleReader = true,\r\n            };\r\n \r\n            _processLogMessageChannel = Channel.CreateBounded<LoggingEvent>(channelOptions);\r\n \r\n            _processingTask = Task.Run(\r\n                async () =>\r\n                {\r\n                    while (await _processLogMessageChannel.Reader.WaitToReadAsync().ConfigureAwait(false))\r\n                    {\r\n                        while (_processLogMessageChannel.Reader.TryRead(out LoggingEvent? loggingEvent))\r\n                        {\r\n                            // Do the thing\r\n                        }\r\n                    }\r\n                });\r\n \r\n// Enqueuing\r\n \r\n        public async Task EnqueueAsync(LoggingEvent loggingEvent)\r\n        {\r\n            ValueTask writeTask = _processLogMessageChannel.Writer.WriteAsync(loggingEvent);\r\n            if (!writeTask.IsCompleted)\r\n            {\r\n                // If full, block until it's written.\r\n                await writeTask;\r\n            }\r\n        }\r\n \r\n// Draining\r\n \r\n        public async Task DrainAsync()\r\n        {\r\n            _processLogMessageChannel.Writer.Complete();\r\n            await _processLogMessageChannel.Reader.Completion;\r\n            await _processingTask;\r\n        }\r\n```",
+        "createdAt": "2023-03-17T17:50:56Z",
+        "author": {
+          "login": "dfederm"
+        }
+      },
+      {
+        "body": "@stephentoub with .net core MRES I can't repro this issue. Unfortunately Windows MRES implementation is quite different. See: https://referencesource.microsoft.com/#mscorlib/system/threading/ManualResetEventSlim.cs,542 weird combination logic spinning, yielding and sleeping.\r\nWhen I feed ctor with 200+ it worked too. But it seemed to me too fragile. 0 in ctor would probably work as well, if I read sources right, but I actually like new autoresetevent better as it will unblock just one tread which is what is needed:\r\n- multiple threads are blocking on ingesting into bounded queue\r\n- one event from queue is consumed and processed\r\n- dequeu auto event is set\r\n- one thread is unblocked\r\nAs oppose to MRES where all threads would unblock and then all-1 went back to sleep bcz queue is full again.\r\nI was originally thinking about BlockingCollection which is, IIRC, designed with this use case in mind, however, since our code has to run in .net 3.5 I had to implement it myself.\r\n",
+        "createdAt": "2023-03-17T19:13:53Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "@dfederm as for Channel it is interesting idea, I will play with it when I have some time, however, since msbuild is quite low and need to support source building we are trying to avoid external decencies if possible. Additionally any external dependencies can cause assembly hell in VS and often has to be handled by assembly redirects.\r\n\r\nThe purpose of this PR is to fix the bug, and the code provided do so. Since this will have to go into servicing VS 17.4 I am trying to make minimal most safe changes.\r\n\r\nI am open for advices how to best implement that `multiple blocking bounded publishers, one consumer thread` as I like concurrency programming a lot, but I would rather address it in different issue and PR.",
+        "createdAt": "2023-03-17T19:20:49Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "For a servicing fix, seems reasonable then if this small change mitigates the issue.",
+        "createdAt": "2023-03-17T19:28:27Z",
+        "author": {
+          "login": "dfederm"
+        }
+      },
+      {
+        "body": "I believe it does fixed the issue:\r\n\r\nnew\r\n![image](https://user-images.githubusercontent.com/25249058/226029650-69e9cc1a-fc4d-4650-82b3-8f5d43d51d27.png)\r\n\r\nold\r\n![image](https://user-images.githubusercontent.com/25249058/226030328-0a31e842-67df-4cd8-90fb-1c979ea04c72.png)\r\n\r\n",
+        "createdAt": "2023-03-17T20:25:26Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "@ladipro asked:\r\n> Also, is it really expected to be logging at such a high rate that a 200k-item queue fills up?\r\n\r\nUsing /bl trigger \"diag\" logging verbosity which causes lot of messages flowing through system.\r\nFor example for orchardcore /graph /bl /m when I stop it right after all projects are evaluated it looks like this:\r\n![image](https://user-images.githubusercontent.com/25249058/226392815-6d17c874-a549-4c6e-95ee-f81bdc88dc7d.png)\r\n\r\nFor orchard I started to see this only for `MSBUILDLOGGINGQUEUECAPACITY=25000` and bellow. For bigger repositories builds running on more CPU cores I believe it can easily reach 200K queue size limit.\r\n\r\n",
+        "createdAt": "2023-03-20T15:49:42Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "should diag verbosity cause a larger queue?",
+        "createdAt": "2023-03-20T18:40:10Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "> Also, is it really expected to be logging at such a high rate that a 200k-item queue fills up?\r\n\r\nThis is a combination of a few things, which all make sense individually:\r\n\r\n1. Machines are getting more parallel threads.\r\n2. `-graph` evaluates projects for the whole build all at once up front, in order to discover graph structure.\r\n3. It does so in parallel.\r\n4. Evaluation produces log events.\r\n5. At diag/binlog verbosity, evaluation can log quite a lot of events.\r\n\r\nWhen combined, that can mean that on a big machine + a big repo + `-graph` + `-bl`, _lots_ of events are logged very quickly.\r\n\r\nBut I that even with all of that considered together the overall thing still makes sense, with the backpressure that we can now provide from the logger back to the event production.\r\n\r\n> should diag verbosity cause a larger queue?\r\n\r\nI would rather the change queue size for all configurations than tweak it by logger verbosity personally. The existing values aren't written in stone but we did see OOM failures caused by the prior (broken) bounding approach, and I'd like any future fixes to that to be easy to diagnose + tweak.",
+        "createdAt": "2023-03-20T18:58:14Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "From @rokonec's screenshot it looks like the average cost of one event is ~60 bytes. Even if it was 100 I'd say the queue should be much larger than 200k. In massive builds spending hundreds of megs is totally justifiable if the alternative is to block the execution.\r\n\r\nMaybe with the exception of running in a 32-bit process where we want to stay frugal.",
+        "createdAt": "2023-03-21T07:05:08Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "Hello! I noticed that you're targeting one of our servicing branches. Please consider updating the version.",
+        "createdAt": "2023-03-21T17:24:52Z",
+        "author": null
+      },
+      {
+        "body": "Hello! I noticed that you're targeting one of our servicing branches. Please consider updating the version.",
+        "createdAt": "2023-03-21T17:24:55Z",
+        "author": null
+      },
+      {
+        "body": "Hello! I noticed that you're targeting one of our servicing branches. Please consider updating the version.",
+        "createdAt": "2023-03-21T20:29:45Z",
+        "author": null
+      }
+    ]
+  },
+  "reviewThreads": {
+    "nodes": []
+  }
+}

@@ -1,0 +1,2325 @@
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TargetEntry.cs b/src/Build/BackEnd/Components/RequestBuilder/TargetEntry.cs
+index 988e01c6b69..869ba1a1184 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TargetEntry.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TargetEntry.cs
+@@ -13,9 +13,6 @@
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Microsoft.Build.Collections;
+-#if FEATURE_MSBUILD_DEBUGGER
+-using Microsoft.Build.Debugging;
+-#endif
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+@@ -839,22 +836,9 @@ private async Task<WorkUnitResult> ProcessBucket(ITaskBuilder taskBuilder, Targe
+                 {
+                     ProjectTargetInstanceChild targetChildInstance = _target.Children[currentTask];
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                    if (DebuggerManager.DebuggingEnabled)
+-                    {
+-                        DebuggerManager.EnterState(targetChildInstance.Location, lookupForExecution.GlobalsForDebugging /* does not matter which lookup we get this from */);
+-                    }
+-#endif
+-
+                     // Execute the task.
+                     lastResult = await taskBuilder.ExecuteTask(targetLoggingContext, _requestEntry, _targetBuilderCallback, targetChildInstance, mode, lookupForInference, lookupForExecution, _cancellationToken);
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                    if (DebuggerManager.DebuggingEnabled)
+-                    {
+-                        DebuggerManager.LeaveState(targetChildInstance.Location);
+-                    }
+-#endif
+                     if (lastResult.ResultCode == WorkUnitResultCode.Failed)
+                     {
+                         aggregatedTaskResult = WorkUnitResultCode.Failed;
+diff --git a/src/Build/Debugger/DebuggerLocalType.cs b/src/Build/Debugger/DebuggerLocalType.cs
+deleted file mode 100644
+index 0bc3ae3d1c7..00000000000
+--- a/src/Build/Debugger/DebuggerLocalType.cs
++++ /dev/null
+@@ -1,63 +0,0 @@
+-﻿// Copyright (c) Microsoft. All rights reserved.
+-// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+-//-----------------------------------------------------------------------
+-// </copyright>
+-// <summary>Description of a local type for a debugger local.</summary>
+-//-----------------------------------------------------------------------
+-
+-#if FEATURE_MSBUILD_DEBUGGER
+-
+-using System;
+-using Microsoft.Build.Shared;
+-using System.Diagnostics;
+-
+-namespace Microsoft.Build.Debugging
+-{
+-    /// <summary>
+-    /// Immutable class to describe the name and type for an early bound local
+-    /// </summary>
+-#if JMC
+-    [DebuggerNonUserCode]
+-#endif
+-    internal struct DebuggerLocalType
+-    {
+-        /// <summary>
+-        /// Name of the local variable.
+-        /// </summary>
+-        private string _name;
+-
+-        /// <summary>
+-        /// Type of the local variable.
+-        /// </summary>
+-        private Type _type;
+-
+-        /// <summary>
+-        /// Constructor 
+-        /// </summary>
+-        internal DebuggerLocalType(string name, Type type)
+-        {
+-            ErrorUtilities.VerifyThrowInternalLength(name, "name");
+-            ErrorUtilities.VerifyThrowInternalNull(type, "type");
+-
+-            _name = name;
+-            _type = type;
+-        }
+-
+-        /// <summary>
+-        /// Name of the local variable.
+-        /// </summary>
+-        internal string Name
+-        {
+-            get { return _name; }
+-        }
+-
+-        /// <summary>
+-        /// Type of the local variable.
+-        /// </summary>
+-        internal Type Type
+-        {
+-            get { return _type; }
+-        }
+-    }
+-}
+-#endif
+diff --git a/src/Build/Debugger/DebuggerManager.cs b/src/Build/Debugger/DebuggerManager.cs
+deleted file mode 100644
+index 07031a52c9c..00000000000
+--- a/src/Build/Debugger/DebuggerManager.cs
++++ /dev/null
+@@ -1,923 +0,0 @@
+-﻿// Copyright (c) Microsoft. All rights reserved.
+-// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+-//-----------------------------------------------------------------------
+-// </copyright>
+-// <summary>Provides debugging support for state machines.</summary>
+-//-----------------------------------------------------------------------
+-
+-#if FEATURE_MSBUILD_DEBUGGER
+-
+-using System;
+-using System.Collections.Generic;
+-using System.Diagnostics;
+-using System.Diagnostics.CodeAnalysis;
+-using System.Reflection;
+-using System.Reflection.Emit;
+-using System.Threading;
+-
+-using Microsoft.Build.Collections;
+-using Microsoft.Build.Construction;
+-using Microsoft.Build.Shared;
+-#if FEATURE_DEBUGGER
+-using System.Diagnostics.SymbolStore;
+-#endif
+-
+-namespace Microsoft.Build.Debugging
+-{
+-    /// <summary>
+-    /// Manager for supporting debugging a state machine.   
+-    /// This is for internal use by MSBuild, only.
+-    /// </summary>    
+-    /// <comment>
+-    /// This is using the theory described at: 
+-    ///  http://blogs.msdn.com/jmstall/archive/2005/07/27/state-machine-theory.aspx. 
+-    /// The summary is that it emits IL snippets ("Islands") for each state in the machine.
+-    /// The island serves as a spot to set a breakpoint. 
+-    ///
+-    /// You should be able to set breakpoints on states and hit them.
+-    /// To do stepping between states:
+-    ///   - ensure the interpreter is non-user code (perhaps by placing the [DebuggerNonUserCode] attribute
+-    ///      on all the classes, or not providing the symbols to the debugger)
+-    ///   - ensure Just-My-Code is turned on. In VS2005, 
+-    ///       this is at: Tools > Options  > Debugging > General, "Enable Just My Code".
+-    ///  - Use step-in (F11) between states.
+-    /// 
+-    /// 
+-    /// The general usage is to call:
+-    ///  - DefineState() for each state
+-    ///  - Bake() once you've defined all the states you need to enter.
+-    ///  - EnterState() / LeaveState() for each state. 
+-    /// You can Define new states and bake them, such as if the script loads a new file.
+-    /// Baking is expensive, so it's best to define as many states in each batch.
+-    ///
+-    /// UNDONE: Show proper state of items and properties set and modified within targets.
+-    /// UNDONE: Characterization and fixing of debugging multiproc MSBuild, and MSBuild hosted by VS.
+-    /// </comment>
+-#if JMC
+-    [DebuggerNonUserCode]
+-#endif
+-    public static class DebuggerManager
+-    {
+-        /// <summary>
+-        /// Whether debugging should break on startup.
+-        /// This is normally true, but setting it to false 
+-        /// might be useful in some situations, such as multiproc build.
+-        /// </summary>
+-        private static bool s_breakOnStartup;
+-
+-        /// <summary>
+-        /// Whether debugging is enabled. This is not normally
+-        /// enabled as it makes everything slow.
+-        /// </summary>
+-        private static bool? s_debuggingEnabled;
+-
+-        /// <summary>
+-        /// The states that the debugger may be in, indexed
+-        /// by their location. All baked states are in here.
+-        /// </summary>
+-        private static IDictionary<ElementLocation, DebuggerState> s_allBakedStates = new Dictionary<ElementLocation, DebuggerState>();
+-
+-        /// <summary>
+-        /// Method that islands call back to.
+-        /// </summary>
+-        private static MethodInfo s_islandCallback;
+-
+-#if FEATURE_DEBUGGER
+-        /// <summary>
+-        /// Cached mapping of file path to symbol store documents
+-        /// </summary>
+-        private static Dictionary<string, ISymbolDocumentWriter> s_sources = new Dictionary<string, ISymbolDocumentWriter>(StringComparer.OrdinalIgnoreCase);
+-#endif
+-
+-        /// <summary>
+-        /// The single dynamic module used.
+-        /// </summary>
+-        private static ModuleBuilder s_dynamicModule;
+-
+-        /// <summary>
+-        /// Islands are executed on an auxiliary thread instead of the main thread.
+-        /// This gives a better default stepping experience (allows Step-in, step-over, step-out),
+-        /// and also allows unloading the islands (since the thread can be in a separate appdomain).
+-        /// </summary>
+-        private static IslandThread s_islandThread;
+-
+-        /// <summary>
+-        /// List of all state that have been created with DefineState
+-        /// and are yet to be Baked into types.
+-        /// We use a hashtable instead of a list so that we can find duplicate
+-        /// state names immediately.
+-        /// </summary>
+-        private static Dictionary<string, DebuggerState> s_unbakedStates = new Dictionary<string, DebuggerState>(StringComparer.OrdinalIgnoreCase);
+-
+-        /// <summary>
+-        /// In special cases, we ignore an EnterState, and increment this counter
+-        /// so that we can ignore the matching LeaveState.
+-        /// </summary>
+-        private static int s_skippedEnters;
+-
+-        /// <summary>
+-        /// Whether the debugger manager has been initialized yet.
+-        /// </summary>
+-        private static bool s_initialized;
+-
+-        /// <summary>
+-        /// Type of delegate used by the debugger worker thread to call back to invoke an island
+-        /// </summary>
+-        internal delegate void InvokeIslandDelegate(object argument, VirtualStackFrame stackFrame);
+-
+-        /// <summary>
+-        /// Whether debugging of project files is enabled.
+-        /// By default it is not.
+-        /// </summary>
+-        internal static bool DebuggingEnabled
+-        {
+-            get
+-            {
+-                if (!s_debuggingEnabled.HasValue)
+-                {
+-                    s_debuggingEnabled = String.Equals(Environment.GetEnvironmentVariable("MSBUILDDEBUGGING"), "1", StringComparison.OrdinalIgnoreCase);
+-                }
+-
+-                return s_debuggingEnabled.Value;
+-            }
+-        }
+-
+-        /// <summary>
+-        /// Stop debugging thread.
+-        /// This may not necessarily unload islands or dynamic modules that were created until the calling appdomain has exited.
+-        /// UNDONE: Call this. Otherwise we still exit cleanly, just only when the process exits.
+-        /// </summary>
+-        internal static void Terminate()
+-        {
+-            ErrorUtilities.VerifyThrow(s_initialized, "Not initialized");
+-            ErrorUtilities.VerifyThrow(DebuggingEnabled, "Debugging not enabled");
+-
+-            if (s_islandThread != null)
+-            {
+-                s_islandThread.Exit();
+-                s_islandThread = null;
+-            }
+-        }
+-
+-        /// <summary>
+-        /// Declare a new state associated with the given source location.
+-        /// States should (probably) have disjoint source locations.
+-        /// Define as many states as possible using this method before calling Bake().
+-        /// Location must map to a unique state within the type in which it is baked.
+-        /// Name of the state will showup in the callstack as if it was a method name. Must be unique within the type in which it is baked.
+-        /// Early-bound locals are arbitrary types whose values will be supplied on EnterState. May be null.
+-        /// </summary>
+-        internal static void DefineState(ElementLocation location, string name, ICollection<DebuggerLocalType> earlyLocals)
+-        {
+-            ErrorUtilities.VerifyThrow(s_initialized, "Not initialized");
+-            ErrorUtilities.VerifyThrow(DebuggingEnabled, "Debugging not enabled");
+-
+-            // Special case: elements added by editing, such as in a solution wrapper project,
+-            // do not have line numbers. Such files cannot be debugged, so we special case
+-            // such locations by doing nothing.
+-            if (location.Line == 0)
+-            {
+-                return;
+-            }
+-
+-            ErrorUtilities.VerifyThrow(!s_unbakedStates.ContainsKey(name), "Need unique debug state name, already seen '{0}'", name);
+-
+-            DebuggerState state = new DebuggerState(location, name, earlyLocals);
+-            s_unbakedStates.Add(name, state);
+-        }
+-
+-        /// <summary>
+-        /// Bake all unbaked states. States must be baked before calling EnterState().
+-        /// Islands are created in a type with the specified name.
+-        /// File name is to show up on the callstack as the type name: "ASSEMBLYNAME!FILENAME.STATENAME(...LOCALS...)"
+-        /// If the type name is not unique, it will be appended with a unique identifier.
+-        /// </summary>
+-        internal static void BakeStates(string fileName)
+-        {
+-            ErrorUtilities.VerifyThrow(s_initialized, "Not initialized");
+-            ErrorUtilities.VerifyThrow(DebuggingEnabled, "Debugging not enabled");
+-
+-            // We may have baked no states if all states were in a file
+-            // for which we did not have detailed location information
+-            if (s_unbakedStates.Count == 0)
+-            {
+-                return;
+-            }
+-
+-            // Default assembly name, eg., for unnamed projects
+-            fileName = fileName ?? "MSBuild";
+-
+-            int suffix = 0;
+-            while (s_dynamicModule.GetType(fileName, false, false) != null)
+-            {
+-                fileName += suffix;
+-                suffix++;
+-            }
+-
+-            TypeBuilder type = s_dynamicModule.DefineType(fileName, TypeAttributes.Public | TypeAttributes.Class);
+-
+-            foreach (DebuggerState state in s_unbakedStates.Values)
+-            {
+-                if (s_allBakedStates.ContainsKey(state.Location))
+-                {
+-                    // This will happen if it is an import loaded by more than one project
+-                    continue;
+-                }
+-
+-                string methodName = CreateIsland(type, state);
+-
+-                state.RecordMethodInfo(type.CreateTypeInfo().AsType(), methodName);
+-
+-                s_allBakedStates.Add(state.Location, state);
+-            }
+-
+-            s_unbakedStates = new Dictionary<string, DebuggerState>(StringComparer.OrdinalIgnoreCase);
+-
+-            // Although type is going out of scope now, it will
+-            // subsequently be accessed by its name
+-            type.CreateTypeInfo();
+-        }
+-
+-        /// <summary>
+-        /// Enter a state and push it onto the 'virtual callstack'.
+-        /// If the user set a a breakpoint at the source location associated with 
+-        /// this state, this call will hit that breakpoint.
+-        /// Call LeaveState when the interpreter is finished with this state.
+-        /// State must have already been defined.
+-        /// </summary>
+-        /// <param name="location">
+-        /// Location of state to enter, used to look up the state.
+-        /// </param>
+-        /// <param name="locals">
+-        /// Local variables associated with this state, matching by index with the types
+-        /// passed into DefineState. The debugger will show the names, types, and values.
+-        /// </param>
+-        /// <remarks>
+-        /// EnterState can be called reentrantly. If code calls Enter(A); Enter(B); Enter(C); 
+-        /// Then on the call to Enter(C), the virtual callstack will be A-->B-->C. 
+-        /// Each call to Enter() will rebuild the virtual callstack. 
+-        /// </remarks>
+-        internal static void EnterState(ElementLocation location, IDictionary<string, object> locals)
+-        {
+-            ErrorUtilities.VerifyThrow(s_initialized, "Not initialized");
+-            ErrorUtilities.VerifyThrow(DebuggingEnabled, "Debugging not enabled");
+-
+-            // Special case: elements added by editing, such as in a solution wrapper project,
+-            // do not have line numbers. Such files cannot be debugged, so we special case
+-            // such locations by doing nothing.
+-            if (location.Line == 0)
+-            {
+-                s_skippedEnters++;
+-                return;
+-            }
+-
+-            DebuggerState state;
+-            ErrorUtilities.VerifyThrow(s_allBakedStates.TryGetValue(location, out state), "No state defined and baked for location {0}", location.LocationString);
+-
+-            s_islandThread.EnterState(state, locals);
+-        }
+-
+-        /// <summary>
+-        /// Enter and immediately leave a state, so that any breakpoint can be hit.
+-        /// </summary>
+-        internal static void PulseState(ElementLocation location, IDictionary<string, object> locals)
+-        {
+-            ErrorUtilities.VerifyThrow(s_initialized, "Not initialized");
+-            ErrorUtilities.VerifyThrow(DebuggingEnabled, "Debugging not enabled");
+-
+-            EnterState(location, locals);
+-            LeaveState(location);
+-        }
+-
+-        /// <summary>
+-        /// Break in the current state last set by EnterState(). 
+-        /// An interpreter could call this to
+-        /// implement a "data breakpoint".
+-        /// </summary>
+-        internal static void Break()
+-        {
+-            ErrorUtilities.VerifyThrow(s_initialized, "Not initialized");
+-            ErrorUtilities.VerifyThrow(DebuggingEnabled, "Debugging not enabled");
+-
+-            s_islandThread.Break();
+-        }
+-
+-        /// <summary>
+-        /// Pop the state most recently pushed by EnterState. 
+-        /// The identifier (location) of a Leave must match the Enter at the top of the stack,
+-        /// to catch mismatched Leaves.
+-        /// </summary>
+-        internal static void LeaveState(ElementLocation location)
+-        {
+-            ErrorUtilities.VerifyThrow(s_initialized, "Not initialized");
+-            ErrorUtilities.VerifyThrow(DebuggingEnabled, "Debugging not enabled");
+-            ErrorUtilities.VerifyThrow(s_skippedEnters >= 0, "Left too many");
+-
+-            // Special case: elements added by editing, such as in a solution wrapper project,
+-            // do not have line numbers. Such files cannot be debugged, so we special case
+-            // such locations by doing nothing.
+-            if (s_skippedEnters > 0)
+-            {
+-                s_skippedEnters--;
+-                return;
+-            }
+-
+-            s_islandThread.LeaveState(location);
+-        }
+-
+-        /// <summary>
+-        /// Starts debugger worker thread immediately, if debugging is enabled.
+-        /// This must not be called by a static constructor, as the 
+-        /// time at which it is called will then be undefined, and
+-        /// the debugging environment variable might not have had a 
+-        /// chance to be set.
+-        /// </summary>
+-        internal static void Initialize()
+-        {
+-            if (s_islandThread == null)
+-            {
+-                if (DebuggingEnabled)
+-                {
+-                    Trace.WriteLine("MSBuild debugging enabled");
+-
+-                    s_breakOnStartup = !String.Equals(Environment.GetEnvironmentVariable("MSBUILDDONOTBREAKONSTARTUP"), "1", StringComparison.OrdinalIgnoreCase);
+-
+-                    CreateDynamicModule();
+-
+-                    s_islandCallback = typeof(IslandThread).GetMethod("IslandWorker", BindingFlags.Static | BindingFlags.Public);
+-                    s_islandThread = new IslandThread(InvokeIsland /* delegate to invoke an island */, s_breakOnStartup);
+-                }
+-            }
+-
+-            s_initialized = true;
+-        }
+-
+-        /// <summary>
+-        /// Create the single dynamic module that will
+-        /// contain all our types and states.
+-        /// </summary>
+-        /// <remarks>
+-        /// Emits the module into the current appdomain.
+-        /// This could be improved to use another appdomain so that all
+-        /// the types could be unloaded. All locals would have to be 
+-        /// marshalable in this case.
+-        /// </remarks>
+-        private static void CreateDynamicModule()
+-        {
+-            // See http://blogs.msdn.com/jmstall/archive/2005/02/03/366429.aspx for a simple example
+-            // of debuggable reflection-emit.
+-            ErrorUtilities.VerifyThrow(s_dynamicModule == null, "Already emitted");
+-
+-#if FEATURE_DEBUGGER
+-            // In a later release, this could be changed to use LightweightCodeGen (DynamicMethod instead of AssemblyBuilder); 
+-            // currently they don't support sequence points, so they can't be debugged in the normal way
+-            AssemblyBuilder assembly = AppDomain.CurrentDomain.DefineDynamicAssembly(new AssemblyName("msbuild"), AssemblyBuilderAccess.Run);
+-
+-            // Mark generated code as debuggable. 
+-            // See http://blogs.msdn.com/rmbyers/archive/2005/06/26/432922.aspx for explanation.        
+-            ConstructorInfo constructor = typeof(DebuggableAttribute).GetConstructor(new Type[] { typeof(DebuggableAttribute.DebuggingModes) });
+-
+-            DebuggableAttribute.DebuggingModes debuggingMode = DebuggableAttribute.DebuggingModes.DisableOptimizations |
+-                                                               DebuggableAttribute.DebuggingModes.Default;
+-
+-            CustomAttributeBuilder attribute = new CustomAttributeBuilder(constructor, new object[] { debuggingMode });
+-            assembly.SetCustomAttribute(attribute);
+-
+-            // Arbitrary but reasonable name
+-            string name = Process.GetCurrentProcess().ProcessName;
+-#if FEATURE_REFLECTION_EMIT_DEBUG_INFO
+-            s_dynamicModule = assembly.DefineDynamicModule(name, true /* track debug information */);
+-#else
+-            s_dynamicModule = assembly.DefineDynamicModule(name);
+-#endif
+-#endif
+-        }
+-
+-        /// <summary>
+-        /// Create the representation of a single state, known as an "island".
+-        /// It is implemented as a small method in the type being baked into the dynamic module.
+-        /// Returns the name of the method.
+-        /// </summary>
+-        private static string CreateIsland(TypeBuilder typeBuilder, DebuggerState state)
+-        {
+-            // Parameters to the islands:
+-            // 1. Island thread
+-            // 2 ... N.  list of early bound locals.
+-            Type[] parameterTypes = new Type[1 + state.EarlyLocalsTypes.Count];
+-            parameterTypes[0] = typeof(IslandThread);
+-
+-            int i = 1;
+-            foreach (DebuggerLocalType local in state.EarlyLocalsTypes)
+-            {
+-                parameterTypes[i] = local.Type;
+-                i++;
+-            }
+-
+-            MethodBuilder method = typeBuilder.DefineMethod
+-                (
+-                state.Name /* method name */,
+-                MethodAttributes.Static | MethodAttributes.Public,
+-                typeof(void) /* return type */,
+-                parameterTypes
+-                );
+-
+-            // Define the parameter names.
+-            // Do not define a parameter for the first parameter, as this is an
+-            // implementation detail and we want to hide it from VS.
+-            // Parameter 0 is the return type.
+-            int j = 2;
+-            foreach (DebuggerLocalType local in state.EarlyLocalsTypes)
+-            {
+-                method.DefineParameter(j, ParameterAttributes.None, local.Name);
+-                j++;
+-            }
+-
+-            // Note that the locals are ignored by the method, they are only for the debugger to display;
+-            // only the thread parameter is passed on.
+-
+-            // void MethodName(IslandThread thread, ... early locals ... )
+-            // {
+-            //    .line
+-            //     nop
+-            //     call Worker(thread)
+-            //     ret;
+-            // }
+-            ILGenerator generator = method.GetILGenerator();
+-
+-#if FEATURE_DEBUGGER
+-            ISymbolDocumentWriter source;
+-            if (!s_sources.TryGetValue(state.Location.File, out source))
+-            {
+-                source = s_dynamicModule.DefineDocument(state.Location.File, Guid.Empty, Guid.Empty, Guid.Empty);
+-                s_sources.Add(state.Location.File, source);
+-            }
+-
+-            // Lines may not be zero, columns may be zero
+-            int line = (state.Location.Line == 0) ? 1 : state.Location.Line;
+-
+-            generator.MarkSequencePoint(source, line, state.Location.Column, line, Int32.MaxValue); // mapping to source file
+-            generator.Emit(OpCodes.Nop); // Can help with setting a breakpoint
+-
+-            generator.Emit(OpCodes.Ldarg_0); // Load argument 0 that went to this method back onto the stack to pass to the call
+-            generator.EmitCall(OpCodes.Call, s_islandCallback /* method */, null /* no opt params */);
+-
+-            generator.Emit(OpCodes.Ret); // Return from state
+-#endif
+-
+-            return method.Name;
+-        }
+-
+-        /// <summary>
+-        /// Invoke an "island", marshaling the arguments.
+-        /// Called on debugger worker thread.
+-        /// </summary>
+-        private static void InvokeIsland(Object islandThread, VirtualStackFrame frame)
+-        {
+-            Object[] arguments = new Object[1 + frame.State.EarlyLocalsTypes.Count];
+-            arguments[0] = islandThread;
+-
+-            int i = 1;
+-            foreach (DebuggerLocalType localType in frame.State.EarlyLocalsTypes)
+-            {
+-                object value;
+-                ErrorUtilities.VerifyThrow(frame.Locals.TryGetValue(localType.Name, out value), "Didn't define value for {0}", localType.Name);
+-
+-                arguments[i] = value;
+-                i++;
+-            }
+-
+-            // ReflectionPermission perm = new ReflectionPermission(ReflectionPermissionFlag.MemberAccess);
+-            // perm.Assert();
+-            // frame.State.MethodInfo.Invoke(null /* no instance */, BindingFlags.NonPublic | BindingFlags.Static, null /* default binder */, args2, null /* default culture */);
+-            frame.State.Method.Invoke(null /* no instance */, arguments);
+-        }
+-
+-        /// <summary>
+-        /// This is for internal use by MSBuild, only.
+-        /// </summary>
+-        /// <comment>
+-        /// Executes the islands on a dedicated worker thread. The worker thread's
+-        /// physical callstack then maps to the interpreter's virtual callstack.
+-        /// </comment>
+-#if JMC
+-        [DebuggerNonUserCode]
+-#endif
+-        [SuppressMessage("Microsoft.Design", "CA1034:NestedTypesShouldNotBeVisible", Justification = "Working to avoid this being public")]
+-        public sealed class IslandThread : IDisposable
+-        {
+-            /// <summary>
+-            /// Callback used to enter an island
+-            /// </summary>
+-            private InvokeIslandDelegate _invokeIsland;
+-
+-            /// <summary>
+-            /// Set to true to notify to Break on first instruction. This helps the F11 on startup experience.
+-            /// Since the islands are on a new thread, there may be no user code on the main thread and so 
+-            /// F11 doesn't work. Thus the new worker thread needs to fire some break event.
+-            /// This gets reset after the 'startup breakpoint'.
+-            /// The initial Properties can override this.
+-            /// </summary>
+-            private bool _breakOnStartup;
+-
+-            /// <summary>
+-            /// Wrapped worker thread
+-            /// </summary>
+-            private Thread _workerThread;
+-
+-            /// <summary>
+-            /// Signalled when the main thread wants to send an event to the debugger worker thread.
+-            /// The main thread fills out the data first. 
+-            /// </summary>
+-            private AutoResetEvent _workToDoEvent;
+-
+-            /// <summary>
+-            /// Signalled by the worker thread when it's finished handling the event and 
+-            /// the main thread can resume.
+-            /// </summary>
+-            private AutoResetEvent _workDoneEvent;
+-
+-            /// <summary>
+-            /// Slot for passing operation to the worker thread
+-            /// </summary>
+-            private DebugAction _debugAction = DebugAction.Invalid;
+-
+-            /// <summary>
+-            /// Parameter for EnterState.
+-            /// Stored on a stack only for verification that enters and leaves are matched.
+-            /// </summary>
+-            private Stack<VirtualStackFrame> _virtualStack;
+-
+-            /// <summary>
+-            /// Constructor
+-            /// </summary>
+-            internal IslandThread(InvokeIslandDelegate invokeIsland, bool breakOnStartup)
+-            {
+-                _invokeIsland = invokeIsland;
+-
+-                _breakOnStartup = breakOnStartup;
+-
+-                _virtualStack = new Stack<VirtualStackFrame>();
+-
+-                _workToDoEvent = new AutoResetEvent(false);
+-                _workDoneEvent = new AutoResetEvent(false);
+-
+-                _workerThread = new Thread(new ThreadStart(WorkerThreadProc));
+-                _workerThread.Name = "DebuggerWorker";
+-                _workerThread.IsBackground = true; // Don't prevent process exit
+-                _workerThread.Start();
+-            }
+-
+-            /// <summary>
+-            /// Action for the thread to take
+-            /// </summary>
+-            private enum DebugAction
+-            {
+-                /// <summary>
+-                /// Uninitialized
+-                /// </summary>
+-                Invalid,
+-
+-                /// <summary>
+-                /// Enter a state 
+-                /// </summary>
+-                Enter,
+-
+-                /// <summary>
+-                /// Leave the current state
+-                /// </summary>
+-                Leave,
+-
+-                /// <summary>
+-                /// Stop execution
+-                /// </summary>
+-                Break
+-            }
+-
+-            /// <summary>
+-            /// This is for internal use by MSBuild, only.
+-            /// </summary>
+-            /// <comment>
+-            /// Private Entry point called from islands. Must be public so that the islands can invoke it.
+-            /// UNDONE: Make this internal somehow.
+-            /// Called on debugger worker thread.
+-            /// </comment>
+-            public static void IslandWorker(IslandThread controller)
+-            {
+-                controller.Worker(true);
+-            }
+-
+-            /// <summary>
+-            /// IDisposable implementation.
+-            /// </summary>
+-            void IDisposable.Dispose()
+-            {
+-                Dispose(true);
+-                GC.SuppressFinalize(this);
+-            }
+-
+-            /// <summary>
+-            /// Worker thread loop.
+-            /// Called on debugger worker thread.
+-            /// </summary>
+-            internal void Worker(bool withinCallback)
+-            {
+-                if (withinCallback)
+-                {
+-                    // Fire the 1-time "startup" breakpoint
+-                    // the first time we are entered from an island
+-                    if (_breakOnStartup)
+-                    {
+-#if FEATURE_DEBUG_LAUNCH
+-                        Debugger.Launch();
+-#endif
+-                        _breakOnStartup = false;
+-                    }
+-
+-                    _workDoneEvent.Set(); // Done entering state
+-                }
+-
+-                // The final terminator is when leave returns, but from a recursive call.
+-                while (true)
+-                {
+-                    _workToDoEvent.WaitOne();
+-                    switch (_debugAction)
+-                    {
+-                        case DebugAction.Enter:
+-                            _invokeIsland(this, _virtualStack.Peek());
+-
+-                            // LeaveState() caused a return back to here
+-                            _workDoneEvent.Set(); // Done leaving state
+-                            break;
+-
+-                        case DebugAction.Leave:
+-                            // Back up the stack, and if this is the
+-                            // top of the stack, return out of 
+-                            // this method. In that case workDoneEvent
+-                            // must be set by the caller
+-                            return;
+-
+-                        case DebugAction.Break:
+-                            if (!Debugger.IsAttached)
+-                            {
+-                                Trace.WriteLine("Triggering debugger attach");
+-                                Debugger.Break();
+-                            }
+-
+-                            _workDoneEvent.Set();
+-                            break;
+-
+-                        default:
+-                            ErrorUtilities.ThrowInternalErrorUnreachable();
+-                            break;
+-                    }
+-                }
+-            }
+-
+-            /// <summary>
+-            /// Posts an Enter instruction to the island thread.
+-            /// Called by debugger manager thread
+-            /// </summary>
+-            internal void EnterState(DebuggerState state, IDictionary<string, object> locals)
+-            {
+-                _debugAction = DebugAction.Enter;
+-                _virtualStack.Push(new VirtualStackFrame(state, locals));
+-                _workToDoEvent.Set();
+-
+-                // Block until Island executes NOP, 
+-                // giving BPs a chance to be hit.
+-                // Must block here if the island is stopped at a breakpoint.
+-                _workDoneEvent.WaitOne();
+-            }
+-
+-            /// <summary>
+-            /// Posts a Leave instruction to the island thread.
+-            /// Called by debugger manager thread
+-            /// If location is provided, verifies that the state being left is the state that was entered.
+-            /// Stack may already be empty, in which case it is not modified.
+-            /// </summary>
+-            internal void LeaveState(ElementLocation location)
+-            {
+-                ErrorUtilities.VerifyThrow(location == null || location == _virtualStack.Peek().State.Location, "Mismatched leave was {0} expected {1}", location.LocationString, _virtualStack.Peek().State.Location.LocationString);
+-
+-                _debugAction = DebugAction.Leave;
+-
+-                if (_virtualStack.Count > 0) // May be falling out of the first enter
+-                {
+-                    _virtualStack.Pop();
+-                }
+-
+-                _workToDoEvent.Set();
+-                _workDoneEvent.WaitOne();
+-            }
+-
+-            /// <summary>
+-            /// Posts a Break instruction to the island thread.
+-            /// Called by debugger manager thread.
+-            /// </summary>
+-            internal void Break()
+-            {
+-                _debugAction = DebugAction.Break;
+-
+-                _workToDoEvent.Set();
+-                _workDoneEvent.WaitOne();
+-
+-                ((IDisposable)this).Dispose();
+-            }
+-
+-            /// <summary>
+-            /// Exit debugging.
+-            /// Called by debugger manager thread.
+-            /// </summary>
+-            internal void Exit()
+-            {
+-                // Pop out of any existing stack
+-                while (_virtualStack.Count >= 0)
+-                {
+-                    LeaveState(null /* don't know what was the state */);
+-                }
+-
+-                // Add an unbalanced leave to make
+-                // the debugger worker thread leave the threadproc.
+-                LeaveState(null /* unbalanced */);
+-
+-                _workerThread.Join();
+-
+-                _workToDoEvent.Dispose();
+-                _workDoneEvent.Dispose();
+-            }
+-
+-            /// <summary>
+-            /// The real disposer.
+-            /// </summary>
+-            private void Dispose(bool disposing)
+-            {
+-                if (disposing)
+-                {
+-                    _workToDoEvent.Dispose();
+-                    _workDoneEvent.Dispose();
+-                }
+-            }
+-
+-            /// <summary>
+-            /// Threadproc.
+-            /// Called on debugger worker thread.
+-            /// </summary>
+-            private void WorkerThreadProc()
+-            {
+-                Worker(false /* not within callback */);
+-
+-                _workDoneEvent.Set(); // Done leaving state the last time
+-            }
+-        }
+-
+-        /// <summary>
+-        /// Describes a state in the interpreter. A state is any source location that 
+-        /// a breakpoint could be set on or that could be stepped to, such
+-        /// as a line of code or a statement.
+-        /// </summary>
+-#if JMC
+-    [DebuggerNonUserCode]
+-#endif
+-        internal class DebuggerState
+-        {
+-            /// <summary>
+-            /// Type to later call GetMethod on
+-            /// </summary>
+-            private Type _type;
+-
+-            /// <summary>
+-            /// Name to later call GetMethod with
+-            /// </summary>
+-            private string _methodName;
+-
+-            /// <summary>
+-            /// Cached MethodInfo for the method for this state
+-            /// </summary>
+-            private MethodInfo _methodInfo;
+-
+-            /// <summary>
+-            /// Constructor.
+-            /// State is given arbitrary provided name, which will appear in the debugger callstack: "ASSEMBLYNAME!FILENAME.STATENAME(...LOCALS...)"
+-            /// Early locals are any locals whose names and types available at the time the state was created. May be null.
+-            /// "Calling Type.GetMethod() is slow (10,000 calls can take ~1 minute). So defer that to later."
+-            /// CALLED ONLY FROM THE DEBUGGER MANAGER.
+-            /// </summary>
+-            internal DebuggerState(ElementLocation location, string name, ICollection<DebuggerLocalType> earlyLocalsTypes)
+-            {
+-                ErrorUtilities.VerifyThrowInternalNull(location, "location");
+-                ErrorUtilities.VerifyThrowInternalLength(name, "name");
+-
+-                this.Location = location;
+-                this.Name = name;
+-                this.EarlyLocalsTypes = earlyLocalsTypes ?? Array.Empty<DebuggerLocalType>();
+-            }
+-
+-            /// <summary>
+-            /// Location in source file associated with this state.
+-            /// SourceLocations for all the states should be disjoint.
+-            /// </summary>
+-            internal ElementLocation Location
+-            {
+-                get;
+-                private set;
+-            }
+-
+-            /// <summary>
+-            /// Friendly name of the state, such as method name.
+-            /// Never null.
+-            /// </summary>
+-            internal string Name
+-            {
+-                get;
+-                private set;
+-            }
+-
+-            /// <summary>
+-            /// Type definitions for early bound locals. This list is ordered.
+-            /// Names should be unique. 
+-            /// </summary>
+-            internal ICollection<DebuggerLocalType> EarlyLocalsTypes
+-            {
+-                get;
+-                private set;
+-            }
+-
+-            /// <summary>
+-            /// Method to call into this state.
+-            /// Must be gotten on the debugger thread, otherwise 
+-            /// "NotSupportedException: The invoked member is not supported in a dynamic module."
+-            /// </summary>
+-            internal MethodInfo Method
+-            {
+-                get
+-                {
+-                    ErrorUtilities.VerifyThrow(_type != null, "Didn't bake state '{0}'", Name);
+-
+-                    if (_methodInfo == null)
+-                    {
+-                        _methodInfo = _type.GetMethod(_methodName);
+-                    }
+-
+-                    return _methodInfo;
+-                }
+-            }
+-
+-            /// <summary>
+-            /// Record information necessary to find the method info from
+-            /// the debugger thread.
+-            /// CALLED ONLY FROM THE DEBUGGER MANAGER.
+-            /// </summary>
+-            internal void RecordMethodInfo(Type typeToRecord, string methodNameToRecord)
+-            {
+-                ErrorUtilities.VerifyThrow(_type == null, "already recorded type");
+-                ErrorUtilities.VerifyThrowInternalNull(typeToRecord, "typeToRecord");
+-                ErrorUtilities.VerifyThrowInternalLength(methodNameToRecord, "methodNameToRecord");
+-
+-                _type = typeToRecord;
+-                _methodName = methodNameToRecord;
+-            }
+-        }
+-
+-        /// <summary>
+-        /// A virtual callstack frame for the interpreter. 
+-        /// This is created by calls to EnterState and LeaveState.
+-        /// </summary>
+-#if JMC
+-        [DebuggerNonUserCode]
+-#endif
+-        internal class VirtualStackFrame
+-        {
+-            /// <summary>
+-            /// Construct a stack frame for the given state with the given locals (both early and late bound).
+-            /// </summary>
+-            /// <param name="state">state for this stackframe</param>
+-            /// <param name="locals">collection of all locals (both early and late) for this frame. May be null.</param>
+-            internal VirtualStackFrame(DebuggerState state, IDictionary<string, object> locals)
+-            {
+-                ErrorUtilities.VerifyThrowInternalNull(state, "state");
+-
+-                State = state;
+-                Locals = locals;
+-            }
+-
+-            /// <summary>
+-            /// State for this frame.
+-            /// </summary>
+-            internal DebuggerState State
+-            {
+-                get;
+-                private set;
+-            }
+-
+-            /// <summary>
+-            /// All locals (both early-bound and late-bound) for this frame.
+-            /// </summary>
+-            internal IDictionary<string, object> Locals
+-            {
+-                get;
+-                private set;
+-            }
+-        }
+-    }
+-}
+-#endif
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index ae2919518fd..813db630afc 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -13,9 +13,6 @@
+ using System.Reflection;
+ using System.Text;
+ using Microsoft.Build.Construction;
+-#if FEATURE_MSBUILD_DEBUGGER
+-using Microsoft.Build.Debugging;
+-#endif
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Execution;
+ using ObjectModel = System.Collections.ObjectModel;
+@@ -196,58 +193,6 @@ internal class Evaluator<P, I, M, D>
+ 
+         private bool _logProjectImportedEvents = true;
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-        /// <summary>
+-        /// Types of locals pulled in at the start - environment, global, toolset, and built-in properties
+-        /// </summary>
+-        private static IList<DebuggerLocalType> s_initialLocalsTypes;
+-
+-        /// <summary>
+-        /// Types of locals relevant to the property pass
+-        /// </summary>
+-        private static IList<DebuggerLocalType> s_propertyPassLocalsTypes;
+-
+-        /// <summary>
+-        /// Types of locals relevant to the item definition pass
+-        /// </summary>
+-        private static IList<DebuggerLocalType> s_itemDefinitionPassLocalsTypes;
+-
+-        /// <summary>
+-        /// Types of locals relevant to the item pass
+-        /// </summary>
+-        private static IList<DebuggerLocalType> s_itemPassLocalsTypes;
+-
+-        /// <summary>
+-        /// List of values and names available initially
+-        /// </summary>
+-        private IDictionary<string, object> _initialLocals;
+-
+-        /// <summary>
+-        /// List of values and names available in the property pass of evaluation
+-        /// </summary>
+-        private IDictionary<string, object> _propertyPassLocals;
+-
+-        /// <summary>
+-        /// List of values and names available in the item definition pass of evaluation
+-        /// </summary>
+-        private IDictionary<string, object> _itemDefinitionPassLocals;
+-
+-        /// <summary>
+-        /// List of values and names available in the item pass of evaluation
+-        /// </summary>
+-        private IDictionary<string, object> _itemPassLocals;
+-
+-        /// <summary>
+-        /// Dictionary of {child, parent} import relationships.
+-        /// </summary>
+-        private IDictionary<ProjectRootElement, ProjectRootElement> _importRelationships;
+-
+-        /// <summary>
+-        /// This is passed back so it can go to the build for debugger display while executing targets
+-        /// </summary>
+-        private IDictionary<string, object> _projectLevelLocalsForBuild;
+-#endif
+-
+         /// <summary>
+         /// The search paths are machine specific and should not change during builds
+         /// </summary>
+@@ -463,44 +408,6 @@ internal static List<I> CreateItemsFromInclude(string rootDirectory, ProjectItem
+             return items;
+         }
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-        /// <summary>
+-        /// Initializes DebuggerManager.
+-        /// Initialize definitions of locals types.
+-        /// This must not be called by a static constructor, as the 
+-        /// time at which it is called will then be undefined, and
+-        /// the debugging environment variable might not have had a 
+-        /// chance to be set.
+-        /// </summary>
+-        private static void InitializeForDebugging()
+-        {
+-            DebuggerManager.Initialize();
+-
+-            if (DebuggerManager.DebuggingEnabled)
+-            {
+-                s_initialLocalsTypes = new List<DebuggerLocalType>(6);
+-                s_initialLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.Project], typeof(ProjectInstance)));
+-                s_initialLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.BuiltIn], typeof(ICollection<P>)));
+-                s_initialLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.Environment], typeof(ICollection<P>)));
+-                s_initialLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.Toolset], typeof(ICollection<P>)));
+-                s_initialLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.SubToolset], typeof(ICollection<P>)));
+-                s_initialLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.Global], typeof(ICollection<P>)));
+-
+-                s_propertyPassLocalsTypes = new List<DebuggerLocalType>(s_initialLocalsTypes);
+-                s_propertyPassLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.EvaluateExpression], typeof(ExpandExpression)));
+-                s_propertyPassLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.EvaluateCondition], typeof(EvaluateConditionalExpression)));
+-                s_propertyPassLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.ToolsVersion], typeof(string)));
+-                s_propertyPassLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.Properties], typeof(PropertyDictionary<P>)));
+-
+-                s_itemDefinitionPassLocalsTypes = new List<DebuggerLocalType>(s_propertyPassLocalsTypes);
+-                s_itemDefinitionPassLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.ItemDefinitions], typeof(IEnumerable<D>)));
+-
+-                s_itemPassLocalsTypes = new List<DebuggerLocalType>(s_itemDefinitionPassLocalsTypes);
+-                s_itemPassLocalsTypes.Add(new DebuggerLocalType(Evaluator<P, I, M, D>.s_localsTypesNames[(int)LocalsTypes.Items], typeof(ItemDictionary<I>)));
+-            }
+-        }
+-#endif
+-
+         /// <summary>
+         /// Read the task into an instance.
+         /// Do not evaluate anything: this occurs during build.
+@@ -741,10 +648,6 @@ private IDictionary<string, object> Evaluate(ILoggingService loggingService, Bui
+ 
+                 _logProjectImportedEvents = Traits.Instance.EscapeHatches.LogProjectImports;
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                InitializeForDebugging();
+-#endif
+-
+                 ICollection<P> builtInProperties;
+                 ICollection<P> environmentProperties;
+                 ICollection<P> toolsetProperties;
+@@ -760,42 +663,6 @@ private IDictionary<string, object> Evaluate(ILoggingService loggingService, Bui
+                     globalProperties = AddGlobalProperties();
+                 }
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                // Create a state for the root project node to show initial properties
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    _initialLocals = new Dictionary<string, object>();
+-                    _initialLocals.Add(new KeyValuePair<string, object>(s_initialLocalsTypes[(int)LocalsTypes.Project].Name, _projectInstanceIfAnyForDebuggerOnly));
+-                    _initialLocals.Add(new KeyValuePair<string, object>(s_initialLocalsTypes[(int)LocalsTypes.BuiltIn].Name, builtInProperties));
+-                    _initialLocals.Add(new KeyValuePair<string, object>(s_initialLocalsTypes[(int)LocalsTypes.Environment].Name, environmentProperties));
+-                    _initialLocals.Add(new KeyValuePair<string, object>(s_initialLocalsTypes[(int)LocalsTypes.Toolset].Name, toolsetProperties));
+-                    _initialLocals.Add(new KeyValuePair<string, object>(s_initialLocalsTypes[(int)LocalsTypes.Global].Name, globalProperties));
+-
+-                    DebuggerManager.DefineState(_projectRootElement.Location, _projectRootElement.ElementName, s_initialLocalsTypes);
+-
+-                    DebuggerManager.BakeStates(Path.GetFileNameWithoutExtension(_projectRootElement.FullPath));
+-
+-                    DebuggerManager.PulseState(_projectRootElement.Location, _initialLocals);
+-
+-                    _propertyPassLocals = new Dictionary<string, object>(_initialLocals);
+-                    _propertyPassLocals.Add(new KeyValuePair<string, object>(s_propertyPassLocalsTypes[(int)LocalsTypes.EvaluateExpression].Name, (ExpandExpression)_data.ExpandString));
+-                    _propertyPassLocals.Add(new KeyValuePair<string, object>(s_propertyPassLocalsTypes[(int)LocalsTypes.EvaluateCondition].Name, (EvaluateConditionalExpression)_data.EvaluateCondition));
+-                    _propertyPassLocals.Add(new KeyValuePair<string, object>(s_propertyPassLocalsTypes[(int)LocalsTypes.ToolsVersion].Name, _data.Toolset.ToolsVersion));
+-                    _propertyPassLocals.Add(new KeyValuePair<string, object>(s_propertyPassLocalsTypes[(int)LocalsTypes.Properties].Name, _data.Properties));
+-
+-                    _itemDefinitionPassLocals = new Dictionary<string, object>(_propertyPassLocals);
+-                    _itemDefinitionPassLocals.Add(new KeyValuePair<string, object>(s_itemDefinitionPassLocalsTypes[(int)LocalsTypes.ItemDefinitions].Name, _data.ItemDefinitionsEnumerable));
+-
+-                    _itemPassLocals = new Dictionary<string, object>(_itemDefinitionPassLocals);
+-                    _itemPassLocals.Add(new KeyValuePair<string, object>(s_itemPassLocalsTypes[(int)LocalsTypes.Items].Name, _data.Items));
+-
+-                    // This is currently only needed when debugging
+-                    _importRelationships = new Dictionary<ProjectRootElement, ProjectRootElement>();
+-
+-                    // This is passed back to the build, so locals are visible during the build
+-                    _projectLevelLocalsForBuild = _itemPassLocals;
+-                }
+-#endif
+ #if (!STANDALONEBUILD)
+             CodeMarkers.Instance.CodeMarker(CodeMarkerEvent.perfMSBuildProjectEvaluatePass0End);
+ #endif
+@@ -998,11 +865,8 @@ private IDictionary<string, object> Evaluate(ILoggingService loggingService, Bui
+                 ProjectFile = projectFile,
+                 ProfilerResult = (_loadSettings & ProjectLoadSettings.ProfileEvaluation) != 0 ? (ProfilerResult?)_evaluationProfiler.ProfiledResult : null
+             });
+-#if FEATURE_MSBUILD_DEBUGGER
+-            return _projectLevelLocalsForBuild;
+-#else
++
+             return null;
+-#endif
+         }
+ 
+         /// <summary>
+@@ -1029,47 +893,17 @@ private void PerformDepthFirstPass(ProjectRootElement currentProjectOrImport)
+ 
+                 UpdateDefaultTargets(currentProjectOrImport);
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
++                // Get all the implicit imports (e.g. <Project Sdk="" />, but not <Import Sdk="" />)
++                List<ProjectImportElement> implicitImports = currentProjectOrImport.GetImplicitImportNodes(currentProjectOrImport);
++
++                // Evaluate the "top" implicit imports as if they were the first entry in the file.
++                foreach (var import in implicitImports)
+                 {
+-                    // Create a state for every element processed during the properties pass
+-                    foreach (ProjectElement element in currentProjectOrImport.AllChildren)
++                    if (import.ImplicitImportLocation == ImplicitImportLocation.Top)
+                     {
+-                        if (
+-                            element is ProjectPropertyGroupElement ||
+-                            element is ProjectPropertyElement ||
+-                            element is ProjectImportGroupElement ||
+-                            element is ProjectImportElement ||
+-                            element is ProjectChooseElement ||
+-                            element is ProjectWhenElement || // although Whens are encountered again during the item pass, the condition is only evaluated on the first pass, hence, property locals only
+-                            element is ProjectOtherwiseElement
+-                            )
+-                        {
+-                            // Skip any that are somewhere below targets; those will be defined later
+-                            if (!(element is ProjectTargetElement) &&
+-                                element.AllParents.FirstOrDefault(delegate (ProjectElementContainer current) { return (current != null && current is ProjectTargetElement); }) == null)
+-                            {
+-                                DebuggerManager.DefineState(element.Location, element.Location.LocationString, s_propertyPassLocalsTypes);
+-                            }
+-                        }
++                        EvaluateImportElement(currentProjectOrImport.DirectoryPath, import);
+                     }
+-
+-                    // Bake the property pass states so we can enter them
+-                    DebuggerManager.BakeStates(Path.GetFileNameWithoutExtension(currentProjectOrImport.FullPath));
+                 }
+-#endif
+-
+-            // Get all the implicit imports (e.g. <Project Sdk="" />, but not <Import Sdk="" />)
+-            List<ProjectImportElement> implicitImports = currentProjectOrImport.GetImplicitImportNodes(currentProjectOrImport);
+-
+-            // Evaluate the "top" implicit imports as if they were the first entry in the file.
+-            foreach (var import in implicitImports)
+-            {
+-                if (import.ImplicitImportLocation == ImplicitImportLocation.Top)
+-                {
+-                    EvaluateImportElement(currentProjectOrImport.DirectoryPath, import);
+-                }
+-            }
+ 
+                 foreach (ProjectElement element in currentProjectOrImport.Children)
+                 {
+@@ -1087,23 +921,6 @@ element is ProjectOtherwiseElement
+                     {
+                         _itemGroupElements.Add(itemGroup);
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                        if (DebuggerManager.DebuggingEnabled)
+-                        {
+-                            DebuggerManager.DefineState(element.Location, element.Location.LocationString, s_itemPassLocalsTypes);
+-
+-                            foreach (ProjectItemElement item in itemGroup.Items)
+-                            {
+-                                DebuggerManager.DefineState(item.Location, item.Location.LocationString, s_itemPassLocalsTypes);
+-
+-                                foreach (ProjectMetadataElement metadatum in item.Metadata)
+-                                {
+-                                    DebuggerManager.DefineState(metadatum.Location, metadatum.Location.LocationString, s_itemPassLocalsTypes);
+-                                }
+-                            }
+-                        }
+-#endif
+-
+                         continue;
+                     }
+ 
+@@ -1113,23 +930,6 @@ element is ProjectOtherwiseElement
+                     {
+                         _itemDefinitionGroupElements.Add(itemDefinitionGroup);
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                        if (DebuggerManager.DebuggingEnabled)
+-                        {
+-                            DebuggerManager.DefineState(element.Location, element.Location.LocationString, s_itemDefinitionPassLocalsTypes);
+-
+-                            foreach (ProjectItemDefinitionElement itemDefinition in itemDefinitionGroup.ItemDefinitions)
+-                            {
+-                                DebuggerManager.DefineState(itemDefinition.Location, itemDefinition.Location.LocationString, s_itemDefinitionPassLocalsTypes);
+-
+-                                foreach (ProjectMetadataElement metadatum in itemDefinition.Metadata)
+-                                {
+-                                    DebuggerManager.DefineState(metadatum.Location, metadatum.Location.LocationString, s_itemDefinitionPassLocalsTypes);
+-                                }
+-                            }
+-                        }
+-#endif
+-
+                         continue;
+                     }
+ 
+@@ -1137,18 +937,6 @@ element is ProjectOtherwiseElement
+ 
+                     if (target != null)
+                     {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                        if (DebuggerManager.DebuggingEnabled)
+-                        {
+-                            DebuggerManager.DefineState(element.Location, element.Location.LocationString, s_itemPassLocalsTypes);
+-
+-                            foreach (ProjectElement child in (target.AllChildren))
+-                            {
+-                                DebuggerManager.DefineState(child.Location, child.Location.LocationString, s_itemPassLocalsTypes);
+-                            }
+-                        }
+-#endif
+-
+                         if (_projectSupportsReturnsAttribute.ContainsKey(currentProjectOrImport))
+                         {
+                             _projectSupportsReturnsAttribute[currentProjectOrImport] |= (target.Returns != null);
+@@ -1182,13 +970,6 @@ element is ProjectOtherwiseElement
+ 
+                     if (usingTask != null)
+                     {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                        if (DebuggerManager.DebuggingEnabled)
+-                        {
+-                            DebuggerManager.DefineState(element.Location, element.Location.LocationString, s_itemPassLocalsTypes);
+-                        }
+-#endif
+-
+                         _usingTaskElements.Add(new Pair<string, ProjectUsingTaskElement>(currentProjectOrImport.DirectoryPath, usingTask));
+                         continue;
+                     }
+@@ -1197,23 +978,6 @@ element is ProjectOtherwiseElement
+ 
+                     if (choose != null)
+                     {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                        if (DebuggerManager.DebuggingEnabled)
+-                        {
+-                            // Already defined states for all choose children that were relevant to the
+-                            // property pass; now the ones relevant to the item pass, which get the item pass locals
+-                            foreach (ProjectElement child in choose.AllChildren)
+-                            {
+-                                if (child is ProjectItemGroupElement ||
+-                                    child is ProjectItemElement ||
+-                                    child is ProjectMetadataElement)
+-                                {
+-                                    DebuggerManager.DefineState(child.Location, child.Location.LocationString, s_itemPassLocalsTypes);
+-                                }
+-                            }
+-                        }
+-#endif
+-
+                         EvaluateChooseElement(choose);
+                         continue;
+                     }
+@@ -1231,21 +995,14 @@ child is ProjectItemElement ||
+                     ErrorUtilities.ThrowInternalError("Unexpected child type");
+                 }
+ 
+-            // Evaluate the "bottom" implicit imports as if they were the last entry in the file.
+-            foreach (var import in implicitImports)
+-            {
+-                if (import.ImplicitImportLocation == ImplicitImportLocation.Bottom)
++                // Evaluate the "bottom" implicit imports as if they were the last entry in the file.
++                foreach (var import in implicitImports)
+                 {
+-                    EvaluateImportElement(currentProjectOrImport.DirectoryPath, import);
+-                }
+-            }
+-
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.BakeStates(Path.GetFileNameWithoutExtension(currentProjectOrImport.FullPath));
++                    if (import.ImplicitImportLocation == ImplicitImportLocation.Bottom)
++                    {
++                        EvaluateImportElement(currentProjectOrImport.DirectoryPath, import);
++                    }
+                 }
+-#endif
+             }
+         }
+ 
+@@ -1285,13 +1042,6 @@ private void EvaluatePropertyGroupElement(ProjectPropertyGroupElement propertyGr
+         {
+             using (_evaluationProfiler.TrackElement(propertyGroupElement))
+             { 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.PulseState(propertyGroupElement.Location, _propertyPassLocals);
+-                }
+-#endif
+-
+                 if (EvaluateConditionCollectingConditionedProperties(propertyGroupElement, ExpanderOptions.ExpandProperties, ParserOptions.AllowProperties))
+                 {
+                     foreach (ProjectPropertyElement propertyElement in propertyGroupElement.Properties)
+@@ -1307,13 +1057,6 @@ private void EvaluatePropertyGroupElement(ProjectPropertyGroupElement propertyGr
+         /// </summary>
+         private void EvaluateItemDefinitionGroupElement(ProjectItemDefinitionGroupElement itemDefinitionGroupElement)
+         {
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (DebuggerManager.DebuggingEnabled)
+-            {
+-                DebuggerManager.PulseState(itemDefinitionGroupElement.Location, _itemDefinitionPassLocals);
+-            }
+-#endif
+-
+             if (EvaluateCondition(itemDefinitionGroupElement, ExpanderOptions.ExpandProperties, ParserOptions.AllowProperties))
+             {
+                 foreach (ProjectItemDefinitionElement itemDefinitionElement in itemDefinitionGroupElement.ItemDefinitions)
+@@ -1331,13 +1074,6 @@ private void EvaluateItemDefinitionGroupElement(ProjectItemDefinitionGroupElemen
+         /// </summary>
+         private void EvaluateItemGroupElement(ProjectItemGroupElement itemGroupElement, LazyItemEvaluator<P, I, M, D> lazyEvaluator)
+         {
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (DebuggerManager.DebuggingEnabled)
+-            {
+-                DebuggerManager.PulseState(itemGroupElement.Location, _itemPassLocals);
+-            }
+-#endif
+-
+             bool itemGroupConditionResult;
+             if (lazyEvaluator != null)
+             {
+@@ -1365,13 +1101,6 @@ private void EvaluateItemGroupElement(ProjectItemGroupElement itemGroupElement,
+         /// </summary>
+         private void EvaluateUsingTaskElement(string directoryOfImportingFile, ProjectUsingTaskElement projectUsingTaskElement)
+         {
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (DebuggerManager.DebuggingEnabled)
+-            {
+-                DebuggerManager.PulseState(projectUsingTaskElement.Location, _itemPassLocals);
+-            }
+-#endif
+-
+             TaskRegistry.RegisterTasksFromUsingTaskElement<P, I>
+                 (
+                 _evaluationLoggingContext.LoggingService,
+@@ -1654,14 +1383,6 @@ private void EvaluatePropertyElement(ProjectPropertyElement propertyElement)
+         {
+             using (_evaluationProfiler.TrackElement(propertyElement))
+             {
+-
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.EnterState(propertyElement.Location, _propertyPassLocals);
+-                }
+-#endif
+-
+                 // Global properties cannot be overridden.  We silently ignore them if we try.  Legacy behavior.
+                 // That is, unless this global property has been explicitly labeled as one that we want to treat as overridable for the duration 
+                 // of this project (or import). 
+@@ -1670,25 +1391,11 @@ private void EvaluatePropertyElement(ProjectPropertyElement propertyElement)
+                         !_data.GlobalPropertiesToTreatAsLocal.Contains(propertyElement.Name)
+                     )
+                 {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                    if (DebuggerManager.DebuggingEnabled)
+-                    {
+-                        DebuggerManager.LeaveState(propertyElement.Location);
+-                    }
+-#endif
+-
+                     return;
+                 }
+ 
+                 if (!EvaluateConditionCollectingConditionedProperties(propertyElement, ExpanderOptions.ExpandProperties, ParserOptions.AllowProperties))
+                 {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                    if (DebuggerManager.DebuggingEnabled)
+-                    {
+-                        DebuggerManager.LeaveState(propertyElement.Location);
+-                    }
+-#endif
+-
+                     return;
+                 }
+ 
+@@ -1724,13 +1431,6 @@ private void EvaluatePropertyElement(ProjectPropertyElement propertyElement)
+                 {
+                     LogPropertyReassignment(predecessor, property, propertyElement.Location.LocationString);
+                 }
+-
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.LeaveState(propertyElement.Location);
+-                }
+-#endif
+             }
+         }
+ 
+@@ -1753,13 +1453,6 @@ private void LogPropertyReassignment(P predecessor, P property, string location)
+ 
+         private void EvaluateItemElement(bool itemGroupConditionResult, ProjectItemElement itemElement, LazyItemEvaluator<P, I, M, D> lazyEvaluator)
+         {
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (DebuggerManager.DebuggingEnabled)
+-            {
+-                DebuggerManager.EnterState(itemElement.Location, _itemPassLocals);
+-            }
+-#endif
+-
+             bool itemConditionResult;
+             if (lazyEvaluator != null)
+             {
+@@ -1772,13 +1465,6 @@ private void EvaluateItemElement(bool itemGroupConditionResult, ProjectItemEleme
+ 
+             if (!itemConditionResult && !(_data.ShouldEvaluateForDesignTime && _data.CanEvaluateElementsWithFalseConditions))
+             {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.LeaveState(itemElement.Location);
+-                }
+-#endif
+-
+                 return;
+             }
+ 
+@@ -1836,13 +1522,6 @@ private void EvaluateItemElementUpdate(ProjectItemElement itemElement)
+         /// </summary>
+         private void EvaluateItemElementInclude(bool itemGroupConditionResult, bool itemConditionResult, ProjectItemElement itemElement)
+         {
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (DebuggerManager.DebuggingEnabled)
+-            {
+-                DebuggerManager.EnterState(itemElement.Location, _itemPassLocals);
+-            }
+-#endif
+-
+             // Paths in items are evaluated relative to the outer project file, rather than relative to any targets file they may be contained in
+             IList<I> items = CreateItemsFromInclude(_projectRootElement.DirectoryPath, itemElement, _itemFactory, itemElement.Include, _expander);
+ 
+@@ -1907,13 +1586,6 @@ private void EvaluateItemElementInclude(bool itemGroupConditionResult, bool item
+                     _data.AddItemIgnoringCondition(item);
+                 }
+             }
+-
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (DebuggerManager.DebuggingEnabled)
+-            {
+-                DebuggerManager.LeaveState(itemElement.Location);
+-            }
+-#endif
+         }
+ 
+         private void DecorateItemsWithMetadataFromProjectItemElement(ProjectItemElement itemElement, IList<I> items)
+@@ -1990,13 +1662,6 @@ private void DecorateItemsWithMetadataFromProjectItemElement(ProjectItemElement
+ 
+                         foreach (ProjectMetadataElement metadatumElement in itemElement.Metadata)
+                         {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                            if (DebuggerManager.DebuggingEnabled)
+-                            {
+-                                DebuggerManager.PulseState(metadatumElement.Location, _itemPassLocals);
+-                            }
+-#endif
+-
+                             if (!EvaluateCondition(metadatumElement, ExpanderOptions.ExpandAll, ParserOptions.AllowAll))
+                             {
+                                 continue;
+@@ -2034,13 +1699,6 @@ private void DecorateItemsWithMetadataFromProjectItemElement(ProjectItemElement
+                             continue;
+                         }
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                        if (DebuggerManager.DebuggingEnabled)
+-                        {
+-                            DebuggerManager.PulseState(metadatumElement.Location, _itemPassLocals);
+-                        }
+-#endif
+-
+                         string evaluatedValue = _expander.ExpandIntoStringLeaveEscaped(metadatumElement.Value, ExpanderOptions.ExpandAll, metadatumElement.Location);
+ 
+                         metadataTable.SetValue(metadatumElement, evaluatedValue);
+@@ -2067,13 +1725,6 @@ private void DecorateItemsWithMetadataFromProjectItemElement(ProjectItemElement
+         /// </summary>
+         private void EvaluateItemDefinitionElement(ProjectItemDefinitionElement itemDefinitionElement)
+         {
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (DebuggerManager.DebuggingEnabled)
+-            {
+-                DebuggerManager.PulseState(itemDefinitionElement.Location, _itemDefinitionPassLocals);
+-            }
+-#endif
+-
+             // Get matching existing item definition, if any.
+             IItemDefinition<M> itemDefinition = _data.GetItemDefinition(itemDefinitionElement.ItemType);
+ 
+@@ -2098,13 +1749,6 @@ private void EvaluateItemDefinitionElement(ProjectItemDefinitionElement itemDefi
+ 
+                 foreach (ProjectMetadataElement metadataElement in itemDefinitionElement.Metadata)
+                 {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                    if (DebuggerManager.DebuggingEnabled)
+-                    {
+-                        DebuggerManager.PulseState(metadataElement.Location, _itemDefinitionPassLocals);
+-                    }
+-#endif
+-
+                     if (EvaluateCondition(metadataElement, ExpanderOptions.ExpandPropertiesAndMetadata, ParserOptions.AllowPropertiesAndCustomMetadata))
+                     {
+                         string evaluatedValue = _expander.ExpandIntoStringLeaveEscaped(metadataElement.Value, ExpanderOptions.ExpandPropertiesAndCustomMetadata, itemDefinitionElement.Location);
+@@ -2136,36 +1780,14 @@ private void EvaluateImportElement(string directoryOfImportingFile, ProjectImpor
+         {
+             using (_evaluationProfiler.TrackElement(importElement))
+             {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.EnterState(importElement.Location, _propertyPassLocals);
+-                }
+-#endif
+-
+                 List<ProjectRootElement> importedProjectRootElements = ExpandAndLoadImports(directoryOfImportingFile, importElement);
+ 
+                 foreach (ProjectRootElement importedProjectRootElement in importedProjectRootElements)
+                 {
+                     _data.RecordImport(importElement, importedProjectRootElement, importedProjectRootElement.Version);
+ 
+-                    // This key should be unique, as duplicate imports were already discarded
+-#if FEATURE_MSBUILD_DEBUGGER
+-                    if (DebuggerManager.DebuggingEnabled)
+-                    {
+-                        _importRelationships.Add(importedProjectRootElement, importElement.ContainingProject);
+-                    }
+-#endif
+-
+                     PerformDepthFirstPass(importedProjectRootElement);
+                 }
+-
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.LeaveState(importElement.Location);
+-                }
+-#endif
+             }
+         }
+ 
+@@ -2180,13 +1802,6 @@ private void EvaluateImportGroupElement(string directoryOfImportingFile, Project
+         {
+             using (_evaluationProfiler.TrackElement(importGroupElement))
+             {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.PulseState(importGroupElement.Location, _propertyPassLocals);
+-                }
+-#endif
+-
+                 if (EvaluateConditionCollectingConditionedProperties(importGroupElement, ExpanderOptions.ExpandProperties, ParserOptions.AllowProperties, _projectRootElementCache))
+                 {
+                     foreach (ProjectImportElement importElement in importGroupElement.Imports)
+@@ -2211,13 +1826,6 @@ private void EvaluateChooseElement(ProjectChooseElement chooseElement)
+             {
+                 foreach (ProjectWhenElement whenElement in chooseElement.WhenElements)
+                 {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.PulseState(whenElement.Location, _propertyPassLocals);
+-                }
+-#endif
+-
+                     if (EvaluateConditionCollectingConditionedProperties(whenElement, ExpanderOptions.ExpandProperties, ParserOptions.AllowProperties))
+                     {
+                         EvaluateWhenOrOtherwiseChildren(whenElement.Children);
+@@ -2228,13 +1836,6 @@ private void EvaluateChooseElement(ProjectChooseElement chooseElement)
+                 // "Otherwise" elements never have a condition
+                 if (chooseElement.OtherwiseElement != null)
+                 {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                if (DebuggerManager.DebuggingEnabled)
+-                {
+-                    DebuggerManager.PulseState(chooseElement.OtherwiseElement.Location, _propertyPassLocals);
+-                }
+-#endif
+-
+                     EvaluateWhenOrOtherwiseChildren(chooseElement.OtherwiseElement.Children);
+                 }
+             }
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs b/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
+index 258aa8769bb..455f9f476cf 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
+@@ -163,13 +163,6 @@ protected void DecorateItemsWithMetadata(ImmutableList<I> items, ImmutableList<P
+ 
+                             foreach (var metadataElement in metadata)
+                             {
+-#if FEATURE_MSBUILD_DEBUGGER
+-                                //if (DebuggerManager.DebuggingEnabled)
+-                                //{
+-                                //    DebuggerManager.PulseState(metadataElementElement.Location, _itemPassLocals);
+-                                //}
+-#endif
+-
+                                 if (!EvaluateCondition(metadataElement.Condition, metadataElement, metadataExpansionOptions, ParserOptions.AllowAll, _expander, _lazyEvaluator))
+                                 {
+                                     continue;
+@@ -207,13 +200,6 @@ protected void DecorateItemsWithMetadata(ImmutableList<I> items, ImmutableList<P
+                                 continue;
+                             }
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                            //if (DebuggerManager.DebuggingEnabled)
+-                            //{
+-                            //    DebuggerManager.PulseState(metadataElementElement.Location, _itemPassLocals);
+-                            //}
+-#endif
+-
+                             string evaluatedValue = _expander.ExpandIntoStringLeaveEscaped(metadataElement.Value, metadataExpansionOptions, metadataElement.Location);
+                             evaluatedValue = FileUtilities.MaybeAdjustFilePath(evaluatedValue, metadataElement.ContainingProject.DirectoryPath);
+ 
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.cs b/src/Build/Evaluation/LazyItemEvaluator.cs
+index cee97e1da09..e710988563d 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.cs
+@@ -4,9 +4,6 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
+-#if FEATURE_MSBUILD_DEBUGGER
+-using Microsoft.Build.Debugging;
+-#endif 
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using System;
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 1bba2ad33d5..4f6cd938ca6 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -410,8 +410,6 @@
+     <Compile Include="Construction\Solution\SolutionFile.cs">
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+     </Compile>
+-    <Compile Include="Debugger\DebuggerLocalType.cs" />
+-    <Compile Include="Debugger\DebuggerManager.cs" />
+     <!-- #### DEFINITION MODEL ### -->
+     <Compile Include="Definition\BuiltInMetadata.cs" />
+     <Compile Include="Definition\ProjectCollection.cs" />
+diff --git a/src/Directory.BeforeCommon.targets b/src/Directory.BeforeCommon.targets
+index d2d6a17249e..23b3bc4bce4 100644
+--- a/src/Directory.BeforeCommon.targets
++++ b/src/Directory.BeforeCommon.targets
+@@ -132,11 +132,6 @@
+     <DefineConstants>$(DefineConstants);USE_MSBUILD_DLL_EXTN</DefineConstants>
+   </PropertyGroup>
+ 
+-  <!-- Change define constants as needed -->
+-  <PropertyGroup Condition="'$(MsbuildDebugger)' == 'true' AND '$(MonoBuild)' != 'true'">
+-    <DefineConstants>$(DefineConstants);FEATURE_MSBUILD_DEBUGGER</DefineConstants>
+-  </PropertyGroup>
+-
+   <PropertyGroup>
+     <IBCMergeSubPath>x86/MSBuild</IBCMergeSubPath>
+   </PropertyGroup>
+diff --git a/src/MSBuild.UnitTests/CommandLineSwitches_Tests.cs b/src/MSBuild.UnitTests/CommandLineSwitches_Tests.cs
+index dd9b6c01723..c0971ee1659 100644
+--- a/src/MSBuild.UnitTests/CommandLineSwitches_Tests.cs
++++ b/src/MSBuild.UnitTests/CommandLineSwitches_Tests.cs
+@@ -1124,7 +1124,6 @@ public void InvalidToolsVersionErrors()
+                                         true,
+                                         new StringWriter(),
+                                         false,
+-                                        false, 
+                                         warningsAsErrors: null,
+                                         warningsAsMessages: null,
+                                         enableRestore: false,
+diff --git a/src/MSBuild/CommandLineSwitches.cs b/src/MSBuild/CommandLineSwitches.cs
+index c1576664647..0cd54d73d6c 100644
+--- a/src/MSBuild/CommandLineSwitches.cs
++++ b/src/MSBuild/CommandLineSwitches.cs
+@@ -48,9 +48,6 @@ internal enum ParameterlessSwitch
+             OldOM,
+ #endif
+             DistributedFileLogger,
+-#if FEATURE_MSBUILD_DEBUGGER
+-            Debugger,
+-#endif
+             DetailedSummary,
+ #if DEBUG
+             WaitForDebugger,
+@@ -235,9 +232,6 @@ bool emptyParametersAllowed
+             new ParameterlessSwitchInfo(  new string[] { "oldom" },                         ParameterlessSwitch.OldOM,                 null, null              ),
+ #endif
+             new ParameterlessSwitchInfo(  new string[] { "distributedfilelogger", "dfl" },  ParameterlessSwitch.DistributedFileLogger, null, null              ),
+-#if FEATURE_MSBUILD_DEBUGGER
+-            new ParameterlessSwitchInfo(  new string[] { "debug", "d" },                    ParameterlessSwitch.Debugger,              null, "DebuggerEnabled" ),
+-#endif
+             new ParameterlessSwitchInfo(  new string[] { "detailedsummary", "ds" },         ParameterlessSwitch.DetailedSummary,       null , null             ),
+ #if DEBUG
+             new ParameterlessSwitchInfo(  new string[] { "waitfordebugger", "wfd" },        ParameterlessSwitch.WaitForDebugger,       null , null             ),
+diff --git a/src/MSBuild/Resources/Strings.resx b/src/MSBuild/Resources/Strings.resx
+index 515481d6093..dfb9c8f3471 100644
+--- a/src/MSBuild/Resources/Strings.resx
++++ b/src/MSBuild/Resources/Strings.resx
+@@ -579,13 +579,6 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                      (Short form: /ds)
+     </value>
+   </data>
+-  <data name="HelpMessage_27_DebuggerSwitch" UESanitized="false" Visibility="Public">
+-   <value>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </value>
+-  </data>
+   <data name="HelpMessage_28_WarnAsErrorSwitch" UESanitized="false" Visibility="Public">
+     <value>  /warnaserror[:code[;code2]]
+                      List of warning codes to treats as errors.  Use a semicolon
+diff --git a/src/MSBuild/Resources/xlf/Strings.cs.xlf b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+index ee369a802ef..96828dc6bcf 100644
+--- a/src/MSBuild/Resources/xlf/Strings.cs.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Způsobí okamžité zobrazení příkazového řádku ladicího programu,
+-                     takže je možné připojit sadu Visual Studio k ladění souboru XML MSBuild
+-                     a používaných úloh a protokolovacích nástrojů.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: Nepodařilo se spustit aplikaci. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.de.xlf b/src/MSBuild/Resources/xlf/Strings.de.xlf
+index 534bf1dc05e..584f670c5da 100644
+--- a/src/MSBuild/Resources/xlf/Strings.de.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.de.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Sorgt dafür, dass ein Debugger umgehend angezeigt wird,
+-                     damit Visual Studio angefügt werden kann, um die MSBuild-XML
+-                     und alle dafür verwendeten Aufgaben und Protokollierungen zu debuggen.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: Die Anwendung konnte nicht gestartet werden. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.en.xlf b/src/MSBuild/Resources/xlf/Strings.en.xlf
+index 02d5618640b..13d9cfed60b 100644
+--- a/src/MSBuild/Resources/xlf/Strings.en.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.en.xlf
+@@ -764,19 +764,6 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="new">  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="HelpMessage_28_WarnAsErrorSwitch">
+         <source>  /warnaserror[:code[;code2]]
+                      List of warning codes to treats as errors.  Use a semicolon
+diff --git a/src/MSBuild/Resources/xlf/Strings.es.xlf b/src/MSBuild/Resources/xlf/Strings.es.xlf
+index 65527a01051..e518f4e4f65 100644
+--- a/src/MSBuild/Resources/xlf/Strings.es.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.es.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Hace que aparezca inmediatamente un mensaje del depurador para
+-                     poder asociar Visual Studio para depurar
+-                     XML de MSBuild y todas las tareas y registradores que usa.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: No se pudo iniciar la aplicación. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.fr.xlf b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+index ed51ddd2099..3725ad3204d 100644
+--- a/src/MSBuild/Resources/xlf/Strings.fr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Entraîne l'affichage immédiat d'une invite de débogueur permettant
+-                     d'attacher Visual Studio automatiquement pour déboguer le code
+-                     XML MSBuild, ainsi que les tâches et enregistreurs d'événements utilisés.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: L'application n'a pas pu démarrer. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.it.xlf b/src/MSBuild/Resources/xlf/Strings.it.xlf
+index 3b2ca5e909f..97e87e1c347 100644
+--- a/src/MSBuild/Resources/xlf/Strings.it.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.it.xlf
+@@ -767,20 +767,6 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Causa la visualizzazione immediata di un prompt del
+-                     debugger in modo che sia possibile collegare Visual Studio
+-                     per il debug dell'XML di MSBuild e di eventuali attività e
+-                     logger usati.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: non è stato possibile avviare l'applicazione. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.ja.xlf b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+index a3a16a2e404..83df975c08e 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ja.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                    デバッガー プロンプトを直ちに表示します。
+-                    Visual Studio がアタッチされ、MSBuild XML と、
+-                    使用されるすべてのタスクおよびロガーをデバッグできます。
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: アプリケーションを起動できませんでした。{0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.ko.xlf b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+index 49d7f695951..2d110e58708 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ko.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     디버거 프롬프트를 즉시 나타나게 하여 
+-                     MSBuild XML 및 Visual Studio에서 사용하는 모든 작업 및
+-                     로거를 디버그하기 위해 Visual Studio를 연결할 수 있습니다.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: 응용 프로그램을 시작할 수 없습니다. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.pl.xlf b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+index 91855ae71b8..4210e18cd72 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pl.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Powoduje, że monit debugera jest wyświetlany natychmiast,
+-                     więc można dołączyć program Visual Studio w celu debugowania
+-                     kodu XML utworzonego w programie MSBuild oraz wszelkich używanych w nim zadań i rejestratorów.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: nie można uruchomić aplikacji. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+index 4590f9ca707..bfa15c4c136 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. Todos os direitos reservados.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Faz com que um prompt de depurador apareça imediatamente para que o
+-                     Visual Studio possa ser anexado para que seja possível fazer a depuração do 
+-                     XML MSBuild e de qualquer tarefa ou agente usado por ele.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: Não foi possível iniciar o aplicativo. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.ru.xlf b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+index 89aa9547647..3df5655e4c9 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ru.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+@@ -753,19 +753,6 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Вызывает мгновенное отображение запроса отладчика, чтобы
+-                     Visual Studio можно было подключить к отладке
+-                     XML-кода MSBuild и любых используемых им задач и средств ведения журнала.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: Не удалось запустить приложение. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.tr.xlf b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+index e6a6c9554d9..f4bcb90738d 100644
+--- a/src/MSBuild/Resources/xlf/Strings.tr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+@@ -755,19 +755,6 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     Bir hata ayıklayıcı isteminin görüntülenmesini, böylece sizin için
+-                     Visual Studio’nun eklenerek MSBuild XML’de ve kullandığı görevlerle günlükçülerde
+-                     hata ayıklaması yapabilmenizi sağlar.
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: Uygulama başlatılamadı. {0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+index cafd3ff5dfa..abcd918e3aa 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                    使调试器提示立即出现，以便
+-                    可以附加 Visual Studio，供用户调试
+-                    MSBuild XML 及其使用的任何任务和记录器。
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: 应用程序未能启动。{0}</target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+index 8c78ee70bfd..58c8c1275ec 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+@@ -754,19 +754,6 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+     </target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="HelpMessage_27_DebuggerSwitch">
+-        <source>  /debug
+-                     Causes a debugger prompt to appear immediately so that
+-                     Visual Studio can be attached for you to debug the
+-                     MSBuild XML and any tasks and loggers it uses.
+-   </source>
+-        <target state="translated">  /debug
+-                     使偵錯工具提示立即顯示，
+-                     讓 Visual Studio 得以連結，以供您
+-                     對 MSBuild XML 及其使用的任何工作與記錄器進行偵錯。
+-   </target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="InvalidConfigurationFile">
+         <source>MSBUILD : Configuration error MSB1043: The application could not start. {0}</source>
+         <target state="translated">MSBUILD : Configuration error MSB1043: 應用程式無法啟動。{0}</target>
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 7a70e79c9fb..eaf17e4ad45 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -550,7 +550,6 @@ string [] commandLine
+                 bool enableNodeReuse = false;
+ #endif
+                 TextWriter preprocessWriter = null;
+-                bool debugger = false;
+                 bool detailedSummary = false;
+                 ISet<string> warningsAsErrors = null;
+                 ISet<string> warningsAsMessages = null;
+@@ -579,7 +578,6 @@ string [] commandLine
+                         ref cpuCount,
+                         ref enableNodeReuse,
+                         ref preprocessWriter,
+-                        ref debugger,
+                         ref detailedSummary,
+                         ref warningsAsErrors,
+                         ref warningsAsMessages,
+@@ -597,7 +595,7 @@ string [] commandLine
+                     {
+                         Console.WriteLine(ResourceUtilities.GetResourceString("PossiblyOmittedMaxCPUSwitch"));
+                     }
+-                    if (preprocessWriter != null || debugger)
++                    if (preprocessWriter != null)
+                     {
+                         // Indicate to the engine that it can NOT toss extraneous file content: we want to 
+                         // see that in preprocessing/debugging
+@@ -623,7 +621,7 @@ string [] commandLine
+ #if FEATURE_XML_SCHEMA_VALIDATION
+                             needToValidateProject, schemaFile,
+ #endif
+-                            cpuCount, enableNodeReuse, preprocessWriter, debugger, detailedSummary, warningsAsErrors, warningsAsMessages, enableRestore, profilerLogger, enableProfiler))
++                            cpuCount, enableNodeReuse, preprocessWriter, detailedSummary, warningsAsErrors, warningsAsMessages, enableRestore, profilerLogger, enableProfiler))
+                             {
+                                 exitType = ExitType.BuildError;
+                             }
+@@ -917,7 +915,6 @@ internal static bool BuildProject
+             int cpuCount,
+             bool enableNodeReuse,
+             TextWriter preprocessWriter,
+-            bool debugger,
+             bool detailedSummary,
+             ISet<string> warningsAsErrors,
+             ISet<string> warningsAsMessages,
+@@ -1020,14 +1017,6 @@ bool enableProfiler
+                     onlyLogCriticalEvents
+                 );
+ 
+-                if (debugger)
+-                {
+-                    // Debugging is not currently fully supported so we don't want to open
+-                    // public API for it. Also, we want to have a way to make it work when running inside VS.
+-                    // So use an environment variable. The undocumented /debug switch is just an easy way to set it.
+-                    Environment.SetEnvironmentVariable("MSBUILDDEBUGGING", "1");
+-                }
+-
+                 if (toolsVersion != null && !projectCollection.ContainsToolset(toolsVersion))
+                 {
+                     ThrowInvalidToolsVersionInitializationException(projectCollection.Toolsets, toolsVersion);
+@@ -1901,7 +1890,6 @@ private static bool ProcessCommandLineSwitches
+             ref int cpuCount,
+             ref bool enableNodeReuse,
+             ref TextWriter preprocessWriter,
+-            ref bool debugger,
+             ref bool detailedSummary,
+             ref ISet<string> warningsAsErrors,
+             ref ISet<string> warningsAsMessages,
+@@ -2012,7 +2000,6 @@ bool recursing
+                                                                ref cpuCount,
+                                                                ref enableNodeReuse,
+                                                                ref preprocessWriter,
+-                                                               ref debugger,
+                                                                ref detailedSummary,
+                                                                ref warningsAsErrors,
+                                                                ref warningsAsMessages,
+@@ -2051,9 +2038,6 @@ bool recursing
+                         preprocessWriter = ProcessPreprocessSwitch(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.Preprocess]);
+                     }
+ 
+-#if FEATURE_MSBUILD_DEBUGGER
+-                    debugger = commandLineSwitches.IsParameterlessSwitchSet(CommandLineSwitches.ParameterlessSwitch.Debugger);
+-#endif
+                     detailedSummary = commandLineSwitches.IsParameterlessSwitchSet(CommandLineSwitches.ParameterlessSwitch.DetailedSummary);
+ 
+                     warningsAsErrors = ProcessWarnAsErrorSwitch(commandLineSwitches);
+@@ -3522,12 +3506,6 @@ private static void ShowHelpMessage()
+             Console.WriteLine(AssemblyResources.GetString("HelpMessage_25_PreprocessSwitch"));
+ 
+             Console.WriteLine(AssemblyResources.GetString("HelpMessage_26_DetailedSummarySwitch"));
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (CommandLineSwitches.IsParameterlessSwitch("debug"))
+-            {
+-                Console.WriteLine(AssemblyResources.GetString("HelpMessage_27_DebuggerSwitch"));
+-            }
+-#endif
+             Console.WriteLine(AssemblyResources.GetString("HelpMessage_31_RestoreSwitch"));
+             Console.WriteLine(AssemblyResources.GetString("HelpMessage_33_RestorePropertySwitch"));
+             Console.WriteLine(AssemblyResources.GetString("HelpMessage_32_ProfilerSwitch"));
+diff --git a/src/Shared/ProjectErrorUtilities.cs b/src/Shared/ProjectErrorUtilities.cs
+index 283b4affa78..bc63745e3cb 100644
+--- a/src/Shared/ProjectErrorUtilities.cs
++++ b/src/Shared/ProjectErrorUtilities.cs
+@@ -14,9 +14,6 @@
+  * 
+  * 
+  ******************************************************************************/
+-#if FEATURE_MSBUILD_DEBUGGER
+-using Microsoft.Build.Debugging;
+-#endif
+ using InvalidProjectFileException = Microsoft.Build.Exceptions.InvalidProjectFileException;
+ 
+ namespace Microsoft.Build.Shared
+@@ -412,33 +409,7 @@ params object[] args
+             string helpKeyword;
+             string message = ResourceUtilities.FormatResourceString(out errorCode, out helpKeyword, resourceName, args);
+ 
+-            Exception exceptionToThrow = new InvalidProjectFileException(elementLocation.File, elementLocation.Line, elementLocation.Column, 0 /* Unknown end line */, 0 /* Unknown end column */, message, errorSubCategory, errorCode, helpKeyword);
+-
+-#if FEATURE_MSBUILD_DEBUGGER
+-            if (!DebuggerManager.DebuggingEnabled)
+-            {
+-                throw exceptionToThrow;
+-            }
+-
+-            try
+-            {
+-                throw exceptionToThrow;
+-            }
+-            catch (InvalidProjectFileException ex)
+-            {
+-                // To help out the user debugging their project, break into the debugger here.
+-                // That's because otherwise, since they're debugging our optimized code with JMC on,
+-                // they may not be able to break on this exception at all themselves.
+-                // Also, dump the exception information, as it's hard to see in optimized code.
+-                // Note that we use Trace as Debug.WriteLine is not compiled in release builds, which is 
+-                // what we are in here.
+-                Trace.WriteLine(ex.ToString());
+-                Debugger.Break();
+-                throw;
+-            }
+-#else
+-            throw exceptionToThrow;
+-#endif
++            throw new InvalidProjectFileException(elementLocation.File, elementLocation.Line, elementLocation.Column, 0 /* Unknown end line */, 0 /* Unknown end column */, message, errorSubCategory, errorCode, helpKeyword);
+         }
+     }
+ }

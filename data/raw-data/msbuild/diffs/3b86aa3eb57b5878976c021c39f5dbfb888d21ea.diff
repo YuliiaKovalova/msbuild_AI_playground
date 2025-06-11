@@ -1,0 +1,177 @@
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 545fdbc9844..23c3d593e15 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -1774,7 +1774,10 @@ private static BuildResult ExecuteRestore(string projectFile, string toolsVersio
+             // Add/set a property with a random value to ensure that restore happens under a different evaluation context
+             // If the evaluation context is not different, then projects won't be re-evaluated after restore
+             // The initializer syntax can't be used just in case a user set this property to a value
+-            restoreGlobalProperties["MSBuildRestoreSessionId"] = Guid.NewGuid().ToString("D");
++            restoreGlobalProperties[MSBuildConstants.MSBuildRestoreSessionId] = Guid.NewGuid().ToString("D");
++
++            // Add a property to indicate that a Restore is executing
++            restoreGlobalProperties[MSBuildConstants.MSBuildIsRestoring] = bool.TrueString;
+ 
+             // Create a new request with a Restore target only and specify:
+             //  - BuildRequestDataFlags.ClearCachesAfterBuild to ensure the projects will be reloaded from disk for subsequent builds
+diff --git a/src/Shared/Constants.cs b/src/Shared/Constants.cs
+index 0e596c6cf56..28cbfd7d229 100644
+--- a/src/Shared/Constants.cs
++++ b/src/Shared/Constants.cs
+@@ -69,6 +69,17 @@ internal static class MSBuildConstants
+ 
+         internal const string MSBuildDummyGlobalPropertyHeader = "MSBuildProjectInstance";
+ 
++        /// <summary>
++        /// A property set during a in implicit restore (/restore) or explicit restore (/t:restore) to ensure that the evaluations are not re-used during build
++        /// </summary>
++        internal const string MSBuildRestoreSessionId = nameof(MSBuildRestoreSessionId);
++
++        /// <summary>
++        /// A property set during a in implicit restore (/restore) or explicit restore (/t:restore) to indicate that a restore is executing.
++        /// </summary>
++        internal const string MSBuildIsRestoring = nameof(MSBuildIsRestoring);
++
++
+         /// <summary>
+         /// The most current VSGeneralAssemblyVersion known to this version of MSBuild.
+         /// </summary>
+diff --git a/src/Tasks.UnitTests/ProjectExtensionsImportTestBase.cs b/src/Tasks.UnitTests/ProjectExtensionsImportTestBase.cs
+index a430f5c2993..30eae83deae 100644
+--- a/src/Tasks.UnitTests/ProjectExtensionsImportTestBase.cs
++++ b/src/Tasks.UnitTests/ProjectExtensionsImportTestBase.cs
+@@ -5,6 +5,7 @@
+ using System.IO;
+ using System.Linq;
+ using Microsoft.Build.Evaluation;
++using Microsoft.Build.Shared;
+ using Shouldly;
+ using Xunit;
+ 
+@@ -68,6 +69,57 @@ public void DoesNotImportProjectIfNotExist()
+             project.GetPropertyValue(PropertyNameToSignalImportSucceeded).ShouldBeEmpty();
+         }
+ 
++        [Fact]
++        public void DoesNotImportProjectIfRestoring()
++        {
++            ObjectModelHelpers.CreateFileInTempProjectDirectory(ImportProjectPath, BasicProjectImportContents);
++
++            Project project = ObjectModelHelpers.LoadProjectFileInTempProjectDirectory(ObjectModelHelpers.CreateFileInTempProjectDirectory(_projectRelativePath, $@"
++                <Project DefaultTargets=`Build` ToolsVersion=`msbuilddefaulttoolsversion`>
++                    <PropertyGroup>
++                        <{MSBuildConstants.MSBuildIsRestoring}>true</{MSBuildConstants.MSBuildIsRestoring}>
++                    </PropertyGroup>
++
++                    <Import Project=`$(MSBuildBinPath)\Microsoft.Common.props` />
++
++                    <Import Project=`$(MSBuildBinPath)\Microsoft.CSharp.targets` />
++                </Project>
++            "));
++
++            string projectExtensionsPath = project.GetPropertyValue("MSBuildProjectExtensionsPath");
++
++            projectExtensionsPath.ShouldNotBeNullOrWhiteSpace();
++            Directory.Exists(projectExtensionsPath).ShouldBeTrue();
++            project.GetPropertyValue(PropertyNameToEnableImport).ShouldBe(bool.FalseString, StringCompareShould.IgnoreCase);
++            project.GetPropertyValue(PropertyNameToSignalImportSucceeded).ShouldBeEmpty();
++        }
++
++        [Fact]
++        public void ImportsProjectIfRestoringAndExplicitlySet()
++        {
++            ObjectModelHelpers.CreateFileInTempProjectDirectory(ImportProjectPath, BasicProjectImportContents);
++
++            Project project = ObjectModelHelpers.LoadProjectFileInTempProjectDirectory(ObjectModelHelpers.CreateFileInTempProjectDirectory(_projectRelativePath, $@"
++                <Project DefaultTargets=`Build` ToolsVersion=`msbuilddefaulttoolsversion`>
++                    <PropertyGroup>
++                        <{PropertyNameToEnableImport}>true</{PropertyNameToEnableImport}>
++                        <{MSBuildConstants.MSBuildIsRestoring}>true</{MSBuildConstants.MSBuildIsRestoring}>
++                    </PropertyGroup>
++
++                    <Import Project=`$(MSBuildBinPath)\Microsoft.Common.props` />
++
++                    <Import Project=`$(MSBuildBinPath)\Microsoft.CSharp.targets` />
++                </Project>
++            "));
++
++            string projectExtensionsPath = project.GetPropertyValue("MSBuildProjectExtensionsPath");
++
++            projectExtensionsPath.ShouldNotBeNullOrWhiteSpace();
++            Directory.Exists(projectExtensionsPath).ShouldBeTrue();
++            project.GetPropertyValue(PropertyNameToEnableImport).ShouldBe(bool.TrueString, StringCompareShould.IgnoreCase);
++            project.GetPropertyValue(PropertyNameToSignalImportSucceeded).ShouldBe(bool.TrueString, StringCompareShould.IgnoreCase);
++        }
++
+         /// <summary>
+         /// Ensures that even if the MSBuildProjectExtensionsPath exists, the extensions are not imported if the functionality is disabled via the <see cref="PropertyNameToEnableImport"/>.
+         /// </summary>
+diff --git a/src/Tasks/Microsoft.Common.CrossTargeting.targets b/src/Tasks/Microsoft.Common.CrossTargeting.targets
+index 8d079e3f057..785485f0f74 100644
+--- a/src/Tasks/Microsoft.Common.CrossTargeting.targets
++++ b/src/Tasks/Microsoft.Common.CrossTargeting.targets
+@@ -227,6 +227,13 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     build.
+   -->
+   <PropertyGroup>
++    <!--
++        Don't import project extensions during restore because NuGet restore generates them.  Importing them during restore will embed
++        the pre-restore files in the binary log and then NuGet won't be able to embed the generated one after restore.  If some other
++        project extension mechanism wants to import project extensions during restore, they need to explicitly set ImportProjectExtensionTargets
++    -->
++    <ImportProjectExtensionTargets Condition="'$(ImportProjectExtensionTargets)' == '' And '$(MSBuildIsRestoring)' == 'true'">false</ImportProjectExtensionTargets>
++    
+     <ImportProjectExtensionTargets Condition="'$(ImportProjectExtensionTargets)' == ''">true</ImportProjectExtensionTargets>
+   </PropertyGroup>
+ 
+diff --git a/src/Tasks/Microsoft.Common.props b/src/Tasks/Microsoft.Common.props
+index e3771628bdd..faddabbe8e5 100644
+--- a/src/Tasks/Microsoft.Common.props
++++ b/src/Tasks/Microsoft.Common.props
+@@ -59,6 +59,14 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     -->
+     <MSBuildProjectExtensionsPath Condition="'$([System.IO.Path]::IsPathRooted($(MSBuildProjectExtensionsPath)))' == 'false'">$([System.IO.Path]::Combine('$(MSBuildProjectDirectory)', '$(MSBuildProjectExtensionsPath)'))</MSBuildProjectExtensionsPath>
+     <MSBuildProjectExtensionsPath Condition="!HasTrailingSlash('$(MSBuildProjectExtensionsPath)')">$(MSBuildProjectExtensionsPath)\</MSBuildProjectExtensionsPath>
++
++    <!--
++        Don't import project extensions during restore because NuGet restore generates them.  Importing them during restore will embed
++        the pre-restore files in the binary log and then NuGet won't be able to embed the generated one after restore.  If some other
++        project extension mechanism wants to import project extensions during restore, they need to explicitly set ImportProjectExtensionProps
++    -->
++    <ImportProjectExtensionProps Condition="'$(ImportProjectExtensionProps)' == '' And '$(MSBuildIsRestoring)' == 'true'">false</ImportProjectExtensionProps>
++    
+     <ImportProjectExtensionProps Condition="'$(ImportProjectExtensionProps)' == ''">true</ImportProjectExtensionProps>
+     <_InitialMSBuildProjectExtensionsPath Condition=" '$(ImportProjectExtensionProps)' == 'true' ">$(MSBuildProjectExtensionsPath)</_InitialMSBuildProjectExtensionsPath>
+   </PropertyGroup>
+@@ -134,4 +142,4 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     <DisableLogTaskParameterItemMetadata_WriteLinesToFile_Lines>true</DisableLogTaskParameterItemMetadata_WriteLinesToFile_Lines>
+   </PropertyGroup>
+ 
+-</Project>
+\ No newline at end of file
++</Project>
+diff --git a/src/Tasks/Microsoft.Common.targets b/src/Tasks/Microsoft.Common.targets
+index 4e71065ca26..23c7ba6ddfd 100644
+--- a/src/Tasks/Microsoft.Common.targets
++++ b/src/Tasks/Microsoft.Common.targets
+@@ -29,6 +29,13 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+         management system can write out multiple files but the order of the import is alphabetic because MSBuild sorts the list.
+   -->
+   <PropertyGroup>
++    <!--
++        Don't import project extensions during restore because NuGet restore generates them.  Importing them during restore will embed
++        the pre-restore files in the binary log and then NuGet won't be able to embed the generated one after restore.  If some other
++        project extension mechanism wants to import project extensions during restore, they need to explicitly set ImportProjectExtensionTargets
++    -->
++    <ImportProjectExtensionTargets Condition="'$(ImportProjectExtensionTargets)' == '' And '$(MSBuildIsRestoring)' == 'true'">false</ImportProjectExtensionTargets>
++    
+     <ImportProjectExtensionTargets Condition="'$(ImportProjectExtensionTargets)' == ''">true</ImportProjectExtensionTargets>
+   </PropertyGroup>
+ 
+@@ -54,4 +61,4 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+ 
+   <Import Project="$(CustomAfterDirectoryBuildTargets)" Condition="'$(CustomAfterDirectoryBuildTargets)' != ''" />
+ 
+-</Project>
+\ No newline at end of file
++</Project>

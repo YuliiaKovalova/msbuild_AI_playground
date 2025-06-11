@@ -1,0 +1,227 @@
+diff --git a/ref/Microsoft.Build/net/Microsoft.Build.cs b/ref/Microsoft.Build/net/Microsoft.Build.cs
+index fb5b4b8da5e..c06bce83735 100644
+--- a/ref/Microsoft.Build/net/Microsoft.Build.cs
++++ b/ref/Microsoft.Build/net/Microsoft.Build.cs
+@@ -881,6 +881,7 @@ public partial class EvaluationContext
+     {
+         internal EvaluationContext() { }
+         public static Microsoft.Build.Evaluation.Context.EvaluationContext Create(Microsoft.Build.Evaluation.Context.EvaluationContext.SharingPolicy policy) { throw null; }
++        public static Microsoft.Build.Evaluation.Context.EvaluationContext Create(Microsoft.Build.Evaluation.Context.EvaluationContext.SharingPolicy policy, Microsoft.Build.FileSystem.IDirectoryCacheFactory directoryCacheFactory) { throw null; }
+         public static Microsoft.Build.Evaluation.Context.EvaluationContext Create(Microsoft.Build.Evaluation.Context.EvaluationContext.SharingPolicy policy, Microsoft.Build.FileSystem.MSBuildFileSystemBase fileSystem) { throw null; }
+         public enum SharingPolicy
+         {
+@@ -1504,6 +1505,19 @@ public ProxyTargets(System.Collections.Generic.IReadOnlyDictionary<string, strin
+ }
+ namespace Microsoft.Build.FileSystem
+ {
++    public delegate bool FindPredicate(ref System.ReadOnlySpan<char> fileName);
++    public delegate TResult FindTransform<TResult>(ref System.ReadOnlySpan<char> fileName);
++    public partial interface IDirectoryCache
++    {
++        bool DirectoryExists(string path);
++        System.Collections.Generic.IEnumerable<TResult> EnumerateDirectories<TResult>(string path, Microsoft.Build.FileSystem.FindPredicate predicate, Microsoft.Build.FileSystem.FindTransform<TResult> transform);
++        System.Collections.Generic.IEnumerable<TResult> EnumerateFiles<TResult>(string path, Microsoft.Build.FileSystem.FindPredicate predicate, Microsoft.Build.FileSystem.FindTransform<TResult> transform);
++        bool FileExists(string path);
++    }
++    public partial interface IDirectoryCacheFactory
++    {
++        Microsoft.Build.FileSystem.IDirectoryCache GetDirectoryCacheForProject(Microsoft.Build.Evaluation.Project project);
++    }
+     public abstract partial class MSBuildFileSystemBase
+     {
+         protected MSBuildFileSystemBase() { }
+diff --git a/ref/Microsoft.Build/netstandard/Microsoft.Build.cs b/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
+index b387429467c..7eccfc39bf4 100644
+--- a/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
++++ b/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
+@@ -881,6 +881,7 @@ public partial class EvaluationContext
+     {
+         internal EvaluationContext() { }
+         public static Microsoft.Build.Evaluation.Context.EvaluationContext Create(Microsoft.Build.Evaluation.Context.EvaluationContext.SharingPolicy policy) { throw null; }
++        public static Microsoft.Build.Evaluation.Context.EvaluationContext Create(Microsoft.Build.Evaluation.Context.EvaluationContext.SharingPolicy policy, Microsoft.Build.FileSystem.IDirectoryCacheFactory directoryCacheFactory) { throw null; }
+         public static Microsoft.Build.Evaluation.Context.EvaluationContext Create(Microsoft.Build.Evaluation.Context.EvaluationContext.SharingPolicy policy, Microsoft.Build.FileSystem.MSBuildFileSystemBase fileSystem) { throw null; }
+         public enum SharingPolicy
+         {
+@@ -1498,6 +1499,19 @@ public ProxyTargets(System.Collections.Generic.IReadOnlyDictionary<string, strin
+ }
+ namespace Microsoft.Build.FileSystem
+ {
++    public delegate bool FindPredicate(ref System.ReadOnlySpan<char> fileName);
++    public delegate TResult FindTransform<TResult>(ref System.ReadOnlySpan<char> fileName);
++    public partial interface IDirectoryCache
++    {
++        bool DirectoryExists(string path);
++        System.Collections.Generic.IEnumerable<TResult> EnumerateDirectories<TResult>(string path, Microsoft.Build.FileSystem.FindPredicate predicate, Microsoft.Build.FileSystem.FindTransform<TResult> transform);
++        System.Collections.Generic.IEnumerable<TResult> EnumerateFiles<TResult>(string path, Microsoft.Build.FileSystem.FindPredicate predicate, Microsoft.Build.FileSystem.FindTransform<TResult> transform);
++        bool FileExists(string path);
++    }
++    public partial interface IDirectoryCacheFactory
++    {
++        Microsoft.Build.FileSystem.IDirectoryCache GetDirectoryCacheForProject(Microsoft.Build.Evaluation.Project project);
++    }
+     public abstract partial class MSBuildFileSystemBase
+     {
+         protected MSBuildFileSystemBase() { }
+diff --git a/src/Build/Evaluation/Context/EvaluationContext.cs b/src/Build/Evaluation/Context/EvaluationContext.cs
+index 8acccc64d13..1d98f307eb4 100644
+--- a/src/Build/Evaluation/Context/EvaluationContext.cs
++++ b/src/Build/Evaluation/Context/EvaluationContext.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
++using System.Runtime.CompilerServices;
+ using System.Threading;
+ using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.FileSystem;
+@@ -45,6 +46,9 @@ public enum SharingPolicy
+         internal IFileSystem FileSystem { get; }
+         internal EngineFileUtilities EngineFileUtilities { get; }
+ 
++        private IDirectoryCacheFactory _directoryCacheFactory;
++        private ConditionalWeakTable<Project, IDirectoryCache> _directoryCachesPerProject;
++
+         /// <summary>
+         /// Key to file entry list. Example usages: cache glob expansion and intermediary directory expansions during glob expansion.
+         /// </summary>
+@@ -60,12 +64,16 @@ private EvaluationContext(SharingPolicy policy, IFileSystem fileSystem, IDirecto
+ 
+             Policy = policy;
+ 
+-            // TODO: Use directoryCacheFactory.
+-
+             SdkResolverService = new CachingSdkResolverService();
+             FileEntryExpansionCache = new ConcurrentDictionary<string, IReadOnlyList<string>>();
+             FileSystem = fileSystem ?? new CachingFileSystemWrapper(FileSystems.Default);
+             EngineFileUtilities = new EngineFileUtilities(new FileMatcher(FileSystem, FileEntryExpansionCache));
++
++            if (directoryCacheFactory != null)
++            {
++                _directoryCacheFactory = directoryCacheFactory;
++                _directoryCachesPerProject = new ConditionalWeakTable<Project, IDirectoryCache>();
++            }
+         }
+ 
+         /// <summary>
+@@ -144,5 +152,18 @@ internal EvaluationContext ContextForNewProject()
+                     return null;
+             }
+         }
++
++        internal IDirectoryCache GetDirectoryCacheForProject(Project project)
++        {
++            IDirectoryCache directoryCache = _directoryCachesPerProject?.GetValue(
++                project,
++                project => _directoryCacheFactory.GetDirectoryCacheForProject(project));
++            if (directoryCache == null)
++            {
++                return directoryCache;
++            }
++            // TODO
++            return null;
++        }
+     }
+ }
+diff --git a/src/Build/FileSystem/IDirectoryCache.cs b/src/Build/FileSystem/IDirectoryCache.cs
+index a9612ec6f61..aa44e7be235 100644
+--- a/src/Build/FileSystem/IDirectoryCache.cs
++++ b/src/Build/FileSystem/IDirectoryCache.cs
+@@ -1,26 +1,57 @@
+ ﻿// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
++using System;
+ using System.Collections.Generic;
+-#if NETCOREAPP
+-using System.IO.Enumeration;
+-#else
+-using Microsoft.IO.Enumeration;
+-#endif
+ 
+ using Microsoft.Build.Evaluation;
+ 
+ namespace Microsoft.Build.FileSystem
+ {
++    /// <summary>
++    /// A provider of <see cref="IDirectoryCache"/> instances. To be implemented by MSBuild hosts that wish to intercept
++    /// file existence checks and file enumerations performed during project evaluation.
++    /// </summary>
++    /// <remarks>
++    /// Unlike <see cref="MSBuildFileSystemBase"/>, file enumeration returns file/directory names, not full paths.
++    /// </remarks>
+     public interface IDirectoryCacheFactory
+     {
++        /// <summary>
++        /// Returns an <see cref="IDirectoryCache"/> to be used when evaluating the given <see cref="Project"/>.
++        /// </summary>
++        /// <param name="project">The project being evaluated.</param>
+         IDirectoryCache GetDirectoryCacheForProject(Project project);
+     }
+ 
++    /// <summary>
++    /// A predicate taking file name.
++    /// </summary>
++    /// <param name="fileName">The file name to check.</param>
++    public delegate bool FindPredicate(ref ReadOnlySpan<char> fileName);
++
++    /// <summary>
++    /// A function taking file name and returning an arbitrary result.
++    /// </summary>
++    /// <typeparam name="TResult">The type of the result to return</typeparam>
++    /// <param name="fileName">The file name to transform.</param>
++    public delegate TResult FindTransform<TResult>(ref ReadOnlySpan<char> fileName);
++
++    /// <summary>
++    /// Allows the implementor to intercept file existence checks and file enumerations performed during project evaluation.
++    /// </summary>
+     public interface IDirectoryCache
+     {
++        /// <summary>
++        /// Returns <code>true</code> if the given path points to an existing file on disk.
++        /// </summary>
++        /// <param name="path">A normalized path.</param>
+         bool FileExists(string path);
+ 
++        /// <summary>
++        /// Returns <code>true</code> if the given path points to an existing directory on disk.
++        /// </summary>
++        /// <param name="path">A normalized path.</param>
+         bool DirectoryExists(string path);
+ 
+         /// <summary>
+@@ -29,9 +60,8 @@ public interface IDirectoryCache
+         /// <typeparam name="TResult">The desired return type.</typeparam>
+         /// <param name="path">The directory to enumerate.</param>
+         /// <param name="predicate">A predicate to test whether a file should be included.</param>
+-        /// <param name="transform">A transform from <see cref="FileSystemEntry"/> to <typeparamref name="TResult"/>.</param>
+-        /// <returns></returns>
+-        IEnumerable<TResult> EnumerateFiles<TResult>(string path, FileSystemEnumerable<TResult>.FindPredicate predicate, FileSystemEnumerable<TResult>.FindTransform transform);
++        /// <param name="transform">A transform from <code>ReadOnlySpan&lt;char&gt;</code> to <typeparamref name="TResult"/>.</param>
++        IEnumerable<TResult> EnumerateFiles<TResult>(string path, FindPredicate predicate, FindTransform<TResult> transform);
+ 
+         /// <summary>
+         /// Enumerates subdirectories in the given directory only (non-recursively).
+@@ -39,8 +69,7 @@ public interface IDirectoryCache
+         /// <typeparam name="TResult">The desired return type.</typeparam>
+         /// <param name="path">The directory to enumerate.</param>
+         /// <param name="predicate">A predicate to test whether a directory should be included.</param>
+-        /// <param name="transform">A transform from <see cref="FileSystemEntry"/> to <typeparamref name="TResult"/>.</param>
+-        /// <returns></returns>
+-        IEnumerable<TResult> EnumerateDirectories<TResult>(string path, FileSystemEnumerable<TResult>.FindPredicate predicate, FileSystemEnumerable<TResult>.FindTransform transform);
++        /// <param name="transform">A transform from <code>ReadOnlySpan&lt;char&gt;</code> to <typeparamref name="TResult"/>.</param>
++        IEnumerable<TResult> EnumerateDirectories<TResult>(string path, FindPredicate predicate, FindTransform<TResult> transform);
+     }
+ }
+diff --git a/src/Shared/FileMatcher.cs b/src/Shared/FileMatcher.cs
+index 9af0619bab7..e2f846cffb8 100644
+--- a/src/Shared/FileMatcher.cs
++++ b/src/Shared/FileMatcher.cs
+@@ -244,7 +244,7 @@ private static IReadOnlyList<string> GetAccessibleFileSystemEntries(IFileSystem
+             {
+                 case FileSystemEntity.Files: return GetAccessibleFiles(fileSystem, path, pattern, projectDirectory, stripProjectDirectory);
+                 case FileSystemEntity.Directories: return GetAccessibleDirectories(fileSystem, path, pattern);
+-                case FileSystemEntity.FilesAndDirectories: return GetAccessibleFilesAndDirectories(fileSystem,path, pattern);
++                case FileSystemEntity.FilesAndDirectories: return GetAccessibleFilesAndDirectories(fileSystem, path, pattern);
+                 default:
+                     ErrorUtilities.VerifyThrow(false, "Unexpected filesystem entity type.");
+                     break;

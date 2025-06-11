@@ -1,0 +1,158 @@
+diff --git a/documentation/specs/event-source.md b/documentation/specs/event-source.md
+index 812d28fe413..18936da2249 100644
+--- a/documentation/specs/event-source.md
++++ b/documentation/specs/event-source.md
+@@ -34,6 +34,7 @@ EventSource is primarily used to profile code. For MSBuild specifically, a major
+ | Save | Saves a project to the file system if dirty, creating directories as necessary. |
+ | SdkResolverResolveSdk | A single SDK resolver is called. |
+ | SdkResolverServiceInitialize | Initializes SDK resolvers. |
++| SdkResolverEvent | An SDK resolver logs an event. |
+ | Target | Executes a target. |
+ | TargetUpToDate | Checks whether a particular target needs to run or is up-to-date. |
+ | WriteLinesToFile | Checks whether the WriteLinesToFile task needs to execute. |
+diff --git a/src/Build/BackEnd/Components/SdkResolution/CachingSdkResolverService.cs b/src/Build/BackEnd/Components/SdkResolution/CachingSdkResolverService.cs
+index 87666f95341..4ec872e6718 100644
+--- a/src/Build/BackEnd/Components/SdkResolution/CachingSdkResolverService.cs
++++ b/src/Build/BackEnd/Components/SdkResolution/CachingSdkResolverService.cs
+@@ -38,10 +38,12 @@ public override void ClearCaches()
+ 
+         public override SdkResult ResolveSdk(int submissionId, SdkReference sdk, LoggingContext loggingContext, ElementLocation sdkReferenceLocation, string solutionPath, string projectPath, bool interactive, bool isRunningInVisualStudio)
+         {
+-            MSBuildEventSource.Log.CachedSdkResolverServiceResolveSdkStart(sdk.Name, solutionPath, projectPath);
+-
+             SdkResult result;
+ 
++            bool wasResultCached = true;
++
++            MSBuildEventSource.Log.CachedSdkResolverServiceResolveSdkStart(sdk.Name, solutionPath, projectPath);
++
+             if (Traits.Instance.EscapeHatches.DisableSdkResolutionCache)
+             {
+                 result = base.ResolveSdk(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio);
+@@ -59,7 +61,12 @@ public override SdkResult ResolveSdk(int submissionId, SdkReference sdk, Logging
+                  */
+                 Lazy<SdkResult> resultLazy = cached.GetOrAdd(
+                     sdk.Name,
+-                    key => new Lazy<SdkResult>(() => base.ResolveSdk(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio)));
++                    key => new Lazy<SdkResult>(() =>
++                    {
++                        wasResultCached = false;
++
++                        return base.ResolveSdk(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio);
++                    }));
+ 
+                 // Get the lazy value which will block all waiting threads until the SDK is resolved at least once while subsequent calls get cached results.
+                 result = resultLazy.Value;
+@@ -73,7 +80,7 @@ public override SdkResult ResolveSdk(int submissionId, SdkReference sdk, Logging
+                 loggingContext.LogWarning(null, new BuildEventFileInfo(sdkReferenceLocation), "ReferencingMultipleVersionsOfTheSameSdk", sdk.Name, result.Version, result.ElementLocation, sdk.Version);
+             }
+ 
+-            MSBuildEventSource.Log.CachedSdkResolverServiceResolveSdkStop(sdk.Name, solutionPath, projectPath, result.Success);
++            MSBuildEventSource.Log.CachedSdkResolverServiceResolveSdkStop(sdk.Name, solutionPath, projectPath, result.Success, wasResultCached);
+ 
+             return result;
+         }
+diff --git a/src/Build/BackEnd/Components/SdkResolution/OutOfProcNodeSdkResolverService.cs b/src/Build/BackEnd/Components/SdkResolution/OutOfProcNodeSdkResolverService.cs
+index 1a449cf0c44..9db962d2a21 100644
+--- a/src/Build/BackEnd/Components/SdkResolution/OutOfProcNodeSdkResolverService.cs
++++ b/src/Build/BackEnd/Components/SdkResolution/OutOfProcNodeSdkResolverService.cs
+@@ -4,6 +4,7 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
++using Microsoft.Build.Eventing;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using System;
+@@ -28,7 +29,7 @@ internal sealed class OutOfProcNodeSdkResolverService : HostedSdkResolverService
+         /// <summary>
+         /// The cache of responses which is cleared between builds.
+         /// </summary>
+-        private readonly ConcurrentDictionary<string, SdkResult> _responseCache = new ConcurrentDictionary<string, SdkResult>(MSBuildNameIgnoreCaseComparer.Default);
++        private readonly ConcurrentDictionary<string, Lazy<SdkResult>> _responseCache = new ConcurrentDictionary<string, Lazy<SdkResult>>(MSBuildNameIgnoreCaseComparer.Default);
+ 
+         /// <summary>
+         /// An event to signal when a response has been received.
+@@ -65,14 +66,21 @@ public override void PacketReceived(int node, INodePacket packet)
+         /// <inheritdoc cref="ISdkResolverService.ResolveSdk"/>
+         public override SdkResult ResolveSdk(int submissionId, SdkReference sdk, LoggingContext loggingContext, ElementLocation sdkReferenceLocation, string solutionPath, string projectPath, bool interactive, bool isRunningInVisualStudio)
+         {
++            bool wasResultCached = true;
++
++            MSBuildEventSource.Log.OutOfProcSdkResolverServiceRequestSdkPathFromMainNodeStart(submissionId, sdk.Name, solutionPath, projectPath);
++
+             // Get a cached response if possible, otherwise send the request
+-            var sdkResult = _responseCache.GetOrAdd(
++            Lazy<SdkResult> sdkResultLazy = _responseCache.GetOrAdd(
+                 sdk.Name,
+-                key =>
++                key => new Lazy<SdkResult>(() =>
+                 {
+-                    var result = RequestSdkPathFromMainNode(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio);
+-                    return result;
+-                });
++                    wasResultCached = false;
++
++                    return RequestSdkPathFromMainNode(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio);
++                }));
++
++            SdkResult sdkResult = sdkResultLazy.Value;
+ 
+             if (sdkResult.Version != null && !SdkResolverService.IsReferenceSameVersion(sdk, sdkResult.Version))
+             {
+@@ -80,6 +88,8 @@ public override SdkResult ResolveSdk(int submissionId, SdkReference sdk, Logging
+                 loggingContext.LogWarning(null, new BuildEventFileInfo(sdkReferenceLocation), "ReferencingMultipleVersionsOfTheSameSdk", sdk.Name, sdkResult.Version, sdkResult.ElementLocation, sdk.Version);
+             }
+ 
++            MSBuildEventSource.Log.OutOfProcSdkResolverServiceRequestSdkPathFromMainNodeStop(submissionId, sdk.Name, solutionPath, projectPath, _lastResponse.Success, wasResultCached);
++
+             return sdkResult;
+         }
+ 
+diff --git a/src/Framework/MSBuildEventSource.cs b/src/Framework/MSBuildEventSource.cs
+index da912a435c7..b4e335f7849 100644
+--- a/src/Framework/MSBuildEventSource.cs
++++ b/src/Framework/MSBuildEventSource.cs
+@@ -7,6 +7,9 @@ namespace Microsoft.Build.Eventing
+     /// <summary>
+     /// This captures information of how various key methods of building with MSBuild ran.
+     /// </summary>
++    /// <remarks>
++    /// Changes to existing event method signatures will not be reflected unless you update the <see cref="EventAttribute.Version" /> property or assign a new event ID.
++    /// </remarks>
+     [EventSource(Name = "Microsoft-Build")]
+     internal sealed class MSBuildEventSource : EventSource
+     {
+@@ -501,10 +504,10 @@ public void CachedSdkResolverServiceResolveSdkStart(string sdkName, string solut
+             WriteEvent(66, sdkName, solutionPath, projectPath);
+         }
+ 
+-        [Event(67, Keywords = Keywords.All)]
+-        public void CachedSdkResolverServiceResolveSdkStop(string sdkName, string solutionPath, string projectPath, bool success)
++        [Event(67, Keywords = Keywords.All, Version = 2)]
++        public void CachedSdkResolverServiceResolveSdkStop(string sdkName, string solutionPath, string projectPath, bool success, bool wasResultCached)
+         {
+-            WriteEvent(67, sdkName, solutionPath, projectPath, success);
++            WriteEvent(67, sdkName, solutionPath, projectPath, success, wasResultCached);
+         }
+ 
+         /// <remarks>
+@@ -584,6 +587,18 @@ public void ProjectCacheEndBuildStop(string pluginTypeName)
+             WriteEvent(78, pluginTypeName);
+         }
+ 
++        [Event(79, Keywords = Keywords.All)]
++        public void OutOfProcSdkResolverServiceRequestSdkPathFromMainNodeStart(int submissionId, string sdkName, string solutionPath, string projectPath)
++        {
++            WriteEvent(79, submissionId, sdkName, solutionPath, projectPath);
++        }
++
++        [Event(80, Keywords = Keywords.All)]
++        public void OutOfProcSdkResolverServiceRequestSdkPathFromMainNodeStop(int submissionId, string sdkName, string solutionPath, string projectPath, bool success, bool wasResultCached)
++        {
++            WriteEvent(80, submissionId, sdkName, solutionPath, projectPath, success, wasResultCached);
++        }
++
+         #endregion
+     }
+ }

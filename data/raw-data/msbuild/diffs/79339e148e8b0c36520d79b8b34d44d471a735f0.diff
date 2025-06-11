@@ -1,0 +1,648 @@
+diff --git a/documentation/wiki/Binary-Log.md b/documentation/wiki/Binary-Log.md
+index 9edcddc6fd4..97445f88f21 100644
+--- a/documentation/wiki/Binary-Log.md
++++ b/documentation/wiki/Binary-Log.md
+@@ -84,7 +84,7 @@ It is a `GZipStream`-compressed binary stream of serialized `BuildEventArgs` obj
+ 
+ ## Incrementing the file format
+ 
+-Every .binlog file has the first three bytes that indicate the file version. The current file format version is 9 (`00 00 09`).
++Every .binlog file has the first four bytes that indicate the file version. The current file format is indicated in [`BinaryLogger.cs`](/src/Build/Logging/BinaryLogger/BinaryLogger.cs).
+ 
+ When incrementing the file format, keep this in mind:
+  * Increment the version and add a summary of the changes: https://github.com/dotnet/msbuild/blob/main/src/Build/Logging/BinaryLogger/BinaryLogger.cs#L22
+@@ -94,4 +94,59 @@ When incrementing the file format, keep this in mind:
+ 
+ The format is backwards compatible, i.e. MSBuild will be able to play back .binlog files created with an older version of MSBuild. The Viewer will also be able to open files of any older version. Since the viewer updates automatically and I can push out updates easily, we can consider the Viewer is always able to read all .binlogs.
+ 
+-However MSBuild of version 15.3 won't be able to read .binlogs created with MSBuild version 15.6. This means the format is unfortunately not forwards-compatible. It is not self-describing, i.e. it doesn't carry its schema around for performance and compactness reasons. This is not a problem with a Viewer because Viewer is always up-to-date (there isn't an "old version" of the Viewer unless people go to great lengths to prevent it from auto-updating).
++## Forward compatibility reading
++
++From version 18, the binlog contains as well the minimum version of reader that can interpret it (stored in bytes 4 to 8). A support for best effor forward compatibility is added by this version. Best effort only because binlog format is not self-describing, i.e. it doesn't carry its schema around for performance and compactness reasons.
++
++This is not of a high importance for users of the Viewer because Viewer is always up-to-date (there isn't an "old version" of the Viewer unless people go to great lengths to prevent it from auto-updating).
++
++## Reading API
++
++We recommend usage of `BinaryLogReplayEventSource`. It provides simplified helpers for creating and configuring `BuildEventArgsReader` and subscribing to the events.
++
++```csharp
++var logReader = new BinaryLogReplayEventSource()
++{
++    AllowForwardCompatibility = true
++};
++
++// Handling of the structured events contained within the log
++logReader.AnyEventRaised += (_, e) =>
++{
++    if (e is BuildErrorEventArgs error)
++    {
++        //...
++    }
++
++    // ...
++};
++
++// Those can be raised only during forward compatibility reading mode.
++logReader.OnRecoverableReadError += (errorType, recordKind, message) =>
++{
++    // ...
++
++    // e.g. we can decide to ignore the error and continue reading or break reading
++    //  based on the type of the error or/and type of the record
++};
++
++// Starts the synchronous log reading loop.
++logReader.Replay(path_to_binlog_file);
++
++```
++
++### Handling the recoverable reading errors
++
++In compatibility mode (default for `BinaryLogReplayEventSource`. Only supported for binlogs of version 18 and higher) reader is capable of skipping unknown event types and unknown parts of known events (`BuildEventArgsReader` can configure the behavior via 2 separate properties - `SkipUnknownEvents` and `SkipUnknownEventParts`).
++
++The unknown events and event parts are regarded as recverable errors - since reader is capable to continue reading following records in binlog. However the specific user logic should have the last call in deciding whether errors are realy recoverable (e.g. is presence of unrecognized or unparsable event fine? Might be fine when searching only for specific events - e.g. errors, but not acceptable when trying to provide definitive overview of the built).
++
++To allow the calling code to decide - based on the type of error, type of events getting the error, or the number of errors - the `OnRecoverableReadError` event is exposed (from both `BinaryLogReplayEventSource` and `BuildEventArgsReader`).
++
++```csharp
++/// <summary>
++/// Receives recoverable errors during reading.
++/// Communicates type of the error, kind of the record that encountered the error and the message detailing the error.
++/// </summary>
++event Action<ReaderErrorType, BinaryLogRecordKind, string>? OnRecoverableReadError;
++```
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index 7e5762f0768..8425237d1f3 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -8,6 +8,7 @@
+ using System.Linq;
+ using System.Reflection;
+ using System.Text;
++using FluentAssertions;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+@@ -256,42 +257,7 @@ private static void AssertFilesAreBinaryEqualAfterUnpack(string firstPath, strin
+                 readCount += bufferSize;
+             }
+ 
+-            br2.ReadBytes(bufferSize).Length.ShouldBe(0, "Second buffer contains byt after first end");
+-        }
+-
+-        private static void AssertFilesAreBinaryEqual(string firstPath, string secondPath)
+-        {
+-            FileInfo first = new(firstPath);
+-            FileInfo second = new(secondPath);
+-
+-            // Skipping shortcut test - so that we can better troubleshoot failures.
+-            ////if (first.Length != second.Length)
+-            ////{
+-            ////    Assert.Fail($"Files differ in size ({first.Name}:{first.Length} and {second.Name}:{second.Length}");
+-            ////}
+-
+-            if (string.Equals(first.FullName, second.FullName, StringComparison.OrdinalIgnoreCase))
+-            {
+-                return;
+-            }
+-
+-            using FileStream fs1 = first.OpenRead();
+-            using FileStream fs2 = second.OpenRead();
+-            for (int i = 0; i < Math.Min(first.Length, second.Length); i++)
+-            {
+-                byte b1 = (byte)fs1.ReadByte();
+-                byte b2 = (byte)fs2.ReadByte();
+-                if (b1 != b2)
+-                {
+-                    Assert.Fail(
+-                        $"Files ({first.Name}:{first.Length} and {second.Name}:{second.Length} sizes) are not equal at byte {i} ({b1} vs {b2})");
+-                }
+-            }
+-
+-            if (first.Length != second.Length)
+-            {
+-                Assert.Fail($"Files differ in size ({first.Name}:{first.Length} and {second.Name}:{second.Length}");
+-            }
++            br2.ReadBytes(bufferSize).Length.ShouldBe(0, "Second buffer contains bytes after first file end");
+         }
+ 
+         private static void AssertBinlogsHaveEqualContent(string firstPath, string secondPath)
+@@ -313,41 +279,15 @@ private static void AssertBinlogsHaveEqualContent(string firstPath, string secon
+             {
+                 i++;
+                 var ev2 = reader2.Read();
+-                if (!Compare(ev1, ev2, out string diffReason, $"event arg {i}"))
+-                {
+-                    Assert.Fail($"Binlogs ({firstPath} and {secondPath}) are not equal at event {i} ({diffReason})");
+-                }
++
++                ev1.Should().BeEquivalentTo(ev2,
++                    $"Binlogs ({firstPath} and {secondPath}) should be equal at event {i}");
+             }
+             // Read the second reader - to confirm there are no more events
+             //  and to force the embedded files to be read.
+             reader2.Read().ShouldBeNull($"Binlogs ({firstPath} and {secondPath}) are not equal - second has more events >{i + 1}");
+ 
+-            SweepArchiveFiles();
+-
+-            embedFiles1.ShouldBeEmpty();
+-            embedFiles2.ShouldBeEmpty();
+-
+-            void SweepArchiveFiles()
+-            {
+-                List<string> toRemove = new();
+-                foreach (var file in embedFiles1)
+-                {
+-                    if (embedFiles2.TryGetValue(file.Key, out string content))
+-                    {
+-                        if (!string.Equals(file.Value, content))
+-                        {
+-                            Assert.Fail($"Binlogs ({firstPath} and {secondPath}) are not equal at embedded file {file.Key}");
+-                        }
+-                        toRemove.Add(file.Key);
+-                        embedFiles2.Remove(file.Key);
+-                    }
+-                }
+-
+-                foreach (var file in toRemove)
+-                {
+-                    embedFiles1.Remove(file);
+-                }
+-            }
++            Assert.Equal(embedFiles1, embedFiles2);
+ 
+             void AddArchiveFile(Dictionary<string, string> files, ArchiveFileEventArgs arg)
+             {
+@@ -355,142 +295,7 @@ void AddArchiveFile(Dictionary<string, string> files, ArchiveFileEventArgs arg)
+                 string content = embedFile.GetContent();
+                 files.Add(embedFile.FullPath, content);
+                 arg.SetResult(embedFile.FullPath, content);
+-                SweepArchiveFiles();
+-            }
+-        }
+-
+-        private static bool Compare(object left, object right, out string diffReason, string name = "", HashSet<object> compared = null)
+-        {
+-            diffReason = null;
+-            if (compared == null)
+-            {
+-                compared = new HashSet<object>();
+-            }
+-            else if(compared.Contains(left) && compared.Contains(right))
+-            {
+-                return true;
+-            }
+-            else
+-            {
+-                compared.Add(left);
+-                compared.Add(right);
+-            }
+-
+-            if (ReferenceEquals(left, right))
+-            {
+-                return true;
+-            }
+-
+-            if ((left == null) ^ (right == null))
+-            {
+-                diffReason = "One object is null and the other is not." + name;
+-                return false;
+-            }
+-
+-            if (left.GetType() != right.GetType())
+-            {
+-                diffReason = $"Object types are different ({left.GetType().FullName} vs {right.GetType().FullName}).";
+-                return false;
+-            }
+-
+-            Type type = left.GetType();
+-            if (name == string.Empty)
+-            {
+-                name = type.Name;
+-            }
+-
+-            if (IsSimpleType(type))
+-            {
+-                if (!left.Equals(right))
+-                {
+-                    diffReason = $"Objects are different ({left} vs {right}). " + name;
+-                    return false;
+-                }
+-                return true;
+-            }
+-
+-            if (type.IsArray)
+-            {
+-                Array first = left as Array;
+-                Array second = right as Array;
+-                if (first.Length != second.Length)
+-                {
+-                    diffReason = $"{type.Name} : array size differs ({first.Length} vs {second.Length})";
+-                    return false;
+-                }
+-
+-                var en = first.GetEnumerator();
+-                int i = 0;
+-                while (en.MoveNext())
+-                {
+-                    if(!Compare(en.Current, second.GetValue(i), out diffReason, name, compared))
+-                    {
+-                        diffReason += $" (Index {i})";
+-                        return false;
+-                    }
+-                    i++;
+-                }
+-            }
+-            else if (typeof(System.Collections.IEnumerable).IsAssignableFrom(type))
+-            {
+-                System.Collections.IEnumerable first = left as System.Collections.IEnumerable;
+-                System.Collections.IEnumerable second = right as System.Collections.IEnumerable;
+-
+-                var en = first.GetEnumerator();
+-                var en2 = second.GetEnumerator();
+-                int i = 0;
+-                while (en.MoveNext())
+-                {
+-                    if (!en2.MoveNext())
+-                    {
+-                        diffReason = $"{name} : enumerable size differs";
+-                        return false;
+-                    }
+-
+-                    if (!Compare(en.Current, en2.Current, out diffReason, name, compared))
+-                    {
+-                        diffReason += $" (Position {i})";
+-                        return false;
+-                    }
+-                    i++;
+-                }
+-            }
+-            else
+-            {
+-                // Careful - the default argument-less impl gets the static properties as well (e.g. DateTime.Now)
+-                foreach (PropertyInfo pi in type.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+-                {
+-                    try
+-                    {
+-                        var val = pi.GetValue(left);
+-                        var tval = pi.GetValue(right);
+-                        var name1 = name + "." + pi.Name;
+-                        if (!Compare(val, tval, out diffReason, name1, compared))
+-                        {
+-                            return false;
+-                        }
+-                    }
+-                    catch (TargetParameterCountException)
+-                    {
+-                        // index property
+-                    }
+-                }
+-            }
+-
+-            return true;
+-        }
+-
+-        internal static bool IsSimpleType(Type type)
+-        {
+-            // Nullables
+-            if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>))
+-            {
+-                return IsSimpleType(type.GetGenericArguments()[0]);
+             }
+-            return type.IsPrimitive
+-                   || type.IsEnum
+-                   || type == typeof(string)
+-                   || type == typeof(decimal);
+         }
+ 
+         [Fact]
+diff --git a/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs b/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
+index 4712e89e73d..35d8f22a0bd 100644
+--- a/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
++++ b/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
+@@ -7,6 +7,7 @@
+ using System.IO;
+ using System.Linq;
+ using System.Text;
++using FluentAssertions;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Framework.Profiler;
+@@ -894,6 +895,175 @@ public void ReadingCorruptedStreamThrows()
+             }
+         }
+ 
++        [Fact]
++        public void ForwardCompatibleRead_HandleAppendOnlyChanges()
++        {
++            // Let's not write any strings prior the first event - to make locating (and overwriting) the size byte(s) easier.
++            BuildErrorEventArgs error = new(null, null, null, 1, 2, 3, 4, null, null, null);
++            BuildFinishedEventArgs finished = new("Message", "HelpKeyword", true);
++
++            var memoryStream = new MemoryStream();
++            var binaryWriter = new BinaryWriter(memoryStream);
++            var binaryReader = new BinaryReader(memoryStream);
++            var buildEventArgsWriter = new BuildEventArgsWriter(binaryWriter);
++
++            buildEventArgsWriter.Write(error);
++
++            //Some future data that are not known in current version
++            binaryWriter.Write(new byte[] { 1, 2, 3, 4 });
++
++
++            int positionAfterFirstEvent = (int)memoryStream.Position;
++            memoryStream.Position = 0;
++            //event type
++            Microsoft.Build.Shared.BinaryReaderExtensions.Read7BitEncodedInt(binaryReader);
++            int eventSizePos = (int)memoryStream.Position;
++            int eventSize = Microsoft.Build.Shared.BinaryReaderExtensions.Read7BitEncodedInt(binaryReader);
++            int positionAfterFirstEventSize = (int)memoryStream.Position;
++            memoryStream.Position = eventSizePos;
++            //the extra 4 bytes
++            Microsoft.Build.Shared.BinaryWriterExtensions.Write7BitEncodedInt(binaryWriter, eventSize + 4);
++            memoryStream.Position.ShouldBe(positionAfterFirstEventSize, "The event size need to be overwritten in place - without overwriting any bytes after the size info");
++            memoryStream.Position = positionAfterFirstEvent;
++
++            buildEventArgsWriter.Write(finished);
++
++            // Remember num of bytes written - we should read them all.
++            long length = memoryStream.Length;
++            // Now move back to the beginning of the stream and start reading.
++            memoryStream.Position = 0;
++
++            using var buildEventArgsReader = new BuildEventArgsReader(binaryReader, BinaryLogger.FileFormatVersion)
++            {
++                SkipUnknownEventParts = true
++            };
++
++            List<(ReaderErrorType errorType, BinaryLogRecordKind recordKind, string error)> readerErrors = new();
++            buildEventArgsReader.OnRecoverableReadError += (t, et, e) => readerErrors.Add((t, et, e));
++
++            var deserializedError = (BuildErrorEventArgs)buildEventArgsReader.Read();
++
++            readerErrors.Count.ShouldBe(1);
++            readerErrors[0].errorType.ShouldBe(ReaderErrorType.UnknownEventData);
++            readerErrors[0].recordKind.ShouldBe(BinaryLogRecordKind.Error);
++
++            deserializedError.Should().BeEquivalentTo(error);
++
++            var deserializedFinished = (BuildFinishedEventArgs)buildEventArgsReader.Read();
++
++            readerErrors.Count.ShouldBe(1);
++
++            deserializedFinished.Should().BeEquivalentTo(finished);
++
++            // There is nothing else in the stream
++            memoryStream.Position.Should().Be(length);
++        }
++
++        [Fact]
++        public void ForwardCompatibleRead_HandleUnknownEvent()
++        {
++            // Let's not write any strings prior the first event - to make locating (and overwriting) the event type byte(s) easier.
++            BuildErrorEventArgs error = new(null, null, null, 1, 2, 3, 4, null, null, null);
++            BuildFinishedEventArgs finished = new("Message", "HelpKeyword", true);
++
++            var memoryStream = new MemoryStream();
++            var binaryWriter = new BinaryWriter(memoryStream);
++            var binaryReader = new BinaryReader(memoryStream);
++            var buildEventArgsWriter = new BuildEventArgsWriter(binaryWriter);
++
++            buildEventArgsWriter.Write(error);
++
++            int positionAfterFirstEvent = (int)memoryStream.Position;
++            memoryStream.Position = 0;
++            //event type
++            Microsoft.Build.Shared.BinaryReaderExtensions.Read7BitEncodedInt(binaryReader);
++            int eventSizePos = (int)memoryStream.Position;
++            memoryStream.Position = 0;
++
++            // some future type that is not known in current version
++            BinaryLogRecordKind unknownType = (BinaryLogRecordKind) Enum.GetValues(typeof(BinaryLogRecordKind)).Cast<BinaryLogRecordKind>().Select(e => (int)e).Max() + 2;
++            Microsoft.Build.Shared.BinaryWriterExtensions.Write7BitEncodedInt(binaryWriter, (int)unknownType);
++            memoryStream.Position.ShouldBe(eventSizePos, "The event type need to be overwritten in place - without overwriting any bytes after the type info");
++            memoryStream.Position = positionAfterFirstEvent;
++
++            buildEventArgsWriter.Write(finished);
++
++            // Remember num of bytes written - we should read them all.
++            long length = memoryStream.Length;
++            // Now move back to the beginning of the stream and start reading.
++            memoryStream.Position = 0;
++
++            using var buildEventArgsReader = new BuildEventArgsReader(binaryReader, BinaryLogger.FileFormatVersion)
++            {
++                SkipUnknownEvents = true
++            };
++
++            List<(ReaderErrorType errorType, BinaryLogRecordKind recordKind, string error)> readerErrors = new();
++            buildEventArgsReader.OnRecoverableReadError += (t, et, e) => readerErrors.Add((t, et, e));
++
++            var deserializedEvent = /*(BuildErrorEventArgs)*/buildEventArgsReader.Read();
++
++            readerErrors.Count.ShouldBe(1);
++            readerErrors[0].errorType.ShouldBe(ReaderErrorType.UnkownEventType);
++            readerErrors[0].recordKind.ShouldBe(unknownType);
++
++            deserializedEvent.Should().BeEquivalentTo(finished);
++
++            // There is nothing else in the stream
++            memoryStream.Position.Should().Be(length);
++        }
++
++        [Fact]
++        public void ForwardCompatibleRead_HandleMismatchedFormatOfEvent()
++        {
++            //BuildErrorEventArgs error = new("Subcategory", "Code", "File", 1, 2, 3, 4, "Message", "HelpKeyword", "SenderName");
++            BuildErrorEventArgs error = new(null, null, null, 1, 2, 3, 4, null, null, null);
++            BuildFinishedEventArgs finished = new("Message", "HelpKeyword", true);
++
++            var memoryStream = new MemoryStream();
++            var binaryWriter = new BinaryWriter(memoryStream);
++            var binaryReader = new BinaryReader(memoryStream);
++            var buildEventArgsWriter = new BuildEventArgsWriter(binaryWriter);
++
++            buildEventArgsWriter.Write(error);
++
++            int positionAfterFirstEvent = (int)memoryStream.Position;
++            memoryStream.Position = 0;
++            //event type
++            Microsoft.Build.Shared.BinaryReaderExtensions.Read7BitEncodedInt(binaryReader);
++            int eventSize = Microsoft.Build.Shared.BinaryReaderExtensions.Read7BitEncodedInt(binaryReader);
++            //overwrite the entire event with garbage
++            binaryWriter.Write(Enumerable.Repeat(byte.MaxValue, eventSize).ToArray());
++
++            memoryStream.Position.ShouldBe(positionAfterFirstEvent, "The event need to be overwritten in place - without overwriting any bytes after the size info");
++
++            buildEventArgsWriter.Write(finished);
++
++            // Remember num of bytes written - we should read them all.
++            long length = memoryStream.Length;
++            // Now move back to the beginning of the stream and start reading.
++            memoryStream.Position = 0;
++
++            using var buildEventArgsReader = new BuildEventArgsReader(binaryReader, BinaryLogger.FileFormatVersion)
++            {
++                SkipUnknownEvents = true
++            };
++
++            List<(ReaderErrorType errorType, BinaryLogRecordKind recordKind, string error)> readerErrors = new();
++            buildEventArgsReader.OnRecoverableReadError += (t, et, e) => readerErrors.Add((t, et, e));
++
++            var deserializedEvent = /*(BuildErrorEventArgs)*/buildEventArgsReader.Read();
++
++            readerErrors.Count.ShouldBe(1);
++            readerErrors[0].errorType.ShouldBe(ReaderErrorType.UnknownFormatOfEventData);
++            readerErrors[0].recordKind.ShouldBe(BinaryLogRecordKind.Error);
++
++            deserializedEvent.Should().BeEquivalentTo(finished);
++
++            // There is nothing else in the stream
++            memoryStream.Position.Should().Be(length);
++        }
++
+         private string ToString(BuildEventContext context)
+         {
+             return $"{context.BuildRequestId} {context.NodeId} {context.ProjectContextId} {context.ProjectInstanceId} {context.SubmissionId} {context.TargetId} {context.TaskId}";
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs b/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
+index 9fe1638fd3a..22921695dea 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
+@@ -5,7 +5,12 @@
+ 
+ namespace Microsoft.Build.Logging
+ {
+-    internal enum BinaryLogRecordKind
++    /// <summary>
++    /// Indicates the type of record stored in the binary log.
++    /// There is a record type for each type of build event and there
++    /// are also few meta-data record types (e.g. string data, lookup data, EOF).
++    /// </summary>
++    public enum BinaryLogRecordKind
+     {
+         EndOfFile = 0,
+         BuildStarted,
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+index 71102153d5e..bc8744e36fb 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+@@ -65,7 +65,7 @@ static BinaryLogReplayEventSource()
+         public bool AllowForwardCompatibility { private get; init; } = true;
+ 
+         /// <inheritdoc cref="IBinlogReaderErrors.OnRecoverableReadError"/>
+-        public event Action<ReaderErrorType, string>? OnRecoverableReadError;
++        public event Action<ReaderErrorType, BinaryLogRecordKind, string>? OnRecoverableReadError;
+ 
+         /// <summary>
+         /// WARNING: This event is under low support and low maintenance - please use events directly exposed by <see cref="BinaryLogReplayEventSource"/> instead. 
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index d07b11f5e48..095ca07e20c 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -127,7 +127,7 @@ private void EnsureForwardCompatibleReadingSupported()
+         /// Receives recoverable errors during reading.
+         /// Applicable mainly when <see cref="SkipUnknownEvents"/> or <see cref="SkipUnknownEventParts"/> is set to true."/>
+         /// </summary>
+-        public event Action<ReaderErrorType, string>? OnRecoverableReadError;
++        public event Action<ReaderErrorType, BinaryLogRecordKind, string>? OnRecoverableReadError;
+ 
+         public void Dispose()
+         {
+@@ -227,11 +227,11 @@ e is FormatException formatException ||
+                     hasError = true;
+                     string error =
+                         ResourceUtilities.FormatResourceStringStripCodeAndKeyword("Binlog_ReaderMismatchedRead",
+-                            recordNumber, serializedEventLength, e.Message) + (_skipUnknownEventParts
++                            recordNumber, serializedEventLength, e.Message) + (_skipUnknownEvents
+                             ? " " + ResourceUtilities.GetResourceString("Binlog_ReaderSkippingRecord")
+                             : string.Empty);
+ 
+-                    HandleError(error, _skipUnknownEventParts, ReaderErrorType.UnknownFormatOfEventData, e);
++                    HandleError(error, _skipUnknownEvents, ReaderErrorType.UnknownFormatOfEventData, recordKind, e);
+                 }
+ 
+                 if (result == null && !hasError)
+@@ -242,7 +242,7 @@ e is FormatException formatException ||
+                             ? " " + ResourceUtilities.GetResourceString("Binlog_ReaderSkippingRecord")
+                             : string.Empty);
+ 
+-                    HandleError(error, _skipUnknownEvents, ReaderErrorType.UnkownEventType);
++                    HandleError(error, _skipUnknownEvents, ReaderErrorType.UnkownEventType, recordKind);
+                 }
+ 
+                 if (_readStream.BytesCountAllowedToReadRemaining > 0)
+@@ -251,7 +251,7 @@ e is FormatException formatException ||
+                         ResourceUtilities.FormatResourceStringStripCodeAndKeyword("Binlog_ReaderUnderRead",
+                             recordNumber, serializedEventLength, serializedEventLength - _readStream.BytesCountAllowedToReadRemaining);
+ 
+-                    HandleError(error, _skipUnknownEventParts, ReaderErrorType.UnknownEventData);
++                    HandleError(error, _skipUnknownEventParts, ReaderErrorType.UnknownEventData, recordKind);
+                 }
+ 
+                 recordNumber += 1;
+@@ -259,11 +259,11 @@ e is FormatException formatException ||
+ 
+             return result;
+ 
+-            void HandleError(string msg, bool noThrow, ReaderErrorType readerErrorType, Exception? innerException = null)
++            void HandleError(string msg, bool noThrow, ReaderErrorType readerErrorType, BinaryLogRecordKind recordKind, Exception? innerException = null)
+             {
+                 if (noThrow)
+                 {
+-                    OnRecoverableReadError?.Invoke(readerErrorType, msg);
++                    OnRecoverableReadError?.Invoke(readerErrorType, recordKind, msg);
+                     SkipBytes(_readStream.BytesCountAllowedToReadRemaining);
+                 }
+                 else
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IBinlogReaderErrors.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IBinlogReaderErrors.cs
+index 67d457e26ff..f663c9bc967 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/IBinlogReaderErrors.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IBinlogReaderErrors.cs
+@@ -9,11 +9,36 @@
+ 
+ namespace Microsoft.Build.Logging
+ {
++    /// <summary>
++    /// Type of the error that occurred during reading.
++    /// </summary>
+     public enum ReaderErrorType
+     {
++        /// <summary>
++        /// The file format of the binlog is not supported by the current reader.
++        /// Despite the logs should be supported by older readers - there might be certain format updates that prevent
++        ///  such forward compatibility. The binlog file contains the info about the minimum required reader version
++        ///  to detect this case.
++        /// </summary>
+         UnsupportedFileFormat,
++
++        /// <summary>
++        /// The encountered event is completely unknown to the reader. It cannot interpret neither a part of it.
++        /// </summary>
+         UnkownEventType,
++
++        /// <summary>
++        /// The encountered event is known to the reader and reader is able to read the event as it knows it.
++        /// However there are some extra data (append only extension to the event in future version), that reader cannot interpret,
++        ///  it can only skip it.
++        /// </summary>
+         UnknownEventData,
++
++        /// <summary>
++        /// The encountered event is known to the reader, however the reader cannot interpret the data of the event.
++        /// This is probably caused by the fact that the event definition changed in the future revision in other than append-only manner.
++        /// For this reason reader can only skip the event in full.
++        /// </summary>
+         UnknownFormatOfEventData,
+     }
+ 
+@@ -21,7 +46,8 @@ public interface IBinlogReaderErrors
+     {
+         /// <summary>
+         /// Receives recoverable errors during reading.
++        /// Communicates type of the error, kind of the record that encountered the error and the message detailing the error.
+         /// </summary>
+-        event Action<ReaderErrorType, string>? OnRecoverableReadError;
++        event Action<ReaderErrorType, BinaryLogRecordKind, string>? OnRecoverableReadError;
+     }
+ }

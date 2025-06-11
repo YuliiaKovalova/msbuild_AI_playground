@@ -1,0 +1,501 @@
+{
+  "number": 4025,
+  "title": "NuGetSdkResolver adds significant overhead to evaluation and should not be used",
+  "body": "For evaluation time, The NuGetSdkResolver is extremely slow.\r\n\r\nBased on investigation in CoreFX, I found:\r\n\r\n- On restored state, it added 180-400ms overhead to a single project evaluation\r\n- On unrestored state, it added 1000-6000ms overhead to a single project evaluation\r\n\r\nI've looked [at the original design](https://github.com/Microsoft/msbuild/issues/2803), and it's built on a incorrect premise; that its performance impact will only affect the loading state of projects that use it. The image it shows where projects are being loaded in the background via Asynchronous Solution Load (ASL) was removed from the product in 15.5.\r\n\r\nIf a project opts into this resolver, it has the following effects:\r\n\r\n- On solution load, blocks interaction with VS until it has completed downloading & resolving the SDK. \r\n- Increases the time it takes for the project-system to send design-time build results to Roslyn, resulting in delayed IntelliSense results\r\n- Increases the time it takes for designers to open \r\n- Increases the time it takes for tests to be discovered\r\n- Increases the time it takes for VS to react to changing the active configuration\r\n- Increases the time and blocks interaction with VS when making changes to a project, such as adding/removing a file\r\n- Increases design-time builds for every project that references it\r\n- Increases the time for above when switching branches\r\n\r\nWhen we designed SDK resolvers, it was explicitly called out that due to them being used during evaluation - that they _must be_ extremely fast and _must not_ hit the network. While this only hits the network on unrestored state, it still has a large negative impact on evaluation time when the package is already downloaded.\r\n\r\nThis is the entire reason that NuGet restore does not run during the build while inside Visual Studio.\r\n\r\nRogue resolvers can cause Visual Studio and other IDEs to be blamed for performance and UI delay issues, please remove or change the design of this resolver to play nicely with Visual Studio.\r\n\r\n",
+  "state": "OPEN",
+  "createdAt": "2018-12-21T07:23:09Z",
+  "updatedAt": "2025-06-02T08:29:36Z",
+  "closedAt": null,
+  "author": {
+    "login": "davkean"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": [
+      {
+        "login": "ladipro"
+      }
+    ]
+  },
+  "labels": [
+    "backlog",
+    "Area: Performance",
+    "Partner request",
+    "For consideration",
+    "Priority:1",
+    "triaged"
+  ],
+  "comments": {
+    "nodes": [
+      {
+        "body": "ACK on the negative performance impact. However, taking the feature out at this point is an impossibility.\r\n\r\nCould we work together to figure out how to change the current design in a way to meet the perf requirements for VS?",
+        "createdAt": "2018-12-21T22:53:21Z",
+        "author": {
+          "login": "livarcocc"
+        }
+      },
+      {
+        "body": "@davkean Do you have the repro steps for how this measurement is taken?\r\n\r\nIt is very bizarre that the nuget sdk resolver would be any worse than the regular resolver in the restored state.",
+        "createdAt": "2019-02-05T01:29:05Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "Putting this in 16.1 based on discussion just now. The resolver is actually now in the nuget repo, but first we should check that it is not something msbuild is doing in calling the resolver that is taking the time.",
+        "createdAt": "2019-02-05T01:30:25Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "Loooking at the code, https://github.com/NuGet/NuGet.Client/blob/dev/src/NuGet.Core/Microsoft.Build.NuGetSdkResolver/NuGetSdkResolver.cs\r\n\r\nIt really doesn't do much in the restored state.",
+        "createdAt": "2019-02-05T01:35:33Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "It was doing work, loading files off disk and parsing them if I remember correctly. I wish I could remember how I verified the overhead, I think I isolated in a single project and measured evaluation time. It was the overwhelming cause of the CoreFX evaluation time.",
+        "createdAt": "2019-02-05T02:01:48Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "I can repro this:\r\n\r\nEvaluation time for `dotnet new console`: 178 ms\r\nEvaluation time for `dotnet new console` + MSBuild.Sdk.Extras (unrestored): 3.8 seconds\r\nEvaluation time for `dotnet new console` + MSBuild.Sdk.Extras (restored): 381 ms\r\n\r\n",
+        "createdAt": "2019-02-05T02:29:11Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "I will profile this simple repro.",
+        "createdAt": "2019-02-05T02:29:20Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "![image](https://user-images.githubusercontent.com/75470/52251053-c3bf6900-28af-11e9-84e5-f0b21e9b0224.png)\r\n\r\nSome quick thoughts:\r\n\r\nIt is spending the most time parsing global.json, which is sad because my global.json is 74 bytes.  We should look at switching to the new corefx json reader. There's a sources version for netfx IIRC. This file is trivial, we don't need a fancy deserializer. \r\n\r\nThat said, it will avoid doing this more than once per build across projects:\r\n\r\nhttps://github.com/NuGet/NuGet.Client/blob/b6cd1677ae2bd3b07f4cc23c2e8d408f784e8b05/src/NuGet.Core/Microsoft.Build.NuGetSdkResolver/NuGetSdkResolver.cs#L89-L90\r\n\r\nBut I suspect VS evaluations aren't retaining this context object between projects. Fixing that if possible will help non-NuGet sdk evaluation considerably too.\r\n\r\nAnother major contributor is nuget loading its configuration files. I presume it needs to do this to answer the question of where a downloaded package is because values in the config can impact the answer to that. The parsing there can probably be improved as well.\r\n\r\nFor both of these we can possibly cache things in static state. and check config timestamps. I did some trickery like that in the non-nuget resolver.\r\n\r\n\r\n\r\n\r\n",
+        "createdAt": "2019-02-05T03:08:06Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "> It is spending the most time parsing global.json, which is sad because my global.json is 74 bytes. We should look at switching to the new corefx json reader. There's a sources version for netfx IIRC. This file is trivial, we don't need a fancy deserializer.\r\n\r\nYou don't have to switch if that's a big short term cost. Just use the JSONReader directly (since the global.json schema is fixed). The corefx reader should be lower allocation regardless though...",
+        "createdAt": "2019-02-05T03:22:38Z",
+        "author": {
+          "login": "davidfowl"
+        }
+      },
+      {
+        "body": "So it's mostly Jit time being measured there. 140ms of jitting newtonsoft.json.",
+        "createdAt": "2019-02-05T03:27:11Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "\ud83d\ude2e wow",
+        "createdAt": "2019-02-05T03:29:04Z",
+        "author": {
+          "login": "davidfowl"
+        }
+      },
+      {
+        "body": "Have to check if build at least reuses that jitting. I think it might if the version of nuget in the sdk matches the version used by nuget msbuild resolver. The location of the dll is different for full msbuild.",
+        "createdAt": "2019-02-05T03:29:09Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "This time matches almost identical to what I found in https://github.com/dotnet/sdk/issues/1483.",
+        "createdAt": "2019-02-05T03:31:41Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "![image](https://user-images.githubusercontent.com/75470/52251752-9ffe2200-28b3-11e9-978f-0df83d44babd.png)\r\n",
+        "createdAt": "2019-02-05T03:32:43Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "Nope, strike that, JSON.NET was way less than above.",
+        "createdAt": "2019-02-05T03:32:55Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "We could just NGEN the one that comes with VS.",
+        "createdAt": "2019-02-05T03:33:33Z",
+        "author": {
+          "login": "davidfowl"
+        }
+      },
+      {
+        "body": "@davkean Different API used? This is a huge hammer to read global.json: https://github.com/NuGet/NuGet.Client/blob/b6cd1677ae2bd3b07f4cc23c2e8d408f784e8b05/src/NuGet.Core/Microsoft.Build.NuGetSdkResolver/GlobalJsonReader.cs#L66",
+        "createdAt": "2019-02-05T03:36:13Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "Yep, just to grab a couple of strings from that file, hell I betcha regex would beat this hands down.",
+        "createdAt": "2019-02-05T03:37:10Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Yeah, there's a ReadAllText + IndexOf before it to avoid the deserialization, and that's not even showing up. \ud83d\ude06 \r\n\r\nhttps://github.com/NuGet/NuGet.Client/blob/b6cd1677ae2bd3b07f4cc23c2e8d408f784e8b05/src/NuGet.Core/Microsoft.Build.NuGetSdkResolver/GlobalJsonReader.cs#L39-L46\r\n\r\n\r\n\r\n",
+        "createdAt": "2019-02-05T03:40:04Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "I'll study some more tomorrow. This is interesting, but doesn't fully explain seeing 200ms - 400ms per project. I'm seeing 200ms, of which 140ms is Jitting that would not have been happening N times for loading of full solution, right?\r\n\r\nMind you above you said: \"I think I isolated in a single project and measured evaluation time\". Possible your 200ms - 400ms included jitting?\r\n\r\n",
+        "createdAt": "2019-02-05T03:44:52Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "When I was looking at traces for CoreFx, the resolver showing up as significant, enough to make me isolate this case and measure it by itself. Best way to measure this would be grab a real world use - such as the CoreFx solution I shared.",
+        "createdAt": "2019-02-05T03:56:56Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Yep. Will do that.",
+        "createdAt": "2019-02-05T03:58:53Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "The remaining 60ms is still quite bad. Just wondering if the isolation process bloated it to 200ms. I will dig.",
+        "createdAt": "2019-02-05T04:00:14Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "Bear in mind that the cost in that solution load will be ballooned by the number of evaluations (we evaluate every single project and configuration because the solution is incomplete) but it should be accurate to the cost of the total evaluation.",
+        "createdAt": "2019-02-05T04:03:29Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "The parsed SDK versions from `global.json` are cached so it should only be read once.\r\n\r\nhttps://github.com/NuGet/NuGet.Client/blob/b6cd1677ae2bd3b07f4cc23c2e8d408f784e8b05/src/NuGet.Core/Microsoft.Build.NuGetSdkResolver/NuGetSdkResolver.cs#L81\r\n\r\nMSBuild caches the resolved path for a particular SDK so that should only happen once. But for each unique SDK, the [NuGet settings are read](https://github.com/NuGet/NuGet.Client/blob/b6cd1677ae2bd3b07f4cc23c2e8d408f784e8b05/src/NuGet.Core/Microsoft.Build.NuGetSdkResolver/NuGetSdkResolver.cs#L121).  That could be improved.",
+        "createdAt": "2019-02-05T04:11:54Z",
+        "author": {
+          "login": "jeffkl"
+        }
+      },
+      {
+        "body": "@nguerrera can you double check that if you have two or more projects referencing the same SDK-from-a-NuGet-package that there is no overhead except for one?  Also we still need to figure out if VS is using the EvaluationContext that enables caching of SDK resolution results.  If that hasn't been implemented yet, it would add a ton of overhead in VS.",
+        "createdAt": "2019-02-05T04:17:01Z",
+        "author": {
+          "login": "jeffkl"
+        }
+      },
+      {
+        "body": "I don't think VS is using the context, (for non-build evaluation) which is probably the biggest issue here.",
+        "createdAt": "2019-02-05T04:43:56Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "Adding you to a thread Dave started on that.",
+        "createdAt": "2019-02-05T04:48:55Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "Confirming that nuget setting reading is showing up. I mentioned that too with the trace. \r\n\r\nEven for happening once or once per sdk and even subtracting jit, it shouldn't need to take so long to read a few tiny files. Probably not what needs to be fixed for the large sln case, though, which I wil be studying next. Above was just thoughts as they came to me looking at a trace for the first time.\r\n",
+        "createdAt": "2019-02-05T04:59:03Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "The question for evaluation retaining context.State is what's the correct lifetime? It's not as simple as per build is, right? We have to react to global.json / project files changing at some point. For that reason I think we should attack both the cost on cache miss and hit. And separately ensure a good yet correct hit rate.",
+        "createdAt": "2019-02-05T05:04:01Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "@cdmihai  and @lifengl have done some thinking about evaluation contexts in VS. We'd like to hook them up for the IO caching stuff too.",
+        "createdAt": "2019-02-05T16:12:00Z",
+        "author": {
+          "login": "Pilchie"
+        }
+      },
+      {
+        "body": "There might be an easy win at \"wrap a cache lifetime around solution load\" where a ton of evaluations happen in a batch.",
+        "createdAt": "2019-02-05T16:35:24Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "> There might be an easy win at \"wrap a cache lifetime around solution load\" where a ton of evaluations happen in a batch.\r\n\r\nWhenever VS needs to evaluate a batch of projects would be good places to wrap in evaluation contexts, because if the disk changes then the result is undefined either way. Solution load is the most natural, but all APIs that receive a collection of projects to be evaluated / re-evaluated should do this.\r\n\r\nThere's also additional improvements that can be made to enhance the evaluation context:\r\n- Seeding the contexts with partial views of the file system that VS has\r\n- Setting them up in evaluations triggered by file based design time builds. The evaluations for these happen deep inside the engine, no way to currently inject an evaluation context in there.\r\n- The ability to query the context for all the IO an evaluation did, so that VS can add extra file watchers and see when anything gets invalidated. But since this is not detours based tracking but rather tracking-by-convention, it gets more tricky",
+        "createdAt": "2019-02-05T18:39:00Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "@rainersigwald Yeah I was thinking the same thing; how do I use said cache?",
+        "createdAt": "2019-02-05T22:04:33Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "You use one of these new `Project` factory methods: https://github.com/Microsoft/msbuild/blob/master/src/Build/Definition/Project.cs#L526-L570\r\nAnd pass the context in via `ProjectOptions`: https://github.com/Microsoft/msbuild/blob/master/src/Build/Definition/ProjectOptions.cs#L40\r\n\r\n```c#\r\nvar context = EvaluationContext.Create(SharingPolicy.Shared);\r\nvar evaluatedProjects = projectsPaths.Select(p => Project.FromFile(p, new ProjectOptions{EvaluationContext = context}));\r\n```",
+        "createdAt": "2019-02-05T23:35:51Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "On the same note, the `SdkResolverManifest` resolver:\r\n\r\nhttps://github.com/Microsoft/msbuild/blob/b4f5792a8fadab87e5199ec54d355c3ba1397a6a/src/Build/BackEnd/Components/SdkResolution/SdkResolverManifest.cs#L27\r\n\r\nis taking 236ms to initialize on my machine, which is more than the 153ms that the `NuGetSdkResolver` initialization is taking, mainly spent in the processing of the `DataContractSerializer`.",
+        "createdAt": "2019-02-17T02:25:07Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "That can easily be converted to XmlReader, but does it happen more than once?",
+        "createdAt": "2019-02-17T02:50:01Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "We should still change it, just curious if one time or many.",
+        "createdAt": "2019-02-17T02:51:19Z",
+        "author": {
+          "login": "nguerrera"
+        }
+      },
+      {
+        "body": "The result seems cached, as it goes through `CachingSdkResolverService`, but it adds up to the rest. For instance, on the same profiling session, a single `new ProjectCollection()` takes 500ms (most of the time is spent searching for toolsets).",
+        "createdAt": "2019-02-17T02:55:35Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "I was walking through some code today, and figured out that we do currently do use EvaluationContext during solution load if enabled via remote setting (let's us do an experiment). Figuring out if we actually turned this experiment on.",
+        "createdAt": "2019-03-01T06:59:40Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "To update the thread, the team originally found no benefit to using evaluation context during load when we tested this - hence why it wasn't turned on (it could only break things). I suspect these resolvers might change this so we'll probably want to re-experiment on this, which I've filed https://github.com/dotnet/project-system/issues/4649 to investigate.",
+        "createdAt": "2019-03-15T06:33:07Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Here's a customer raising similar concerns on the symptoms I raised above: https://github.com/NuGet/Home/issues/8157.",
+        "createdAt": "2019-05-24T10:28:29Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Please review https://github.com/NuGet/NuGet.Client/pull/2879 to help me make this faster when reading global.json",
+        "createdAt": "2019-06-07T16:53:41Z",
+        "author": {
+          "login": "jeffkl"
+        }
+      },
+      {
+        "body": "Another internal partner reached out to me where they are experencing hangs and delays when reloading projects or adding a new file, and its caused by the same underlying resolver.\r\n\r\n\r\n\r\n",
+        "createdAt": "2019-08-20T23:41:40Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Wanted to bump this. Just had a conversation with @davkean and he pointed to this as being one of the reasons why loading an sln with 500+ projects is terribly slow. (dotnet/runtime - libraries part)\r\n\r\n@rainersigwald I think the assignee needs to be updated?",
+        "createdAt": "2020-03-06T13:19:02Z",
+        "author": {
+          "login": "ViktorHofer"
+        }
+      },
+      {
+        "body": "This appears to be an issue causing hangs while VS is loading.  Can we get this off the UI codepath while loading? Thanks! :)",
+        "createdAt": "2020-03-10T03:36:35Z",
+        "author": {
+          "login": "CyrusNajmabadi"
+        }
+      },
+      {
+        "body": "> Can we get this off the UI codepath while loading?\r\n\r\nTrue, there's two/three potential lines of work:\r\n- make the nuget resolver faster by either making the resolver or nuget faster, or both\r\n- don't do builds on the UI thread",
+        "createdAt": "2020-03-10T17:47:26Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "@cdmihai can this be prioritized?  This can literally block the UI thread for minutes *while VS is loading*.  Please see the linked dump.  This breaks VS entirely for the user.  It also violates a ton of best practices around using the UI thread.  \r\n\r\nCan you explain what the nuget resolver does?  if it's anything related to IO, it sounds like the only option here is to get this off the UI thread.",
+        "createdAt": "2020-03-10T19:41:20Z",
+        "author": {
+          "login": "CyrusNajmabadi"
+        }
+      },
+      {
+        "body": "@cdmihai This is not about doing builds on the UI thread, this is evaluation. We need to block on UI thread on evaluation because the user experience is really odd when you don't (you just added a file and it doesn't appear in the tree), or you just loaded a project and your files don't appear.\r\n\r\nThis isn't about making this feature faster, we were promised this extension point would never be used to hit the network which you can't avoid. We need to come up with an new extension point that is designed with IDEs in mind. Given I've seen no progress on this, and these bugs are constantly pushed our way, I'm going to introduce new analysis that prompts a yellow bar when this feature causes delays.",
+        "createdAt": "2020-03-10T22:08:04Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "I'm trying to get some time to fix the perf issues in the case when the packages are already on disk:\r\n\r\n- [ ] Use native library for loading `global.json` instead of a managed library (just like the .NET Core resolver does)\r\n- [ ] NGen the resolver and load it by name instead of path in MSBuild to reduce JIT time\r\n- [ ] Improve the perf of reading `NuGet.config` and cache the `NuGet.config` like we do with `global.json` so the file is only read once\r\n\r\nThe goal would be to make resolving an SDK from a NuGet package on par with the .NET Core SDK resolver.  Does that seem like the right direction?\r\n\r\nTo address the performance of when the resolver needs to pull a package, I want to add to the NuGet API so we can pull a single package faster.  Most SDK packages are very small so it should be quick.  https://github.com/NuGet/Home/issues/5919\r\n\r\nAlternatively, I could add a new API to MSBuild that the project system could call to pre-resolve SDKs so they don't happen during evaluation.  That would be a bit more work but is entirely possible.",
+        "createdAt": "2020-03-10T23:11:00Z",
+        "author": {
+          "login": "jeffkl"
+        }
+      },
+      {
+        "body": ">Alternatively, I could add a new API to MSBuild that the project system could call to pre-resolve SDKs so they don't happen during evaluation. That would be a bit more work but is entirely possible.\r\n\r\nYes, this is the approach we should be taking - no matter how fast we make NuGet restore, it will never be fast enough.",
+        "createdAt": "2020-03-11T00:00:22Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "> I'm trying to get some time to fix the perf issues in the case when the packages are already on disk:\r\n\r\nWhat happens when teh packages are not on disk?",
+        "createdAt": "2020-03-11T00:03:50Z",
+        "author": {
+          "login": "CyrusNajmabadi"
+        }
+      },
+      {
+        "body": "It hits the network.",
+        "createdAt": "2020-03-11T00:05:02Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "@CyrusNajmabadi from what I remember, it can also freezes VS. I have to run `msbuild /r /t:Restore` to fix that.",
+        "createdAt": "2020-03-11T00:05:21Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "ok.  so network on hte UI thread basically has to be a complete no-no.  for one thing, i have *terrible* network access.  For anotehr, this blocks *loading* vs.  meaning i can't even do any work while this is happening because VS must be killed.",
+        "createdAt": "2020-03-11T00:27:09Z",
+        "author": {
+          "login": "CyrusNajmabadi"
+        }
+      },
+      {
+        "body": "I have a proposal to avoid the network access on the UI thread.  See the \"NuGet SDK Resolver\" section in this proposal: https://github.com/dotnet/designs/pull/104\r\n\r\nBasically we are going to [update the MSBuild SDK resolver interface](https://github.com/microsoft/msbuild/issues/5239) so that a resolver can return no resolved SDK paths without failing.  A resolver will also be able to return items that should be added to the evaluation.\r\n\r\nWe can leverage this to fix the issue where the NuGet resolver downloads files on the UI thread.  In VS, the resolver should run in a mode that does not allow downloading SDKs.  Rather, if it can't find the SDK locally, it should return success and include a `MissingMSBuildSDK` item describing the SDK it would have downloaded.  The VS project system should check for those items on evaluation, and if there are any of them, it should spin off a non-UI thread task to download them.",
+        "createdAt": "2020-04-06T07:23:03Z",
+        "author": {
+          "login": "dsplaisted"
+        }
+      },
+      {
+        "body": "@dsplaisted with the optional workload work getting in, is it now possible for project system to update to handle this differently?",
+        "createdAt": "2020-10-02T17:23:13Z",
+        "author": {
+          "login": "marcpopMSFT"
+        }
+      },
+      {
+        "body": "This has been unblocked since the new SDK resolver support went in to MSBuild.  We would need to make changes to the [NuGet SDK Resolver](https://github.com/NuGet/NuGet.Client/tree/dev/src/NuGet.Core/Microsoft.Build.NuGetSdkResolver), and the project system would also need to make changes.  It would be nice to do that for 5.0.200 / VS 16.9.",
+        "createdAt": "2020-10-02T17:40:19Z",
+        "author": {
+          "login": "dsplaisted"
+        }
+      },
+      {
+        "body": "This is another issue caused by it: https://developercommunity.visualstudio.com/t/VisualStudio-was-hang-when-open-the-wpf-/1429662. We have ~57 threads all blocked behind the NuGet resolver.",
+        "createdAt": "2021-06-03T00:46:55Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "This is another issue caused by this: https://developercommunity.visualstudio.com/t/vs-performance-issue-ide-hangs-when-changing-file/1643242.",
+        "createdAt": "2022-01-21T04:11:15Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "NuGet Epic to address perf issues in the NuGetSDKResolver: https://github.com/NuGet/Home/issues/11441.\r\n\r\nPlease feel free to reach out to @jeffkl directly.",
+        "createdAt": "2022-02-25T01:02:52Z",
+        "author": {
+          "login": "aortiz-msft"
+        }
+      },
+      {
+        "body": "I'm looking at this issue, trying to break it down into units of work across the affected components. A couple of observations:\r\n\r\n1. **Avoid downloading NuGet packages during evaluation**\r\nI'm actually not sure if it should be built on top of the new SDK resolver support. If the SDK cannot be resolved, there is no point in continuing evaluation. Instead of defining items on the evaluated project to indicate which NuGet packages need to be restored, the resolver may as well just throw an exception with this info, which the project system would catch. Maybe I'm not understanding the flow correctly, though, will need to follow up.\r\n\r\nThe work needed here:\r\n- From NuGet SDK resolver:\r\n  - Detect that it's running in VS and it's not allowed to restore. The flag for VS is already there as `SdkResolverContext.IsRunningInVisualStudio` but presumably we'll want a way to opt-in/out to experiment so we may need an additional flag.\r\n  - If the above holds true, indicate the unresolved package via an exception or via `ItemsToAdd` in the new SDK interface.\r\n  - Overall, this is a fairly small work item.\r\n\r\n- From MSBuild:\r\n  - Depending on the exact mechanism of indicating the need to restore, MSBuild may need to aggregate the information from all resolver invocations. This is because `<Project Sdk=\"Package1/Version1;Package2/Version2\">` is perfectly legal, whether intended to or not.\r\n  - Very small amount of work.\r\n\r\n- From the project system:\r\n  - This would depend on the desired UX. We may want to have VS automatically restore the missing packages and then retry evaluating the affected project, all within the context of solution load. Or finish loading the solution leaving the affected projects 'unloaded' and then asynchronously pop a dialog? Or take the user directly to the VS NuGet Manager? Or something else. Very much an open question, feedback welcome.\r\n\r\n2. **Avoid JITting**\r\nThere is indeed some non-trivial JITting cost when a process runs SDK resolution for the first time. For VS, the first project loaded after VS starts pays the price. On command-line it's generally every build (i.e. every MSBuild.exe invocation). On my machine I measured it at 45 ms for `Microsoft.Build.NuGetSdkResolver.dll` and 85 ms for `Microsoft.DotNet.MSBuildSdkResolver.dll`. The latter has nothing to do with NuGet SDK resolution but it's always invoked and because it's more expensive to JIT than the NuGet resolver, if we decide to address JITting it would make sense to prioritize fixing the base SDK resolver first.\r\n\r\nI have played with prototyping a change to NGEN `Microsoft.Build.NuGetSdkResolver.dll` + its dependency `Microsoft.Deployment.DotNet.Releases` and it's not straightforward. MSBuild uses `Assembly.LoadFrom`, which immediately disqualifies the native image from being loaded. To be able to `Assembly.Load` by full name, we 1) Need to know the full name and 2) Need add a binding redirect to `devenv.exe.config` and `MSBuild.exe.config` so the CLR binder can find the file. For this we need to know the assembly version and in some cases this appears to be hitting layering & versioning unfortunacies, i.e. MSBuild generally doesn't know the specific .NET SDK version it's going to be part of. Not unsolvable but likely P2 in the grand scheme of things.",
+        "createdAt": "2023-04-26T14:30:55Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "> 1. I'm actually not sure if it should be built on top of the new SDK resolver support. If the SDK cannot be resolved, there is no point in continuing evaluation. Instead of defining items on the evaluated project to indicate which NuGet packages need to be restored, the resolver may as well just throw an exception with this info, which the project system would catch. Maybe I'm not understanding the flow correctly, though, will need to follow up.\r\n\r\nThe resolver needs to communicate this information to Visual Studio.  You could probably include it as data on an exception, but adding items seems cleaner to me.  Also if you do it via items, then I don't think you need to do the work in MSBuild to aggregate the information about which packages need to be downloaded, as there will just be multiple items with the information from the different resolver invocations.",
+        "createdAt": "2023-04-26T16:36:10Z",
+        "author": {
+          "login": "dsplaisted"
+        }
+      },
+      {
+        "body": "True, I think in general it's uglier to rely on structured data attached to an exception. On the other hand, if the resolver fails in this way, conceptually there's no value in evaluating the project. Other than the items added via `ItemsToAdd` it's pretty much useless. Perf wouldn't be an issue as this an error path. But what I'm kind of debating is whether a dummy `ProjectInstance` fits the CPS internal model or not. I.e. if it's good for CPS to always receive a valid object or if it's a potential source of confusion downstream. (ex: Would it be good or bad for such a `ProjectInstance` to be persisted to project system's evaluation cache?)",
+        "createdAt": "2023-04-27T10:10:34Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "@ladipro are you still working on this?",
+        "createdAt": "2025-02-23T01:48:37Z",
+        "author": {
+          "login": "BenjaminBrienen"
+        }
+      },
+      {
+        "body": "@BenjaminBrienen no, I have moved to another project and I'm not working on this anymore. Apologies for not unassigning myself earlier, doing it now.\n\nThe summary, the best I remember it: We've made incremental improvements to related areas e.g. sped up the NuGet resolver, eliminated some JITting, improved caching within MSBuild, but the overall architectural flaw of the synchronous evaluation API blocking on network requests hasn't had high enough priority to justify the (likely extensive) changes to the system.",
+        "createdAt": "2025-02-24T07:51:20Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "I am hoping to work on the NuGet-based MSBuild project SDK resolver this year and am tracking work at https://github.com/NuGet/Home/issues/11441",
+        "createdAt": "2025-02-24T17:40:27Z",
+        "author": {
+          "login": "jeffkl"
+        }
+      }
+    ]
+  }
+}

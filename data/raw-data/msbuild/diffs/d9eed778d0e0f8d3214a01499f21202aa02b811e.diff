@@ -1,0 +1,300 @@
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index b1e8f1ecce6..81b389bebf8 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -301,10 +301,8 @@ private static void AssertBinlogsHaveEqualContent(string firstPath, string secon
+ 
+             void AddArchiveFile(Dictionary<string, string> files, ArchiveFileEventArgs arg)
+             {
+-                ArchiveFile embedFile = arg.ObtainArchiveFile();
+-                string content = embedFile.GetContent();
+-                files.Add(embedFile.FullPath, content);
+-                arg.SetResult(embedFile.FullPath, content);
++                ArchiveFile embedFile = arg.ArchiveData.ToArchString();
++                files.Add(embedFile.FullPath, embedFile.Content);
+             }
+ 
+             void AddArchiveFileFromStringHandler(StringReadEventArgs args)
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index e6b9a6b8c20..6ee2013669a 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -387,7 +387,7 @@ private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+ 
+                 foreach (var entry in zipArchive.Entries/*.OrderBy(e => e.LastWriteTime)*/)
+                 {
+-                    var file = ArchiveFile.From(entry);
++                    var file = ArchiveStream.From(entry);
+                     ArchiveFileEventArgs archiveFileEventArgs = new(file);
+                     // ArchiveFileEventArgs is not IDisposable as we do not want to clutter exposed API
+                     using var cleanupScope = new CleanupScope(archiveFileEventArgs.Dispose);
+@@ -395,13 +395,13 @@ private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+ 
+                     if (projectImportsCollector != null)
+                     {
+-                        var resultFile = archiveFileEventArgs.ObtainArchiveFile();
++                        var resultFile = archiveFileEventArgs.ArchiveData;
+ 
+-                        if (resultFile.CanUseReader)
++                        if (resultFile is ArchiveStream archiveStream)
+                         {
+                             projectImportsCollector.AddFileFromMemory(
+-                                resultFile.FullPath,
+-                                resultFile.GetContentReader().BaseStream,
++                                archiveStream.FullPath,
++                                archiveStream.ContentReader.BaseStream,
+                                 makePathAbsolute: false,
+                                 entryCreationStamp: entry.LastWriteTime);
+                         }
+@@ -409,7 +409,7 @@ private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+                         {
+                             projectImportsCollector.AddFileFromMemory(
+                                 resultFile.FullPath,
+-                                resultFile.GetContent(),
++                                resultFile.ToArchString().Content,
+                                 makePathAbsolute: false,
+                                 entryCreationStamp: entry.LastWriteTime);
+                         }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs
+index e7c28eabe4a..89ca3663438 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs
+@@ -11,78 +11,81 @@ namespace Microsoft.Build.Logging
+ {
+     /// <summary>
+     /// An object model for binlog embedded files.
++    /// Used in <see cref="IBuildFileReader.ArchiveFileEncountered"/> event.
+     /// </summary>
+-    public sealed class ArchiveFile
++    public abstract class ArchiveData : IDisposable
+     {
+-        private bool _streamAcquired;
+-        private bool _stringAcquired;
+-        private readonly StreamReader _contentReader;
+-        private string? _content;
++        private protected ArchiveData(string fullPath) => FullPath = fullPath;
+ 
+-        public ArchiveFile(string fullPath, Stream contentStream)
+-        {
+-            FullPath = fullPath;
+-            _contentReader = new StreamReader(contentStream);
+-        }
++        /// <summary>
++        /// Full path of the original file before it was put in the embedded archive.
++        /// </summary>
++        public string FullPath { get; }
+ 
+-        public ArchiveFile(string fullPath, string content)
+-        {
+-            FullPath = fullPath;
+-            _content = content;
+-            _stringAcquired = true;
+-            _contentReader = StreamReader.Null;
+-        }
++        /// <summary>
++        /// Materializes the whole content of the embedded file in memory as a string.
++        /// </summary>
++        /// <returns></returns>
++        public abstract ArchiveFile ToArchString();
+ 
+-        internal static ArchiveFile From(ZipArchiveEntry entry)
+-        {
+-            return new ArchiveFile(entry.FullName, entry.Open());
+-        }
++        public virtual void Dispose()
++        { }
++    }
+ 
+-        public string FullPath { get; }
+-        public bool CanUseReader => !_stringAcquired;
+-        public bool CanUseString => !_streamAcquired;
++    /// <summary>
++    /// Fully materialized (in-memory) embedded file.
++    /// Easier to work with (the content is expressed in a single string), but more memory greedy.
++    /// </summary>
++    public class ArchiveFile : ArchiveData
++    {
++        public ArchiveFile(string fullPath, string content)
++            : base(fullPath)
++            => Content = content;
+ 
+         /// <summary>
+-        /// Fetches the file content as a stream reader (forward only).
+-        /// This prevents the content from being read as string.
++        /// The content of the original file.
+         /// </summary>
+-        /// <returns></returns>
+-        /// <exception cref="InvalidOperationException"></exception>
+-        public StreamReader GetContentReader()
+-        {
+-            if (_stringAcquired)
+-            {
+-                throw new InvalidOperationException(ResourceUtilities.GetResourceString("Binlog_ArchiveFile_AcquiredAsString"));
+-            }
++        public string Content { get; }
+ 
+-            _streamAcquired = true;
+-            return _contentReader;
+-        }
++        /// <inheritdoc cref="ArchiveData.ToArchString" />
++        public override ArchiveFile ToArchString()
++            => this;
++    }
++
++    /// <summary>
++    /// Lazy (streaming) embedded file.
++    /// Might be favorable for large files, as it doesn't materialize the whole content in memory.
++    /// </summary>
++    public class ArchiveStream : ArchiveData
++    {
++        public ArchiveStream(string fullPath, StreamReader contentReader)
++            : base(fullPath)
++            => ContentReader = contentReader;
++
++        /// <summary>
++        /// Stream over the content of the archived file.
++        /// </summary>
++        public StreamReader ContentReader { get; }
+ 
+         /// <summary>
+-        /// Fetches the file content as a string.
+-        /// This prevents the content to be fetched via StreamReader.
++        /// Creates an externally exposable embedded file representation from a <see cref="ZipArchiveEntry"/> (which is an implementation detail currently).
+         /// </summary>
++        /// <param name="entry"></param>
+         /// <returns></returns>
+-        /// <exception cref="InvalidOperationException"></exception>
+-        public string GetContent()
++        internal static ArchiveStream From(ZipArchiveEntry entry)
+         {
+-            if (_streamAcquired)
+-            {
+-                throw new InvalidOperationException(ResourceUtilities.GetResourceString("Binlog_ArchiveFile_AcquiredAsStream"));
+-            }
+-
+-            if (!_stringAcquired)
+-            {
+-                _stringAcquired = true;
+-                _content = _contentReader.ReadToEnd();
+-            }
++            return new ArchiveStream(entry.FullName, new StreamReader(entry.Open()));
++        }
+ 
+-            return _content!;
++        /// <inheritdoc cref="ArchiveData.ToArchString" />
++        public override ArchiveFile ToArchString()
++        {
++            var content = ContentReader.ReadToEnd();
++            ContentReader.Dispose();
++            return new ArchiveFile(content, FullPath);
+         }
+ 
+-        // Intentionally not exposing this publicly (e.g. as IDisposable implementation)
+-        // as we don't want to user to be bothered with ownership and disposing concerns.
+-        internal void Dispose() => _contentReader.Dispose();
++        public override void Dispose()
++            => ContentReader.Dispose();
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgs.cs b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgs.cs
+index 16ae1a3130d..e01b5aee76f 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgs.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgs.cs
+@@ -2,8 +2,6 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
+-using System.IO;
+-using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Logging;
+ 
+@@ -12,47 +10,11 @@ namespace Microsoft.Build.Logging;
+ /// </summary>
+ public sealed class ArchiveFileEventArgs : EventArgs
+ {
+-    private ArchiveFile _archiveFile;
+-    private bool _resultSet;
+-    private Action _disposeAction;
++    public ArchiveData ArchiveData { get; set; }
+ 
+-    public ArchiveFileEventArgs(ArchiveFile archiveFile) =>
+-        (_archiveFile, _resultSet, _disposeAction) = (archiveFile, true, archiveFile.Dispose);
+-
+-    /// <summary>
+-    /// Acquires the <see cref="ArchiveFile"/> instance. This method can only be called once and
+-    /// <see cref="SetResult(string,Stream)"/> or <see cref="SetResult(string,string)"/> must be called afterwards
+-    /// (this is because the embedded files are stored as forward only stream - reading them prevents re-reads).
+-    /// </summary>
+-    /// <returns></returns>
+-    /// <exception cref="InvalidOperationException"></exception>
+-    public ArchiveFile ObtainArchiveFile()
+-    {
+-        if (!_resultSet)
+-        {
+-            throw new InvalidOperationException(
+-                ResourceUtilities.GetResourceString("Binlog_ArchiveFile_NotSetAfterAcquire"));
+-        }
+-
+-        _resultSet = false;
+-        return _archiveFile;
+-    }
+-
+-    public void SetResult(string resultPath, Stream resultStream)
+-    {
+-        _archiveFile = new ArchiveFile(resultPath, resultStream);
+-        _disposeAction += _archiveFile.Dispose;
+-        _resultSet = true;
+-    }
+-
+-    public void SetResult(string resultPath, string resultContent)
+-    {
+-        _archiveFile = new ArchiveFile(resultPath, resultContent);
+-        _disposeAction += _archiveFile.Dispose;
+-        _resultSet = true;
+-    }
++    public ArchiveFileEventArgs(ArchiveData archiveData) => ArchiveData = archiveData;
+ 
+     // Intentionally not exposing this publicly (e.g. as IDisposable implementation)
+     // as we don't want to user to be bothered with ownership and disposing concerns.
+-    internal void Dispose() => _disposeAction();
++    internal void Dispose() => ArchiveData.Dispose();
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgsExtensions.cs b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgsExtensions.cs
+index 818cffaa91a..7a0b2d7220a 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgsExtensions.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgsExtensions.cs
+@@ -11,13 +11,17 @@ public static Action<ArchiveFileEventArgs> ToArchiveFileHandler(this Action<Stri
+     {
+         return args =>
+         {
+-            var archiveFile = args.ObtainArchiveFile();
++            var archiveFile = args.ArchiveData.ToArchString();
+             var pathArgs = new StringReadEventArgs(archiveFile.FullPath);
+             stringHandler(pathArgs);
+-            var contentArgs = new StringReadEventArgs(archiveFile.GetContent());
++            var contentArgs = new StringReadEventArgs(archiveFile.Content);
+             stringHandler(contentArgs);
+ 
+-            args.SetResult(pathArgs.StringToBeUsed, contentArgs.StringToBeUsed);
++            if(pathArgs.StringToBeUsed != pathArgs.OriginalString ||
++               contentArgs.StringToBeUsed != contentArgs.OriginalString)
++            {
++                args.ArchiveData = new ArchiveFile(pathArgs.StringToBeUsed, contentArgs.StringToBeUsed);
++            }
+         };
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IBuildFileReader.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildFileReader.cs
+index 9910ee1a06a..b47a4979458 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/IBuildFileReader.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildFileReader.cs
+@@ -9,8 +9,6 @@ public interface IBuildFileReader
+ {
+     /// <summary>
+     /// An event that allows the caller to be notified when an embedded file is encountered in the binary log.
+-    /// Subscribing to this event obligates the subscriber to read the file content and set the resulting content
+-    ///  via <see cref="ArchiveFileEventArgs.SetResult(string,System.IO.Stream)"/> or <see cref="ArchiveFileEventArgs.SetResult(string,string)"/>.
+     /// When subscriber is OK with greedy reading entire content of the file, it can simplify subscribing to this event,
+     /// by using handler with same signature as handler for <see cref="IBuildEventStringsReader.StringReadDone"/> and wrapping it via
+     /// <see cref="ArchiveFileEventArgsExtensions.ToArchiveFileHandler"/> extension.

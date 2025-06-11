@@ -1,0 +1,188 @@
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 96a57e974ef..41591945b26 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -573,7 +573,10 @@ public CheckWrapper Initialize(Check ba, ConfigurationContext configContext)
+                     throw new BuildCheckConfigurationException(
+                         $"The Check '{ba.FriendlyName}' failed to initialize: {e.Message}", e);
+                 }
+-                return new CheckWrapper(ba);
++
++                CheckWrapper wrapper = new(ba);
++                wrapper.Initialize();
++                return wrapper;
+             }
+ 
+             public CheckWrapper? MaterializedCheck { get; set; }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index f2925ff1556..7a932c671f9 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -242,10 +242,6 @@ private static void ReportResult(
+             return;
+         }
+ 
+-        BuildEventArgs eventArgs = result.ToEventArgs(config.Severity);
+-
+-        eventArgs.BuildEventContext = checkContext.BuildEventContext;
+-
+-        checkContext.DispatchBuildEvent(eventArgs);
++        checkWrapper.ReportResult(result, checkContext, config);
+     }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs b/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
+index 62011296cb5..c8875af7e1b 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
+@@ -7,6 +7,7 @@
+ using System.Linq;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Framework;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+@@ -17,6 +18,16 @@ internal sealed class CheckWrapper
+ {
+     private readonly Stopwatch _stopwatch = new Stopwatch();
+ 
++    /// <summary>
++    /// Maximum amount of messages that could be sent per check rule.
++    /// </summary>
++    public const int MaxMessageCountPerRule = 10;
++
++    /// <summary>
++    /// Keeps track of number of reports sent per rule.
++    /// </summary>
++    private Dictionary<string, int>? _reportsCountPerRule;
++
+     public CheckWrapper(Check check)
+     {
+         Check = check;
+@@ -29,6 +40,11 @@ public CheckWrapper(Check check)
+     // In such case - configuration will be same for all projects. So we do not need to store it per project in a collection.
+     internal CheckConfigurationEffective? CommonConfig { get; private set; }
+ 
++    internal void Initialize()
++    {
++        _reportsCountPerRule = new Dictionary<string, int>();
++    }
++
+     // start new project
+     internal void StartNewProject(
+         string fullProjectPath,
+@@ -52,6 +68,33 @@ internal void StartNewProject(
+         }
+     }
+ 
++    public void ReportResult(BuildCheckResult result, ICheckContext checkContext, CheckConfigurationEffective config)
++    {
++        if (_reportsCountPerRule is not null)
++        {
++            if (!_reportsCountPerRule.ContainsKey(result.CheckRule.Id))
++            {
++                _reportsCountPerRule[result.CheckRule.Id] = 0;
++            }
++            _reportsCountPerRule[result.CheckRule.Id]++;
++
++            if (_reportsCountPerRule[result.CheckRule.Id] == MaxMessageCountPerRule + 1)
++            {
++                checkContext.DispatchAsCommentFromText(MessageImportance.Normal, $"The check '{Check.FriendlyName}' has exceeded the maximum number of results allowed for the rule '{result.CheckRule.Id}'. Any additional results will not be displayed.");
++                return;
++            }
++
++            if (_reportsCountPerRule[result.CheckRule.Id] > MaxMessageCountPerRule + 1)
++            {
++                return;
++            }
++        }
++
++        BuildEventArgs eventArgs = result.ToEventArgs(config.Severity);
++        eventArgs.BuildEventContext = checkContext.BuildEventContext;
++        checkContext.DispatchBuildEvent(eventArgs);
++    }
++
+     // to be used on eval node (BuildCheckDataSource.check)
+     internal void Uninitialize()
+     {
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 31eabe4a9d6..8b6450817bb 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -62,6 +62,30 @@ public void PropertiesUsageAnalyzerTest(bool buildInOutOfProcessNode)
+         Regex.Matches(output, "BC0203 .* Property").Count.ShouldBe(2);
+     }
+ 
++
++    [Theory]
++    [InlineData(true)]
++    [InlineData(false)]
++    public void WarningsCountExceedsLimitTest(bool buildInOutOfProcessNode)
++    {
++        PrepareSampleProjectsAndConfig(
++            buildInOutOfProcessNode,
++            out TransientTestFile projectFile,
++            "PropsCheckTestWithLimit.csproj");
++
++        string output = RunnerUtilities.ExecBootstrapedMSBuild($"{projectFile.Path} -check", out bool success);
++        _env.Output.WriteLine(output);
++        _env.Output.WriteLine("=========================");
++        success.ShouldBeTrue(output);
++
++        output.ShouldMatch(@"has exceeded the maximum number of results allowed for the rule");
++
++        // each finding should be found just once - but reported twice, due to summary
++        Regex.Matches(output, "BC0202: .* Property").Count.ShouldBe(2);
++        Regex.Matches(output, "BC0203: .* Property").Count.ShouldBe(20);
++    }
++
++
+     [Theory]
+     [InlineData(true, true)]
+     [InlineData(false, true)]
+diff --git a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/PropsCheckTestWithLimit.csproj b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/PropsCheckTestWithLimit.csproj
+new file mode 100644
+index 00000000000..28731ffb1a4
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/PropsCheckTestWithLimit.csproj
+@@ -0,0 +1,22 @@
++<Project DefaultTargets="PrintEnvVar">
++    <PropertyGroup>
++        <MyProp01>$(MyProp01)</MyProp01>
++        <MyProp02>$(MyProp02)</MyProp02>
++        <MyProp03>$(MyProp03)</MyProp03>
++        <MyProp04>$(MyProp04)</MyProp04>
++        <MyProp05>$(MyProp05)</MyProp05>
++        <MyProp06>$(MyProp06)</MyProp06>
++        <MyProp07>$(MyProp07)</MyProp07>
++        <MyProp08>$(MyProp08)</MyProp08>
++        <MyProp09>$(MyProp09)</MyProp09>
++        <MyProp10>$(MyProp10)</MyProp10>
++        <MyProp11>$(MyProp11)</MyProp11>
++    </PropertyGroup>
++
++    <Target Name="PrintEnvVar">
++        <Message Text="MyPropT2 has value $(MyPropT2)" Importance="High" />
++        <PropertyGroup>
++            <MyPropT2>SomeValue</MyPropT2>
++        </PropertyGroup>
++    </Target>
++</Project>
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 8411c5408ba..86da1102387 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -2721,6 +2721,13 @@ private static bool ProcessCommandLineSwitches(
+ 
+                     isBuildCheckEnabled = IsBuildCheckEnabled(commandLineSwitches);
+ 
++                    // BuildCheck is not compatible with node reusing, see #10317.
++                    // Disable node reuse when build check is on.
++                    if (isBuildCheckEnabled)
++                    {
++                        enableNodeReuse = false;
++                    }
++
+                     inputResultsCaches = ProcessInputResultsCaches(commandLineSwitches);
+ 
+                     outputResultsCache = ProcessOutputResultsCache(commandLineSwitches);

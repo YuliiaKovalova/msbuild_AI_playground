@@ -1,0 +1,448 @@
+diff --git a/src/Build.UnitTests/BackEnd/TaskBuilderTestTask.cs b/src/Build.UnitTests/BackEnd/TaskBuilderTestTask.cs
+index 7f390cdf98c..b595211e838 100644
+--- a/src/Build.UnitTests/BackEnd/TaskBuilderTestTask.cs
++++ b/src/Build.UnitTests/BackEnd/TaskBuilderTestTask.cs
+@@ -514,7 +514,8 @@ public TaskPropertyInfo[] GetTaskParameters()
+                         infos[i].Name,
+                         infos[i].PropertyType,
+                         infos[i].GetCustomAttributes(typeof(OutputAttribute), false).Length > 0,
+-                        infos[i].GetCustomAttributes(typeof(RequiredAttribute), false).Length > 0);
++                        infos[i].GetCustomAttributes(typeof(RequiredAttribute), false).Length > 0,
++                        infos[i].GetCustomAttributes(typeof(AllowEmptyStringAttribute), false).Length > 0);
+                 }
+ 
+                 return propertyInfos;
+diff --git a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+index fb7c35ad18e..a9eafdf201e 100644
+--- a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
++++ b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+@@ -333,6 +333,7 @@ bool ITaskExecutionHost.SetTaskParameters(IDictionary<string, (string, ElementLo
+             // "required" so that we can keep track of whether or not they all get set.
+             var setParameters = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+             IDictionary<string, string> requiredParameters = GetNamesOfPropertiesWithRequiredAttribute();
++            IDictionary<string, string> allowEmptyStringParameters = GetNamesOfPropertiesWithAllowEmptyStringAttribute();
+ 
+             // look through all the attributes of the task element
+             foreach (KeyValuePair<string, (string, ElementLocation)> parameter in parameters)
+@@ -342,7 +343,7 @@ bool ITaskExecutionHost.SetTaskParameters(IDictionary<string, (string, ElementLo
+ 
+                 try
+                 {
+-                    success = SetTaskParameter(parameter.Key, parameter.Value.Item1, parameter.Value.Item2, requiredParameters.ContainsKey(parameter.Key), out taskParameterSet);
++                    success = SetTaskParameter(parameter.Key, parameter.Value.Item1, parameter.Value.Item2, requiredParameters.ContainsKey(parameter.Key), allowEmptyStringParameters.ContainsKey(parameter.Key), out taskParameterSet);
+                 }
+                 catch (Exception e) when (!ExceptionHandling.NotExpectedReflectionException(e))
+                 {
+@@ -1007,6 +1008,7 @@ private bool SetTaskParameter
+             string parameterValue,
+             ElementLocation parameterLocation,
+             bool isRequired,
++            bool allowEmptyString,
+             out bool parameterSet
+         )
+         {
+@@ -1064,6 +1066,7 @@ out bool parameterSet
+                             parameterType,
+                             parameterValue,
+                             parameterLocation,
++                            allowEmptyString,
+                             out parameterSet
+                             );
+                     }
+@@ -1109,7 +1112,7 @@ out parameterSet
+                     // flag an error if we find a parameter that has no .NET property equivalent
+                     _taskLoggingContext.LogError
+                         (
+-                        new BuildEventFileInfo( parameterLocation ),
++                        new BuildEventFileInfo(parameterLocation),
+                         "UnexpectedTaskAttribute",
+                         parameterName,
+                         _taskName,
+@@ -1151,6 +1154,7 @@ private bool InitializeTaskScalarParameter
+             Type parameterType,
+             string parameterValue,
+             ElementLocation parameterLocation,
++            bool allowEmptyString,
+             out bool taskParameterSet
+         )
+         {
+@@ -1169,6 +1173,11 @@ out bool taskParameterSet
+                     if (finalTaskItems.Count == 0)
+                     {
+                         success = true;
++                        if (allowEmptyString)
++                        {
++                            success = SetTaskItemParameter(parameter, new TaskItem(parameterValue, parameterLocation.LocationString, allowEmptyString));
++                            taskParameterSet = true;
++                        }
+                     }
+                     else
+                     {
+@@ -1607,6 +1616,31 @@ private IDictionary<string, string> GetNamesOfPropertiesWithRequiredAttribute()
+             return requiredParameters;
+         }
+ 
++        /// <summary>
++        /// Finds all the task properties that are allowEmptyString.
++        /// Returns them as keys in a dictionary.
++        /// </summary>
++        /// <returns>Gets a list of properties which are allowEmptyString.</returns>
++        private IDictionary<string, string> GetNamesOfPropertiesWithAllowEmptyStringAttribute()
++        {
++            ErrorUtilities.VerifyThrow(_taskFactoryWrapper != null, "Expected taskFactoryWrapper to not be null");
++            IDictionary<string, string> allowEmptyStringParameters = null;
++
++            try
++            {
++                allowEmptyStringParameters = _taskFactoryWrapper.GetNamesOfPropertiesWithAllowEmptyStringAttribute;
++            }
++            catch (Exception e) when (!ExceptionHandling.NotExpectedReflectionException(e))
++            {
++                // Reflection related exception
++                _targetLoggingContext.LogError(new BuildEventFileInfo(_taskLocation), "AttributeTypeLoadError", _taskName, e.Message);
++
++                ProjectErrorUtilities.VerifyThrowInvalidProject(false, _taskLocation, "TaskDeclarationOrUsageError", _taskName);
++            }
++
++            return allowEmptyStringParameters;
++        }
++
+         /// <summary>
+         /// Show a message that cancel has not yet finished.
+         /// </summary>
+diff --git a/src/Build/Instance/ProjectItemInstance.cs b/src/Build/Instance/ProjectItemInstance.cs
+index 4d5d9804805..48d0a4e5054 100644
+--- a/src/Build/Instance/ProjectItemInstance.cs
++++ b/src/Build/Instance/ProjectItemInstance.cs
+@@ -781,8 +781,8 @@ internal sealed class TaskItem :
+             /// <summary>
+             /// Creates an instance of this class given the item-spec.
+             /// </summary>
+-            internal TaskItem(string includeEscaped, string definingFileEscaped)
+-                : this(includeEscaped, includeEscaped, null, null, null, immutable: false, definingFileEscaped)
++            internal TaskItem(string includeEscaped, string definingFileEscaped, bool allowEmptyString = false)
++                : this(includeEscaped, includeEscaped, null, null, null, immutable: false, definingFileEscaped, allowEmptyString)
+             {
+             }
+ 
+@@ -797,11 +797,15 @@ internal TaskItem(
+                               List<ProjectItemDefinitionInstance> itemDefinitions,
+                               string projectDirectory,
+                               bool immutable,
+-                              string definingFileEscaped // the actual project file (or import) that defines this item.
++                              string definingFileEscaped, // the actual project file (or import) that defines this item.
++                              bool allowEmptyString = false
+                               )
+             {
+-                ErrorUtilities.VerifyThrowArgumentLength(includeEscaped, nameof(includeEscaped));
+-                ErrorUtilities.VerifyThrowArgumentLength(includeBeforeWildcardExpansionEscaped, nameof(includeBeforeWildcardExpansionEscaped));
++                if (!allowEmptyString)
++                {
++                    ErrorUtilities.VerifyThrowArgumentLength(includeEscaped, nameof(includeEscaped));
++                    ErrorUtilities.VerifyThrowArgumentLength(includeBeforeWildcardExpansionEscaped, nameof(includeBeforeWildcardExpansionEscaped));
++                }
+ 
+                 _includeEscaped = FileUtilities.FixFilePath(includeEscaped);
+                 _includeBeforeWildcardExpansionEscaped = FileUtilities.FixFilePath(includeBeforeWildcardExpansionEscaped);
+@@ -1137,7 +1141,7 @@ internal CopyOnWritePropertyDictionary<ProjectMetadataInstance> MetadataCollecti
+ 
+             IEnumerable<ProjectMetadataInstance> IItem<ProjectMetadataInstance>.Metadata => MetadataCollection;
+ 
+-#region Operators
++            #region Operators
+ 
+             /// <summary>
+             /// This allows an explicit typecast from a "TaskItem" to a "string", returning the ItemSpec for this item.
+@@ -1178,7 +1182,7 @@ public static explicit operator string(TaskItem that)
+                 return !(left == right);
+             }
+ 
+-#endregion
++            #endregion
+ 
+             /// <summary>
+             /// Produce a string representation.
+@@ -1200,7 +1204,7 @@ public override object InitializeLifetimeService()
+             }
+ #endif
+ 
+-#region IItem and ITaskItem2 Members
++            #region IItem and ITaskItem2 Members
+ 
+             /// <summary>
+             /// Returns the metadata with the specified key.
+@@ -1451,9 +1455,9 @@ IDictionary ITaskItem2.CloneCustomMetadataEscaped()
+                 return clonedMetadata;
+             }
+ 
+-#endregion
++            #endregion
+ 
+-#region INodePacketTranslatable Members
++            #region INodePacketTranslatable Members
+ 
+             /// <summary>
+             /// Reads or writes the packet to the serializer.
+@@ -1483,9 +1487,9 @@ void ITranslatable.Translate(ITranslator translator)
+                 }
+             }
+ 
+-#endregion
++            #endregion
+ 
+-#region IEquatable<TaskItem> Members
++            #region IEquatable<TaskItem> Members
+ 
+             /// <summary>
+             /// Override of GetHashCode.
+@@ -1594,7 +1598,7 @@ public bool Equals(TaskItem other)
+                 return thisNames.Count == 0;
+             }
+ 
+-#endregion
++            #endregion
+ 
+             /// <summary>
+             /// Returns true if a particular piece of metadata is defined on this item (even if
+@@ -1655,7 +1659,7 @@ private void WriteInternString(ITranslator translator, LookasideStringInterner i
+                 var key = interner.Intern(str);
+                 translator.Writer.Write(key);
+             }
+-            
++
+             private void ReadInternString(ITranslator translator, LookasideStringInterner interner, ref string str)
+             {
+                 var val = translator.Reader.ReadInt32();
+diff --git a/src/Build/Instance/ReflectableTaskPropertyInfo.cs b/src/Build/Instance/ReflectableTaskPropertyInfo.cs
+index 66c846646dc..9a54afec924 100644
+--- a/src/Build/Instance/ReflectableTaskPropertyInfo.cs
++++ b/src/Build/Instance/ReflectableTaskPropertyInfo.cs
+@@ -32,7 +32,7 @@ internal class ReflectableTaskPropertyInfo : TaskPropertyInfo
+         /// <param name="taskPropertyInfo">The original property info that generated this instance.</param>
+         /// <param name="taskType">The type to reflect over to get the reflection propertyinfo later.</param>
+         internal ReflectableTaskPropertyInfo(TaskPropertyInfo taskPropertyInfo, Type taskType)
+-            : base(taskPropertyInfo.Name, taskPropertyInfo.PropertyType, taskPropertyInfo.Output, taskPropertyInfo.Required)
++            : base(taskPropertyInfo.Name, taskPropertyInfo.PropertyType, taskPropertyInfo.Output, taskPropertyInfo.Required, taskPropertyInfo.AllowEmptyString)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(taskType, nameof(taskType));
+             _taskType = taskType;
+@@ -47,7 +47,8 @@ internal ReflectableTaskPropertyInfo(PropertyInfo propertyInfo)
+             propertyInfo.Name,
+             propertyInfo.PropertyType,
+             propertyInfo.GetCustomAttributes(typeof(OutputAttribute), true).Any(),
+-            propertyInfo.GetCustomAttributes(typeof(RequiredAttribute), true).Any())
++            propertyInfo.GetCustomAttributes(typeof(RequiredAttribute), true).Any(),
++            propertyInfo.GetCustomAttributes(typeof(AllowEmptyStringAttribute), true).Any())
+         {
+             _propertyInfo = propertyInfo;
+         }
+@@ -57,12 +58,13 @@ internal ReflectableTaskPropertyInfo(PropertyInfo propertyInfo)
+         /// used with MetadataLoadContext, as these parameters cannot be computed for the property type passed in directly but
+         /// rather the relevant base type.
+         /// </summary>
+-        internal ReflectableTaskPropertyInfo(PropertyInfo propertyInfo, bool output, bool required, bool isAssignableToITaskItemType)
++        internal ReflectableTaskPropertyInfo(PropertyInfo propertyInfo, bool output, bool required,bool allowEmptyString, bool isAssignableToITaskItemType)
+             : base(
+             propertyInfo.Name,
+             propertyInfo.PropertyType,
+             output,
+-            required)
++            required,
++            allowEmptyString)
+         {
+             _propertyInfo = propertyInfo;
+             IsAssignableToITask = isAssignableToITaskItemType;
+diff --git a/src/Build/Instance/TaskFactoryWrapper.cs b/src/Build/Instance/TaskFactoryWrapper.cs
+index 72bf3ec5624..37a38a7ef17 100644
+--- a/src/Build/Instance/TaskFactoryWrapper.cs
++++ b/src/Build/Instance/TaskFactoryWrapper.cs
+@@ -29,6 +29,11 @@ internal sealed class TaskFactoryWrapper
+         /// </summary>
+         private IDictionary<string, string> _namesOfPropertiesWithRequiredAttribute;
+ 
++        /// <summary>
++        /// Cache of names of allowEmptyString properties on this type
++        /// </summary>
++        private IDictionary<string, string> _namesOfPropertiesWithAllowEmptyStringAttribute;
++
+         /// <summary>
+         /// Cache of names of output properties on this type
+         /// </summary>
+@@ -149,6 +154,15 @@ public IDictionary<string, string> FactoryIdentityParameters
+             }
+         }
+ 
++        public IDictionary<string, string> GetNamesOfPropertiesWithAllowEmptyStringAttribute {
++            get
++            {
++                PopulatePropertyInfoCacheIfNecessary();
++
++                return _namesOfPropertiesWithAllowEmptyStringAttribute;
++            }
++        }
++
+         #endregion
+ 
+         #region Methods.
+@@ -305,6 +319,17 @@ private void PopulatePropertyInfoCacheIfNecessary()
+                         // we have a output attribute defined, keep a record of that
+                         _namesOfPropertiesWithOutputAttribute[propertyInfo.Name] = String.Empty;
+                     }
++
++                    if (propertyInfos[i].AllowEmptyString)
++                    {
++                        if (_namesOfPropertiesWithAllowEmptyStringAttribute == null)
++                        {
++                            _namesOfPropertiesWithAllowEmptyStringAttribute = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
++                        }
++
++                        // we have a output attribute defined, keep a record of that
++                        _namesOfPropertiesWithAllowEmptyStringAttribute[propertyInfo.Name] = String.Empty;
++                    }
+                 }
+ 
+                 _propertyInfoCache ??= ReadOnlyEmptyDictionary<string, TaskPropertyInfo>.Instance;
+@@ -312,6 +337,7 @@ private void PopulatePropertyInfoCacheIfNecessary()
+                 _namesOfPropertiesWithRequiredAttribute ??= ReadOnlyEmptyDictionary<string, string>.Instance;
+                 _namesOfPropertiesWithOutputAttribute ??= ReadOnlyEmptyDictionary<string, string>.Instance;
+                 _namesOfPropertiesWithAmbiguousMatches ??= ReadOnlyEmptyDictionary<string, string>.Instance;
++                _namesOfPropertiesWithAllowEmptyStringAttribute ??= ReadOnlyEmptyDictionary<string, string>.Instance;
+             }
+         }
+         #endregion
+diff --git a/src/Framework/AllowEmptyStringAttribute.cs b/src/Framework/AllowEmptyStringAttribute.cs
+new file mode 100644
+index 00000000000..ff1c1931430
+--- /dev/null
++++ b/src/Framework/AllowEmptyStringAttribute.cs
+@@ -0,0 +1,24 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++
++#nullable disable
++
++namespace Microsoft.Build.Framework
++{
++    /// <summary>
++    /// This class defines the attribute that a task writer can apply to a task's taskitem property to declare the property to be a
++    /// allowEmptyString property.
++    /// </summary>
++    [AttributeUsage(AttributeTargets.Property, AllowMultiple = false, Inherited = false)]
++    public sealed class AllowEmptyStringAttribute : Attribute
++    {
++        /// <summary>
++        /// Default constructor.
++        /// </summary>
++        public AllowEmptyStringAttribute()
++        {
++        }
++    }
++}
+diff --git a/src/Framework/TaskPropertyInfo.cs b/src/Framework/TaskPropertyInfo.cs
+index 3d06ce4d747..18990adefc2 100644
+--- a/src/Framework/TaskPropertyInfo.cs
++++ b/src/Framework/TaskPropertyInfo.cs
+@@ -21,7 +21,8 @@ public class TaskPropertyInfo
+         /// <param name="typeOfParameter">The actual type of the parameter</param>
+         /// <param name="output">True if the parameter is both an output and input parameter. False if the parameter is only an input parameter</param>
+         /// <param name="required">True if the parameter must be supplied to each invocation of the task.</param>
+-        public TaskPropertyInfo(string name, Type typeOfParameter, bool output, bool required)
++        /// <param name="allowEmptyString"></param>
++        public TaskPropertyInfo(string name, Type typeOfParameter, bool output, bool required, bool allowEmptyString = false)
+         {
+             Name = name;
+             PropertyType = typeOfParameter;
+@@ -30,6 +31,7 @@ public TaskPropertyInfo(string name, Type typeOfParameter, bool output, bool req
+             Type elementType = typeOfParameter.IsArray ? typeOfParameter.GetElementType() : typeOfParameter;
+             IsValueTypeOutputParameter = elementType.GetTypeInfo().IsValueType || elementType.FullName.Equals("System.String");
+             IsAssignableToITask = typeof(ITaskItem).IsAssignableFrom(elementType);
++            AllowEmptyString = allowEmptyString;
+         }
+ 
+         /// <summary>
+@@ -52,6 +54,11 @@ public TaskPropertyInfo(string name, Type typeOfParameter, bool output, bool req
+         /// </summary>
+         public bool Required { get; private set; }
+ 
++        /// <summary>
++        /// This task parameter is required (analogous to the [Required] attribute)
++        /// </summary>
++        public bool AllowEmptyString { get; private set; }
++
+         /// <summary>
+         /// This task parameter should be logged when LogTaskInputs is set. Defaults to true.
+         /// </summary>
+diff --git a/src/Shared/LoadedType.cs b/src/Shared/LoadedType.cs
+index c7181787b69..38057290306 100644
+--- a/src/Shared/LoadedType.cs
++++ b/src/Shared/LoadedType.cs
+@@ -79,6 +79,7 @@ internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo, Assembly loade
+             {
+                 bool outputAttribute = false;
+                 bool requiredAttribute = false;
++                bool allowEmptyStringAttribute = false;
+                 foreach (CustomAttributeData attr in CustomAttributeData.GetCustomAttributes(props[i]))
+                 {
+                     if (attr.AttributeType.Name.Equals(nameof(OutputAttribute)))
+@@ -89,6 +90,10 @@ internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo, Assembly loade
+                     {
+                         requiredAttribute = true;
+                     }
++                    else if (attr.AttributeType.Name.Equals(nameof(AllowEmptyStringAttribute)))
++                    {
++                        allowEmptyStringAttribute = true;
++                    }
+                 }
+ 
+                 // Check whether it's assignable to ITaskItem or ITaskItem[]. Simplify to just checking for ITaskItem.
+@@ -100,7 +105,7 @@ internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo, Assembly loade
+ 
+                 bool isAssignableToITask = iTaskItemType.IsAssignableFrom(pt);
+ 
+-                Properties[i] = new ReflectableTaskPropertyInfo(props[i], outputAttribute, requiredAttribute, isAssignableToITask);
++                Properties[i] = new ReflectableTaskPropertyInfo(props[i], outputAttribute, requiredAttribute, allowEmptyStringAttribute, isAssignableToITask);
+                 if (loadedViaMetadataLoadContext)
+                 {
+                     PropertyAssemblyQualifiedNames[i] = Properties[i].PropertyType.AssemblyQualifiedName;
+diff --git a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
+index abeba2b2791..a57f16bfefc 100644
+--- a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
++++ b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
+@@ -190,7 +190,8 @@ public bool Initialize(string taskName, IDictionary<string, TaskPropertyInfo> pa
+                             i.Name,
+                             i.PropertyType,
+                             i.GetCustomAttribute<OutputAttribute>() != null,
+-                            i.GetCustomAttribute<RequiredAttribute>() != null))
++                            i.GetCustomAttribute<RequiredAttribute>() != null,
++                            i.GetCustomAttribute<AllowEmptyStringAttribute>() != null))
+                         .ToArray();
+                 }
+             }
+diff --git a/src/Tasks/XamlTaskFactory/XamlTaskFactory.cs b/src/Tasks/XamlTaskFactory/XamlTaskFactory.cs
+index 7378f094c43..dddfdcad07c 100644
+--- a/src/Tasks/XamlTaskFactory/XamlTaskFactory.cs
++++ b/src/Tasks/XamlTaskFactory/XamlTaskFactory.cs
+@@ -230,7 +230,8 @@ public TaskPropertyInfo[] GetTaskParameters()
+                     infos[i].Name,
+                     infos[i].PropertyType,
+                     infos[i].GetCustomAttributes(typeof(OutputAttribute), false).Length > 0,
+-                    infos[i].GetCustomAttributes(typeof(RequiredAttribute), false).Length > 0);
++                    infos[i].GetCustomAttributes(typeof(RequiredAttribute), false).Length > 0,
++                    infos[i].GetCustomAttributes(typeof(AllowEmptyStringAttribute), false).Length > 0);
+             }
+ 
+             return propertyInfos;
+diff --git a/src/Tasks/XmlPoke.cs b/src/Tasks/XmlPoke.cs
+index b64579109fd..d287dcf028a 100644
+--- a/src/Tasks/XmlPoke.cs
++++ b/src/Tasks/XmlPoke.cs
+@@ -70,6 +70,7 @@ public string Query
+         /// The value to be inserted into the specified location.
+         /// </summary>
+         [Required]
++        [AllowEmptyString]
+         public ITaskItem Value
+         {
+             get

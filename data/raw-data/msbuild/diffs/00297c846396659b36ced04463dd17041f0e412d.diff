@@ -1,0 +1,527 @@
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index 9aba801df72..7246adee0bd 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -228,7 +228,7 @@ public void AssemblyLoadsDuringTaskRunLogged()
+                 RunnerUtilities.ExecMSBuild($"{logger.Parameters} -flp:logfile={Path.Combine(logFolder.Path, "logFile.log")};verbosity=diagnostic", out success);
+                 success.ShouldBeTrue();
+                 string text = File.ReadAllText(Path.Combine(logFolder.Path, "logFile.log"));
+-                text.ShouldContain("Assembly loaded during task run: System.Diagnostics.Debug");
++                text.ShouldContain("Assembly loaded during TaskRun: System.Diagnostics.Debug");
+             }
+         }
+ 
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index b10bd378e32..23f768bc588 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -8,6 +8,7 @@
+ using System.Linq;
+ using System.Reflection;
+ using System.Threading;
++using Microsoft.Build.BackEnd.Components.RequestBuilder;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using InternalLoggerException = Microsoft.Build.Exceptions.InternalLoggerException;
+@@ -1594,6 +1595,8 @@ private void InitializeLogger(ILogger logger, IEventSource sourceForLogger)
+         {
+             try
+             {
++                // TODO: can we distinguish builtin and custom loggers here?
++                using var _ = AssemblyLoadsTracker.StartTracking(this, AssemblyLoadingContext.LoggerInitialization);
+                 INodeLogger nodeLogger = logger as INodeLogger;
+                 if (nodeLogger != null)
+                 {
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs b/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
+index a27f462cb2d..4941d136819 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
+@@ -9,32 +9,40 @@
+ 
+ namespace Microsoft.Build.BackEnd.Components.RequestBuilder
+ {
+-    internal class AssemblyLoadsTracker : IDisposable
++    internal class AssemblyLoadsTracker : MarshalByRefObject, IDisposable
+     {
+-        private static readonly ConcurrentDictionary<AppDomain, AssemblyLoadsTracker> s_instances =
+-            new ConcurrentDictionary<AppDomain, AssemblyLoadsTracker>();
+-        private readonly LoggingContext _loggingContext;
++        private static readonly ConcurrentDictionary<AppDomain, AssemblyLoadsTracker> s_instances = new();
++        private readonly LoggingContext? _loggingContext;
++        private readonly LoggingService? _loggingService;
++        private readonly AssemblyLoadingContext _context;
+         private readonly AppDomain _appDomain;
+ 
+-        private AssemblyLoadsTracker(LoggingContext loggingContext)
+-            : this(loggingContext, AppDomain.CurrentDomain)
+-        { }
+-
+-        private AssemblyLoadsTracker(LoggingContext loggingContext, AppDomain appDomain)
++        private AssemblyLoadsTracker(
++            LoggingContext? loggingContext,
++            LoggingService? loggingService,
++            AssemblyLoadingContext context,
++            AppDomain appDomain)
+         {
+             _loggingContext = loggingContext;
++            _loggingService = loggingService;
++            _context = context;
+             _appDomain = appDomain;
+         }
+ 
+-        public static IDisposable StartTracking(LoggingContext loggingContext, AppDomain? appDomain = null)
++        public static IDisposable StartTracking(
++            LoggingContext loggingContext,
++            AssemblyLoadingContext context,
++            AppDomain? appDomain = null)
+         {
+-            var tracker = new AssemblyLoadsTracker(loggingContext, appDomain ?? AppDomain.CurrentDomain);
+-            if (appDomain != null)
+-            {
+-                s_instances.AddOrUpdate(appDomain, tracker, (_, loadsTracker) => loadsTracker);
+-            }
+-            tracker.StartTracking();
+-            return tracker;
++            return StartTracking(loggingContext, null, context, appDomain);
++        }
++
++        public static IDisposable StartTracking(
++            LoggingService loggingService,
++            AssemblyLoadingContext context,
++            AppDomain? appDomain = null)
++        {
++            return StartTracking(null, loggingService, context, appDomain);
+         }
+ 
+         public static void StopTracking(AppDomain appDomain)
+@@ -49,8 +57,26 @@ public void Dispose()
+         {
+             StopTracking();
+         }
++
++        private static IDisposable StartTracking(
++            LoggingContext? loggingContext,
++            LoggingService? loggingService,
++            AssemblyLoadingContext context,
++            AppDomain? appDomain = null)
++        {
++            var tracker = new AssemblyLoadsTracker(loggingContext, loggingService, context, appDomain ?? AppDomain.CurrentDomain);
++            if (appDomain != null)
++            {
++                s_instances.AddOrUpdate(appDomain, tracker, (_, loadsTracker) => loadsTracker);
++            }
++            tracker.StartTracking();
++            return tracker;
++        }
++
+         private void StartTracking()
+         {
++            // Make multisubscriptions idempotent
++            _appDomain.AssemblyLoad -= CurrentDomainOnAssemblyLoad;
+             _appDomain.AssemblyLoad += CurrentDomainOnAssemblyLoad;
+         }
+ 
+@@ -65,11 +91,12 @@ private void CurrentDomainOnAssemblyLoad(object? sender, AssemblyLoadEventArgs a
+             string? assemblyPath = args.LoadedAssembly.Location;
+             Guid mvid = args.LoadedAssembly.ManifestModule.ModuleVersionId;
+ 
+-            AssemblyLoadBuildEventArgs buildArgs = new(assemblyName, assemblyPath, mvid, _appDomain.Id, _appDomain.FriendlyName)
++            AssemblyLoadBuildEventArgs buildArgs = new(_context, assemblyName, assemblyPath, mvid, _appDomain.Id, _appDomain.FriendlyName)
+             {
+-                BuildEventContext = _loggingContext.BuildEventContext
++                BuildEventContext = _loggingContext?.BuildEventContext
+             };
+-            _loggingContext.LogBuildEvent(buildArgs);
++            _loggingContext?.LogBuildEvent(buildArgs);
++            _loggingService?.LogBuildEvent(buildArgs);
+         }
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+index 0a4aea07542..b8cfa7b34bd 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+@@ -663,7 +663,7 @@ private void ExecuteIntrinsicTask(ItemBucket bucket)
+         /// </summary>
+         private async Task<WorkUnitResult> InitializeAndExecuteTask(TaskLoggingContext taskLoggingContext, ItemBucket bucket, IDictionary<string, string> taskIdentityParameters, TaskHost taskHost, TaskExecutionMode howToExecuteTask)
+         {
+-            using var assemblyLoadsTracker = AssemblyLoadsTracker.StartTracking(taskLoggingContext);
++            using var assemblyLoadsTracker = AssemblyLoadsTracker.StartTracking(taskLoggingContext, AssemblyLoadingContext.TaskRun);
+             if (!_taskExecutionHost.InitializeForBatch(taskLoggingContext, bucket, taskIdentityParameters))
+             {
+                 ProjectErrorUtilities.ThrowInvalidProject(_targetChildInstance.Location, "TaskDeclarationOrUsageError", _taskNode.Name);
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 59dba0b96ad..655e04b096f 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -11,6 +11,7 @@
+ using System.Text;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Components.Logging;
++using Microsoft.Build.BackEnd.Components.RequestBuilder;
+ using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
+@@ -606,6 +607,7 @@ private static ProjectTargetInstance ReadNewTargetElement(ProjectTargetElement t
+         private void Evaluate()
+         {
+             string projectFile = String.IsNullOrEmpty(_projectRootElement.ProjectFileLocation.File) ? "(null)" : _projectRootElement.ProjectFileLocation.File;
++            using (AssemblyLoadsTracker.StartTracking(_evaluationLoggingContext, AssemblyLoadingContext.Evaluation))
+             using (_evaluationProfiler.TrackPass(EvaluationPass.TotalEvaluation))
+             {
+                 ErrorUtilities.VerifyThrow(_data.EvaluationId == BuildEventContext.InvalidEvaluationId, "There is no prior evaluation ID. The evaluator data needs to be reset at this point");
+@@ -1847,6 +1849,8 @@ static string EvaluateProperty(string value, IElementLocation location,
+                 // Combine SDK path with the "project" relative path
+                 try
+                 {
++                    // TODO: can we distinguish builtin and custom sdkresolvers here?
++                    using var _ = AssemblyLoadsTracker.StartTracking(_evaluationLoggingContext, AssemblyLoadingContext.SdkResolution);
+                     sdkResult = _sdkResolverService.ResolveSdk(_submissionId, sdkReference, _evaluationLoggingContext, importElement.Location, solutionPath, projectPath, _interactive, _isRunningInVisualStudio,
+                         failOnUnresolvedSdk: !_loadSettings.HasFlag(ProjectLoadSettings.IgnoreMissingImports) || _loadSettings.HasFlag(ProjectLoadSettings.FailOnUnresolvedSdk));
+                 }
+diff --git a/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs b/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
+index 01d73a4a13a..e33cc13e9dc 100644
+--- a/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
++++ b/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
+@@ -374,7 +374,7 @@ internal ITask CreateTaskInstance(ElementLocation taskLocation, TaskLoggingConte
+                 ITask taskInstance = TaskLoader.CreateTask(_loadedType, _taskName, taskLocation.File, taskLocation.Line, taskLocation.Column, new TaskLoader.LogError(ErrorLoggingDelegate)
+ #if FEATURE_APPDOMAIN
+                     , appDomainSetup
+-                    , appDomain => AssemblyLoadsTracker.StartTracking(taskLoggingContext, appDomain)
++                    , appDomain => AssemblyLoadsTracker.StartTracking(taskLoggingContext, AssemblyLoadingContext.TaskRun, appDomain)
+ #endif
+                     , isOutOfProc
+ #if FEATURE_APPDOMAIN
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index 1aec0fc0491..42c0ea373e2 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -807,6 +807,7 @@ private AssemblyLoadBuildEventArgs ReadAssemblyLoadEventArgs()
+         {
+             var fields = ReadBuildEventArgsFields(readImportance: false);
+ 
++            AssemblyLoadingContext context = (AssemblyLoadingContext)ReadInt32();
+             string assemblyName = ReadDeduplicatedString();
+             string assemblyPath = ReadDeduplicatedString();
+             Guid mvid = ReadGuid();
+@@ -814,6 +815,7 @@ private AssemblyLoadBuildEventArgs ReadAssemblyLoadEventArgs()
+             string appDomainName = ReadDeduplicatedString();
+ 
+             var e = new AssemblyLoadBuildEventArgs(
++                context,
+                 assemblyName,
+                 assemblyPath,
+                 mvid,
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+index ac6c5251e07..218755cf993 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+@@ -474,6 +474,7 @@ private void Write(AssemblyLoadBuildEventArgs e)
+         {
+             Write(BinaryLogRecordKind.AssemblyLoad);
+             WriteMessageFields(e, writeMessage: false, writeImportance: false);
++            Write((int)e.LoadingContext);
+             WriteDeduplicatedString(e.AssemblyName);
+             WriteDeduplicatedString(e.AssemblyPath);
+             Write(e.MVID);
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 8d929b5e09b..ce3e441c1c2 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1978,6 +1978,6 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>SDK resolver "{0}" returned null.</value>
+   </data>
+   <data name="TaskAssemblyLoaded" xml:space="preserve">
+-    <value>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</value>
++    <value>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</value>
+   </data>
+ </root>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 78e2129337e..a0bc782f9fe 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 29cd0a2d615..8c8286209a1 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 9791c272b2b..c9e056c58a3 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index b2e3b0b1286..bb8929a06a9 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 45b525cb78d..f6b0c9e65c6 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index a66f6f6d586..72cfcdd4a45 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index b9eccf5019f..017841bd53b 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 189264cf718..a4d111b5245 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 6aa44bdf002..5f25d70e709 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index f016d4f3635..f6fd65dbbf6 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 036aece977d..2e33982ae46 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 0d9272939aa..49d887ae03e 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 5a48ff97ff8..a8de1f697d4 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -417,8 +417,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</source>
+-        <target state="new">Assembly loaded during task run: {0} (location: {1}, MVID: {2}, AppDomain: {3}|{4})</target>
++        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
++        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Framework.UnitTests/AssemblyLoadBuildEventArgs_Tests.cs b/src/Framework.UnitTests/AssemblyLoadBuildEventArgs_Tests.cs
+index 924ef7ffdd9..f9bd181ab2b 100644
+--- a/src/Framework.UnitTests/AssemblyLoadBuildEventArgs_Tests.cs
++++ b/src/Framework.UnitTests/AssemblyLoadBuildEventArgs_Tests.cs
+@@ -19,7 +19,9 @@ public void SerializationDeserializationTest()
+             Guid mvid = Guid.NewGuid();
+             int appDomainId = new Random().Next();
+             string appDomainName = Guid.NewGuid().ToString();
+-            AssemblyLoadBuildEventArgs arg = new(assemblyName, assemblyPath, mvid, appDomainId, appDomainName);
++            AssemblyLoadingContext context =
++                (AssemblyLoadingContext)(new Random().Next(Enum.GetNames(typeof(AssemblyLoadingContext)).Length));
++            AssemblyLoadBuildEventArgs arg = new(context, assemblyName, assemblyPath, mvid, appDomainId, appDomainName);
+ 
+             using MemoryStream stream = new MemoryStream();
+             using BinaryWriter bw = new BinaryWriter(stream);
+@@ -35,6 +37,7 @@ public void SerializationDeserializationTest()
+             argDeserialized.MVID.ShouldBe(mvid);
+             argDeserialized.AppDomainId.ShouldBe(appDomainId);
+             argDeserialized.AppDomainFriendlyName.ShouldBe(appDomainName);
++            argDeserialized.LoadingContext.ShouldBe(context);
+         }
+     }
+ }
+diff --git a/src/Framework/AssemblyLoadBuildEventArgs.cs b/src/Framework/AssemblyLoadBuildEventArgs.cs
+index b61c7e9f7c1..1ceb60f6dbc 100644
+--- a/src/Framework/AssemblyLoadBuildEventArgs.cs
++++ b/src/Framework/AssemblyLoadBuildEventArgs.cs
+@@ -16,6 +16,7 @@ public AssemblyLoadBuildEventArgs()
+         { }
+ 
+         public AssemblyLoadBuildEventArgs(
++            AssemblyLoadingContext loadingContext,
+             string assemblyName,
+             string assemblyPath,
+             Guid mvid,
+@@ -24,6 +25,7 @@ public AssemblyLoadBuildEventArgs(
+             MessageImportance importance = MessageImportance.Low)
+             : base(null, null, null, importance, DateTime.UtcNow, assemblyName, assemblyPath, mvid)
+         {
++            LoadingContext = loadingContext;
+             AssemblyName = assemblyName;
+             AssemblyPath = assemblyPath;
+             MVID = mvid;
+@@ -31,6 +33,7 @@ public AssemblyLoadBuildEventArgs(
+             AppDomainFriendlyName = appDomainFriendlyName;
+         }
+ 
++        public AssemblyLoadingContext LoadingContext { get; private set; }
+         public string AssemblyName { get; private set; }
+         public string AssemblyPath { get; private set; }
+         public Guid MVID { get; private set; }
+@@ -39,6 +42,7 @@ public AssemblyLoadBuildEventArgs(
+ 
+         internal override void WriteToStream(BinaryWriter writer)
+         {
++            writer.Write7BitEncodedInt((int)LoadingContext);
+             writer.WriteTimestamp(RawTimestamp);
+             writer.WriteOptionalBuildEventContext(BuildEventContext);
+             writer.WriteGuid(MVID);
+@@ -50,6 +54,7 @@ internal override void WriteToStream(BinaryWriter writer)
+ 
+         internal override void CreateFromStream(BinaryReader reader, int version)
+         {
++            LoadingContext = (AssemblyLoadingContext) reader.Read7BitEncodedInt();
+             RawTimestamp = reader.ReadTimestamp();
+             BuildEventContext = reader.ReadOptionalBuildEventContext();
+             MVID = reader.ReadGuid();
+@@ -65,7 +70,7 @@ public override string Message
+             {
+                 if (RawMessage == null)
+                 {
+-                    RawMessage = FormatResourceStringIgnoreCodeAndKeyword("TaskAssemblyLoaded", AssemblyName, AssemblyPath, MVID.ToString(), AppDomainId.ToString(), AppDomainFriendlyName);
++                    RawMessage = FormatResourceStringIgnoreCodeAndKeyword("TaskAssemblyLoaded", LoadingContext.ToString(), AssemblyName, AssemblyPath, MVID.ToString(), AppDomainId.ToString(), AppDomainFriendlyName);
+                 }
+ 
+                 return RawMessage;
+diff --git a/src/Framework/AssemblyLoadingContext.cs b/src/Framework/AssemblyLoadingContext.cs
+new file mode 100644
+index 00000000000..66dace0b8e6
+--- /dev/null
++++ b/src/Framework/AssemblyLoadingContext.cs
+@@ -0,0 +1,12 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Framework;
++
++public enum AssemblyLoadingContext
++{
++    TaskRun,
++    Evaluation,
++    SdkResolution,
++    LoggerInitialization,
++}

@@ -1,0 +1,226 @@
+diff --git a/src/Build/BuildCheck/Acquisition/AnalyzerAcquisitionData.cs b/src/Build/BuildCheck/Acquisition/AnalyzerAcquisitionData.cs
+index 908aa931bef..19998b75266 100644
+--- a/src/Build/BuildCheck/Acquisition/AnalyzerAcquisitionData.cs
++++ b/src/Build/BuildCheck/Acquisition/AnalyzerAcquisitionData.cs
+@@ -13,15 +13,17 @@ namespace Microsoft.Build.Experimental.BuildCheck.Acquisition;
+ // https://github.com/dotnet/msbuild/issues/9633
+ // Acquisition
+ //  define the data that will be passed to the acquisition module (and remoted if needed)
+-internal class AnalyzerAcquisitionData(string assemblyPath)
++internal class AnalyzerAcquisitionData(string assemblyPath, string projectPath)
+ {
+     public string AssemblyPath { get; init; } = assemblyPath;
++
++    public string ProjectPath { get; init; } = projectPath;
+ }
+ 
+ internal static class AnalyzerAcquisitionDataExtensions
+ {
+     public static AnalyzerAcquisitionData ToAnalyzerAcquisitionData(this BuildCheckAcquisitionEventArgs eventArgs) =>
+-        new(eventArgs.AcquisitionPath);
++        new(eventArgs.AcquisitionPath, eventArgs.ProjectPath);
+ 
+-    public static BuildCheckAcquisitionEventArgs ToBuildEventArgs(this AnalyzerAcquisitionData data) => new(data.AssemblyPath);
++    public static BuildCheckAcquisitionEventArgs ToBuildEventArgs(this AnalyzerAcquisitionData data) => new(data.AssemblyPath, data.ProjectPath);
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 3e8d53982c5..b0eb18b6f11 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -113,7 +113,7 @@ public void ProcessAnalyzerAcquisition(
+                 var analyzersFactories = _acquisitionModule.CreateBuildAnalyzerFactories(acquisitionData, analysisContext);
+                 if (analyzersFactories.Count != 0)
+                 {
+-                    RegisterCustomAnalyzer(BuildCheckDataSource.EventArgs, analyzersFactories, analysisContext);
++                    RegisterCustomAnalyzer(acquisitionData.ProjectPath, BuildCheckDataSource.EventArgs, analyzersFactories, analysisContext);
+                 }
+                 else
+                 {
+@@ -165,37 +165,16 @@ private void RegisterBuiltInAnalyzers(BuildCheckDataSource buildCheckDataSource)
+             }
+         }
+ 
+-        /// <summary>
+-        /// To be used by acquisition module.
+-        /// Registers the custom analyzers, the construction of analyzers is deferred until the first using project is encountered.
+-        /// </summary>
+-        internal void RegisterCustomAnalyzers(
+-            BuildCheckDataSource buildCheckDataSource,
+-            IEnumerable<BuildAnalyzerFactory> factories,
+-            string[] ruleIds,
+-            bool defaultEnablement,
+-            IAnalysisContext analysisContext)
+-        {
+-            if (_enabledDataSources[(int)buildCheckDataSource])
+-            {
+-                foreach (BuildAnalyzerFactory factory in factories)
+-                {
+-                    _analyzersRegistry.Add(new BuildAnalyzerFactoryContext(factory, ruleIds, defaultEnablement));
+-
+-                    var instance = factory();
+-                    analysisContext.DispatchAsComment(MessageImportance.Normal, "CustomAnalyzerSuccessfulAcquisition", instance.FriendlyName);
+-                }
+-            }
+-        }
+-
+         /// <summary>
+         /// To be used by acquisition module
+         /// Registers the custom analyzer, the construction of analyzer is needed during registration.
+         /// </summary>
++        /// <param name="projectPath">The project path is used for the correct .editorconfig resolution</param>
+         /// <param name="buildCheckDataSource">Represents different data sources used in build check operations.</param>
+         /// <param name="factories">A collection of build analyzer factories for rules instantiation.</param>
+         /// <param name="analysisContext">The logging context of the build event.</param>
+         internal void RegisterCustomAnalyzer(
++            string projectPath,
+             BuildCheckDataSource buildCheckDataSource,
+             IEnumerable<BuildAnalyzerFactory> factories,
+             IAnalysisContext analysisContext)
+@@ -205,11 +184,17 @@ internal void RegisterCustomAnalyzer(
+                 foreach (var factory in factories)
+                 {
+                     var instance = factory();
+-                    _analyzersRegistry.Add(new BuildAnalyzerFactoryContext(
++                    var analyzerFactoryContext = new BuildAnalyzerFactoryContext(
+                         factory,
+                         instance.SupportedRules.Select(r => r.Id).ToArray(),
+-                        instance.SupportedRules.Any(r => r.DefaultConfiguration.IsEnabled == true)));
+-                    analysisContext.DispatchAsComment(MessageImportance.Normal, "CustomAnalyzerSuccessfulAcquisition", instance.FriendlyName);
++                        instance.SupportedRules.Any(r => r.DefaultConfiguration.IsEnabled == true));
++
++                    if (analyzerFactoryContext != null)
++                    {
++                        _analyzersRegistry.Add(analyzerFactoryContext);
++                        SetupSingleAnalyzer(analyzerFactoryContext, projectPath);
++                        analysisContext.DispatchAsComment(MessageImportance.Normal, "CustomAnalyzerSuccessfulAcquisition", instance.FriendlyName);
++                    }
+                 }
+             }
+         }
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 75f0216028f..0395322c345 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -3571,8 +3571,15 @@ internal object Execute(object objectInstance, IPropertyProvider<T> properties,
+                         try
+                         {
+                             // First attempt to recognize some well-known functions to avoid binding
+-                            // and potential first-chance MissingMethodExceptions
++                            // and potential first-chance MissingMethodExceptions.
+                             wellKnownFunctionSuccess = TryExecuteWellKnownFunction(out functionResult, objectInstance, args);
++
++                            if (!wellKnownFunctionSuccess)
++                            {
++                                // Some well-known functions need evaluated value from properties.
++                                string projectPath = properties.GetProperty("MSBuildProjectFullPath")!.EvaluatedValue;
++                                wellKnownFunctionSuccess = TryExecuteWellKnownFunctionWithPropertiesParam(projectPath, out functionResult, objectInstance, args);
++                            }
+                         }
+                         // we need to preserve the same behavior on exceptions as the actual binder
+                         catch (Exception ex)
+@@ -3669,6 +3676,26 @@ internal object Execute(object objectInstance, IPropertyProvider<T> properties,
+                 }
+             }
+ 
++            private bool TryExecuteWellKnownFunctionWithPropertiesParam(string projectPath, out object returnVal, object objectInstance, object[] args)
++            {
++                returnVal = null;
++
++                if (_receiverType == typeof(IntrinsicFunctions))
++                {
++                    if (string.Equals(_methodMethodName, nameof(IntrinsicFunctions.RegisterBuildCheck), StringComparison.OrdinalIgnoreCase))
++                    {
++                        ErrorUtilities.VerifyThrow(_loggingContext != null, $"The logging context is missed. {nameof(IntrinsicFunctions.RegisterBuildCheck)} can not be invoked.");
++                        if (TryGetArg(args, out string arg0))
++                        {
++                            returnVal = IntrinsicFunctions.RegisterBuildCheck(projectPath, arg0, _loggingContext);
++                            return true;
++                        }
++                    }
++                }
++
++                return false;
++            }
++
+             /// <summary>
+             /// Shortcut to avoid calling into binding if we recognize some most common functions.
+             /// Binding is expensive and throws first-chance MissingMethodExceptions, which is
+@@ -3934,16 +3961,6 @@ private bool TryExecuteWellKnownFunction(out object returnVal, object objectInst
+                     }
+                     else if (_receiverType == typeof(IntrinsicFunctions))
+                     {
+-                        if (string.Equals(_methodMethodName, nameof(IntrinsicFunctions.RegisterBuildCheck), StringComparison.OrdinalIgnoreCase))
+-                        {
+-                            ErrorUtilities.VerifyThrow(_loggingContext != null, $"The logging context is missed. {nameof(IntrinsicFunctions.RegisterBuildCheck)} can not be invoked.");
+-                            if (TryGetArg(args, out string arg0))
+-                            {
+-                                returnVal = IntrinsicFunctions.RegisterBuildCheck(arg0, _loggingContext);
+-                                return true;
+-                            }
+-                        }
+-
+                         if (string.Equals(_methodMethodName, nameof(IntrinsicFunctions.EnsureTrailingSlash), StringComparison.OrdinalIgnoreCase))
+                         {
+                             if (TryGetArg(args, out string arg0))
+diff --git a/src/Build/Evaluation/IntrinsicFunctions.cs b/src/Build/Evaluation/IntrinsicFunctions.cs
+index 17e67ce123a..8027834af60 100644
+--- a/src/Build/Evaluation/IntrinsicFunctions.cs
++++ b/src/Build/Evaluation/IntrinsicFunctions.cs
+@@ -697,12 +697,12 @@ public static string GetMSBuildExtensionsPath()
+ 
+         public static bool IsRunningFromVisualStudio() => BuildEnvironmentHelper.Instance.Mode == BuildEnvironmentMode.VisualStudio;
+ 
+-        public static bool RegisterBuildCheck(string pathToAssembly, LoggingContext loggingContext)
++        public static bool RegisterBuildCheck(string projectPath, string pathToAssembly, LoggingContext loggingContext)
+         {
+             pathToAssembly = FileUtilities.GetFullPathNoThrow(pathToAssembly);
+             if (File.Exists(pathToAssembly))
+             {
+-                loggingContext.LogBuildEvent(new BuildCheckAcquisitionEventArgs(pathToAssembly));
++                loggingContext.LogBuildEvent(new BuildCheckAcquisitionEventArgs(pathToAssembly, projectPath));
+ 
+                 return true;
+             }
+diff --git a/src/Framework/BuildCheck/BuildCheckEventArgs.cs b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+index 9a8c3459b87..248a2d193fc 100644
+--- a/src/Framework/BuildCheck/BuildCheckEventArgs.cs
++++ b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+@@ -71,10 +71,10 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+     }
+ }
+ 
+-internal sealed class BuildCheckAcquisitionEventArgs(string acquisitionPath) : BuildCheckEventArgs
++internal sealed class BuildCheckAcquisitionEventArgs(string acquisitionPath, string projectPath) : BuildCheckEventArgs
+ {
+     internal BuildCheckAcquisitionEventArgs()
+-        : this(string.Empty)
++        : this(string.Empty, string.Empty)
+     {
+     }
+ 
+@@ -91,11 +91,14 @@ internal BuildCheckAcquisitionEventArgs()
+     /// </value>
+     public string AcquisitionPath { get; private set; } = acquisitionPath;
+ 
++    public string ProjectPath { get; private set; } = projectPath;
++
+     internal override void WriteToStream(BinaryWriter writer)
+     {
+         base.WriteToStream(writer);
+ 
+         writer.Write(AcquisitionPath);
++        writer.Write(ProjectPath);
+     }
+ 
+     internal override void CreateFromStream(BinaryReader reader, int version)
+@@ -103,8 +106,10 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+         base.CreateFromStream(reader, version);
+ 
+         AcquisitionPath = reader.ReadString();
++        ProjectPath = reader.ReadString();
+     }
+ }
++
+ internal sealed class BuildCheckResultWarning : BuildWarningEventArgs
+ {
+     public BuildCheckResultWarning(IBuildCheckResult result, string code)

@@ -1,0 +1,2121 @@
+diff --git a/documentation/wiki/ChangeWaves.md b/documentation/wiki/ChangeWaves.md
+index 5b152e7c1a7..e5fa1a91211 100644
+--- a/documentation/wiki/ChangeWaves.md
++++ b/documentation/wiki/ChangeWaves.md
+@@ -31,7 +31,7 @@ A wave of features is set to "rotate out" (i.e. become standard functionality) t
+ - [Scheduler should honor BuildParameters.DisableInprocNode](https://github.com/dotnet/msbuild/pull/6400)
+ - [Don't compile globbing regexes on .NET Framework](https://github.com/dotnet/msbuild/pull/6632)
+ - [Default to transitively copying content items](https://github.com/dotnet/msbuild/pull/6622)
+-- [Improve debugging experience: add global switch MSBuildDebugEngine; Inject binary logger from BuildManager; print static graph as .dot file](https://github.com/dotnet/msbuild/pull/6639)
++- [Reference assemblies are now no longer placed in the `bin` directory by default](https://github.com/dotnet/msbuild/pull/6560)
+ 
+ ## Change Waves No Longer In Rotation
+ ### 16.8
+diff --git a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+index 28af920a861..609f24fac92 100644
+--- a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
++++ b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+@@ -1476,21 +1476,12 @@ public void DotNotationShouldRepresentGraph(Dictionary<int, int[]> edges)
+             var graph = Helpers.CreateProjectGraph(
+                 _env,
+                 edges,
+-                globalProperties: new Dictionary<string, string> {{"a", "b"}},
+-                createProjectFile: (env, projectId, references, _, _, _) => Helpers.CreateProjectFile(
+-                    env,
+-                    projectId,
+-                    references,
+-                    projectReferenceTargets: new Dictionary<string, string[]>
+-                    {
+-                        {"Build", new[] {$"TargetFrom{projectId}", "Build"}}
+-                    }));
++                new Dictionary<string, string> {{"a", "b"}});
+ 
+-            var targetsPerNode = graph.GetTargetLists(new []{ "Build" });
+ 
+             Func<ProjectGraphNode, string> nodeIdProvider = GetProjectFileName;
+ 
+-            var dot = graph.ToDot(nodeIdProvider, targetsPerNode);
++            var dot = graph.ToDot(nodeIdProvider);
+ 
+             var edgeCount = 0;
+ 
+@@ -1498,12 +1489,9 @@ public void DotNotationShouldRepresentGraph(Dictionary<int, int[]> edges)
+             {
+                 var nodeId = nodeIdProvider(node);
+ 
+-                var targets = string.Join(".*", targetsPerNode[node]);
+-                targets.ShouldNotBeNullOrEmpty();
+-
+                 foreach (var globalProperty in node.ProjectInstance.GlobalProperties)
+                 {
+-                    dot.ShouldMatch($@"{nodeId}\s*\[.*{targets}.*{globalProperty.Key}.*{globalProperty.Value}.*\]");
++                    dot.ShouldMatch($@"{nodeId}\s*\[.*{globalProperty.Key}.*{globalProperty.Value}.*\]");
+                 }
+ 
+                 foreach (var reference in node.ProjectReferences)
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index b98b15bbe8c..07773ddba90 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -30,9 +30,7 @@
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Logging;
+ using Microsoft.Build.Shared;
+-using Microsoft.Build.Shared.Debugging;
+ using Microsoft.Build.Shared.FileSystem;
+-using Microsoft.Build.Utilities;
+ using ForwardingLoggerRecord = Microsoft.Build.Logging.ForwardingLoggerRecord;
+ using LoggerDescription = Microsoft.Build.Logging.LoggerDescription;
+ 
+@@ -488,7 +486,7 @@ public void BeginBuild(BuildParameters parameters)
+             ILoggingService InitializeLoggingService()
+             {
+                 ILoggingService loggingService = CreateLoggingService(
+-                    AppendDebuggingLoggers(_buildParameters.Loggers),
++                    _buildParameters.Loggers,
+                     _buildParameters.ForwardingLoggers,
+                     _buildParameters.WarningsAsErrors,
+                     _buildParameters.WarningsAsMessages);
+@@ -520,22 +518,6 @@ ILoggingService InitializeLoggingService()
+                 return loggingService;
+             }
+ 
+-            // VS builds discard many msbuild events so attach a binlogger to capture them all.
+-            IEnumerable<ILogger> AppendDebuggingLoggers(IEnumerable<ILogger> loggers)
+-            {
+-                if (DebugUtils.ShouldDebugCurrentProcess is false ||
+-                    Traits.Instance.DebugEngine is false)
+-                {
+-                    return loggers;
+-                }
+-
+-                var binlogPath = DebugUtils.FindNextAvailableDebugFilePath($"{DebugUtils.ProcessInfoString}_BuildManager_{_hostName}.binlog");
+-
+-                var logger = new BinaryLogger { Parameters = binlogPath };
+-
+-                return (loggers ?? Enumerable.Empty<ILogger>()).Concat(new[] { logger });
+-            }
+-
+             void InitializeCaches()
+             {
+                 Debug.Assert(Monitor.IsEntered(_syncLock));
+@@ -579,14 +561,17 @@ void InitializeCaches()
+             }
+         }
+ 
+-        private static void AttachDebugger()
++        private void AttachDebugger()
+         {
+             if (Debugger.IsAttached)
+             {
+                 return;
+             }
+ 
+-            if (!DebugUtils.ShouldDebugCurrentProcess)
++            var processNameToBreakInto = Environment.GetEnvironmentVariable("MSBuildDebugBuildManagerOnStartProcessName");
++            var thisProcessMatchesName = string.IsNullOrWhiteSpace(processNameToBreakInto) || Process.GetCurrentProcess().ProcessName.Contains(processNameToBreakInto);
++
++            if (!thisProcessMatchesName)
+             {
+                 return;
+             }
+@@ -1818,17 +1803,11 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+                 if (submission.BuildRequestData.GraphBuildOptions.Build)
+                 {
+                     var cacheServiceTask = Task.Run(() => SearchAndInitializeProjectCachePluginFromGraph(projectGraph));
+-                    var targetListTask = projectGraph.GetTargetLists(submission.BuildRequestData.TargetNames);
+-
+-                    DumpGraph(projectGraph, targetListTask);
++                    var targetListTask = Task.Run(() => projectGraph.GetTargetLists(submission.BuildRequestData.TargetNames));
+ 
+                     using DisposablePluginService cacheService = cacheServiceTask.Result;
+ 
+-                    resultsPerNode = BuildGraph(projectGraph, targetListTask, submission.BuildRequestData);
+-                }
+-                else
+-                {
+-                    DumpGraph(projectGraph);
++                    resultsPerNode = BuildGraph(projectGraph, targetListTask.Result, submission.BuildRequestData);
+                 }
+ 
+                 ErrorUtilities.VerifyThrow(
+@@ -1892,18 +1871,6 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+                     _overallBuildSuccess = false;
+                 }
+             }
+-
+-            static void DumpGraph(ProjectGraph graph, IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetList = null)
+-            {
+-                if (Traits.Instance.DebugEngine is false)
+-                {
+-                    return;
+-                }
+-
+-                var logPath = DebugUtils.FindNextAvailableDebugFilePath($"{DebugUtils.ProcessInfoString}_ProjectGraph.dot");
+-
+-                File.WriteAllText(logPath, graph.ToDot(targetList));
+-            }
+         }
+ 
+         private Dictionary<ProjectGraphNode, BuildResult> BuildGraph(
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+index 2dbcd31ea0e..1038643d11f 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+@@ -12,8 +12,6 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Shared;
+-using Microsoft.Build.Shared.Debugging;
+-using Microsoft.Build.Utilities;
+ using BuildAbortedException = Microsoft.Build.Exceptions.BuildAbortedException;
+ 
+ namespace Microsoft.Build.BackEnd
+@@ -117,10 +115,8 @@ internal class BuildRequestEngine : IBuildRequestEngine, IBuildComponent
+         /// </summary>
+         internal BuildRequestEngine()
+         {
+-            _debugDumpState = Traits.Instance.DebugScheduler;
+-            _debugDumpPath = ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_0)
+-                ? DebugUtils.DebugPath
+-                : Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
++            _debugDumpState = Environment.GetEnvironmentVariable("MSBUILDDEBUGSCHEDULER") == "1";
++            _debugDumpPath = Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+             _debugForceCaching = Environment.GetEnvironmentVariable("MSBUILDDEBUGFORCECACHING") == "1";
+ 
+             if (String.IsNullOrEmpty(_debugDumpPath))
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index 65af9d8c8a7..6ba9e7adf9d 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -14,7 +14,6 @@
+ using Microsoft.Build.Experimental.ProjectCache;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+-using Microsoft.Build.Shared.Debugging;
+ using Microsoft.Build.Utilities;
+ using BuildAbortedException = Microsoft.Build.Exceptions.BuildAbortedException;
+ using ILoggingService = Microsoft.Build.BackEnd.Logging.ILoggingService;
+@@ -177,11 +176,8 @@ internal class Scheduler : IScheduler
+         /// </summary>
+         public Scheduler()
+         {
+-            // Be careful moving these to Traits, changing the timing of reading environment variables has a breaking potential.
+-            _debugDumpState = Traits.Instance.DebugScheduler;
+-            _debugDumpPath = ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_0)
+-                ? DebugUtils.DebugPath
+-                : Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
++            _debugDumpState = Environment.GetEnvironmentVariable("MSBUILDDEBUGSCHEDULER") == "1";
++            _debugDumpPath = Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+             _schedulingUnlimitedVariable = Environment.GetEnvironmentVariable("MSBUILDSCHEDULINGUNLIMITED");
+             _nodeLimitOffset = 0;
+ 
+@@ -318,7 +314,7 @@ public IEnumerable<ScheduleResponse> ReportRequestBlocked(int nodeId, BuildReque
+                 else if ((blocker.BlockingRequestId == blocker.BlockedRequestId) && blocker.BlockingRequestId != BuildRequest.InvalidGlobalRequestId)
+                 {
+                     ErrorUtilities.VerifyThrow(string.IsNullOrEmpty(blocker.BlockingTarget), "Blocking target should be null because this is not a request blocking on a target");
+-                    // We are blocked waiting for a transfer of results.                    
++                    // We are blocked waiting for a transfer of results.
+                     HandleRequestBlockedOnResultsTransfer(parentRequest, responses);
+                 }
+                 else if (blocker.BlockingRequestId != BuildRequest.InvalidGlobalRequestId)
+@@ -349,7 +345,7 @@ public IEnumerable<ScheduleResponse> ReportRequestBlocked(int nodeId, BuildReque
+                 responses.Add(ScheduleResponse.CreateCircularDependencyResponse(nodeId, parentRequest.BuildRequest, ex.Request));
+             }
+ 
+-            // Now see if we can schedule requests somewhere since we 
++            // Now see if we can schedule requests somewhere since we
+             // a) have a new request; and
+             // b) have a node which is now waiting and not doing anything.
+             ScheduleUnassignedRequests(responses);
+@@ -370,7 +366,7 @@ public IEnumerable<ScheduleResponse> ReportResult(int nodeId, BuildResult result
+ 
+             if (result.NodeRequestId == BuildRequest.ResultsTransferNodeRequestId)
+             {
+-                // We are transferring results.  The node to which they should be sent has already been recorded by the 
++                // We are transferring results.  The node to which they should be sent has already been recorded by the
+                 // HandleRequestBlockedOnResultsTransfer method in the configuration.
+                 BuildRequestConfiguration config = _configCache[result.ConfigurationId];
+                 ScheduleResponse response = ScheduleResponse.CreateReportResultResponse(config.ResultsNodeId, result);
+@@ -382,7 +378,7 @@ public IEnumerable<ScheduleResponse> ReportResult(int nodeId, BuildResult result
+                 SchedulableRequest request = _schedulingData.GetExecutingRequest(result.GlobalRequestId);
+                 request.Complete(result);
+ 
+-                // Report results to our parent, or report submission complete as necessary.            
++                // Report results to our parent, or report submission complete as necessary.
+                 if (request.Parent != null)
+                 {
+                     // responses.Add(new ScheduleResponse(request.Parent.AssignedNode, new BuildRequestUnblocker(request.Parent.BuildRequest.GlobalRequestId, result)));
+@@ -390,10 +386,10 @@ public IEnumerable<ScheduleResponse> ReportResult(int nodeId, BuildResult result
+ 
+                     // When adding the result to the cache we merge the result with what ever is already in the cache this may cause
+                     // the result to have more target outputs in it than was was requested.  To fix this we can ask the cache itself for the result we just added.
+-                    // When results are returned from the cache we filter them based on the targets we requested. This causes our result to only 
++                    // When results are returned from the cache we filter them based on the targets we requested. This causes our result to only
+                     // include the targets we requested rather than the merged result.
+ 
+-                    // Note: In this case we do not need to log that we got the results from the cache because we are only using the cache 
++                    // Note: In this case we do not need to log that we got the results from the cache because we are only using the cache
+                     // for filtering the targets for the result instead rather than using the cache as the location where this result came from.
+                     ScheduleResponse response = TrySatisfyRequestFromCache(request.Parent.AssignedNode, request.BuildRequest, skippedResultsDoNotCauseCacheMiss: _componentHost.BuildParameters.SkippedResultsDoNotCauseCacheMiss());
+ 
+@@ -431,13 +427,13 @@ public IEnumerable<ScheduleResponse> ReportResult(int nodeId, BuildResult result
+                         int parentNode = (unscheduledRequest.Parent == null) ? InvalidNodeId : unscheduledRequest.Parent.AssignedNode;
+ 
+                         // There are other requests which we can satisfy based on this result, lets pull the result out of the cache
+-                        // and satisfy those requests.  Normally a skipped result would lead to the cache refusing to satisfy the 
+-                        // request, because the correct response in that case would be to attempt to rebuild the target in case there 
++                        // and satisfy those requests.  Normally a skipped result would lead to the cache refusing to satisfy the
++                        // request, because the correct response in that case would be to attempt to rebuild the target in case there
+                         // are state changes that would cause it to now excute.  At this point, however, we already know that the parent
+-                        // request has completed, and we already know that this request has the same global request ID, which means that 
+-                        // its configuration and set of targets are identical -- from MSBuild's perspective, it's the same.  So since 
+-                        // we're not going to attempt to re-execute it, if there are skipped targets in the result, that's fine. We just 
+-                        // need to know what the target results are so that we can log them. 
++                        // request has completed, and we already know that this request has the same global request ID, which means that
++                        // its configuration and set of targets are identical -- from MSBuild's perspective, it's the same.  So since
++                        // we're not going to attempt to re-execute it, if there are skipped targets in the result, that's fine. We just
++                        // need to know what the target results are so that we can log them.
+                         ScheduleResponse response = TrySatisfyRequestFromCache(parentNode, unscheduledRequest.BuildRequest, skippedResultsDoNotCauseCacheMiss: true);
+ 
+                         // If we have a response we need to tell the loggers that we satisified that request from the cache.
+@@ -447,8 +443,8 @@ public IEnumerable<ScheduleResponse> ReportResult(int nodeId, BuildResult result
+                         }
+                         else
+                         {
+-                            // Response may be null if the result was never added to the cache. This can happen if the result has 
+-                            // an exception in it. If that is the case, we should report the result directly so that the 
++                            // Response may be null if the result was never added to the cache. This can happen if the result has
++                            // an exception in it. If that is the case, we should report the result directly so that the
+                             // build manager knows that it needs to shut down logging manually.
+                             response = GetResponseForResult(parentNode, unscheduledRequest.BuildRequest, newResult.Clone());
+                         }
+@@ -509,7 +505,7 @@ public void ReportBuildAborted(int nodeId)
+         {
+             _schedulingData.EventTime = DateTime.UtcNow;
+ 
+-            // Get the list of build requests currently assigned to the node and report aborted results for them.            
++            // Get the list of build requests currently assigned to the node and report aborted results for them.
+             TraceScheduler("Build aborted by node {0}", nodeId);
+ 
+             foreach (SchedulableRequest request in _schedulingData.GetScheduledRequestsByNode(nodeId))
+@@ -618,7 +614,7 @@ public void InitializeComponent(IBuildComponentHost host)
+             _componentHost = host;
+             _resultsCache = (IResultsCache)_componentHost.GetComponent(BuildComponentType.ResultsCache);
+             _configCache = (IConfigCache)_componentHost.GetComponent(BuildComponentType.ConfigCache);
+-            _inprocNodeContext =  new NodeLoggingContext(_componentHost.LoggingService, InProcNodeId, true);
++            _inprocNodeContext = new NodeLoggingContext(_componentHost.LoggingService, InProcNodeId, true);
+             var inprocNodeDisabledViaEnvironmentVariable = Environment.GetEnvironmentVariable("MSBUILDNOINPROCNODE") == "1";
+             ForceAffinityOutOfProc = ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_0)
+                 ? inprocNodeDisabledViaEnvironmentVariable || _componentHost.BuildParameters.DisableInProcNode
+@@ -734,15 +730,15 @@ private void ScheduleUnassignedRequests(List<ScheduleResponse> responses)
+                 }
+                 else if (_schedulingData.BlockedRequestsCount != 0)
+                 {
+-                    // It is legitimate to have blocked requests with none executing if none of the requests can 
+-                    // be serviced by any currently existing node, or if they are blocked by requests, none of 
+-                    // which can be serviced by any currently existing node.  However, in that case, we had better 
+-                    // be requesting the creation of a node that can service them.  
++                    // It is legitimate to have blocked requests with none executing if none of the requests can
++                    // be serviced by any currently existing node, or if they are blocked by requests, none of
++                    // which can be serviced by any currently existing node.  However, in that case, we had better
++                    // be requesting the creation of a node that can service them.
+                     //
+-                    // Note: This is O(# nodes * closure of requests blocking current set of blocked requests), 
+-                    // but all three numbers should usually be fairly small and, more importantly, this situation 
+-                    // should occur at most once per build, since it requires a situation where all blocked requests 
+-                    // are blocked on the creation of a node that can service them. 
++                    // Note: This is O(# nodes * closure of requests blocking current set of blocked requests),
++                    // but all three numbers should usually be fairly small and, more importantly, this situation
++                    // should occur at most once per build, since it requires a situation where all blocked requests
++                    // are blocked on the creation of a node that can service them.
+                     foreach (SchedulableRequest request in _schedulingData.BlockedRequests)
+                     {
+                         if (RequestOrAnyItIsBlockedByCanBeServiced(request))
+@@ -850,7 +846,7 @@ private bool GetSchedulingPlanAndAlgorithm()
+ 
+                 if (!String.IsNullOrEmpty(customScheduler))
+                 {
+-                    // Assign to the delegate 
++                    // Assign to the delegate
+                     if (customScheduler.Equals("WithPlanByMostImmediateReferences", StringComparison.OrdinalIgnoreCase) && _schedulingPlan.IsPlanValid)
+                     {
+                         _customRequestSchedulingAlgorithm = AssignUnscheduledRequestsWithPlanByMostImmediateReferences;
+@@ -1160,7 +1156,7 @@ private void AssignUnscheduledRequestsWithMaxWaitingRequests(List<ScheduleRespon
+                     BuildRequest currentRequest = currentSchedulableRequest.BuildRequest;
+                     int requiredNodeId = _schedulingData.GetAssignedNodeForRequestConfiguration(currentRequest.ConfigurationId);
+ 
+-                    // This performs the depth-first traversal, assuming that the unassigned build requests has been populated such that the 
++                    // This performs the depth-first traversal, assuming that the unassigned build requests has been populated such that the
+                     // top-most requests are the ones most recently issued.  We schedule the first request which can be scheduled to this node.
+                     if (requiredNodeId == InvalidNodeId || requiredNodeId == nodeId)
+                     {
+@@ -1294,7 +1290,7 @@ private void AssignUnscheduledRequestsUsingCustomSchedulerForSQL(List<ScheduleRe
+ 
+             Dictionary<int, int> configurationCountsByNode = new Dictionary<int, int>(_availableNodes.Count);
+ 
+-            // The configuration count limit will be the average configuration count * X (to allow for some wiggle room) where 
++            // The configuration count limit will be the average configuration count * X (to allow for some wiggle room) where
+             // the default value of X is 1.1 (+ 10%)
+             int configurationCountLimit = 0;
+ 
+@@ -1333,8 +1329,8 @@ private void AssignUnscheduledRequestsUsingCustomSchedulerForSQL(List<ScheduleRe
+                     {
+                         int requiredNodeId = _schedulingData.GetAssignedNodeForRequestConfiguration(request.BuildRequest.ConfigurationId);
+ 
+-                        // Only schedule an entirely new configuration (one not already tied to this node) to this node if we're 
+-                        // not already over the limit needed to keep a reasonable balance. 
++                        // Only schedule an entirely new configuration (one not already tied to this node) to this node if we're
++                        // not already over the limit needed to keep a reasonable balance.
+                         if (request.AssignedNode == nodeId || requiredNodeId == nodeId || configurationCountsByNode[nodeId] <= configurationCountLimit)
+                         {
+                             AssignUnscheduledRequestToNode(request, nodeId, responses);
+@@ -1349,8 +1345,8 @@ private void AssignUnscheduledRequestsUsingCustomSchedulerForSQL(List<ScheduleRe
+                 }
+             }
+ 
+-            // at this point, we may still have work left unassigned, but that's OK -- we're deliberately choosing to delay assigning all available 
+-            // requests in order to avoid overloading certain nodes with excess numbers of requests.  
++            // at this point, we may still have work left unassigned, but that's OK -- we're deliberately choosing to delay assigning all available
++            // requests in order to avoid overloading certain nodes with excess numbers of requests.
+         }
+ 
+         /// <summary>
+@@ -1427,7 +1423,7 @@ private bool AtSchedulingLimit()
+                 return false;
+             }
+ 
+-            // We're at our limit of schedulable requests if: 
++            // We're at our limit of schedulable requests if:
+             // (1) MaxNodeCount requests are currently executing
+             if (_schedulingData.ExecutingRequestsCount >= _componentHost.BuildParameters.MaxNodeCount)
+             {
+@@ -1489,9 +1485,9 @@ private bool CreateNewNodeIfPossible(List<ScheduleResponse> responses, IEnumerab
+             {
+                 int assignedNodeForConfiguration = _schedulingData.GetAssignedNodeForRequestConfiguration(request.BuildRequest.ConfigurationId);
+ 
+-                // Although this request has not been scheduled, this configuration may previously have been 
+-                // scheduled to an existing node.  If so, we shouldn't count it in our checks for new node 
+-                // creation, because it'll only eventually get assigned to its existing node anyway.  
++                // Although this request has not been scheduled, this configuration may previously have been
++                // scheduled to an existing node.  If so, we shouldn't count it in our checks for new node
++                // creation, because it'll only eventually get assigned to its existing node anyway.
+                 if (assignedNodeForConfiguration != Scheduler.InvalidNodeId)
+                 {
+                     continue;
+@@ -1504,9 +1500,9 @@ private bool CreateNewNodeIfPossible(List<ScheduleResponse> responses, IEnumerab
+                     case NodeAffinity.InProc:
+                         inProcNodesToCreate++;
+ 
+-                        // If we've previously seen "Any"-affinitized requests, now that there are some 
+-                        // genuine inproc requests, they get to play with the inproc node first, so 
+-                        // push the "Any" requests to the out-of-proc nodes.  
++                        // If we've previously seen "Any"-affinitized requests, now that there are some
++                        // genuine inproc requests, they get to play with the inproc node first, so
++                        // push the "Any" requests to the out-of-proc nodes.
+                         if (requestsWithAnyAffinityOnInProcNodes > 0)
+                         {
+                             requestsWithAnyAffinityOnInProcNodes--;
+@@ -1543,7 +1539,7 @@ private bool CreateNewNodeIfPossible(List<ScheduleResponse> responses, IEnumerab
+                         break;
+                 }
+ 
+-                // We've already hit the limit of the number of nodes we'll be allowed to create, so just quit counting now. 
++                // We've already hit the limit of the number of nodes we'll be allowed to create, so just quit counting now.
+                 if (inProcNodesToCreate >= availableNodesWithInProcAffinity && outOfProcNodesToCreate >= availableNodesWithOutOfProcAffinity)
+                 {
+                     break;
+@@ -1553,7 +1549,7 @@ private bool CreateNewNodeIfPossible(List<ScheduleResponse> responses, IEnumerab
+             // If we think we want to create inproc nodes
+             if (inProcNodesToCreate > 0)
+             {
+-                // In-proc node determination is simple: we want as many as are available.  
++                // In-proc node determination is simple: we want as many as are available.
+                 inProcNodesToCreate = Math.Min(availableNodesWithInProcAffinity, inProcNodesToCreate);
+ 
+                 // If we still want to create one, go ahead
+@@ -1563,8 +1559,8 @@ private bool CreateNewNodeIfPossible(List<ScheduleResponse> responses, IEnumerab
+                     TraceScheduler("Requesting creation of new node satisfying affinity {0}", NodeAffinity.InProc);
+                     responses.Add(ScheduleResponse.CreateNewNodeResponse(NodeAffinity.InProc, 1));
+ 
+-                    // We only want to submit one node creation request at a time -- as part of node creation we recursively re-request the scheduler 
+-                    // to do more scheduling, so the other request will be dealt with soon enough.  
++                    // We only want to submit one node creation request at a time -- as part of node creation we recursively re-request the scheduler
++                    // to do more scheduling, so the other request will be dealt with soon enough.
+                     return true;
+                 }
+             }
+@@ -1572,17 +1568,17 @@ private bool CreateNewNodeIfPossible(List<ScheduleResponse> responses, IEnumerab
+             // If we think we want to create out-of-proc nodes
+             if (outOfProcNodesToCreate > 0)
+             {
+-                // Out-of-proc node determination is a bit more complicated.  If we have N out-of-proc requests, we want to 
+-                // fill up to N out-of-proc nodes.  However, if we have N "any" requests, we must assume that at least some of them 
+-                // will be fulfilled by the inproc node, in which case we only want to launch up to N-1 out-of-proc nodes, for a 
+-                // total of N nodes overall -- the scheduler will only schedule to N nodes at a time, so launching any more than that 
+-                // is ultimately pointless. 
++                // Out-of-proc node determination is a bit more complicated.  If we have N out-of-proc requests, we want to
++                // fill up to N out-of-proc nodes.  However, if we have N "any" requests, we must assume that at least some of them
++                // will be fulfilled by the inproc node, in which case we only want to launch up to N-1 out-of-proc nodes, for a
++                // total of N nodes overall -- the scheduler will only schedule to N nodes at a time, so launching any more than that
++                // is ultimately pointless.
+                 int maxCreatableOutOfProcNodes = availableNodesWithOutOfProcAffinity;
+ 
+                 if (requestsWithOutOfProcAffinity < availableNodesWithOutOfProcAffinity)
+                 {
+-                    // We don't have enough explicitly out-of-proc requests to justify creating every technically allowed 
+-                    // out-of-proc node, so our max is actually one less than the absolute max for the reasons explained above. 
++                    // We don't have enough explicitly out-of-proc requests to justify creating every technically allowed
++                    // out-of-proc node, so our max is actually one less than the absolute max for the reasons explained above.
+                     maxCreatableOutOfProcNodes--;
+                 }
+ 
+@@ -1595,12 +1591,12 @@ private bool CreateNewNodeIfPossible(List<ScheduleResponse> responses, IEnumerab
+                     responses.Add(ScheduleResponse.CreateNewNodeResponse(NodeAffinity.OutOfProc, outOfProcNodesToCreate));
+                 }
+ 
+-                // We only want to submit one node creation request at a time -- as part of node creation we recursively re-request the scheduler 
+-                // to do more scheduling, so the other request will be dealt with soon enough.  
++                // We only want to submit one node creation request at a time -- as part of node creation we recursively re-request the scheduler
++                // to do more scheduling, so the other request will be dealt with soon enough.
+                 return true;
+             }
+ 
+-            // If we haven't returned before now, we haven't asked that any new nodes be created.  
++            // If we haven't returned before now, we haven't asked that any new nodes be created.
+             return false;
+         }
+ 
+@@ -1635,7 +1631,7 @@ private void HandleRequestBlockedOnInProgressTarget(SchedulableRequest blockedRe
+ 
+             // detect the case for https://github.com/Microsoft/msbuild/issues/3047
+             // if we have partial results AND blocked and blocking share the same configuration AND are blocked on each other
+-            if (blocker.PartialBuildResult !=null &&
++            if (blocker.PartialBuildResult != null &&
+                 blockingRequest.BuildRequest.ConfigurationId == blockedRequest.BuildRequest.ConfigurationId &&
+                 blockingRequest.RequestsWeAreBlockedBy.Contains(blockedRequest))
+             {
+@@ -1665,14 +1661,14 @@ private void HandleRequestBlockedOnResultsTransfer(SchedulableRequest parentRequ
+             // we will update the storage location in the configuration.  This is doing a bit of a run around the scheduler - we don't
+             // create a new formal request, so we treat the blocked request as if it is still executing - this prevents any other requests
+             // from getting onto that node and also means we don't have to do additional work to get the scheduler to understand the bizarre
+-            // case of sending a request for results from a project's own configuration (which it believes reside on the very node which 
++            // case of sending a request for results from a project's own configuration (which it believes reside on the very node which
+             // is actually requesting the results in the first place.)
+             BuildRequestConfiguration configuration = _configCache[parentRequest.BuildRequest.ConfigurationId];
+             responses.Add(ScheduleResponse.CreateScheduleResponse(configuration.ResultsNodeId, newRequest, false));
+ 
+             TraceScheduler("Created request {0} (node request {1}) for transfer of configuration {2}'s results from node {3} to node {4}", newRequest.GlobalRequestId, newRequest.NodeRequestId, configuration.ConfigurationId, configuration.ResultsNodeId, parentRequest.AssignedNode);
+ 
+-            // The configuration's results will now be homed at the new location (once they have come back from the 
++            // The configuration's results will now be homed at the new location (once they have come back from the
+             // original node.)
+             configuration.ResultsNodeId = parentRequest.AssignedNode;
+         }
+@@ -1875,7 +1871,7 @@ private void ResolveRequestFromCacheAndResumeIfPossible(SchedulableRequest reque
+                         responses.Add(response);
+                     }
+ 
+-                    // Is the node we are reporting to idle? If so, does reporting this result allow it to proceed with work? 
++                    // Is the node we are reporting to idle? If so, does reporting this result allow it to proceed with work?
+                     if (!_schedulingData.IsNodeWorking(response.NodeId))
+                     {
+                         ResumeReadyRequestIfAny(response.NodeId, responses);
+@@ -1968,7 +1964,7 @@ private bool CheckIfCacheMissOnReferencedProjectIsAllowedAndErrorIfNot(int nodeF
+             emitNonErrorLogs = _ => { };
+ 
+             var isIsolatedBuild = _componentHost.BuildParameters.IsolateProjects;
+-            var configCache = (IConfigCache) _componentHost.GetComponent(BuildComponentType.ConfigCache);
++            var configCache = (IConfigCache)_componentHost.GetComponent(BuildComponentType.ConfigCache);
+ 
+             // do not check root requests as nothing depends on them
+             if (!isIsolatedBuild || request.IsRootRequest || request.SkipStaticGraphIsolationConstraints)
+@@ -2056,7 +2052,7 @@ string ConcatenateGlobalProperties(BuildRequestConfiguration configuration)
+         /// </summary>
+         private ScheduleResponse GetResponseForResult(int parentRequestNode, BuildRequest requestWhichGeneratedResult, BuildResult result)
+         {
+-            // We have results, return them to the originating node, or if it is a root request, mark the submission complete.      
++            // We have results, return them to the originating node, or if it is a root request, mark the submission complete.
+             if (requestWhichGeneratedResult.IsRootRequest)
+             {
+                 // return new ScheduleResponse(result);
+@@ -2175,9 +2171,9 @@ private bool RequestOrAnyItIsBlockedByCanBeServiced(SchedulableRequest request)
+                     }
+                 }
+ 
+-                // if none of the requests we are blocked by can be serviced, it doesn't matter 
+-                // whether we can be serviced or not -- the reason we're blocked is because none 
+-                // of the requests we are blocked by can be serviced. 
++                // if none of the requests we are blocked by can be serviced, it doesn't matter
++                // whether we can be serviced or not -- the reason we're blocked is because none
++                // of the requests we are blocked by can be serviced.
+                 return false;
+             }
+             else
+diff --git a/src/Build/BackEnd/Components/Scheduler/SchedulingPlan.cs b/src/Build/BackEnd/Components/Scheduler/SchedulingPlan.cs
+index b8546bbe1b6..c719a51d2df 100644
+--- a/src/Build/BackEnd/Components/Scheduler/SchedulingPlan.cs
++++ b/src/Build/BackEnd/Components/Scheduler/SchedulingPlan.cs
+@@ -10,7 +10,6 @@
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Shared.FileSystem;
+-using Microsoft.Build.Utilities;
+ 
+ namespace Microsoft.Build.BackEnd
+ {
+@@ -317,7 +316,7 @@ private int GetConfigWithComparison(IEnumerable<int> realConfigsToSchedule, Comp
+         private void AnalyzeData()
+         {
+             DoRecursiveAnalysis();
+-            if (Traits.Instance.DebugScheduler)
++            if (!String.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILDDEBUGSCHEDULER")))
+             {
+                 DetermineExpensiveConfigs();
+                 DetermineConfigsByNumberOfOccurrences();
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index 9e500181510..80e36648f23 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -118,6 +118,11 @@ public class OutOfProcNode : INode, IBuildComponentHost, INodePacketFactory, INo
+         /// </summary>
+         private Exception _shutdownException;
+ 
++        /// <summary>
++        /// Flag indicating if we should debug communications or not.
++        /// </summary>
++        private readonly bool _debugCommunications;
++
+         /// <summary>
+         /// Data for the use of LegacyThreading semantics.
+         /// </summary>
+@@ -135,6 +140,8 @@ public OutOfProcNode()
+         {
+             s_isOutOfProcNode = true;
+ 
++            _debugCommunications = (Environment.GetEnvironmentVariable("MSBUILDDEBUGCOMM") == "1");
++
+             _receivedPackets = new ConcurrentQueue<INodePacket>();
+             _packetReceivedEvent = new AutoResetEvent(false);
+             _shutdownEvent = new ManualResetEvent(false);
+diff --git a/src/Build/Graph/ProjectGraph.cs b/src/Build/Graph/ProjectGraph.cs
+index 40cf6aee0ed..b445f72d83d 100644
+--- a/src/Build/Graph/ProjectGraph.cs
++++ b/src/Build/Graph/ProjectGraph.cs
+@@ -10,20 +10,19 @@
+ using System.Linq;
+ using System.Text;
+ using System.Threading;
++using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Eventing;
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Shared;
+-using Microsoft.Build.Shared.Debugging;
+-using Microsoft.Build.Utilities;
+ 
+ namespace Microsoft.Build.Graph
+ {
+     /// <summary>
+     ///     Represents a graph of evaluated projects.
+     /// </summary>
+-    [DebuggerDisplay(@"{DebuggerDisplayString()}")]
++    [DebuggerDisplay(@"#roots={GraphRoots.Count}, #nodes={ProjectNodes.Count}, #entryPoints={EntryPointNodes.Count}")]
+     public sealed class ProjectGraph
+     {
+         /// <summary>
+@@ -476,16 +475,13 @@ GraphConstructionMetrics EndMeasurement()
+             }
+         }
+ 
+-        internal string ToDot(IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetsPerNode = null)
++        internal string ToDot()
+         {
+             var nodeCount = 0;
+-            return ToDot(node => nodeCount++.ToString(), targetsPerNode);
++            return ToDot(node => nodeCount++.ToString());
+         }
+ 
+-        internal string ToDot(
+-            Func<ProjectGraphNode, string> nodeIdProvider,
+-            IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetsPerNode = null
+-        )
++        internal string ToDot(Func<ProjectGraphNode, string> nodeIdProvider)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(nodeIdProvider, nameof(nodeIdProvider));
+ 
+@@ -493,56 +489,31 @@ internal string ToDot(
+ 
+             var sb = new StringBuilder();
+ 
+-            sb.AppendLine($"/* {DebuggerDisplayString()} */");
+-
+-            sb.AppendLine("digraph g")
+-                .AppendLine("{")
+-                .AppendLine("\tnode [shape=box]");
++            sb.Append("digraph g\n{\n\tnode [shape=box]\n");
+ 
+             foreach (var node in ProjectNodes)
+             {
+-                var nodeId = GetNodeId(node);
++                var nodeId = nodeIds.GetOrAdd(node, (n, idProvider) => idProvider(n), nodeIdProvider);
+ 
+                 var nodeName = Path.GetFileNameWithoutExtension(node.ProjectInstance.FullPath);
+-
+                 var globalPropertiesString = string.Join(
+                     "<br/>",
+                     node.ProjectInstance.GlobalProperties.OrderBy(kvp => kvp.Key)
+                         .Select(kvp => $"{kvp.Key}={kvp.Value}"));
+ 
+-                var targetListString = GetTargetListString(node);
+-
+-                sb.AppendLine($"\t{nodeId} [label=<{nodeName}<br/>({targetListString})<br/>{globalPropertiesString}>]");
++                sb.Append('\t').Append(nodeId).Append(" [label=<").Append(nodeName).Append("<br/>").Append(globalPropertiesString).AppendLine(">]");
+ 
+                 foreach (var reference in node.ProjectReferences)
+                 {
+-                    var referenceId = GetNodeId(reference);
++                    var referenceId = nodeIds.GetOrAdd(reference, (n, idProvider) => idProvider(n), nodeIdProvider);
+ 
+-                    sb.AppendLine($"\t{nodeId} -> {referenceId}");
++                    sb.Append('\t').Append(nodeId).Append(" -> ").AppendLine(referenceId);
+                 }
+             }
+ 
+             sb.Append("}");
+ 
+             return sb.ToString();
+-
+-            string GetNodeId(ProjectGraphNode node)
+-            {
+-                return nodeIds.GetOrAdd(node, (n, idProvider) => idProvider(n), nodeIdProvider);
+-            }
+-
+-            string GetTargetListString(ProjectGraphNode node)
+-            {
+-                var targetListString = targetsPerNode is null
+-                    ? string.Empty
+-                    : string.Join(", ", targetsPerNode[node]);
+-                return targetListString;
+-            }
+-        }
+-
+-        private string DebuggerDisplayString()
+-        {
+-            return $"#roots={GraphRoots.Count}, #nodes={ProjectNodes.Count}, #entryPoints={EntryPointNodes.Count}";
+         }
+ 
+         private static IReadOnlyCollection<ProjectGraphNode> TopologicalSort(
+diff --git a/src/MSBuild.UnitTests/XMake_Tests.cs b/src/MSBuild.UnitTests/XMake_Tests.cs
+index c9dbd905e72..8b9757a7323 100644
+--- a/src/MSBuild.UnitTests/XMake_Tests.cs
++++ b/src/MSBuild.UnitTests/XMake_Tests.cs
+@@ -23,7 +23,7 @@
+ 
+ namespace Microsoft.Build.UnitTests
+ {
+-    public class XMakeAppTests : IDisposable
++    public class XMakeAppTests
+     {
+ #if USE_MSBUILD_DLL_EXTN
+         private const string MSBuildExeName = "MSBuild.dll";
+@@ -32,12 +32,10 @@ public class XMakeAppTests : IDisposable
+ #endif
+ 
+         private readonly ITestOutputHelper _output;
+-        private readonly TestEnvironment _env;
+ 
+         public XMakeAppTests(ITestOutputHelper output)
+         {
+             _output = output;
+-            _env = UnitTests.TestEnvironment.Create(_output);
+         }
+ 
+         private const string AutoResponseFileName = "MSBuild.rsp";
+@@ -48,7 +46,7 @@ public void GatherCommandLineSwitchesTwoProperties()
+             CommandLineSwitches switches = new CommandLineSwitches();
+ 
+             var arguments = new List<string>();
+-            arguments.AddRange(new[] { "/p:a=b", "/p:c=d" });
++            arguments.AddRange(new string[] { "/p:a=b", "/p:c=d" });
+ 
+             MSBuildApp.GatherCommandLineSwitches(arguments, switches);
+ 
+@@ -63,7 +61,7 @@ public void GatherCommandLineSwitchesMaxCpuCountWithArgument()
+             CommandLineSwitches switches = new CommandLineSwitches();
+ 
+             var arguments = new List<string>();
+-            arguments.AddRange(new[] { "/m:2" });
++            arguments.AddRange(new string[] { "/m:2" });
+ 
+             MSBuildApp.GatherCommandLineSwitches(arguments, switches);
+ 
+@@ -80,7 +78,7 @@ public void GatherCommandLineSwitchesMaxCpuCountWithoutArgument()
+             CommandLineSwitches switches = new CommandLineSwitches();
+ 
+             var arguments = new List<string>();
+-            arguments.AddRange(new[] { "/m:3", "/m" });
++            arguments.AddRange(new string[] { "/m:3", "/m" });
+ 
+             MSBuildApp.GatherCommandLineSwitches(arguments, switches);
+ 
+@@ -100,7 +98,7 @@ public void GatherCommandLineSwitchesMaxCpuCountWithoutArgumentButWithColon()
+             CommandLineSwitches switches = new CommandLineSwitches();
+ 
+             var arguments = new List<string>();
+-            arguments.AddRange(new[] { "/m:" });
++            arguments.AddRange(new string[] { "/m:" });
+ 
+             MSBuildApp.GatherCommandLineSwitches(arguments, switches);
+ 
+@@ -140,8 +138,11 @@ public void GatherCommandLineSwitchesMaxCpuCountWithoutArgumentButWithColon()
+         [Fact]
+         public void SplitUnquotedTest()
+         {
++            List<string> sa;
++            int emptySplits;
++
+             // nothing quoted
+-            var sa = QuotingUtilities.SplitUnquoted("abcdxyz");
++            sa = QuotingUtilities.SplitUnquoted("abcdxyz");
+             sa.Count.ShouldBe(1);
+             sa[0].ShouldBe("abcdxyz");
+ 
+@@ -165,7 +166,7 @@ public void SplitUnquotedTest()
+             sa[2].ShouldBe("dxyz");
+ 
+             // nothing quoted
+-            sa = QuotingUtilities.SplitUnquoted("abc,c;dxyz", 2, false, false, out var emptySplits, ';', ',');
++            sa = QuotingUtilities.SplitUnquoted("abc,c;dxyz", 2, false, false, out emptySplits, ';', ',');
+             emptySplits.ShouldBe(0);
+             sa.Count.ShouldBe(2);
+             sa[0].ShouldBe("abc");
+@@ -183,8 +184,8 @@ public void SplitUnquotedTest()
+             emptySplits.ShouldBe(0);
+             sa.Count.ShouldBe(4);
+             sa[0].ShouldBe("abc");
+-            sa[1].ShouldBe(string.Empty);
+-            sa[2].ShouldBe(string.Empty);
++            sa[1].ShouldBe(String.Empty);
++            sa[2].ShouldBe(String.Empty);
+             sa[3].ShouldBe("dxyz");
+ 
+             // "c d" is quoted
+@@ -330,8 +331,10 @@ public void SplitUnquotedTest()
+         [Fact]
+         public void UnquoteTest()
+         {
++            int doubleQuotesRemoved;
++
+             // "cde" is quoted
+-            QuotingUtilities.Unquote("abc\"cde\"xyz", out var doubleQuotesRemoved).ShouldBe("abccdexyz");
++            QuotingUtilities.Unquote("abc\"cde\"xyz", out doubleQuotesRemoved).ShouldBe("abccdexyz");
+             doubleQuotesRemoved.ShouldBe(2);
+ 
+             // "xyz" is quoted (the terminal double-quote is assumed)
+@@ -391,7 +394,8 @@ public void UnquoteTest()
+         public void ExtractSwitchParametersTest()
+         {
+             string commandLineArg = "\"/p:foo=\"bar";
+-            string unquotedCommandLineArg = QuotingUtilities.Unquote(commandLineArg, out var doubleQuotesRemovedFromArg);
++            int doubleQuotesRemovedFromArg;
++            string unquotedCommandLineArg = QuotingUtilities.Unquote(commandLineArg, out doubleQuotesRemovedFromArg);
+             MSBuildApp.ExtractSwitchParameters(commandLineArg, unquotedCommandLineArg, doubleQuotesRemovedFromArg, "p", unquotedCommandLineArg.IndexOf(':')).ShouldBe(":\"foo=\"bar");
+             doubleQuotesRemovedFromArg.ShouldBe(2);
+ 
+@@ -510,15 +514,15 @@ public void InvalidVerbosity()
+         [Fact]
+         public void ValidMaxCPUCountSwitch()
+         {
+-            MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "1" }).ShouldBe(1);
+-            MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "2" }).ShouldBe(2);
+-            MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "3" }).ShouldBe(3);
+-            MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "4" }).ShouldBe(4);
+-            MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "8" }).ShouldBe(8);
+-            MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "63" }).ShouldBe(63);
++            MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "1" }).ShouldBe(1);
++            MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "2" }).ShouldBe(2);
++            MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "3" }).ShouldBe(3);
++            MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "4" }).ShouldBe(4);
++            MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "8" }).ShouldBe(8);
++            MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "63" }).ShouldBe(63);
+ 
+             // Should pick last value
+-            MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "8", "4" }).ShouldBe(4);
++            MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "8", "4" }).ShouldBe(4);
+         }
+ 
+         [Fact]
+@@ -526,7 +530,7 @@ public void InvalidMaxCPUCountSwitch1()
+         {
+             Should.Throw<CommandLineSwitchException>(() =>
+             {
+-                MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "-1" });
++                MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "-1" });
+             }
+            );
+         }
+@@ -536,7 +540,7 @@ public void InvalidMaxCPUCountSwitch2()
+         {
+             Should.Throw<CommandLineSwitchException>(() =>
+             {
+-                MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "0" });
++                MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "0" });
+             }
+            );
+         }
+@@ -547,7 +551,7 @@ public void InvalidMaxCPUCountSwitch3()
+             Should.Throw<CommandLineSwitchException>(() =>
+             {
+                 // Too big
+-                MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "foo" });
++                MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "foo" });
+             }
+            );
+         }
+@@ -557,7 +561,7 @@ public void InvalidMaxCPUCountSwitch4()
+         {
+             Should.Throw<CommandLineSwitchException>(() =>
+             {
+-                MSBuildApp.ProcessMaxCPUCountSwitch(new[] { "1025" });
++                MSBuildApp.ProcessMaxCPUCountSwitch(new string[] { "1025" });
+             }
+            );
+         }
+@@ -583,7 +587,7 @@ public void SetConsoleUICulture()
+             MSBuildApp.SetConsoleUI();
+ 
+             // Make sure this doesn't throw an exception.
+-            string bar = string.Format(CultureInfo.CurrentUICulture, "{0}", 1);
++            string bar = String.Format(CultureInfo.CurrentUICulture, "{0}", 1);
+ 
+             // Restore the current UI culture back to the way it was at the beginning of this unit test.
+             thisThread.CurrentUICulture = originalUICulture;
+@@ -644,19 +648,20 @@ public void ConfigurationInvalid()
+ 
+                 var msbuildParameters = "\"" + pathToProjectFile + "\"";
+ 
+-                output = RunnerUtilities.ExecMSBuild(newPathToMSBuildExe, msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                output = RunnerUtilities.ExecMSBuild(newPathToMSBuildExe, msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeFalse();
+             }
+             catch (Exception ex)
+             {
+-                _output.WriteLine(ex.ToString());
++                Console.WriteLine(ex.ToString());
+                 throw;
+             }
+             finally
+             {
+                 if (output != null)
+                 {
+-                    _output.WriteLine(output);
++                    Console.WriteLine(output);
+                 }
+ 
+                 try
+@@ -796,7 +801,7 @@ public void MSBuildEngineLogger()
+             }
+         }
+ 
+-        private readonly string _pathToArbitraryBogusFile = NativeMethodsShared.IsWindows // OK on 64 bit as well
++        private string _pathToArbitraryBogusFile = NativeMethodsShared.IsWindows // OK on 64 bit as well
+                                                         ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe")
+                                                         : "/bin/cat";
+ 
+@@ -809,7 +814,8 @@ public void GetCommandLine()
+             var msbuildParameters = "\"" + _pathToArbitraryBogusFile + "\"" + (NativeMethodsShared.IsWindows ? " /v:diag" : " -v:diag");
+             File.Exists(_pathToArbitraryBogusFile).ShouldBeTrue();
+ 
+-            string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++            bool successfulExit;
++            string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out successfulExit);
+             successfulExit.ShouldBeFalse();
+ 
+             output.ShouldContain(RunnerUtilities.PathToCurrentlyRunningMsBuildExe + (NativeMethodsShared.IsWindows ? " /v:diag " : " -v:diag ") + _pathToArbitraryBogusFile, Case.Insensitive);
+@@ -824,6 +830,7 @@ public void GetCommandLineQuotedExe()
+             var msbuildParameters = "\"" + _pathToArbitraryBogusFile + "\"" + (NativeMethodsShared.IsWindows ? " /v:diag" : " -v:diag");
+             File.Exists(_pathToArbitraryBogusFile).ShouldBeTrue();
+ 
++            bool successfulExit;
+             string pathToMSBuildExe = RunnerUtilities.PathToCurrentlyRunningMsBuildExe;
+             // This @pathToMSBuildExe is used directly with Process, so don't quote it on
+             // Unix
+@@ -832,7 +839,7 @@ public void GetCommandLineQuotedExe()
+                 pathToMSBuildExe = "\"" + pathToMSBuildExe + "\"";
+             }
+ 
+-            string output = RunnerUtilities.ExecMSBuild(pathToMSBuildExe, msbuildParameters, out var successfulExit);
++            string output = RunnerUtilities.ExecMSBuild(pathToMSBuildExe, msbuildParameters, out successfulExit);
+             successfulExit.ShouldBeFalse();
+ 
+             output.ShouldContain(RunnerUtilities.PathToCurrentlyRunningMsBuildExe + (NativeMethodsShared.IsWindows ? " /v:diag " : " -v:diag ") + _pathToArbitraryBogusFile, Case.Insensitive);
+@@ -844,7 +851,7 @@ public void GetCommandLineQuotedExe()
+         [Fact]
+         public void GetCommandLineQuotedExeOnPath()
+         {
+-            string output;
++            string output = null;
+             string current = Directory.GetCurrentDirectory();
+ 
+             try
+@@ -853,7 +860,8 @@ public void GetCommandLineQuotedExeOnPath()
+ 
+                 var msbuildParameters = "\"" + _pathToArbitraryBogusFile + "\"" + (NativeMethodsShared.IsWindows ? " /v:diag" : " -v:diag");
+ 
+-                output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                output = RunnerUtilities.ExecMSBuild(msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeFalse();
+             }
+             finally
+@@ -871,23 +879,38 @@ public void GetCommandLineQuotedExeOnPath()
+         [Fact]
+         public void ResponseFileInProjectDirectoryFoundImplicitly()
+         {
+-            string directory = _env.DefaultTestDirectory.Path;
++            string directory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+             string projectPath = Path.Combine(directory, "my.proj");
+             string rspPath = Path.Combine(directory, AutoResponseFileName);
+ 
+-            string content = ObjectModelHelpers.CleanupFileContents("<Project ToolsVersion='msbuilddefaulttoolsversion' xmlns='msbuildnamespace'><Target Name='t'><Warning Text='[A=$(A)]'/></Target></Project>");
+-            File.WriteAllText(projectPath, content);
++            string currentDirectory = Directory.GetCurrentDirectory();
+ 
+-            string rspContent = "/p:A=1";
+-            File.WriteAllText(rspPath, rspContent);
++            try
++            {
++                Directory.CreateDirectory(directory);
+ 
+-            // Find the project in the current directory
+-            _env.SetCurrentDirectory(directory);
++                string content = ObjectModelHelpers.CleanupFileContents("<Project ToolsVersion='msbuilddefaulttoolsversion' xmlns='msbuildnamespace'><Target Name='t'><Warning Text='[A=$(A)]'/></Target></Project>");
++                File.WriteAllText(projectPath, content);
++
++                string rspContent = "/p:A=1";
++                File.WriteAllText(rspPath, rspContent);
+ 
+-            string output = RunnerUtilities.ExecMSBuild(string.Empty, out var successfulExit);
+-            successfulExit.ShouldBeTrue();
++                // Find the project in the current directory
++                Directory.SetCurrentDirectory(directory);
+ 
+-            output.ShouldContain("[A=1]");
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(String.Empty, out successfulExit);
++                successfulExit.ShouldBeTrue();
++
++                output.ShouldContain("[A=1]");
++            }
++            finally
++            {
++                Directory.SetCurrentDirectory(currentDirectory);
++                File.Delete(projectPath);
++                File.Delete(rspPath);
++                FileUtilities.DeleteWithoutTrailingBackslash(directory);
++            }
+         }
+ 
+         /// <summary>
+@@ -913,7 +936,8 @@ public void ResponseFileInProjectDirectoryExplicit()
+ 
+                 var msbuildParameters = "\"" + projectPath + "\"";
+ 
+-                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeTrue();
+ 
+                 output.ShouldContain("[A=1]");
+@@ -948,7 +972,8 @@ public void ResponseFileInProjectDirectoryRandomName()
+ 
+                 var msbuildParameters = "\"" + projectPath + "\"";
+ 
+-                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeTrue();
+ 
+                 output.ShouldContain("[A=]");
+@@ -984,7 +1009,8 @@ public void ResponseFileInProjectDirectoryCommandLineWins()
+ 
+                 var msbuildParameters = "\"" + projectPath + "\"" + " /p:A=2";
+ 
+-                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeTrue();
+ 
+                 output.ShouldContain("[A=2]");
+@@ -1029,7 +1055,8 @@ public void ResponseFileInProjectDirectoryWinsOverMainMSBuildRsp()
+ 
+                 var msbuildParameters = "\"" + projectPath + "\"";
+ 
+-                string output = RunnerUtilities.ExecMSBuild(exePath, msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(exePath, msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeTrue();
+ 
+                 output.ShouldContain("[A=1]");
+@@ -1064,7 +1091,8 @@ public void ProjectDirectoryIsMSBuildExeDirectory()
+ 
+                 var msbuildParameters = "\"" + projectPath + "\"";
+ 
+-                string output = RunnerUtilities.ExecMSBuild(exePath, msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(exePath, msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeTrue();
+ 
+                 output.ShouldContain("[A=1]");
+@@ -1097,7 +1125,8 @@ public void ResponseFileInProjectDirectoryItselfWithNoAutoResponseSwitch()
+ 
+                 var msbuildParameters = "\"" + projectPath + "\"";
+ 
+-                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeFalse();
+ 
+                 output.ShouldContain("MSB1027"); // msbuild.rsp cannot have /noautoresponse in it
+@@ -1132,7 +1161,8 @@ public void ResponseFileInProjectDirectoryButCommandLineNoAutoResponseSwitch()
+ 
+                 var msbuildParameters = "\"" + projectPath + "\" /noautoresponse";
+ 
+-                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeTrue();
+ 
+                 output.ShouldContain("[A=]");
+@@ -1164,7 +1194,8 @@ public void ResponseFileInProjectDirectoryNullCase()
+ 
+                 var msbuildParameters = "\"" + projectPath + "\"";
+ 
+-                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++                bool successfulExit;
++                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out successfulExit);
+                 successfulExit.ShouldBeTrue();
+ 
+                 output.ShouldContain("[A=]");
+@@ -1183,19 +1214,22 @@ public void ResponseFileInProjectDirectoryNullCase()
+         [Fact]
+         public void ResponseFileSupportsThisFileDirectory()
+         {
+-            var content = ObjectModelHelpers.CleanupFileContents(
+-                "<Project ToolsVersion='msbuilddefaulttoolsversion' xmlns='msbuildnamespace'><Target Name='t'><Warning Text='[A=$(A)]'/></Target></Project>");
++            using (var env = UnitTests.TestEnvironment.Create())
++            {
++                var content = ObjectModelHelpers.CleanupFileContents(
++                    "<Project ToolsVersion='msbuilddefaulttoolsversion' xmlns='msbuildnamespace'><Target Name='t'><Warning Text='[A=$(A)]'/></Target></Project>");
+ 
+-            var directory = _env.CreateFolder();
+-            directory.CreateFile("Directory.Build.rsp", "/p:A=%MSBuildThisFileDirectory%");
+-            var projectPath = directory.CreateFile("my.proj", content).Path;
++                var directory = env.CreateFolder();
++                directory.CreateFile("Directory.Build.rsp", "/p:A=%MSBuildThisFileDirectory%");
++                var projectPath = directory.CreateFile("my.proj", content).Path;
+ 
+-            var msbuildParameters = "\"" + projectPath + "\"";
++                var msbuildParameters = "\"" + projectPath + "\"";
+ 
+-            string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
+-            successfulExit.ShouldBeTrue();
++                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit);
++                successfulExit.ShouldBeTrue();
+ 
+-            output.ShouldContain($"[A={directory.Path}{Path.DirectorySeparatorChar}]");
++                output.ShouldContain($"[A={directory.Path}{Path.DirectorySeparatorChar}]");
++            }
+         }
+ 
+         /// <summary>
+@@ -1221,7 +1255,7 @@ public void NormalPriorityBuild()
+ 
+         private void RunPriorityBuildTest(ProcessPriorityClass expectedPrority, params string[] arguments)
+         {
+-            string[] aggregateArguments = arguments.Union(new[] { " /nr:false /v:diag "}).ToArray();
++            string[] aggregateArguments = arguments.Union(new string[] { " /nr:false /v:diag "}).ToArray();
+ 
+             string contents = ObjectModelHelpers.CleanupFileContents(@"
+ <Project DefaultTargets=""Build"" xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
+@@ -1242,7 +1276,7 @@ private void RunPriorityBuildTest(ProcessPriorityClass expectedPrority, params s
+ 
+             string logContents = ExecuteMSBuildExeExpectSuccess(contents, envsToCreate: environmentVars, arguments: aggregateArguments);
+ 
+-            string expected = $@"Task priority is '{expectedPrority}'";
++            string expected = string.Format(@"Task priority is '{0}'", expectedPrority);
+             logContents.ShouldContain(expected, () => logContents);
+         }
+ 
+@@ -1250,11 +1284,11 @@ private void RunPriorityBuildTest(ProcessPriorityClass expectedPrority, params s
+         /// Test the default file to build in cases involving at least one solution filter file.
+         /// </summary>
+         [Theory]
+-        [InlineData(new[] { "my.proj", "my.sln", "my.slnf" }, "my.sln")]
+-        [InlineData(new[] { "abc.proj", "bcd.csproj", "slnf.slnf", "other.slnf" }, "abc.proj")]
+-        [InlineData(new[] { "abc.sln", "slnf.slnf", "abc.slnf" }, "abc.sln")]
+-        [InlineData(new[] { "abc.csproj", "abc.slnf", "not.slnf" }, "abc.csproj")]
+-        [InlineData(new[] { "abc.slnf" }, "abc.slnf")]
++        [InlineData(new string[] { "my.proj", "my.sln", "my.slnf" }, "my.sln")]
++        [InlineData(new string[] { "abc.proj", "bcd.csproj", "slnf.slnf", "other.slnf" }, "abc.proj")]
++        [InlineData(new string[] { "abc.sln", "slnf.slnf", "abc.slnf" }, "abc.sln")]
++        [InlineData(new string[] { "abc.csproj", "abc.slnf", "not.slnf" }, "abc.csproj")]
++        [InlineData(new string[] { "abc.slnf" }, "abc.slnf")]
+         public void TestDefaultBuildWithSolutionFilter(string[] projects, string answer)
+         {
+             string[] extensionsToIgnore = Array.Empty<string>();
+@@ -1271,10 +1305,10 @@ public void TestDefaultBuildWithSolutionFilter(string[] projects, string answer)
+         [Fact]
+         public void TestProcessProjectSwitchOneProjNotFoundExtension()
+         {
+-            string[] projects = { "my.proj" };
+-            string[] extensionsToIgnore = { ".phantomextension" };
++            string[] projects = new string[] { "my.proj" };
++            string[] extensionsToIgnore = new string[] { ".phantomextension" };
+             IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
+         }
+ 
+         /// <summary>
+@@ -1283,10 +1317,10 @@ public void TestProcessProjectSwitchOneProjNotFoundExtension()
+         [Fact]
+         public void TestTwoIdenticalExtensionsToIgnore()
+         {
+-            string[] projects = { "my.proj" };
+-            string[] extensionsToIgnore = { ".phantomextension", ".phantomextension" };
++            string[] projects = new string[] { "my.proj" };
++            string[] extensionsToIgnore = new string[] { ".phantomextension", ".phantomextension" };
+             IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
+         }
+ 
+         /// <summary>
+@@ -1295,13 +1329,13 @@ public void TestTwoIdenticalExtensionsToIgnore()
+         [Fact]
+         public void TestProcessProjectSwitchNullandEmptyProjectsToIgnore()
+         {
+-            string[] projects = { "my.proj" };
++            string[] projects = new string[] { "my.proj" };
+             string[] extensionsToIgnore = null;
+             IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
+ 
+             extensionsToIgnore = new string[] { };
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
+         }
+ 
+         /// <summary>
+@@ -1312,10 +1346,10 @@ public void TestProcessProjectSwitchNullInList()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "my.proj" };
+-                string[] extensionsToIgnore = { ".phantomextension", null };
++                string[] projects = new string[] { "my.proj" };
++                string[] extensionsToIgnore = new string[] { ".phantomextension", null };
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
+             }
+            );
+         }
+@@ -1328,10 +1362,10 @@ public void TestProcessProjectSwitchEmptyInList()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "my.proj" };
+-                string[] extensionsToIgnore = { ".phantomextension", string.Empty };
++                string[] projects = new string[] { "my.proj" };
++                string[] extensionsToIgnore = new string[] { ".phantomextension", string.Empty };
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
+             }
+            );
+         }
+@@ -1343,10 +1377,10 @@ public void TestProcessProjectSwitchExtensionWithoutDot()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "my.proj" };
+-                string[] extensionsToIgnore = { "phantomextension" };
++                string[] projects = new string[] { "my.proj" };
++                string[] extensionsToIgnore = new string[] { "phantomextension" };
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase);
+             }
+            );
+         }
+@@ -1358,10 +1392,10 @@ public void TestProcessProjectSwitchMalformed()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "my.proj" };
+-                string[] extensionsToIgnore = { ".C:\\boocatmoo.a" };
++                string[] projects = new string[] { "my.proj" };
++                string[] extensionsToIgnore = new string[] { ".C:\\boocatmoo.a" };
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("my.proj", StringCompareShould.IgnoreCase); // "Expected my.proj to be only project found"
+             }
+            );
+         }
+@@ -1373,65 +1407,65 @@ public void TestProcessProjectSwitchWildcards()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "my.proj" };
+-                string[] extensionsToIgnore = { ".proj*", ".nativeproj?" };
++                string[] projects = new string[] { "my.proj" };
++                string[] extensionsToIgnore = new string[] { ".proj*", ".nativeproj?" };
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles);
+             }
+            );
+         }
+         [Fact]
+         public void TestProcessProjectSwitch()
+         {
+-            string[] projects = { "test.nativeproj", "test.vcproj" };
+-            string[] extensionsToIgnore = { ".phantomextension", ".vcproj" };
++            string[] projects = new string[] { "test.nativeproj", "test.vcproj" };
++            string[] extensionsToIgnore = new string[] { ".phantomextension", ".vcproj" };
+             IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.nativeproj", StringCompareShould.IgnoreCase); // "Expected test.nativeproj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.nativeproj", StringCompareShould.IgnoreCase); // "Expected test.nativeproj to be only project found"
+ 
+-            projects = new[] { "test.nativeproj", "test.vcproj", "test.proj" };
+-            extensionsToIgnore = new[] { ".phantomextension", ".vcproj" };
++            projects = new string[] { "test.nativeproj", "test.vcproj", "test.proj" };
++            extensionsToIgnore = new string[] { ".phantomextension", ".vcproj" };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.proj", StringCompareShould.IgnoreCase); // "Expected test.proj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.proj", StringCompareShould.IgnoreCase); // "Expected test.proj to be only project found"
+ 
+-            projects = new[] { "test.nativeproj", "test.vcproj" };
+-            extensionsToIgnore = new[] { ".vcproj" };
++            projects = new string[] { "test.nativeproj", "test.vcproj" };
++            extensionsToIgnore = new string[] { ".vcproj" };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.nativeproj", StringCompareShould.IgnoreCase); // "Expected test.nativeproj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.nativeproj", StringCompareShould.IgnoreCase); // "Expected test.nativeproj to be only project found"
+ 
+-            projects = new[] { "test.proj", "test.sln" };
+-            extensionsToIgnore = new[] { ".vcproj" };
++            projects = new string[] { "test.proj", "test.sln" };
++            extensionsToIgnore = new string[] { ".vcproj" };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
+ 
+-            projects = new[] { "test.proj", "test.sln", "test.proj~", "test.sln~" };
++            projects = new string[] { "test.proj", "test.sln", "test.proj~", "test.sln~" };
+             extensionsToIgnore = new string[] { };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
+ 
+-            projects = new[] { "test.proj" };
++            projects = new string[] { "test.proj" };
+             extensionsToIgnore = new string[] { };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.proj", StringCompareShould.IgnoreCase); // "Expected test.proj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.proj", StringCompareShould.IgnoreCase); // "Expected test.proj to be only project found"
+ 
+-            projects = new[] { "test.proj", "test.proj~" };
++            projects = new string[] { "test.proj", "test.proj~" };
+             extensionsToIgnore = new string[] { };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.proj", StringCompareShould.IgnoreCase); // "Expected test.proj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.proj", StringCompareShould.IgnoreCase); // "Expected test.proj to be only project found"
+ 
+-            projects = new[] { "test.sln" };
++            projects = new string[] { "test.sln" };
+             extensionsToIgnore = new string[] { };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
+ 
+-            projects = new[] { "test.sln", "test.sln~" };
++            projects = new string[] { "test.sln", "test.sln~" };
+             extensionsToIgnore = new string[] { };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
+ 
+-            projects = new[] { "test.sln~", "test.sln" };
++            projects = new string[] { "test.sln~", "test.sln" };
+             extensionsToIgnore = new string[] { };
+             projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.sln", StringCompareShould.IgnoreCase); // "Expected test.sln to be only solution found"
+         }
+ 
+         /// <summary>
+@@ -1440,10 +1474,10 @@ public void TestProcessProjectSwitch()
+         [Fact]
+         public void TestProcessProjectSwitchReplicateBuildingDFLKG()
+         {
+-            string[] projects = { "test.proj", "test.sln", "Foo.vcproj" };
++            string[] projects = new string[] { "test.proj", "test.sln", "Foo.vcproj" };
+             string[] extensionsToIgnore = { ".sln", ".vcproj" };
+             IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-            MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.proj"); // "Expected test.proj to be only project found"
++            MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles).ShouldBe("test.proj"); // "Expected test.proj to be only project found"
+         }
+ 
+         /// <summary>
+@@ -1454,10 +1488,12 @@ public void TestProcessProjectSwitchRemovedAllprojects()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                var projects = new[] { "test.nativeproj", "test.vcproj" };
+-                var extensionsToIgnore = new[] { ".nativeproj", ".vcproj" };
++                string[] projects;
++                string[] extensionsToIgnore = null;
++                projects = new string[] { "test.nativeproj", "test.vcproj" };
++                extensionsToIgnore = new string[] { ".nativeproj", ".vcproj" };
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles);
+             }
+            );
+         }
+@@ -1469,10 +1505,10 @@ public void TestProcessProjectSwitchSlnProjDifferentNames()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "test.proj", "Different.sln" };
++                string[] projects = new string[] { "test.proj", "Different.sln" };
+                 string[] extensionsToIgnore = null;
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles);
+             }
+            );
+         }
+@@ -1484,10 +1520,10 @@ public void TestProcessProjectSwitchTwoProj()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "test.proj", "Different.proj" };
++                string[] projects = new string[] { "test.proj", "Different.proj" };
+                 string[] extensionsToIgnore = null;
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles);
+             }
+            );
+         }
+@@ -1499,10 +1535,10 @@ public void TestProcessProjectSwitchTwoNative()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "test.nativeproj", "Different.nativeproj" };
++                string[] projects = new string[] { "test.nativeproj", "Different.nativeproj" };
+                 string[] extensionsToIgnore = null;
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles);
+             }
+            );
+         }
+@@ -1514,10 +1550,10 @@ public void TestProcessProjectSwitchTwoSolutions()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "test.sln", "Different.sln" };
++                string[] projects = new string[] { "test.sln", "Different.sln" };
+                 string[] extensionsToIgnore = null;
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles);
+             }
+            );
+         }
+@@ -1529,10 +1565,10 @@ public void TestProcessProjectSwitchMoreThenTwoProj()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { "test.nativeproj", "Different.csproj", "Another.proj" };
++                string[] projects = new string[] { "test.nativeproj", "Different.csproj", "Another.proj" };
+                 string[] extensionsToIgnore = null;
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles);
+             }
+            );
+         }
+@@ -1544,10 +1580,10 @@ public void TestProcessProjectSwitchNoProjectOrSolution()
+         {
+             Should.Throw<InitializationException>(() =>
+             {
+-                string[] projects = { };
++                string[] projects = new string[] { };
+                 string[] extensionsToIgnore = null;
+                 IgnoreProjectExtensionsHelper projectHelper = new IgnoreProjectExtensionsHelper(projects);
+-                MSBuildApp.ProcessProjectSwitch(new string[] { }, extensionsToIgnore, projectHelper.GetFiles);
++                MSBuildApp.ProcessProjectSwitch(new string[0] { }, extensionsToIgnore, projectHelper.GetFiles);
+             }
+            );
+         }
+@@ -1556,7 +1592,7 @@ public void TestProcessProjectSwitchNoProjectOrSolution()
+         /// </summary>
+         internal class IgnoreProjectExtensionsHelper
+         {
+-            private readonly List<string> _directoryFileNameList;
++            private List<string> _directoryFileNameList;
+ 
+             /// <summary>
+             /// Takes in a list of file names to simulate as being in a directory
+@@ -1583,14 +1619,14 @@ internal string[] GetFiles(string path, string searchPattern)
+                 List<string> fileNamesToReturn = new List<string>();
+                 foreach (string file in _directoryFileNameList)
+                 {
+-                    if (string.Equals(searchPattern, "*.sln", StringComparison.OrdinalIgnoreCase))
++                    if (String.Equals(searchPattern, "*.sln", StringComparison.OrdinalIgnoreCase))
+                     {
+                         if (FileUtilities.IsSolutionFilename(file))
+                         {
+                             fileNamesToReturn.Add(file);
+                         }
+                     }
+-                    else if (string.Equals(searchPattern, "*.*proj", StringComparison.OrdinalIgnoreCase))
++                    else if (String.Equals(searchPattern, "*.*proj", StringComparison.OrdinalIgnoreCase))
+                     {
+                         if (Path.GetExtension(file).Contains("proj"))
+                         {
+@@ -1724,7 +1760,7 @@ public void TestProcessFileLoggerSwitch3()
+             distributedLoggerRecords = new List<DistributedLoggerRecord>();
+ 
+             loggers = new List<ILogger>();
+-            fileLoggerParameters = new[] { "Parameter" };
++            fileLoggerParameters = new string[1] { "Parameter" };
+             MSBuildApp.ProcessDistributedFileLogger
+                        (
+                            distributedFileLogger,
+@@ -1739,7 +1775,7 @@ public void TestProcessFileLoggerSwitch3()
+             distributedLoggerRecords = new List<DistributedLoggerRecord>();
+ 
+             loggers = new List<ILogger>();
+-            fileLoggerParameters = new[] { "Parameter1", "Parameter" };
++            fileLoggerParameters = new string[2] { "Parameter1", "Parameter" };
+             MSBuildApp.ProcessDistributedFileLogger
+                        (
+                            distributedFileLogger,
+@@ -1779,7 +1815,7 @@ public void TestProcessFileLoggerSwitch4()
+             distributedLoggerRecords = new List<DistributedLoggerRecord>();
+ 
+             loggers = new List<ILogger>();
+-            fileLoggerParameters = new[] { "verbosity=Normal;" };
++            fileLoggerParameters = new string[1] { "verbosity=Normal;" };
+             MSBuildApp.ProcessDistributedFileLogger
+                        (
+                            distributedFileLogger,
+@@ -1796,7 +1832,7 @@ public void TestProcessFileLoggerSwitch4()
+             distributedLoggerRecords = new List<DistributedLoggerRecord>();
+ 
+             loggers = new List<ILogger>();
+-            fileLoggerParameters = new[] { "verbosity=Normal", "" };
++            fileLoggerParameters = new string[2] { "verbosity=Normal", "" };
+             MSBuildApp.ProcessDistributedFileLogger
+                        (
+                            distributedFileLogger,
+@@ -1813,7 +1849,7 @@ public void TestProcessFileLoggerSwitch4()
+             distributedLoggerRecords = new List<DistributedLoggerRecord>();
+ 
+             loggers = new List<ILogger>();
+-            fileLoggerParameters = new[] { "", "Parameter1" };
++            fileLoggerParameters = new string[2] { "", "Parameter1" };
+             MSBuildApp.ProcessDistributedFileLogger
+                        (
+                            distributedFileLogger,
+@@ -1830,7 +1866,7 @@ public void TestProcessFileLoggerSwitch4()
+             distributedLoggerRecords = new List<DistributedLoggerRecord>();
+ 
+             loggers = new List<ILogger>();
+-            fileLoggerParameters = new[] { "Parameter1", "verbosity=Normal;logfile=" + (NativeMethodsShared.IsWindows ? "c:\\temp\\cat.log" : "/tmp/cat.log") };
++            fileLoggerParameters = new string[2] { "Parameter1", "verbosity=Normal;logfile=" + (NativeMethodsShared.IsWindows ? "c:\\temp\\cat.log" : "/tmp/cat.log") };
+             MSBuildApp.ProcessDistributedFileLogger
+                        (
+                            distributedFileLogger,
+@@ -1845,7 +1881,7 @@ public void TestProcessFileLoggerSwitch4()
+ 
+             distributedLoggerRecords = new List<DistributedLoggerRecord>();
+             loggers = new List<ILogger>();
+-            fileLoggerParameters = new[] { "Parameter1", "verbosity=Normal;logfile=" + Path.Combine("..", "cat.log") + ";Parameter1" };
++            fileLoggerParameters = new string[2] { "Parameter1", "verbosity=Normal;logfile=" + Path.Combine("..", "cat.log") + ";Parameter1" };
+             MSBuildApp.ProcessDistributedFileLogger
+                        (
+                            distributedFileLogger,
+@@ -1860,7 +1896,7 @@ public void TestProcessFileLoggerSwitch4()
+ 
+             loggers = new List<ILogger>();
+             distributedLoggerRecords = new List<DistributedLoggerRecord>();
+-            fileLoggerParameters = new[] { "Parameter1", ";Parameter;", "", ";", ";Parameter", "Parameter;" };
++            fileLoggerParameters = new string[6] { "Parameter1", ";Parameter;", "", ";", ";Parameter", "Parameter;" };
+             MSBuildApp.ProcessDistributedFileLogger
+                        (
+                            distributedFileLogger,
+@@ -1903,7 +1939,7 @@ public void ProcessConsoleLoggerSwitches()
+             var loggers = new List<ILogger>();
+             LoggerVerbosity verbosity = LoggerVerbosity.Normal;
+             List<DistributedLoggerRecord> distributedLoggerRecords = new List<DistributedLoggerRecord>();
+-            string[] consoleLoggerParameters = { "Parameter1", ";Parameter;", "", ";", ";Parameter", "Parameter;" };
++            string[] consoleLoggerParameters = new string[6] { "Parameter1", ";Parameter;", "", ";", ";Parameter", "Parameter;" };
+ 
+             MSBuildApp.ProcessConsoleLoggerSwitch
+                        (
+@@ -2151,15 +2187,18 @@ public void MissingOptionalLoggersAreIgnored(string logger)
+                 "<Project>" +
+                 "<Target Name=\"t\"><Message Text=\"Hello\"/></Target>" +
+                 "</Project>";
+-            var tempDir = _env.CreateFolder();
+-            var projectFile = tempDir.CreateFile("missingloggertest.proj", projectString);
++            using (var env = UnitTests.TestEnvironment.Create())
++            {
++                var tempDir = env.CreateFolder();
++                var projectFile = tempDir.CreateFile("missingloggertest.proj", projectString);
+ 
+-            var parametersLoggerOptional = $"{logger} -verbosity:diagnostic \"{projectFile.Path}\"";
++                var parametersLoggerOptional = $"{logger} -verbosity:diagnostic \"{projectFile.Path}\"";
+ 
+-            var output = RunnerUtilities.ExecMSBuild(parametersLoggerOptional, out bool successfulExit, _output);
+-            successfulExit.ShouldBe(true);
+-            output.ShouldContain("Hello", output);
+-            output.ShouldContain("The specified logger could not be created and will not be used.", output);
++                var output = RunnerUtilities.ExecMSBuild(parametersLoggerOptional, out bool successfulExit, _output);
++                successfulExit.ShouldBe(true);
++                output.ShouldContain("Hello", output);
++                output.ShouldContain("The specified logger could not be created and will not be used.", output);
++            }
+         }
+ 
+         [Theory]
+@@ -2187,38 +2226,45 @@ public void InteractiveSetsBuiltInProperty(string arguments)
+         [Fact]
+         public void BinaryLogContainsImportedFiles()
+         {
+-            var testProject = _env.CreateFile("Importer.proj", ObjectModelHelpers.CleanupFileContents(@"
+-            <Project xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
+-                <Import Project=""TestProject.proj"" />
++            using (TestEnvironment testEnvironment = UnitTests.TestEnvironment.Create())
++            {
++                var testProject = testEnvironment.CreateFile("Importer.proj", ObjectModelHelpers.CleanupFileContents(@"
++                <Project xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
++                    <Import Project=""TestProject.proj"" />
+ 
+-                <Target Name=""Build"">
+-                </Target>
++                    <Target Name=""Build"">
++                    </Target>
+ 
+-            </Project>"));
++                </Project>"));
+ 
+-            _env.CreateFile("TestProject.proj", @"
+-            <Project xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
+-              <Target Name=""Build"">
+-                <Message Text=""Hello from TestProject!"" />
+-              </Target>
+-            </Project>
+-            ");
++                testEnvironment.CreateFile("TestProject.proj", @"
++                <Project xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
++                  <Target Name=""Build"">
++                    <Message Text=""Hello from TestProject!"" />
++                  </Target>
++                </Project>
++                ");
+ 
+-            string binLogLocation = _env.DefaultTestDirectory.Path;
++                string binLogLocation = testEnvironment.DefaultTestDirectory.Path;
+ 
+-            string output = RunnerUtilities.ExecMSBuild($"\"{testProject.Path}\" \"/bl:{binLogLocation}/output.binlog\"", out var success, _output);
++                string output = RunnerUtilities.ExecMSBuild($"\"{testProject.Path}\" \"/bl:{binLogLocation}/output.binlog\"", out var success, _output);
+ 
+-            success.ShouldBeTrue(output);
++                success.ShouldBeTrue(output);
+ 
+-            RunnerUtilities.ExecMSBuild($"\"{binLogLocation}/output.binlog\" \"/bl:{binLogLocation}/replay.binlog;ProjectImports=ZipFile\"", out success, _output);
++                RunnerUtilities.ExecMSBuild($"\"{binLogLocation}/output.binlog\" \"/bl:{binLogLocation}/replay.binlog;ProjectImports=ZipFile\"", out success, _output);
+ 
+-            using ZipArchive archive = ZipFile.OpenRead($"{binLogLocation}/replay.ProjectImports.zip");
+-            archive.Entries.ShouldContain(e => e.FullName.EndsWith(".proj", StringComparison.OrdinalIgnoreCase), 2);
++                using (ZipArchive archive = ZipFile.OpenRead($"{binLogLocation}/replay.ProjectImports.zip"))
++                {
++                     archive.Entries.ShouldContain(e => e.FullName.EndsWith(".proj", StringComparison.OrdinalIgnoreCase), 2);
++                }
++            }
+         }
+ 
+         [Fact]
+         public void EndToEndWarnAsErrors()
+         {
++            using TestEnvironment testEnvironment = UnitTests.TestEnvironment.Create();
++
+             string projectContents = ObjectModelHelpers.CleanupFileContents(@"<Project>
+ 
+   <Target Name=""IssueWarning"">
+@@ -2227,7 +2273,7 @@ public void EndToEndWarnAsErrors()
+ 
+ </Project>");
+ 
+-            TransientTestProjectWithFiles testProject = _env.CreateTestProjectWithFiles(projectContents);
++            TransientTestProjectWithFiles testProject = testEnvironment.CreateTestProjectWithFiles(projectContents);
+ 
+             RunnerUtilities.ExecMSBuild($"\"{testProject.ProjectFile}\" -warnaserror", out bool success, _output);
+ 
+@@ -2239,40 +2285,44 @@ public void EndToEndWarnAsErrors()
+         [Fact]
+         public void BuildSlnOutOfProc()
+         {
+-            string solutionFileContents =
+-@"Microsoft Visual Studio Solution File, Format Version 12.00
++            using (TestEnvironment testEnvironment = UnitTests.TestEnvironment.Create())
++            {
++                string solutionFileContents =
++                    @"
++Microsoft Visual Studio Solution File, Format Version 12.00
+ # Visual Studio Version 16
+ Project('{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}') = 'TestProject', 'TestProject.proj', '{6185CC21-BE89-448A-B3C0-D1C27112E595}'
+ EndProject
+ Global
+-GlobalSection(SolutionConfigurationPlatforms) = preSolution
+-    Debug|Mixed Platforms = Debug|Mixed Platforms
+-    Release|Any CPU = Release|Any CPU
+-EndGlobalSection
+-GlobalSection(ProjectConfigurationPlatforms) = postSolution
+-    {6185CC21-BE89-448A-B3C0-D1C27112E595}.Debug|Mixed Platforms.ActiveCfg = CSConfig1|Any CPU
+-    {6185CC21-BE89-448A-B3C0-D1C27112E595}.Debug|Mixed Platforms.Build.0 = CSConfig1|Any CPU
+-EndGlobalSection
++    GlobalSection(SolutionConfigurationPlatforms) = preSolution
++        Debug|Mixed Platforms = Debug|Mixed Platforms
++        Release|Any CPU = Release|Any CPU
++    EndGlobalSection
++    GlobalSection(ProjectConfigurationPlatforms) = postSolution
++        {6185CC21-BE89-448A-B3C0-D1C27112E595}.Debug|Mixed Platforms.ActiveCfg = CSConfig1|Any CPU
++        {6185CC21-BE89-448A-B3C0-D1C27112E595}.Debug|Mixed Platforms.Build.0 = CSConfig1|Any CPU
++    EndGlobalSection
+ EndGlobal
+-                ".Replace("'", "\"");
++                    ".Replace("'", "\"");
+ 
+-            var testSolution = _env.CreateFile("TestSolution.sln", ObjectModelHelpers.CleanupFileContents(solutionFileContents));
++                var testSolution = testEnvironment.CreateFile("TestSolution.sln", ObjectModelHelpers.CleanupFileContents(solutionFileContents));
+ 
+-            string testMessage = "Hello from TestProject!";
+-            _env.CreateFile("TestProject.proj", @$"
+-            <Project xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
+-              <Target Name=""Build"">
+-                <Message Text=""{testMessage}"" />
+-              </Target>
+-            </Project>
+-            ");
++                string testMessage = "Hello from TestProject!";
++                testEnvironment.CreateFile("TestProject.proj", @$"
++                <Project xmlns=""http://schemas.microsoft.com/developer/msbuild/2003"">
++                  <Target Name=""Build"">
++                    <Message Text=""{testMessage}"" />
++                  </Target>
++                </Project>
++                ");
+ 
+-            _env.SetEnvironmentVariable("MSBUILDNOINPROCNODE", "1");
++                testEnvironment.SetEnvironmentVariable("MSBUILDNOINPROCNODE", "1");
+ 
+-            string output = RunnerUtilities.ExecMSBuild($"\"{testSolution.Path}\" /p:Configuration=Debug", out var success, _output);
++                string output = RunnerUtilities.ExecMSBuild($"\"{testSolution.Path}\" /p:Configuration=Debug", out var success, _output);
+ 
+-            success.ShouldBeTrue(output);
+-            output.ShouldContain(testMessage);
++                success.ShouldBeTrue(output);
++                output.ShouldContain(testMessage);
++            }
+         }
+ 
+         /// <summary>
+@@ -2429,32 +2479,32 @@ private string ExecuteMSBuildExeExpectFailure(string projectContents, IDictionar
+ 
+         private (bool result, string output) ExecuteMSBuildExe(string projectContents, IDictionary<string, string> filesToCreate = null, IDictionary<string, string> envsToCreate = null, params string[] arguments)
+         {
+-            TransientTestProjectWithFiles testProject = _env.CreateTestProjectWithFiles(projectContents, new string[0]);
+-
+-            if (filesToCreate != null)
++            using (TestEnvironment testEnvironment = UnitTests.TestEnvironment.Create())
+             {
+-                foreach (var item in filesToCreate)
++                TransientTestProjectWithFiles testProject = testEnvironment.CreateTestProjectWithFiles(projectContents, new string[0]);
++
++                if (filesToCreate != null)
+                 {
+-                    File.WriteAllText(Path.Combine(testProject.TestRoot, item.Key), item.Value);
++                    foreach (var item in filesToCreate)
++                    {
++                        File.WriteAllText(Path.Combine(testProject.TestRoot, item.Key), item.Value);
++                    }
+                 }
+-            }
+ 
+-            if (envsToCreate != null)
+-            {
+-                foreach (var env in envsToCreate)
++                if (envsToCreate != null)
+                 {
+-                    _env.SetEnvironmentVariable(env.Key, env.Value);
++                    foreach (var env in envsToCreate)
++                    {
++                        testEnvironment.SetEnvironmentVariable(env.Key, env.Value);
++                    }
+                 }
+-            }
+ 
+-            string output = RunnerUtilities.ExecMSBuild($"\"{testProject.ProjectFile}\" {string.Join(" ", arguments)}", out var success, _output);
++                bool success;
+ 
+-            return (success, output);
+-        }
++                string output = RunnerUtilities.ExecMSBuild($"\"{testProject.ProjectFile}\" {String.Join(" ", arguments)}", out success, _output);
+ 
+-        public void Dispose()
+-        {
+-            _env.Dispose();
++                return (success, output);
++            }
+         }
+     }
+ }
+diff --git a/src/MSBuild/OutOfProcTaskHostNode.cs b/src/MSBuild/OutOfProcTaskHostNode.cs
+index 9ee7405d822..245be77f0af 100644
+--- a/src/MSBuild/OutOfProcTaskHostNode.cs
++++ b/src/MSBuild/OutOfProcTaskHostNode.cs
+@@ -172,7 +172,7 @@ public OutOfProcTaskHostNode()
+             // We don't know what the current build thinks this variable should be until RunTask(), but as a fallback in case there are
+             // communications before we get the configuration set up, just go with what was already in the environment from when this node
+             // was initially launched.
+-            _debugCommunications = Traits.Instance.DebugNodeCommunication;
++            _debugCommunications = (Environment.GetEnvironmentVariable("MSBUILDDEBUGCOMM") == "1");
+ 
+             _receivedPackets = new Queue<INodePacket>();
+ 
+diff --git a/src/Shared/CommunicationsUtilities.cs b/src/Shared/CommunicationsUtilities.cs
+index 9f643cc6ea6..f8337625465 100644
+--- a/src/Shared/CommunicationsUtilities.cs
++++ b/src/Shared/CommunicationsUtilities.cs
+@@ -13,11 +13,7 @@
+ 
+ using Microsoft.Build.Shared;
+ using System.Reflection;
+-using Microsoft.Build.Utilities;
+ 
+-#if !CLR2COMPATIBILITY
+-using Microsoft.Build.Shared.Debugging;
+-#endif
+ #if !FEATURE_APM
+ using System.Threading.Tasks;
+ #endif
+@@ -135,7 +131,7 @@ static internal class CommunicationsUtilities
+         /// <summary>
+         /// Whether to trace communications
+         /// </summary>
+-        private static bool s_trace = Traits.Instance.DebugNodeCommunication;
++        private static bool s_trace = String.Equals(Environment.GetEnvironmentVariable("MSBUILDDEBUGCOMM"), "1", StringComparison.Ordinal);
+ 
+         /// <summary>
+         /// Place to dump trace
+@@ -179,13 +175,6 @@ static internal int NodeConnectionTimeout
+         /// </summary>
+         internal static Dictionary<string, string> GetEnvironmentVariables()
+         {
+-#if !CLR2COMPATIBILITY
+-            // The DebugUtils static constructor can set the MSBUILDDEBUGPATH environment variable to propagate the debug path to out of proc nodes.
+-            // Need to ensure that constructor is called before this method returns in order to capture its env var write.
+-            // Otherwise the env var is not captured and thus gets deleted when RequiestBuilder resets the environment based on the cached results of this method.
+-            ErrorUtilities.VerifyThrowInternalNull(DebugUtils.DebugPath, nameof(DebugUtils.DebugPath));
+-#endif
+-
+             Dictionary<string, string> table = new Dictionary<string, string>(200, StringComparer.OrdinalIgnoreCase); // Razzle has 150 environment variables
+ 
+             if (NativeMethodsShared.IsWindows)
+@@ -563,14 +552,7 @@ internal static void Trace(int nodeId, string format, params object[] args)
+             {
+                 if (s_debugDumpPath == null)
+                 {
+-                    s_debugDumpPath =
+-#if CLR2COMPATIBILITY
+-                        Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+-#else
+-                        ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_0)
+-                            ? DebugUtils.DebugPath
+-                            : Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+-#endif
++                    s_debugDumpPath = Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+ 
+                     if (String.IsNullOrEmpty(s_debugDumpPath))
+                     {
+diff --git a/src/Shared/Debugging/DebugUtils.cs b/src/Shared/Debugging/DebugUtils.cs
+deleted file mode 100644
+index 03736d2ad73..00000000000
+--- a/src/Shared/Debugging/DebugUtils.cs
++++ /dev/null
+@@ -1,99 +0,0 @@
+-﻿// Copyright (c) Microsoft. All rights reserved.
+-// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+-
+-using Microsoft.Build.Utilities;
+-using System;
+-using System.Diagnostics;
+-using System.IO;
+-using System.Text.RegularExpressions;
+-
+-namespace Microsoft.Build.Shared.Debugging
+-{
+-    internal static class DebugUtils
+-    {
+-        private enum NodeMode
+-        {
+-            CentralNode,
+-            OutOfProcNode,
+-            OutOfProcTaskHostNode
+-        }
+-
+-        static DebugUtils()
+-        {
+-            string environmentDebugPath = Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+-            var debugDirectory = environmentDebugPath ?? Path.Combine(Directory.GetCurrentDirectory(), "MSBuild_Logs");
+-
+-            if (Traits.Instance.DebugEngine)
+-            {
+-                FileUtilities.EnsureDirectoryExists(debugDirectory);
+-
+-                // Out of proc nodes do not know the startup directory so set the environment variable for them.
+-                if (string.IsNullOrWhiteSpace(environmentDebugPath))
+-                {
+-                    Environment.SetEnvironmentVariable("MSBUILDDEBUGPATH", debugDirectory);
+-                }
+-            }
+-
+-            DebugPath = debugDirectory;
+-        }
+-
+-        private static readonly Lazy<NodeMode> ProcessNodeMode = new(
+-        () =>
+-        {
+-            return ScanNodeMode(Environment.CommandLine);
+-
+-            NodeMode ScanNodeMode(string input)
+-            {
+-                var match = Regex.Match(input, @"/nodemode:(?<nodemode>[12\s])(\s|$)", RegexOptions.IgnoreCase);
+-
+-                if (!match.Success)
+-                {
+-                    return NodeMode.CentralNode;
+-                }
+-                var nodeMode = match.Groups["nodemode"].Value;
+-
+-                Trace.Assert(!string.IsNullOrEmpty(nodeMode));
+-
+-                return nodeMode switch
+-                {
+-                    "1" => NodeMode.OutOfProcNode,
+-                    "2" => NodeMode.OutOfProcTaskHostNode,
+-                    _ => throw new NotImplementedException(),
+-                };
+-            }
+-        });
+-
+-        private static bool CurrentProcessMatchesDebugName()
+-        {
+-            var processNameToBreakInto = Environment.GetEnvironmentVariable("MSBuildDebugProcessName");
+-            var thisProcessMatchesName = string.IsNullOrWhiteSpace(processNameToBreakInto) ||
+-                                         Process.GetCurrentProcess().ProcessName.Contains(processNameToBreakInto);
+-
+-            return thisProcessMatchesName;
+-        }
+-
+-        public static readonly string ProcessInfoString =
+-            $"{ProcessNodeMode.Value}_{Process.GetCurrentProcess().ProcessName}_PID={Process.GetCurrentProcess().Id}_x{(Environment.Is64BitProcess ? "64" : "86")}";
+-
+-        public static readonly bool ShouldDebugCurrentProcess = CurrentProcessMatchesDebugName();
+-
+-        public static string DebugPath { get; }
+-
+-        public static string FindNextAvailableDebugFilePath(string fileName)
+-        {
+-            var extension = Path.GetExtension(fileName);
+-            var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(fileName);
+-
+-            var fullPath = Path.Combine(DebugPath, fileName);
+-
+-            var counter = 0;
+-            while (File.Exists(fullPath))
+-            {
+-                fileName = $"{fileNameWithoutExtension}_{counter++}{extension}";
+-                fullPath = Path.Combine(DebugPath, fileName);
+-            }
+-
+-            return fullPath;
+-        }
+-    }
+-}
+diff --git a/src/Shared/Debugging/PrintLineDebugger.cs b/src/Shared/Debugging/PrintLineDebugger.cs
+index 28fe6c8587a..bfcdbfd57c4 100644
+--- a/src/Shared/Debugging/PrintLineDebugger.cs
++++ b/src/Shared/Debugging/PrintLineDebugger.cs
+@@ -20,6 +20,13 @@ namespace Microsoft.Build.Shared.Debugging
+     /// </summary>
+     internal class PrintLineDebugger : IDisposable
+     {
++        internal enum NodeMode
++        {
++            CentralNode,
++            OutOfProcNode,
++            OutOfProcTaskHostNode
++        }
++
+         private static readonly Lazy<PropertyInfo> CommonWriterProperty = new Lazy<PropertyInfo>(
+             () =>
+             {
+@@ -38,10 +45,41 @@ internal class PrintLineDebugger : IDisposable
+         public static Lazy<PrintLineDebugger> DefaultWithProcessInfo =
+             new Lazy<PrintLineDebugger>(() => Create(null, null, true));
+ 
++        private static readonly Lazy<NodeMode> ProcessNodeMode = new Lazy<NodeMode>(
++            () =>
++            {
++                return ScanNodeMode(Environment.CommandLine);
++
++                NodeMode ScanNodeMode(string input)
++                {
++                    var match = Regex.Match(input, @"/nodemode:(?<nodemode>[12\s])(\s|$)", RegexOptions.IgnoreCase);
++
++                    if (!match.Success)
++                    {
++                        return NodeMode.CentralNode;
++                    }
++                    var nodeMode = match.Groups["nodemode"].Value;
++
++                    Trace.Assert(!string.IsNullOrEmpty(nodeMode));
++
++                    return nodeMode switch
++                    {
++                        "1" => NodeMode.OutOfProcNode,
++                        "2" => NodeMode.OutOfProcTaskHostNode,
++                        _ => throw new NotImplementedException(),
++                    };
++                }
++            });
++
+         private readonly string _id;
+ 
+         private readonly CommonWriterType _writerSetByThisInstance;
+ 
++        public static string ProcessInfo
++            =>
++                $"{ProcessNodeMode.Value}_PID={Process.GetCurrentProcess() .Id}({Process.GetCurrentProcess() .ProcessName})x{(Environment.Is64BitProcess ? "64" : "86")}"
++            ;
++
+         public PrintLineDebugger(string id, CommonWriterType writer)
+         {
+             _id = id ?? string.Empty;
+@@ -109,7 +147,7 @@ public static PrintLineDebugger Create(
+         {
+             return new PrintLineDebugger(
+                 prependProcessInfo
+-                    ? $"{DebugUtils.ProcessInfoString}_{id}"
++                    ? $"{ProcessInfo}_{id}"
+                     : id,
+                 writer);
+         }
+diff --git a/src/Shared/ExceptionHandling.cs b/src/Shared/ExceptionHandling.cs
+index 8ba3e225520..ae0dac9bfe3 100644
+--- a/src/Shared/ExceptionHandling.cs
++++ b/src/Shared/ExceptionHandling.cs
+@@ -19,10 +19,6 @@ namespace Microsoft.Build.AppxPackage.Shared
+ using Microsoft.Build.Shared.FileSystem;
+ using System.Xml.Schema;
+ using System.Runtime.Serialization;
+-#if !CLR2COMPATIBILITY
+-using Microsoft.Build.Shared.Debugging;
+-#endif
+-using Microsoft.Build.Utilities;
+ 
+ namespace Microsoft.Build.Shared
+ #endif
+@@ -45,16 +41,7 @@ static ExceptionHandling()
+         /// <returns></returns>
+         private static string GetDebugDumpPath()
+         {
+-            string debugPath =
+-// Cannot access change wave logic from these assemblies (https://github.com/dotnet/msbuild/issues/6707)
+-#if CLR2COMPATIBILITY || MICROSOFT_BUILD_ENGINE_OM_UNITTESTS
+-                        Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+-#else
+-                ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_0)
+-                    ? DebugUtils.DebugPath
+-                    : Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+-#endif
+-
++            string debugPath = Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH");
+             return !string.IsNullOrEmpty(debugPath)
+                     ? debugPath
+                     : Path.GetTempPath();
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index 3d468e23e95..99f43c83280 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -43,6 +43,11 @@ internal abstract class NodeEndpointOutOfProcBase : INodeEndpoint
+         /// </summary>
+         private const int PipeBufferSize = 131072;
+ 
++        /// <summary>
++        /// Flag indicating if we should debug communications or not.
++        /// </summary>
++        private bool _debugCommunications = false;
++
+         /// <summary>
+         /// The current communication status of the node.
+         /// </summary>
+@@ -188,6 +193,8 @@ internal void InternalConstruct(string pipeName)
+         {
+             ErrorUtilities.VerifyThrowArgumentLength(pipeName, nameof(pipeName));
+ 
++            _debugCommunications = (Environment.GetEnvironmentVariable("MSBUILDDEBUGCOMM") == "1");
++
+             _status = LinkStatus.Inactive;
+             _asyncDataMonitor = new object();
+             _sharedReadBuffer = InterningBinaryReader.CreateSharedBuffer();
+diff --git a/src/Shared/Traits.cs b/src/Shared/Traits.cs
+index d1fc45ffe12..6b7f20e1a27 100644
+--- a/src/Shared/Traits.cs
++++ b/src/Shared/Traits.cs
+@@ -27,9 +27,6 @@ public static Traits Instance
+         public Traits()
+         {
+             EscapeHatches = new EscapeHatches();
+-
+-            DebugScheduler = DebugEngine || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILDDEBUGSCHEDULER"));
+-            DebugNodeCommunication = DebugEngine || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILDDEBUGCOMM"));
+         }
+ 
+         public EscapeHatches EscapeHatches { get; }
+@@ -94,10 +91,6 @@ public Traits()
+         /// </summary>
+         public readonly int DictionaryBasedItemRemoveThreshold = ParseIntFromEnvironmentVariableOrDefault("MSBUILDDICTIONARYBASEDITEMREMOVETHRESHOLD", 100);
+ 
+-        public readonly bool DebugEngine = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBuildDebugEngine"));
+-        public readonly bool DebugScheduler;
+-        public readonly bool DebugNodeCommunication;
+-
+         private static int ParseIntFromEnvironmentVariableOrDefault(string environmentVariable, int defaultValue)
+         {
+             return int.TryParse(Environment.GetEnvironmentVariable(environmentVariable), out int result)

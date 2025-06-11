@@ -1,0 +1,560 @@
+diff --git a/documentation/specs/BuildCheck/Codes.md b/documentation/specs/BuildCheck/Codes.md
+index f52c4f47317..a311b316edb 100644
+--- a/documentation/specs/BuildCheck/Codes.md
++++ b/documentation/specs/BuildCheck/Codes.md
+@@ -7,6 +7,7 @@ Report codes are chosen to conform to suggested guidelines. Those guidelines are
+ | [BC0101](#bc0101---shared-output-path) | Warning | Shared output path. |
+ | [BC0102](#bc0102---double-writes) | Warning | Double writes. |
+ | [BC0103](#bc0103---used-environment-variable) | Suggestion | Used environment variable. |
++| [BC0104](#bc0104---projectreference-is-prefered-to-reference) | Warning | ProjectReference is prefered to Reference. |
+ | [BC0201](#bc0201---usage-of-undefined-property) | Warning | Usage of undefined property. |
+ | [BC0202](#bc0202---property-first-declared-after-it-was-used) | Warning | Property first declared after it was used. |
+ | [BC0203](#bc0203----property-declared-but-never-used) | Suggestion | Property declared but never used. |
+@@ -48,6 +49,15 @@ Relying on environment variables introduces variability and unpredictability, as
+ 
+ This practice can result in inconsistent build outcomes and makes debugging difficult, since environment variables are external to project files and build scripts. To ensure consistent and reproducible builds, avoid using environment variables. Instead, explicitly pass properties using the /p option, which offers better control and traceability.
+ 
++<a name="BC0104"></a>
++## BC0104 - ProjectReference is prefered to Reference.
++
++"A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'."
++
++It is not recommended to reference project outputs. Such practice leads to losing the explicit dependency between the projects. Build then might not order the projects properly, which can lead to randomly missing reference and hence undeterministic build.
++
++If you need to achieve more advanced dependency behavior - check [Controlling Dependencies Behavior](https://github.com/dotnet/msbuild/blob/main/documentation/wiki/Controlling-Dependencies-Behavior.md) document. If neither suits your needs - then you might need to disable this check for your build or for particular projects.
++
+ <a name="BC0201"></a>
+ ## BC0201 - Usage of undefined property.
+ 
+diff --git a/src/Build/BuildCheck/Checks/PreferProjectReferenceCheck.cs b/src/Build/BuildCheck/Checks/PreferProjectReferenceCheck.cs
+new file mode 100644
+index 00000000000..8ae8d6de7b1
+--- /dev/null
++++ b/src/Build/BuildCheck/Checks/PreferProjectReferenceCheck.cs
+@@ -0,0 +1,119 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.IO;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.Collections;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCheck.Checks;
++internal class PreferProjectReferenceCheck : Check
++{
++    private const string RuleId = "BC0104";
++    public static CheckRule SupportedRule = new CheckRule(RuleId, "PreferProjectReference",
++        ResourceUtilities.GetResourceString("BuildCheck_BC0104_Title")!,
++        ResourceUtilities.GetResourceString("BuildCheck_BC0104_MessageFmt")!,
++        new CheckConfiguration() { RuleId = "BC0104", Severity = CheckResultSeverity.Warning });
++
++    public override string FriendlyName => "MSBuild.PreferProjectReferenceCheck";
++
++    public override IReadOnlyList<CheckRule> SupportedRules { get; } = [SupportedRule];
++
++    public override void Initialize(ConfigurationContext configurationContext)
++    {
++        /* This is it - no custom configuration */
++    }
++
++    public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++    {
++        registrationContext.RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction);
++        registrationContext.RegisterEvaluatedItemsAction(EvaluatedItemsAction);
++    }
++
++    internal override bool IsBuiltIn => true;
++
++    private readonly Dictionary<string, (string, string)> _projectsPerReferencPath = new(MSBuildNameIgnoreCaseComparer.Default);
++    private readonly Dictionary<string, string> _projectsPerOutputPath = new(MSBuildNameIgnoreCaseComparer.Default);
++    private readonly HashSet<string> _projects = new(MSBuildNameIgnoreCaseComparer.Default);
++
++    private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesCheckData> context)
++    {
++        // Just check - do not add yet - it'll be done by EvaluatedItemsAction
++        if (_projects.Contains(context.Data.ProjectFilePath))
++        {
++            return;
++        }
++
++        string? targetPath;
++
++        context.Data.EvaluatedProperties.TryGetValue("TargetPath", out targetPath);
++
++        if (string.IsNullOrEmpty(targetPath))
++        {
++            return;
++        }
++
++        targetPath = RootEvaluatedPath(targetPath, context.Data.ProjectFilePath);
++
++        _projectsPerOutputPath[targetPath] = context.Data.ProjectFilePath;
++
++        (string, string) projectProducingOutput;
++        if (_projectsPerReferencPath.TryGetValue(targetPath, out projectProducingOutput))
++        {
++            context.ReportResult(BuildCheckResult.Create(
++                SupportedRule,
++                // Populating precise location tracked via https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=58661732
++                ElementLocation.EmptyLocation,
++                Path.GetFileName(context.Data.ProjectFilePath),
++                Path.GetFileName(projectProducingOutput.Item1),
++                projectProducingOutput.Item2));
++        }
++    }
++
++    private void EvaluatedItemsAction(BuildCheckDataContext<EvaluatedItemsCheckData> context)
++    {
++        if (!_projects.Add(context.Data.ProjectFilePath))
++        {
++            return;
++        }
++
++        foreach (ItemData itemData in context.Data.EnumerateItemsOfType("Reference"))
++        {
++            string evaluatedReferencePath = itemData.EvaluatedInclude;
++            string referenceFullPath = RootEvaluatedPath(evaluatedReferencePath, context.Data.ProjectFilePath);
++
++            _projectsPerReferencPath[referenceFullPath] = (context.Data.ProjectFilePath, evaluatedReferencePath);
++            string? projectReferencedViaOutput;
++            if (_projectsPerOutputPath.TryGetValue(referenceFullPath, out projectReferencedViaOutput))
++            {
++                context.ReportResult(BuildCheckResult.Create(
++                    SupportedRule,
++                    // Populating precise location tracked via https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=58661732
++                    ElementLocation.EmptyLocation,
++                    Path.GetFileName(projectReferencedViaOutput),
++                    Path.GetFileName(context.Data.ProjectFilePath),
++                    evaluatedReferencePath));
++            }
++        }
++    }
++
++    private static string RootEvaluatedPath(string path, string projectFilePath)
++    {
++        if (!Path.IsPathRooted(path))
++        {
++            path = Path.Combine(Path.GetDirectoryName(projectFilePath)!, path);
++        }
++        // Normalize the path to avoid false negatives due to different path representations.
++        path = FileUtilities.NormalizePath(path)!;
++
++        return path;
++    }
++}
+diff --git a/src/Build/BuildCheck/Checks/PropertiesUsageCheck.cs b/src/Build/BuildCheck/Checks/PropertiesUsageCheck.cs
+index e2e01caf5e7..7c17d13b5f4 100644
+--- a/src/Build/BuildCheck/Checks/PropertiesUsageCheck.cs
++++ b/src/Build/BuildCheck/Checks/PropertiesUsageCheck.cs
+@@ -19,17 +19,17 @@ internal class PropertiesUsageCheck : InternalCheck
+     private static readonly CheckRule _usedBeforeInitializedRule = new CheckRule("BC0201", "PropertyUsedBeforeDeclared",
+         ResourceUtilities.GetResourceString("BuildCheck_BC0201_Title")!,
+         ResourceUtilities.GetResourceString("BuildCheck_BC0201_MessageFmt")!,
+-        new CheckConfiguration() { Severity = CheckResultSeverity.Warning, EvaluationCheckScope = EvaluationCheckScope.ProjectFileOnly });
++        new CheckConfiguration() { RuleId = "BC0201", Severity = CheckResultSeverity.Warning, EvaluationCheckScope = EvaluationCheckScope.ProjectFileOnly });
+ 
+     private static readonly CheckRule _initializedAfterUsedRule = new CheckRule("BC0202", "PropertyDeclaredAfterUsed",
+         ResourceUtilities.GetResourceString("BuildCheck_BC0202_Title")!,
+         ResourceUtilities.GetResourceString("BuildCheck_BC0202_MessageFmt")!,
+-        new CheckConfiguration() { Severity = CheckResultSeverity.Warning, EvaluationCheckScope = EvaluationCheckScope.ProjectFileOnly });
++        new CheckConfiguration() { RuleId = "BC0202", Severity = CheckResultSeverity.Warning, EvaluationCheckScope = EvaluationCheckScope.ProjectFileOnly });
+ 
+     private static readonly CheckRule _unusedPropertyRule = new CheckRule("BC0203", "UnusedPropertyDeclared",
+         ResourceUtilities.GetResourceString("BuildCheck_BC0203_Title")!,
+         ResourceUtilities.GetResourceString("BuildCheck_BC0203_MessageFmt")!,
+-        new CheckConfiguration() { Severity = CheckResultSeverity.Suggestion, EvaluationCheckScope = EvaluationCheckScope.ProjectFileOnly });
++        new CheckConfiguration() { RuleId = "BC0203", Severity = CheckResultSeverity.Suggestion, EvaluationCheckScope = EvaluationCheckScope.ProjectFileOnly });
+ 
+     internal static readonly IReadOnlyList<CheckRule> SupportedRulesList = [_usedBeforeInitializedRule, _initializedAfterUsedRule, _unusedPropertyRule];
+ 
+diff --git a/src/Build/BuildCheck/Checks/SharedOutputPathCheck.cs b/src/Build/BuildCheck/Checks/SharedOutputPathCheck.cs
+index e01f62ab787..9604122c75d 100644
+--- a/src/Build/BuildCheck/Checks/SharedOutputPathCheck.cs
++++ b/src/Build/BuildCheck/Checks/SharedOutputPathCheck.cs
+@@ -6,10 +6,13 @@
+ using System.Collections.Immutable;
+ using System.Diagnostics;
+ using System.IO;
++using System.Linq;
+ using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
++using Microsoft.Build.Collections;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Checks;
+ 
+@@ -37,8 +40,8 @@ public override void RegisterActions(IBuildCheckRegistrationContext registration
+ 
+     internal override bool IsBuiltIn => true;
+ 
+-    private readonly Dictionary<string, string> _projectsPerOutputPath = new(StringComparer.CurrentCultureIgnoreCase);
+-    private readonly HashSet<string> _projects = new(StringComparer.CurrentCultureIgnoreCase);
++    private readonly Dictionary<string, string> _projectsPerOutputPath = new(MSBuildNameIgnoreCaseComparer.Default);
++    private readonly HashSet<string> _projects = new(MSBuildNameIgnoreCaseComparer.Default);
+ 
+     private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesCheckData> context)
+     {
+@@ -56,8 +59,8 @@ private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedProperties
+         // Check objPath only if it is different from binPath
+         if (
+             !string.IsNullOrEmpty(objPath) && !string.IsNullOrEmpty(absoluteBinPath) &&
+-            !objPath.Equals(binPath, StringComparison.CurrentCultureIgnoreCase)
+-            && !objPath.Equals(absoluteBinPath, StringComparison.CurrentCultureIgnoreCase)
++            !MSBuildNameIgnoreCaseComparer.Default.Equals(objPath, binPath)
++            && !MSBuildNameIgnoreCaseComparer.Default.Equals(objPath, absoluteBinPath)
+         )
+         {
+             CheckAndAddFullOutputPath(objPath, context);
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index bf2c5fda3a5..5eacf13637c 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -8,6 +8,7 @@
+ using System.Linq;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCheck.Checks;
+ using Microsoft.Build.BuildCheck.Infrastructure;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Experimental.BuildCheck.Acquisition;
+@@ -135,6 +136,7 @@ private static readonly (string[] ruleIds, bool defaultEnablement, CheckFactory
+             // BuildCheckDataSource.EventArgs
+             [
+                 ([SharedOutputPathCheck.SupportedRule.Id], SharedOutputPathCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<SharedOutputPathCheck>),
++                ([PreferProjectReferenceCheck.SupportedRule.Id], PreferProjectReferenceCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<PreferProjectReferenceCheck>),
+                 ([DoubleWritesCheck.SupportedRule.Id], DoubleWritesCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<DoubleWritesCheck>),
+                 ([NoEnvironmentVariablePropertyCheck.SupportedRule.Id], NoEnvironmentVariablePropertyCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<NoEnvironmentVariablePropertyCheck>)
+             ],
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 54661e23651..82233bf1095 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -2168,6 +2168,12 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>'{0}' with value: '{1}'</value>
+ 	<comment>Will be used as a parameter {0} in previous message.</comment>
+   </data>
++  <data name="BuildCheck_BC0104_Title" xml:space="preserve">
++    <value>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</value>
++  </data>
++  <data name="BuildCheck_BC0104_MessageFmt" xml:space="preserve">
++    <value>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</value>
++  </data>
+   <data name="BuildCheck_BC0201_Title" xml:space="preserve">
+     <value>A property that is accessed should be declared first.</value>
+   </data>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index c7bfcf054a0..33d901b9890 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">Během sestavování by se neměla používat žádná implicitní vlastnost odvozená z proměnné prostředí.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">K vlastnosti: {0} bylo přistupováno, ale nebyla nikdy inicializována.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index a43127ade78..254ad77a2ef 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">Während der Erstellung sollte keine implizite Eigenschaft verwendet werden, die von einer Umgebungsvariablen abgeleitet ist.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Auf die Eigenschaft „{0}“ wurde zugegriffen, sie wurde jedoch nie initialisiert.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 3af6950b952..48a2609831b 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">No se debe usar ninguna propiedad implícita derivada de una variable de entorno durante la compilación.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propiedad: se obtuvo acceso a "{0}", pero nunca se inicializó.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 3b6e2fb82aa..99d641d294b 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">Aucune propriété implicite dérivée d'une variable d'environnement ne doit être utilisée pendant la construction.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propriété : « {0} » a été consultée, mais elle n'a jamais été initialisée.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index f417d787857..1f1ba0692be 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">Durante la compilazione non deve essere usata alcuna proprietà implicita derivata da una variabile di ambiente.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">È stato eseguito l'accesso alla proprietà '{0}', ma non è mai stata inizializzata.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 9d8854c98a7..ec6d658e837 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">ビルド中に環境変数から派生した暗黙的なプロパティを使用しないでください。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">プロパティ: '{0}' にアクセスしましたが、初期化されませんでした。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index f53fc8db9ac..1d468db3fcd 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">빌드하는 동안 환경 변수에서 파생된 암시적 속성을 사용하면 안 됩니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">속성: '{0}'에 액세스했지만 초기화되지 않았습니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 48325a8a2b3..893af2cb161 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">Podczas kompilacji nie należy używać żadnej niejawnej właściwości pochodzącej ze zmiennej środowiskowej.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Właściwość: uzyskano dostęp do „{0}”, ale nigdy nie dokonano inicjacji.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index f542a273cec..1a9a5aec4cd 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">Nenhuma propriedade implícita derivada de uma variável de ambiente deve ser usada durante o build.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propriedade: "{0}" foi acessada, mas nunca foi inicializada.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 515b9b7252d..4dce4a7191f 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">Во время сборки не следует использовать неявные свойства, полученные из переменной среды.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Свойство: к "{0}" получен доступ, но он не инициализирован.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 2c69cd00afe..4b2d0adb616 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">Derleme sırasında bir ortam değişkeninden türetilen hiçbir örtük özellik kullanılmamalıdır.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">'{0}' özelliğine erişildi, ancak hiç başlatılmadı.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index ffb8d1ceb94..b982b7137d9 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">在生成过程中，不应使用派生自环境变量的隐式属性。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">已访问属性“{0}”，但从未将其初始化过。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 219bc0451db..6e20821b064 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -171,6 +171,16 @@
+         <target state="translated">組建期間不應使用衍生自環境變數的隱含屬性。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_MessageFmt">
++        <source>Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</source>
++        <target state="new">Project {0} references output of a project {1}. Referenced path: {2}. ProjectReference should be used instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0104_Title">
++        <source>A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</source>
++        <target state="new">A project should not be referenced via 'Reference' to its output, but rather directly via 'ProjectReference'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">已存取屬性: '{0}'，但從未初始化。</target>
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 58891677b6a..b22328d9da3 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -187,12 +187,14 @@ public void SampleCheckIntegrationTest_CheckOnBuild(bool buildInOutOfProcessNode
+             output.ShouldContain("BC0101");
+             output.ShouldContain("BC0102");
+             output.ShouldContain("BC0103");
++            output.ShouldContain("BC0104");
+         }
+         else
+         {
+             output.ShouldNotContain("BC0101");
+             output.ShouldNotContain("BC0102");
+             output.ShouldNotContain("BC0103");
++            output.ShouldNotContain("BC0104");
+         }
+     }
+ 
+diff --git a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project2.csproj b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project2.csproj
+index b8355528363..fe539035baa 100644
+--- a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project2.csproj
++++ b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project2.csproj
+@@ -11,7 +11,7 @@
+     </PropertyGroup>
+                     
+     <ItemGroup>
+-        <Reference Include="bin/Project1.dll" />
++        <Reference Include="bin/$(Configuration)/$(TargetFramework)/Project1.dll" />
+     </ItemGroup>
+                     
+     <Target Name="Hello">

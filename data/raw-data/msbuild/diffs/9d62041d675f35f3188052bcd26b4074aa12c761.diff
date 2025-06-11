@@ -1,0 +1,259 @@
+diff --git a/src/Build.OM.UnitTests/Definition/ProjectItem_Tests.cs b/src/Build.OM.UnitTests/Definition/ProjectItem_Tests.cs
+index 0d44fcf3f06..ac91bd2de6c 100644
+--- a/src/Build.OM.UnitTests/Definition/ProjectItem_Tests.cs
++++ b/src/Build.OM.UnitTests/Definition/ProjectItem_Tests.cs
+@@ -13,6 +13,7 @@
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
++using Microsoft.Build.UnitTests.Shared;
+ using Shouldly;
+ using InvalidProjectFileException = Microsoft.Build.Exceptions.InvalidProjectFileException;
+ using Xunit;
+@@ -54,7 +55,8 @@ public class ProjectItem_Tests : IDisposable
+                     </Project>
+                 ";
+ 
+-        protected TestEnvironment _env;
++        protected readonly TestEnvironment _env;
++        private DummyMappedDrive _mappedDrive = null;
+ 
+         public ProjectItem_Tests()
+         {
+@@ -64,6 +66,7 @@ public ProjectItem_Tests()
+         public void Dispose()
+         {
+             _env.Dispose();
++            _mappedDrive?.Dispose();
+         }
+ 
+         /// <summary>
+@@ -795,7 +798,6 @@ public void ProjectGetterResultsInDriveEnumerationException(string unevaluatedIn
+         /// <summary>
+         /// Project getter that renames an item to a drive enumerating wildcard that results in a logged warning.
+         /// </summary>
+-        [ActiveIssue("https://github.com/dotnet/msbuild/issues/7330")]
+         [PlatformSpecific(TestPlatforms.Windows)]
+         [Theory]
+         [InlineData(@"z:\**\*.log")]
+@@ -806,6 +808,9 @@ public void ProjectGetterResultsInDriveEnumerationException(string unevaluatedIn
+         [InlineData(@"z:\**\*.cs")]
+         public void ProjectGetterResultsInWindowsDriveEnumerationWarning(string unevaluatedInclude)
+         {
++            // let's create the mapped drive only once it's needed by any test, then let's reuse;
++            _mappedDrive ??= new DummyMappedDrive();
++            unevaluatedInclude = UpdatePathToMappedDrive(unevaluatedInclude, _mappedDrive.MappedDriveLetter);
+             ProjectGetterResultsInDriveEnumerationWarning(unevaluatedInclude);
+         }
+ 
+@@ -880,7 +885,6 @@ public void ThrowExceptionUponProjectInstanceCreationFromDriveEnumeratingContent
+         /// <summary>
+         /// Project instance created from a file that contains a drive enumerating wildcard results in a logged warning on the Windows platform.
+         /// </summary>
+-        [ActiveIssue("https://github.com/dotnet/msbuild/issues/7330")]
+         [PlatformSpecific(TestPlatforms.Windows)]
+         [Theory]
+         [InlineData(
+@@ -901,10 +905,23 @@ public void ThrowExceptionUponProjectInstanceCreationFromDriveEnumeratingContent
+             @"z:\$(Microsoft_WindowsAzure_EngSys)**")]
+         public void LogWindowsWarningUponProjectInstanceCreationFromDriveEnumeratingContent(string content, string placeHolder, string excludePlaceHolder = null)
+         {
++            // let's create the mapped drive only once it's needed by any test, then let's reuse;
++            _mappedDrive ??= new DummyMappedDrive();
++            placeHolder = UpdatePathToMappedDrive(placeHolder, _mappedDrive.MappedDriveLetter);
++            excludePlaceHolder = UpdatePathToMappedDrive(excludePlaceHolder, _mappedDrive.MappedDriveLetter);
+             content = string.Format(content, placeHolder, excludePlaceHolder);
+             CleanContentsAndCreateProjectInstanceFromFileWithDriveEnumeratingWildcard(content, false);
+         }
+ 
++        private static string UpdatePathToMappedDrive(string path, char driveLetter)
++        {
++            if (!string.IsNullOrEmpty(path) && path.StartsWith(driveLetter + ":", StringComparison.OrdinalIgnoreCase))
++            {
++                path = driveLetter + path.Substring(1);
++            }
++            return path;
++        }
++
+         [ActiveIssue("https://github.com/dotnet/msbuild/issues/7330")]
+         [PlatformSpecific(TestPlatforms.AnyUnix)]
+         [Theory]
+diff --git a/src/Build.OM.UnitTests/Microsoft.Build.Engine.OM.UnitTests.csproj b/src/Build.OM.UnitTests/Microsoft.Build.Engine.OM.UnitTests.csproj
+index 51d86b2f804..d3fa763cf2a 100644
+--- a/src/Build.OM.UnitTests/Microsoft.Build.Engine.OM.UnitTests.csproj
++++ b/src/Build.OM.UnitTests/Microsoft.Build.Engine.OM.UnitTests.csproj
+@@ -80,6 +80,8 @@
+     </Compile>
+     <Compile Include="..\Shared\ProcessExtensions.cs" />
+     <Compile Include="..\UnitTests.Shared\RunnerUtilities.cs" />
++    <Compile Include="..\UnitTests.Shared\DriveMapping.cs" />
++    <Compile Include="..\UnitTests.Shared\DummyMappedDrive.cs" />
+     <None Include="..\Shared\UnitTests\App.config">
+       <Link>App.config</Link>
+       <SubType>Designer</SubType>
+diff --git a/src/UnitTests.Shared/DriveMapping.cs b/src/UnitTests.Shared/DriveMapping.cs
+new file mode 100644
+index 00000000000..9bdc36c031b
+--- /dev/null
++++ b/src/UnitTests.Shared/DriveMapping.cs
+@@ -0,0 +1,73 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++#nullable enable
++using System.Runtime.InteropServices;
++using System.Text;
++
++namespace Microsoft.Build.UnitTests.Shared;
++
++internal static class DriveMapping
++{
++    private const int ERROR_FILE_NOT_FOUND = 2;
++    private const int ERROR_INSUFFICIENT_BUFFER = 122;
++    private const int DDD_REMOVE_DEFINITION = 2;
++    private const int DDD_NO_FLAG = 0;
++    // extra space for '\??\'. Not counting for long paths support in tests.
++    private const int MAX_PATH = 259;
++
++    /// <summary>
++    /// Windows specific. Maps path to a requested drive.
++    /// </summary>
++    /// <param name="letter">Drive letter</param>
++    /// <param name="path">Path to be mapped</param>
++    public static void MapDrive(char letter, string path)
++    {
++        if (!DefineDosDevice(DDD_NO_FLAG, ToDeviceName(letter), path))
++        {
++            NativeMethodsShared.ThrowExceptionForErrorCode(Marshal.GetLastWin32Error());
++        }
++    }
++
++    /// <summary>
++    /// Windows specific. Unmaps drive mapping.
++    /// </summary>
++    /// <param name="letter">Drive letter.</param>
++    public static void UnmapDrive(char letter)
++    {
++        if (!DefineDosDevice(DDD_REMOVE_DEFINITION, ToDeviceName(letter), null))
++        {
++            NativeMethodsShared.ThrowExceptionForErrorCode(Marshal.GetLastWin32Error());
++        }
++    }
++
++    /// <summary>
++    /// Windows specific. Fetches path mapped under specific drive letter.
++    /// </summary>
++    /// <param name="letter">Drive letter.</param>
++    /// <returns>Path mapped under specified letter. Empty string if mapping not found.</returns>
++    public static string GetDriveMapping(char letter)
++    {
++        // since this is just for test purposes - let's not overcomplicate with long paths support
++        var sb = new StringBuilder(MAX_PATH);
++        if (QueryDosDevice(ToDeviceName(letter), sb, sb.Capacity) == 0)
++        {
++            // Return empty string if the drive is not mapped
++            int err = Marshal.GetLastWin32Error();
++            if (err == ERROR_FILE_NOT_FOUND) return string.Empty;
++            NativeMethodsShared.ThrowExceptionForErrorCode(err);
++        }
++        // Translate from the native path semantic - starting with '\??\'
++        return sb.ToString(4, sb.Length - 4);
++    }
++
++    private static string ToDeviceName(char letter)
++    {
++        return new string(char.ToUpper(letter), 1) + ":";
++    }
++
++    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
++    private static extern bool DefineDosDevice(int flags, string deviceName, string? path);
++    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
++    private static extern int QueryDosDevice(string deviceName, StringBuilder buffer, int bufSize);
++}
+diff --git a/src/UnitTests.Shared/DummyMappedDrive.cs b/src/UnitTests.Shared/DummyMappedDrive.cs
+new file mode 100644
+index 00000000000..8b3a99bb72c
+--- /dev/null
++++ b/src/UnitTests.Shared/DummyMappedDrive.cs
+@@ -0,0 +1,81 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++#nullable enable
++using System;
++using System.Diagnostics;
++using System.IO;
++
++namespace Microsoft.Build.UnitTests.Shared;
++
++/// <summary>
++/// Windows specific. Class managing system resource - temporary local path mapped to available drive letter.
++/// </summary>
++public class DummyMappedDrive : IDisposable
++{
++    public char MappedDriveLetter { get; init; } = 'z';
++    private readonly string _mappedPath;
++    private readonly bool _mapped;
++
++    public DummyMappedDrive()
++    {
++        _mappedPath = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
++        Directory.CreateDirectory(_mappedPath);
++        File.Create(Path.Combine(_mappedPath, "x")).Dispose();
++
++        for (char driveLetter = 'z'; driveLetter >= 'a'; driveLetter--)
++        {
++            if (DriveMapping.GetDriveMapping(driveLetter) == string.Empty)
++            {
++                DriveMapping.MapDrive(driveLetter, _mappedPath);
++                MappedDriveLetter = driveLetter;
++                _mapped = true;
++                return;
++            }
++        }
++    }
++
++    private void ReleaseUnmanagedResources(bool disposing)
++    {
++        Exception? e = null;
++        if (Directory.Exists(_mappedPath))
++        {
++            try
++            {
++                Directory.Delete(_mappedPath, true);
++            }
++            catch (Exception exc)
++            {
++                e = exc;
++                Debug.Fail("Exception in DummyMappedDrive finalizer: " + e.ToString());
++            }
++
++        }
++
++        if (_mapped)
++        {
++            try
++            {
++                DriveMapping.UnmapDrive(MappedDriveLetter);
++            }
++            catch (Exception exc)
++            {
++                e = e == null ? exc : new AggregateException(e, exc);
++                Debug.Fail("Exception in DummyMappedDrive finalizer: " + e.ToString());
++            }
++        }
++
++        if (disposing && e != null)
++        {
++            throw e;
++        }
++    }
++
++    public void Dispose()
++    {
++        ReleaseUnmanagedResources(true);
++        GC.SuppressFinalize(this);
++    }
++
++    ~DummyMappedDrive() => ReleaseUnmanagedResources(false);
++}

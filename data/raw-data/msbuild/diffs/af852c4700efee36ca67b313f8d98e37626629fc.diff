@@ -1,0 +1,202 @@
+diff --git a/src/Build.UnitTests/BackEnd/SdkResolverService_Tests.cs b/src/Build.UnitTests/BackEnd/SdkResolverService_Tests.cs
+index e4ef5679ee7..89c73a1b469 100644
+--- a/src/Build.UnitTests/BackEnd/SdkResolverService_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/SdkResolverService_Tests.cs
+@@ -61,10 +61,9 @@ public void AssertAllResolverErrorsLoggedWhenSdkNotResolved()
+             _logger.BuildMessageEvents.Select(i => i.Message).ShouldContain("MockSdkResolver2 running");
+             _logger.BuildMessageEvents.Select(i => i.Message).ShouldNotContain("MockSdkResolverWithResolvableSdkPattern1 running");
+             _logger.BuildMessageEvents.Select(i => i.Message).ShouldContain("MockSdkResolverWithResolvableSdkPattern2 running");
+-            string[] loggerErrors = _logger.Errors.Select(i => i.Message).ToArray();
+-            loggerErrors[1].ShouldBe("ERROR4");
+-            loggerErrors[3].ShouldBe("ERROR1");
+-            loggerErrors[4].ShouldBe("ERROR2");
++
++            // First error is a generic "we failed" message.
++            _logger.Errors.Skip(1).Select(i => i.Message).ShouldBe(new[] { "ERROR4", "ERROR1", "ERROR2" });
+             _logger.Warnings.Select(i => i.Message).ShouldBe(new[] { "WARNING4", "WARNING2" });
+         }
+ 
+diff --git a/src/Build/BackEnd/Components/SdkResolution/SdkResolverService.cs b/src/Build/BackEnd/Components/SdkResolution/SdkResolverService.cs
+index 7247d1609b4..aed63477954 100644
+--- a/src/Build/BackEnd/Components/SdkResolution/SdkResolverService.cs
++++ b/src/Build/BackEnd/Components/SdkResolution/SdkResolverService.cs
+@@ -14,6 +14,7 @@
+ using Microsoft.Build.Eventing;
+ using System.Linq;
+ using System.Text.RegularExpressions;
++using static Microsoft.Build.Shared.FileMatcher;
+ 
+ #nullable disable
+ 
+@@ -118,7 +119,17 @@ public virtual SdkResult ResolveSdk(int submissionId, SdkReference sdk, LoggingC
+             }
+             else
+             {
+-                return ResolveSdkUsingAllResolvers(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio, throwExceptions);
++                SdkResult result = ResolveSdkUsingAllResolvers(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio, out IEnumerable<string> errors, out IEnumerable<string> warnings);
++                if (!result.Success)
++                {
++                    LogWarnings(loggingContext, sdkReferenceLocation, warnings);
++                    foreach (string error in errors)
++                    {
++                        loggingContext.LogErrorFromText(subcategoryResourceName: null, errorCode: null, helpKeyword: null, new BuildEventFileInfo(sdkReferenceLocation), message: error);
++                    }
++                }
++
++                return result;
+             }
+         }
+ 
+@@ -154,6 +165,8 @@ private SdkResult ResolveSdkUsingResolversWithPatternsFirst(int submissionId, Sd
+ 
+             List<SdkResolver> resolvers;
+             SdkResult sdkResult;
++            List<string> errors = new List<string>(0);
++            List<string> warnings = new List<string>(0);
+             if (matchingResolversManifests.Count != 0)
+             {
+                 // First pass.
+@@ -169,11 +182,15 @@ private SdkResult ResolveSdkUsingResolversWithPatternsFirst(int submissionId, Sd
+                     projectPath,
+                     interactive,
+                     isRunningInVisualStudio,
+-                    throwExceptions,
+-                    out sdkResult))
++                    out sdkResult,
++                    out IEnumerable<string> firstErrors,
++                    out IEnumerable<string> firstWarnings))
+                 {
+                     return sdkResult;
+                 }
++
++                errors.AddRange(firstErrors);
++                warnings.AddRange(firstWarnings);
+             }
+ 
+             // Second pass: fallback to general resolvers. 
+@@ -192,12 +209,27 @@ private SdkResult ResolveSdkUsingResolversWithPatternsFirst(int submissionId, Sd
+                 projectPath,
+                 interactive,
+                 isRunningInVisualStudio,
+-                throwExceptions,
+-                out sdkResult))
++                out sdkResult,
++                out IEnumerable<string> moreErrors,
++                out IEnumerable<string> moreWarnings))
+             {
+                 return sdkResult;
+             }
+ 
++            errors.AddRange(moreErrors);
++            warnings.AddRange(moreWarnings);
++
++            if (throwExceptions)
++            {
++                loggingContext.LogError(new BuildEventFileInfo(sdkReferenceLocation), "FailedToResolveSDK", sdk.Name);
++            }
++
++            LogWarnings(loggingContext, sdkReferenceLocation, warnings);
++            foreach (string error in errors)
++            {
++                loggingContext.LogErrorFromText(subcategoryResourceName: null, errorCode: null, helpKeyword: null, file: new BuildEventFileInfo(sdkReferenceLocation), message: error);
++            }
++
+             // No resolvers resolved the sdk.
+             return new SdkResult(sdk, null, null);
+         }
+@@ -230,7 +262,7 @@ private List<SdkResolver> GetResolvers(IList<SdkResolverManifest> resolversManif
+             return resolvers;
+         }
+ 
+-        private SdkResult ResolveSdkUsingAllResolvers(int submissionId, SdkReference sdk, LoggingContext loggingContext, ElementLocation sdkReferenceLocation, string solutionPath, string projectPath, bool interactive, bool isRunningInVisualStudio, bool throwExceptions)
++        private SdkResult ResolveSdkUsingAllResolvers(int submissionId, SdkReference sdk, LoggingContext loggingContext, ElementLocation sdkReferenceLocation, string solutionPath, string projectPath, bool interactive, bool isRunningInVisualStudio, out IEnumerable<string> errors, out IEnumerable<string> warnings)
+         {
+             // Lazy initialize all SDK resolvers
+             if (_resolversList == null)
+@@ -248,15 +280,30 @@ private SdkResult ResolveSdkUsingAllResolvers(int submissionId, SdkReference sdk
+                 projectPath,
+                 interactive,
+                 isRunningInVisualStudio,
+-                throwExceptions,
+-                out SdkResult sdkResult);
++                out SdkResult sdkResult,
++                out errors,
++                out warnings);
+ 
+             return sdkResult;
+         }
+ 
+-        private bool TryResolveSdkUsingSpecifiedResolvers(IList<SdkResolver> resolvers, int submissionId, SdkReference sdk, LoggingContext loggingContext, ElementLocation sdkReferenceLocation, string solutionPath, string projectPath, bool interactive, bool isRunningInVisualStudio, bool throwExceptions, out SdkResult sdkResult)
++        private bool TryResolveSdkUsingSpecifiedResolvers(
++            IList<SdkResolver> resolvers,
++            int submissionId,
++            SdkReference sdk,
++            LoggingContext loggingContext,
++            ElementLocation sdkReferenceLocation,
++            string solutionPath,
++            string projectPath,
++            bool interactive,
++            bool isRunningInVisualStudio,
++            out SdkResult sdkResult,
++            out IEnumerable<string> errors,
++            out IEnumerable<string> warnings)
+         {
+             List<SdkResult> results = new List<SdkResult>();
++            errors = null;
++            warnings = null;
+ 
+             // Loop through resolvers which have already been sorted by priority, returning the first result that was successful
+             SdkLogger buildEngineLogger = new SdkLogger(loggingContext);
+@@ -304,7 +351,7 @@ private bool TryResolveSdkUsingSpecifiedResolvers(IList<SdkResolver> resolvers,
+ 
+                 if (result.Success)
+                 {
+-                    LogWarnings(loggingContext, sdkReferenceLocation, result);
++                    LogWarnings(loggingContext, sdkReferenceLocation, result.Warnings);
+ 
+                     if (!IsReferenceSameVersion(sdk, result.Version))
+                     {
+@@ -322,23 +369,8 @@ private bool TryResolveSdkUsingSpecifiedResolvers(IList<SdkResolver> resolvers,
+                 results.Add(result);
+             }
+ 
+-            if (throwExceptions)
+-            {
+-                loggingContext.LogError(new BuildEventFileInfo(sdkReferenceLocation), "FailedToResolveSDK", sdk.Name);
+-            }
+-
+-            foreach (SdkResult result in results)
+-            {
+-                LogWarnings(loggingContext, sdkReferenceLocation, result);
+-
+-                if (result.Errors != null)
+-                {
+-                    foreach (string error in result.Errors)
+-                    {
+-                        loggingContext.LogErrorFromText(subcategoryResourceName: null, errorCode: null, helpKeyword: null, file: new BuildEventFileInfo(sdkReferenceLocation), message: error);
+-                    }
+-                }
+-            }
++            warnings = results.SelectMany(r => r.Warnings ?? Array.Empty<string>());
++            errors = results.SelectMany(r => r.Errors ?? Array.Empty<string>());
+ 
+             sdkResult = new SdkResult(sdk, null, null);
+             return false;
+@@ -380,14 +412,14 @@ internal void InitializeForTests(SdkResolverLoader resolverLoader = null, IList<
+             }
+         }
+ 
+-        private static void LogWarnings(LoggingContext loggingContext, ElementLocation location, SdkResult result)
++        private static void LogWarnings(LoggingContext loggingContext, ElementLocation location, IEnumerable<string> warnings)
+         {
+-            if (result.Warnings == null)
++            if (warnings == null)
+             {
+                 return;
+             }
+ 
+-            foreach (string warning in result.Warnings)
++            foreach (string warning in warnings)
+             {
+                 loggingContext.LogWarningFromText(null, null, null, new BuildEventFileInfo(location), warning);
+             }

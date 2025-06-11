@@ -1,0 +1,205 @@
+diff --git a/documentation/wiki/ChangeWaves.md b/documentation/wiki/ChangeWaves.md
+index b4b9ae2d540..fbbc8868cc1 100644
+--- a/documentation/wiki/ChangeWaves.md
++++ b/documentation/wiki/ChangeWaves.md
+@@ -28,10 +28,13 @@ A wave of features is set to "rotate out" (i.e. become standard functionality) t
+ - [Warning on serialization custom events by default in .NET framework](https://github.com/dotnet/msbuild/pull/9318)
+ - [Cache SDK resolver data process-wide](https://github.com/dotnet/msbuild/pull/9335)
+ - [Target parameters will be unquoted](https://github.com/dotnet/msbuild/pull/9452), meaning  the ';' symbol in the parameter target name will always be treated as separator
++- [Add Link metadata to Resources in AssignLinkMetadata target](https://github.com/dotnet/msbuild/pull/9464)
+ - [Change Version switch output to finish with a newline](https://github.com/dotnet/msbuild/pull/9485)
+ - [Load Microsoft.DotNet.MSBuildSdkResolver into default load context (MSBuild.exe only)](https://github.com/dotnet/msbuild/pull/9439)
+ - [Load NuGet.Frameworks into secondary AppDomain (MSBuild.exe only)](https://github.com/dotnet/msbuild/pull/9446)
+ - [ResultsCache ignores some of the BuildRequest data, may return incorrect results](https://github.com/dotnet/msbuild/pull/9565)
++- [Update Traits when environment has been changed](https://github.com/dotnet/msbuild/pull/9655)
++
+ 
+ ### 17.8
+ - [[RAR] Don't do I/O on SDK-provided references](https://github.com/dotnet/msbuild/pull/8688)
+diff --git a/src/Build/BackEnd/Node/InProcNode.cs b/src/Build/BackEnd/Node/InProcNode.cs
+index 3b0b1600905..927d696f2e9 100644
+--- a/src/Build/BackEnd/Node/InProcNode.cs
++++ b/src/Build/BackEnd/Node/InProcNode.cs
+@@ -336,18 +336,7 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)
+                 NativeMethodsShared.SetCurrentDirectory(_savedCurrentDirectory);
+ 
+                 // Restore the original environment.
+-                foreach (KeyValuePair<string, string> entry in CommunicationsUtilities.GetEnvironmentVariables())
+-                {
+-                    if (!_savedEnvironment.ContainsKey(entry.Key))
+-                    {
+-                        Environment.SetEnvironmentVariable(entry.Key, null);
+-                    }
+-                }
+-
+-                foreach (KeyValuePair<string, string> entry in _savedEnvironment)
+-                {
+-                    Environment.SetEnvironmentVariable(entry.Key, entry.Value);
+-                }
++                CommunicationsUtilities.SetEnvironment(_savedEnvironment);
+             }
+ 
+             exception = _shutdownException;
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index afa0d2aec65..69f7990dd51 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -476,20 +476,9 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)
+             // If the node was never configured, this will be null.
+             if (_savedEnvironment != null)
+             {
+-                foreach (KeyValuePair<string, string> entry in CommunicationsUtilities.GetEnvironmentVariables())
+-                {
+-                    if (!_savedEnvironment.ContainsKey(entry.Key))
+-                    {
+-                        Environment.SetEnvironmentVariable(entry.Key, null);
+-                    }
+-                }
+-
+-                foreach (KeyValuePair<string, string> entry in _savedEnvironment)
+-                {
+-                    Environment.SetEnvironmentVariable(entry.Key, entry.Value);
+-                }
++                CommunicationsUtilities.SetEnvironment(_savedEnvironment);
++                Traits.UpdateFromEnvironment();
+             }
+-
+             try
+             {
+                 // Shut down logging, which will cause all queued logging messages to be sent.
+@@ -722,12 +711,14 @@ private void HandleNodeConfiguration(NodeConfiguration configuration)
+                 }
+             }
+ 
+-            // Now set the new environment
++            // Now set the new environment and update Traits class accordingly
+             foreach (KeyValuePair<string, string> environmentPair in _buildParameters.BuildProcessEnvironment)
+             {
+                 Environment.SetEnvironmentVariable(environmentPair.Key, environmentPair.Value);
+             }
+ 
++            Traits.UpdateFromEnvironment();
++
+             // We want to make sure the global project collection has the toolsets which were defined on the parent
+             // so that any custom toolsets defined can be picked up by tasks who may use the global project collection but are
+             // executed on the child node.
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index aa28f7213e0..6b2715903e7 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -9,6 +9,7 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Execution;
++using Microsoft.Build.Framework;
+ using Microsoft.Build.Framework.Telemetry;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+@@ -357,7 +358,10 @@ private void HandleServerNodeBuildCommand(ServerNodeBuildCommand command)
+ 
+             // Set build process context
+             Directory.SetCurrentDirectory(command.StartupDirectory);
++
+             CommunicationsUtilities.SetEnvironment(command.BuildProcessEnvironment);
++            Traits.UpdateFromEnvironment();
++
+             Thread.CurrentThread.CurrentCulture = command.Culture;
+             Thread.CurrentThread.CurrentUICulture = command.UICulture;
+ 
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index daf68c5c7dc..afcb4153eb4 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -13,7 +13,7 @@ namespace Microsoft.Build.Framework
+     /// </summary>
+     internal class Traits
+     {
+-        private static readonly Traits _instance = new Traits();
++        private static Traits _instance = new Traits();
+         public static Traits Instance
+         {
+             get
+@@ -136,6 +136,15 @@ public Traits()
+ 
+         public readonly bool InProcNodeDisabled = Environment.GetEnvironmentVariable("MSBUILDNOINPROCNODE") == "1";
+ 
++        public static void UpdateFromEnvironment()
++        {
++            // Re-create Traits instance to update values in Traits according to current environment.
++            if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_10))
++            {
++                _instance = new Traits();
++            }
++        }
++
+         private static int ParseIntFromEnvironmentVariableOrDefault(string environmentVariable, int defaultValue)
+         {
+             return int.TryParse(Environment.GetEnvironmentVariable(environmentVariable), out int result)
+diff --git a/src/Shared/CommunicationsUtilities.cs b/src/Shared/CommunicationsUtilities.cs
+index b10887f23c3..55e0024479d 100644
+--- a/src/Shared/CommunicationsUtilities.cs
++++ b/src/Shared/CommunicationsUtilities.cs
+@@ -377,7 +377,7 @@ internal static void SetEnvironment(IDictionary<string, string> newEnvironment)
+         {
+             if (newEnvironment != null)
+             {
+-                // First, empty out any new variables
++                // First, delete all no longer set variables
+                 foreach (KeyValuePair<string, string> entry in CommunicationsUtilities.GetEnvironmentVariables())
+                 {
+                     if (!newEnvironment.ContainsKey(entry.Key))
+@@ -386,7 +386,7 @@ internal static void SetEnvironment(IDictionary<string, string> newEnvironment)
+                     }
+                 }
+ 
+-                // Then, make sure the old ones have their old values.
++                // Then, make sure the new ones have their new values.
+                 foreach (KeyValuePair<string, string> entry in newEnvironment)
+                 {
+                     Environment.SetEnvironmentVariable(entry.Key, entry.Value);
+diff --git a/src/Tasks/ManifestUtil/PathUtil.cs b/src/Tasks/ManifestUtil/PathUtil.cs
+index 1428e5a01f8..c3f0fe20f69 100644
+--- a/src/Tasks/ManifestUtil/PathUtil.cs
++++ b/src/Tasks/ManifestUtil/PathUtil.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.IO;
++using System.Linq;
+ using Microsoft.Build.Shared;
+ 
+ #nullable disable
+@@ -45,6 +46,24 @@ public static string Format(string path)
+ 
+             string resolvedPath = Resolve(path);
+             Uri u = new Uri(resolvedPath);
++            //
++            // GB18030: Uri class does not correctly encode chars in the PUA range for implicit 
++            // file paths (paths without explicit scheme):
++            // https://github.com/dotnet/runtime/issues/89538
++            // Workaround is to use UriBuilder with the file scheme specified explicitly to 
++            // correctly encode the PUA chars.
++            //
++            if (Uri.UriSchemeFile.Equals(u.Scheme, StringComparison.OrdinalIgnoreCase) &&
++                !IsAsciiString(resolvedPath))
++            {
++                UriBuilder builder = new UriBuilder()
++                {
++                    Scheme = Uri.UriSchemeFile,
++                    Host = string.Empty,
++                    Path = resolvedPath,
++                };
++                u = builder.Uri;
++            }
+             return u.AbsoluteUri;
+         }
+ 
+@@ -209,5 +228,8 @@ public static string Resolve(string path)
+             // if not unc or url then it must be a local disk path...
+             return Path.GetFullPath(path); // make sure it's a full path
+         }
++
++        private static bool IsAsciiString(string str)
++            => str.All(c => c <= 127);
+     }
+ }

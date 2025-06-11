@@ -1,0 +1,184 @@
+{
+  "number": 10231,
+  "title": "Server: Flush console output periodically",
+  "body": "This was the intention of the prior call, but `_syncWriter.Flush()` is\r\na noop because it's a wrapper around a `TextWriter`; instead we need to\r\nflush the `RedirectConsoleWriter` itself, an operation which sends the\r\naccumulated text to the client.\r\n\r\n![delayed output](https://github.com/dotnet/msbuild/assets/3347530/d6dda35f-9ad2-48b6-b911-be507acda158)\r\n\r\n",
+  "state": "MERGED",
+  "createdAt": "2024-06-12T20:57:02Z",
+  "updatedAt": "2024-06-17T18:40:42Z",
+  "closedAt": "2024-06-17T18:39:46Z",
+  "mergedAt": "2024-06-17T18:39:46Z",
+  "additions": 258,
+  "deletions": 54,
+  "changedFiles": 2,
+  "headRefName": "flush-server-console",
+  "isDraft": false,
+  "author": {
+    "login": "rainersigwald"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": [
+      {
+        "login": "YuliiaKovalova"
+      }
+    ]
+  },
+  "labels": [],
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "oid": "7310f740ab29b11e6c4ef8b6d06c2680f0642615",
+          "message": "Manual thread safety in RedirectConsoleWriter\n\nInitially, this delegated thread safety to a `SyncTextWriter`, but the\nobject graph was hard to understand, so it was replaced with a has-a\n`SyncTextWriter` relationship, but this lost the timer-based call to\n`Flush()` to send the output to the client.\n\nThe docs on `MethodImplOptions.Synchronized` also advise that it can be\nrisky due to locking on the object itself, so manage the syncronization\nwith an explicit lock object over the underlying `StringWriter` instead.",
+          "committedDate": "2024-06-17T16:01:08Z",
+          "author": {
+            "name": "Rainer Sigwald",
+            "email": "raines@microsoft.com"
+          }
+        }
+      }
+    ]
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "@YuliiaKovalova I was trying to make a nice video of the before/after where this was working/not, but my most recent 8.0.3xx MSBuild didn't reproduce it--I think this regressed from #9983, somehow.",
+        "createdAt": "2024-06-12T21:28:15Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "> @YuliiaKovalova I was trying to make a nice video of the before/after where this was working/not, but my most recent 8.0.3xx MSBuild didn't reproduce it--I think this regressed from #9983, somehow.\r\n\r\ncould you please check if reverting this change addresses it?\r\nhttps://github.com/dotnet/msbuild/pull/9983/files/6ef1733094989a1b8d56bc5d2998061681cf12fb#diff-fc28ca0d80e868e8557a28620998ecee6d7e1def91d231109d4211dd3e4b2ba7",
+        "createdAt": "2024-06-12T21:34:29Z",
+        "author": {
+          "login": "YuliiaKovalova"
+        }
+      },
+      {
+        "body": "Yup, reverting just that file (and suppressing the warning) fixes the problem. Though I don't see how!",
+        "createdAt": "2024-06-12T22:06:18Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Ah, I see what happened. Before your change, `TimerCallback` called `_syncWriter.Flush()` which was a synchronized wrapper over `RedirectConsoleWriter.Flush()` so it did actually call the \"send bits over the pipe\" code, and in a thread-safe way since the call would be synchronized.\r\n\r\nThe current version of this PR fixes it but breaks the thread safety. I think I'll manage the locking manually without `Syncronized()`.",
+        "createdAt": "2024-06-14T16:09:36Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "It looks like you address this ticket here:\r\nhttps://github.com/dotnet/msbuild/issues/10013",
+        "createdAt": "2024-06-17T09:54:10Z",
+        "author": {
+          "login": "YuliiaKovalova"
+        }
+      }
+    ]
+  },
+  "reviewThreads": {
+    "nodes": [
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "For the `Write` and `WriteLine` overloads I used a regex replace:\r\n\r\n```regex\r\n=> _syncWriter.Write(.*)\r\n```\r\n\r\nto\r\n\r\n```\r\n{ lock (_lock) { _internalWriter.Write$1 } }\r\n```\r\n\r\nFollowed by some document-level reformatting.",
+              "createdAt": "2024-06-14T16:59:07Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)\n+            public override void Flush()\n             {\n-                RedirectConsoleWriter writer = new RedirectConsoleWriter(writeCallback);\n+                lock (_lock)\n+                {\n+                    var sb = _internalWriter.GetStringBuilder();\n+                    string captured = sb.ToString();\n+                    sb.Clear();\n \n-                return writer;\n+                    _writeCallback(captured);\n+                    _internalWriter.Flush();\n+                }\n             }\n \n-            public override void Flush()\n+            public override void Write(char value)\n             {\n-                var sb = _internalWriter.GetStringBuilder();\n-                string captured = sb.ToString();\n-                sb.Clear();\n-\n-                _writeCallback(captured);\n-                _internalWriter.Flush();\n+                lock (_lock)\n+                {\n+                    _internalWriter.Write(value);\n+                }\n             }\n \n-            public override void Write(char value) => _syncWriter.Write(value);\n+            public override void Write(char[]? buffer)",
+              "author": {
+                "login": "rainersigwald"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Was this removal accidental ?",
+              "createdAt": "2024-06-17T09:53:18Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)",
+              "author": {
+                "login": "YuliiaKovalova"
+              }
+            },
+            {
+              "body": "No, the accidental part was where I didn't check in the replacement \ud83d\ude2c",
+              "createdAt": "2024-06-17T15:32:43Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)",
+              "author": {
+                "login": "rainersigwald"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Does the callback need to be executed locked with this lock?",
+              "createdAt": "2024-06-17T10:18:17Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)\n+            public override void Flush()\n             {\n-                RedirectConsoleWriter writer = new RedirectConsoleWriter(writeCallback);\n+                lock (_lock)\n+                {\n+                    var sb = _internalWriter.GetStringBuilder();\n+                    string captured = sb.ToString();\n+                    sb.Clear();\n \n-                return writer;\n+                    _writeCallback(captured);",
+              "author": {
+                "login": "JanKrivanek"
+              }
+            },
+            {
+              "body": "It was before (with `[Synchronized]`) so I left it here. I think it needs to be sorta locked since you want to make sure one `_writeCallback` finishes before the next one starts. I think we could split the lock so that one pipe write happens while the next buffer is filling--think that's worth doing?",
+              "createdAt": "2024-06-17T16:04:49Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)\n+            public override void Flush()\n             {\n-                RedirectConsoleWriter writer = new RedirectConsoleWriter(writeCallback);\n+                lock (_lock)\n+                {\n+                    var sb = _internalWriter.GetStringBuilder();\n+                    string captured = sb.ToString();\n+                    sb.Clear();\n \n-                return writer;\n+                    _writeCallback(captured);",
+              "author": {
+                "login": "rainersigwald"
+              }
+            },
+            {
+              "body": "No wait, just two locks could introduce an ordering where `captured` gets overwritten with new data before the old one gets flushed--I think it needs to be in the lock, barring a fancier strategy.",
+              "createdAt": "2024-06-17T16:06:51Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)\n+            public override void Flush()\n             {\n-                RedirectConsoleWriter writer = new RedirectConsoleWriter(writeCallback);\n+                lock (_lock)\n+                {\n+                    var sb = _internalWriter.GetStringBuilder();\n+                    string captured = sb.ToString();\n+                    sb.Clear();\n \n-                return writer;\n+                    _writeCallback(captured);",
+              "author": {
+                "login": "rainersigwald"
+              }
+            },
+            {
+              "body": "Previously I haven't seen the rest of the code - just a passed-in delegate call in lock - that catched my eye.\r\nSince it's all under our controll - it can just stay as it is\r\n\r\n\r\nOtherwise we'd need to nest the locks - something like:\r\n\r\n\r\n```csharp\r\nlock(_flushLock)\r\n{\r\n  lock(_lock)\r\n  {\r\n     // ... getting the captured string and flushing the internal writter\r\n  }\r\n  _writeCallback(captured);\r\n}\r\n```\r\n\r\nbut since the callback today just enqueues, it's likely unnecessary overoptimisation.",
+              "createdAt": "2024-06-17T18:32:36Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)\n+            public override void Flush()\n             {\n-                RedirectConsoleWriter writer = new RedirectConsoleWriter(writeCallback);\n+                lock (_lock)\n+                {\n+                    var sb = _internalWriter.GetStringBuilder();\n+                    string captured = sb.ToString();\n+                    sb.Clear();\n \n-                return writer;\n+                    _writeCallback(captured);",
+              "author": {
+                "login": "JanKrivanek"
+              }
+            },
+            {
+              "body": "That's a good idea but I think I'll leave it--I agree it doesn't seem to be hot enough and if it turns out to be we can change it then.",
+              "createdAt": "2024-06-17T18:39:14Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)\n+            public override void Flush()\n             {\n-                RedirectConsoleWriter writer = new RedirectConsoleWriter(writeCallback);\n+                lock (_lock)\n+                {\n+                    var sb = _internalWriter.GetStringBuilder();\n+                    string captured = sb.ToString();\n+                    sb.Clear();\n \n-                return writer;\n+                    _writeCallback(captured);",
+              "author": {
+                "login": "rainersigwald"
+              }
+            },
+            {
+              "body": "100%",
+              "createdAt": "2024-06-17T18:40:42Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcServerNode.cs",
+              "diffHunk": "@@ -438,112 +438,316 @@ internal sealed class RedirectConsoleWriter : TextWriter\n         {\n             private readonly Action<string> _writeCallback;\n             private readonly Timer _timer;\n-            private readonly TextWriter _syncWriter;\n-\n+            private readonly object _lock = new();\n             private readonly StringWriter _internalWriter;\n \n             private RedirectConsoleWriter(Action<string> writeCallback)\n             {\n                 _writeCallback = writeCallback;\n                 _internalWriter = new StringWriter();\n-                _syncWriter = Synchronized(_internalWriter);\n                 _timer = new Timer(TimerCallback, null, 0, 40);\n             }\n \n             public override Encoding Encoding => _internalWriter.Encoding;\n \n-            public static TextWriter Create(Action<string> writeCallback)\n+            public override void Flush()\n             {\n-                RedirectConsoleWriter writer = new RedirectConsoleWriter(writeCallback);\n+                lock (_lock)\n+                {\n+                    var sb = _internalWriter.GetStringBuilder();\n+                    string captured = sb.ToString();\n+                    sb.Clear();\n \n-                return writer;\n+                    _writeCallback(captured);",
+              "author": {
+                "login": "JanKrivanek"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

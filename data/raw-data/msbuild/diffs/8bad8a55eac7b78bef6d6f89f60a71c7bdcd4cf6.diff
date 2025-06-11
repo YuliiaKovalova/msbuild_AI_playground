@@ -1,0 +1,200 @@
+diff --git a/src/Build/Evaluation/ItemDataCollectionValue.cs b/src/Build/Evaluation/ItemDataCollectionValue.cs
+index d2664500a1b..2d9f410cb8a 100644
+--- a/src/Build/Evaluation/ItemDataCollectionValue.cs
++++ b/src/Build/Evaluation/ItemDataCollectionValue.cs
+@@ -70,6 +70,30 @@ public void Add(I item)
+             _value = list.Add(item);
+         }
+ 
++        public void Delete(I item)
++        {
++            if (object.ReferenceEquals(_value, item))
++            {
++                _value = null;
++            }
++            else if (_value is ImmutableList<I> list)
++            {
++                _value = list.Remove(item);
++            }
++        }
++
++        public void Replace(I oldItem, I newItem)
++        {
++            if (object.ReferenceEquals(_value, oldItem))
++            {
++                _value = newItem;
++            }
++            else if (_value is ImmutableList<I> list)
++            {
++                _value = list.Replace(oldItem, newItem);
++            }
++        }
++
+         public Enumerator GetEnumerator()
+         {
+             return new Enumerator(_value);
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.OrderedItemDataCollection.cs b/src/Build/Evaluation/LazyItemEvaluator.OrderedItemDataCollection.cs
+index c93c0d73576..555132b12ce 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.OrderedItemDataCollection.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.OrderedItemDataCollection.cs
+@@ -6,6 +6,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Collections.Immutable;
++using System.Diagnostics;
+ 
+ namespace Microsoft.Build.Evaluation
+ {
+@@ -56,9 +57,40 @@ public ItemData this[int index]
+                     get { return _listBuilder[index]; }
+                     set
+                     {
++                        // Update the dictionary if it exists.
++                        if (_dictionaryBuilder != null)
++                        {
++                            ItemData oldItemData = _listBuilder[index];
++                            string oldNormalizedValue = oldItemData.NormalizedItemValue;
++                            string newNormalizedValue = value.NormalizedItemValue;
++                            if (!string.Equals(oldNormalizedValue, newNormalizedValue, StringComparison.OrdinalIgnoreCase))
++                            {
++                                // Normalized values are different - delete from the old entry and add to the new entry.
++                                ItemDataCollectionValue<I> oldDictionaryEntry = _dictionaryBuilder[oldNormalizedValue];
++                                oldDictionaryEntry.Delete(oldItemData.Item);
++                                if (oldDictionaryEntry.IsEmpty)
++                                {
++                                    _dictionaryBuilder.Remove(oldNormalizedValue);
++                                }
++                                else
++                                {
++                                    _dictionaryBuilder[oldNormalizedValue] = oldDictionaryEntry;
++                                }
++
++                                ItemDataCollectionValue<I> newDictionaryEntry = _dictionaryBuilder[newNormalizedValue];
++                                newDictionaryEntry.Add(value.Item);
++                                _dictionaryBuilder[newNormalizedValue] = newDictionaryEntry;
++
++                            }
++                            else
++                            {
++                                // Normalized values are the same - replace the item in the entry.
++                                ItemDataCollectionValue<I> dictionaryEntry = _dictionaryBuilder[newNormalizedValue];
++                                dictionaryEntry.Replace(oldItemData.Item, value.Item);
++                                _dictionaryBuilder[newNormalizedValue] = dictionaryEntry;
++                            }
++                        }
+                         _listBuilder[index] = value;
+-                        // This is a rare operation, don't bother updating the dictionary for now. It will be recreated as needed.
+-                        _dictionaryBuilder = null;
+                     }
+                 }
+ 
+@@ -72,9 +104,11 @@ public ImmutableDictionary<string, ItemDataCollectionValue<I>>.Builder Dictionar
+                         if (_dictionaryBuilder == null)
+                         {
+                             _dictionaryBuilder = ImmutableDictionary.CreateBuilder<string, ItemDataCollectionValue<I>>(StringComparer.OrdinalIgnoreCase);
+-                            foreach (ItemData item in _listBuilder)
++                            for (int i = 0; i < _listBuilder.Count; i++)
+                             {
+-                                AddToDictionary(item.Item);
++                                ItemData itemData = _listBuilder[i];
++                                AddToDictionary(ref itemData);
++                                _listBuilder[i] = itemData;
+                             }
+                         }
+                         return _dictionaryBuilder;
+@@ -83,11 +117,11 @@ public ImmutableDictionary<string, ItemDataCollectionValue<I>>.Builder Dictionar
+ 
+                 public void Add(ItemData data)
+                 {
+-                    _listBuilder.Add(data);
+                     if (_dictionaryBuilder != null)
+                     {
+-                        AddToDictionary(data.Item);
++                        AddToDictionary(ref data);
+                     }
++                    _listBuilder.Add(data);
+                 }
+ 
+                 public void Clear()
+@@ -140,17 +174,17 @@ public OrderedItemDataCollection ToImmutable()
+                     return new OrderedItemDataCollection(_listBuilder.ToImmutable(), _dictionaryBuilder?.ToImmutable());
+                 }
+ 
+-                private void AddToDictionary(I item)
++                private void AddToDictionary(ref ItemData itemData)
+                 {
+-                    string key = FileUtilities.NormalizePathForComparisonNoThrow(item.EvaluatedInclude, item.ProjectDirectory);
++                    string key = itemData.NormalizedItemValue;
+ 
+                     if (!_dictionaryBuilder.TryGetValue(key, out var dictionaryValue))
+                     {
+-                        dictionaryValue = new ItemDataCollectionValue<I>(item);
++                        dictionaryValue = new ItemDataCollectionValue<I>(itemData.Item);
+                     }
+                     else
+                     {
+-                        dictionaryValue.Add(item);
++                        dictionaryValue.Add(itemData.Item);
+                     }
+                     _dictionaryBuilder[key] = dictionaryValue;
+                 }
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.cs b/src/Build/Evaluation/LazyItemEvaluator.cs
+index 19242f0b0d7..9fd3eec87e7 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.cs
+@@ -16,6 +16,7 @@
+ using System.Collections.Immutable;
+ using System.Diagnostics;
+ using System.Linq;
++using System.Threading;
+ 
+ namespace Microsoft.Build.Evaluation
+ {
+@@ -124,12 +125,13 @@ private static string GetCurrentDirectoryForConditionEvaluation(ProjectElement e
+ 
+         public struct ItemData
+         {
+-            public ItemData(I item, ProjectItemElement originatingItemElement, int elementOrder, bool conditionResult)
++            public ItemData(I item, ProjectItemElement originatingItemElement, int elementOrder, bool conditionResult, string normalizedItemValue = null)
+             {
+                 Item = item;
+                 OriginatingItemElement = originatingItemElement;
+                 ElementOrder = elementOrder;
+                 ConditionResult = conditionResult;
++                _normalizedItemValue = normalizedItemValue;
+             }
+ 
+             public ItemData Clone(IItemFactory<I, I> itemFactory, ProjectItemElement initialItemElementForFactory)
+@@ -140,13 +142,31 @@ public ItemData Clone(IItemFactory<I, I> itemFactory, ProjectItemElement initial
+                 var clonedItem = itemFactory.CreateItem(Item, OriginatingItemElement.ContainingProject.FullPath);
+                 itemFactory.ItemElement = initialItemElementForFactory;
+ 
+-                return new ItemData(clonedItem, OriginatingItemElement, ElementOrder, ConditionResult);
++                return new ItemData(clonedItem, OriginatingItemElement, ElementOrder, ConditionResult, _normalizedItemValue);
+             }
+ 
+             public I Item { get; }
+             public ProjectItemElement OriginatingItemElement { get; }
+             public int ElementOrder { get; }
+             public bool ConditionResult { get; }
++
++            /// <summary>
++            /// Lazily created normalized item value.
++            /// </summary>
++            private string _normalizedItemValue;
++            public string NormalizedItemValue
++            {
++                get
++                {
++                    var normalizedItemValue = Volatile.Read(ref _normalizedItemValue);
++                    if (normalizedItemValue == null)
++                    {
++                        normalizedItemValue = FileUtilities.NormalizePathForComparisonNoThrow(Item.EvaluatedInclude, Item.ProjectDirectory);
++                        Volatile.Write(ref _normalizedItemValue, normalizedItemValue);
++                    }
++                    return normalizedItemValue;
++                }
++            }
+         }
+ 
+         private class MemoizedOperation : IItemOperation

@@ -1,0 +1,1516 @@
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index 4928a8d29f8..6282d833a0c 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -5,8 +5,8 @@
+ using System.Collections.Generic;
+ using System.IO;
+ using System.IO.Compression;
++using System.Reflection;
+ using System.Text;
+-
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+@@ -83,10 +83,21 @@ public BinaryLoggerTests(ITestOutputHelper output)
+             _logFile = _env.ExpectFile(".binlog").Path;
+         }
+ 
++        public enum BinlogRoundtripTestReplayMode
++        {
++            NoReplay,
++            Structured,
++            RawEvents
++        }
++
+         [Theory]
+-        [InlineData(s_testProject)]
+-        [InlineData(s_testProject2)]
+-        public void TestBinaryLoggerRoundtrip(string projectText)
++        [InlineData(s_testProject, BinlogRoundtripTestReplayMode.NoReplay)]
++        [InlineData(s_testProject, BinlogRoundtripTestReplayMode.Structured)]
++        [InlineData(s_testProject, BinlogRoundtripTestReplayMode.RawEvents)]
++        [InlineData(s_testProject2, BinlogRoundtripTestReplayMode.NoReplay)]
++        [InlineData(s_testProject2, BinlogRoundtripTestReplayMode.Structured)]
++        [InlineData(s_testProject2, BinlogRoundtripTestReplayMode.RawEvents)]
++        public void TestBinaryLoggerRoundtrip(string projectText, BinlogRoundtripTestReplayMode replayMode)
+         {
+             var binaryLogger = new BinaryLogger();
+ 
+@@ -110,6 +121,44 @@ public void TestBinaryLoggerRoundtrip(string projectText)
+                 project.Build(new ILogger[] { binaryLogger, mockLogFromBuild, serialFromBuild, parallelFromBuild }).ShouldBeTrue();
+             }
+ 
++            string fileToReplay;
++            switch (replayMode)
++            {
++                case BinlogRoundtripTestReplayMode.NoReplay:
++                    fileToReplay = _logFile;
++                    break;
++                case BinlogRoundtripTestReplayMode.Structured:
++                    {
++                        var logReader = new BinaryLogReplayEventSource();
++                        fileToReplay = _env.ExpectFile(".binlog").Path;
++                        // need dummy handler to force structured replay
++                        logReader.BuildFinished += (_, _) => { };
++                        BinaryLogger outputBinlog = new BinaryLogger()
++                        {
++                            Parameters = fileToReplay
++                        };
++                        outputBinlog.Initialize(logReader);
++                        logReader.Replay(_logFile);
++                        outputBinlog.Shutdown();
++                    }
++                    break;
++                case BinlogRoundtripTestReplayMode.RawEvents:
++                    {
++                        var logReader = new BinaryLogReplayEventSource();
++                        fileToReplay = _env.ExpectFile(".binlog").Path;
++                        BinaryLogger outputBinlog = new BinaryLogger()
++                        {
++                            Parameters = fileToReplay
++                        };
++                        outputBinlog.Initialize(logReader);
++                        logReader.Replay(_logFile);
++                        outputBinlog.Shutdown();
++                    }
++                    break;
++                default:
++                    throw new ArgumentOutOfRangeException(nameof(replayMode), replayMode, null);
++            }
++
+             var mockLogFromPlayback = new MockLogger();
+ 
+             var serialFromPlaybackText = new StringBuilder();
+@@ -126,7 +175,10 @@ public void TestBinaryLoggerRoundtrip(string projectText)
+             parallelFromPlayback.Initialize(binaryLogReader);
+ 
+             // read the binary log and replay into mockLogger2
+-            binaryLogReader.Replay(_logFile);
++            binaryLogReader.Replay(fileToReplay);
++            mockLogFromPlayback.Shutdown();
++            serialFromPlayback.Shutdown();
++            parallelFromPlayback.Shutdown();
+ 
+             // the binlog will have more information than recorded by the text log
+             mockLogFromPlayback.FullLog.ShouldContainWithoutWhitespace(mockLogFromBuild.FullLog);
+@@ -140,6 +192,288 @@ public void TestBinaryLoggerRoundtrip(string projectText)
+             parallelActual.ShouldContainWithoutWhitespace(parallelExpected);
+         }
+ 
++        [Theory]
++        [InlineData(s_testProject, BinlogRoundtripTestReplayMode.Structured)]
++        [InlineData(s_testProject, BinlogRoundtripTestReplayMode.RawEvents)]
++        [InlineData(s_testProject2, BinlogRoundtripTestReplayMode.Structured)]
++        [InlineData(s_testProject2, BinlogRoundtripTestReplayMode.RawEvents)]
++        public void TestBinaryLoggerRoundtripEquality(string projectText, BinlogRoundtripTestReplayMode replayMode)
++        {
++            // Make sure the env var will get transcribed to traits.
++            BuildEnvironmentState.s_runningTests = true;
++            _env.SetEnvironmentVariable("MSBUILDDETERMNISTICBINLOG", "1");
++
++            var binaryLogger = new BinaryLogger();
++
++            binaryLogger.Parameters = _logFile;
++
++            // build and log into binary logger
++            using (ProjectCollection collection = new())
++            {
++                Project project = ObjectModelHelpers.CreateInMemoryProject(collection, projectText);
++                project.Build(new ILogger[] { binaryLogger }).ShouldBeTrue();
++            }
++
++            var logReader = new BinaryLogReplayEventSource();
++            string replayedLogFile = _env.ExpectFile(".binlog").Path;
++            if (replayMode == BinlogRoundtripTestReplayMode.Structured)
++            {
++                // need dummy handler to force structured replay
++                logReader.BuildFinished += (_, _) => { };
++            }
++
++            _logFile = @"C:\tmp\trash\console\packed.binlog";
++
++            BinaryLogger outputBinlog = new BinaryLogger()
++            {
++                Parameters = $"LogFile={replayedLogFile};ProjectImports=Replay;OmitInitialInfo"
++            };
++            outputBinlog.Initialize(logReader);
++            logReader.Replay(_logFile);
++            // TODO: remove here
++            // logReader.Replay(originalBuildEventsReader, CancellationToken.None);
++            outputBinlog.Shutdown();
++
++            AssertBinlogsHaveEqualContent(_logFile, replayedLogFile);
++            // If this assertation complicates development - it can possibly be removed
++            // The structured equality above should be enough.
++            AssertFilesAreBinaryEqual(_logFile, replayedLogFile);
++        }
++
++        private static void AssertFilesAreBinaryEqual(string firstPath, string secondPath)
++        {
++            FileInfo first = new(firstPath);
++            FileInfo second = new(secondPath);
++
++            // Skipping shortcut test - so that we can better troubleshoot failures.
++            ////if (first.Length != second.Length)
++            ////{
++            ////    Assert.Fail($"Files differ in size ({first.Name}:{first.Length} and {second.Name}:{second.Length}");
++            ////}
++
++            if (string.Equals(first.FullName, second.FullName, StringComparison.OrdinalIgnoreCase))
++            {
++                return;
++            }
++
++            using FileStream fs1 = first.OpenRead();
++            using FileStream fs2 = second.OpenRead();
++            for (int i = 0; i < Math.Min(first.Length,second.Length); i++)
++            {
++                byte b1 = (byte)fs1.ReadByte();
++                byte b2 = (byte)fs2.ReadByte();
++                if (b1 != b2)
++                {
++                    Assert.Fail(
++                        $"Files ({first.Name}:{first.Length} and {second.Name}:{second.Length} sizes) are not equal at byte {i} ({b1} vs {b2})");
++                }
++            }
++
++            if (first.Length != second.Length)
++            {
++                Assert.Fail($"Files differ in size ({first.Name}:{first.Length} and {second.Name}:{second.Length}");
++            }
++        }
++
++        private static void AssertBinlogsHaveEqualContent(string firstPath, string secondPath)
++        {
++            using var reader1 = BinaryLogReplayEventSource.OpenBuildEventsReader(firstPath);
++            using var reader2 = BinaryLogReplayEventSource.OpenBuildEventsReader(secondPath);
++
++            Dictionary<string, string> embedFiles1 = new();
++            Dictionary<string, string> embedFiles2 = new();
++
++            reader1.ArchiveFileEncountered += arg
++                => AddArchiveFile(embedFiles1, arg);
++
++            reader2.ArchiveFileEncountered += arg
++                => AddArchiveFile(embedFiles2, arg);
++
++            int i = 0;
++            while (reader1.Read() is { } ev1)
++            {
++                i++;
++                var ev2 = reader2.Read();
++                if (!Compare(ev1, ev2, out string diffReason, $"event arg {i}"))
++                {
++                    Assert.Fail($"Binlogs ({firstPath} and {secondPath}) are not equal at event {i} ({diffReason})");
++                }
++            }
++            // Read the second reader - to confirm there are no more events
++            //  and to force the embedded files to be read.
++            reader2.Read().ShouldBeNull($"Binlogs ({firstPath} and {secondPath}) are not equal - second has more events >{i + 1}");
++
++            SweepArchiveFiles();
++
++            embedFiles1.ShouldBeEmpty();
++            embedFiles2.ShouldBeEmpty();
++
++            void SweepArchiveFiles()
++            {
++                List<string> toRemove = new();
++                foreach (var file in embedFiles1)
++                {
++                    if (embedFiles2.TryGetValue(file.Key, out string content))
++                    {
++                        if (!string.Equals(file.Value, content))
++                        {
++                            Assert.Fail($"Binlogs ({firstPath} and {secondPath}) are not equal at embedded file {file.Key}");
++                        }
++                        toRemove.Add(file.Key);
++                        embedFiles2.Remove(file.Key);
++                    }
++                }
++
++                foreach (var file in toRemove)
++                {
++                    embedFiles1.Remove(file);
++                }
++            }
++
++            void AddArchiveFile(Dictionary<string, string> files, ArchiveFileEventArgs arg)
++            {
++                ArchiveFile embedFile = arg.ObtainArchiveFile();
++                string content = embedFile.GetContent();
++                files.Add(embedFile.FullPath, content);
++                arg.SetResult(embedFile.FullPath, content);
++                SweepArchiveFiles();
++            }
++        }
++
++        private static bool Compare(object left, object right, out string diffReason, string name = "", HashSet<object> compared = null)
++        {
++            diffReason = null;
++            if (compared == null)
++            {
++                compared = new HashSet<object>();
++            }
++            else if(compared.Contains(left) && compared.Contains(right))
++            {
++                return true;
++            }
++            else
++            {
++                compared.Add(left);
++                compared.Add(right);
++            }
++
++            if (ReferenceEquals(left, right))
++            {
++                return true;
++            }
++
++            if ((left == null) ^ (right == null))
++            {
++                diffReason = "One object is null and the other is not." + name;
++                return false;
++            }
++
++            if (left.GetType() != right.GetType())
++            {
++                diffReason = $"Object types are different ({left.GetType().FullName} vs {right.GetType().FullName}).";
++                return false;
++            }
++
++            Type type = left.GetType();
++            if (name == string.Empty)
++            {
++                name = type.Name;
++            }
++
++            if (IsSimpleType(type))
++            {
++                if (!left.Equals(right))
++                {
++                    diffReason = $"Objects are different ({left} vs {right}). " + name;
++                    return false;
++                }
++                return true;
++            }
++
++            if (type.IsArray)
++            {
++                Array first = left as Array;
++                Array second = right as Array;
++                if (first.Length != second.Length)
++                {
++                    diffReason = $"{type.Name} : array size differs ({first.Length} vs {second.Length})";
++                    return false;
++                }
++
++                var en = first.GetEnumerator();
++                int i = 0;
++                while (en.MoveNext())
++                {
++                    if(!Compare(en.Current, second.GetValue(i), out diffReason, name, compared))
++                    {
++                        diffReason += $" (Index {i})";
++                        return false;
++                    }
++                    i++;
++                }
++            }
++            else if (typeof(System.Collections.IEnumerable).IsAssignableFrom(type))
++            {
++                System.Collections.IEnumerable first = left as System.Collections.IEnumerable;
++                System.Collections.IEnumerable second = right as System.Collections.IEnumerable;
++
++                var en = first.GetEnumerator();
++                var en2 = second.GetEnumerator();
++                int i = 0;
++                while (en.MoveNext())
++                {
++                    if (!en2.MoveNext())
++                    {
++                        diffReason = $"{name} : enumerable size differs";
++                        return false;
++                    }
++
++                    if (!Compare(en.Current, en2.Current, out diffReason, name, compared))
++                    {
++                        diffReason += $" (Position {i})";
++                        return false;
++                    }
++                    i++;
++                }
++            }
++            else
++            {
++                // Careful - the default argument-less impl gets the static properties as well (e.g. DateTime.Now)
++                foreach (PropertyInfo pi in type.GetProperties(BindingFlags.Instance | BindingFlags.Public))
++                {
++                    try
++                    {
++                        var val = pi.GetValue(left);
++                        var tval = pi.GetValue(right);
++                        var name1 = name + "." + pi.Name;
++                        if (!Compare(val, tval, out diffReason, name1, compared))
++                        {
++                            return false;
++                        }
++                    }
++                    catch (TargetParameterCountException)
++                    {
++                        // index property
++                    }
++                }
++            }
++
++            return true;
++        }
++
++        internal static bool IsSimpleType(Type type)
++        {
++            // Nullables
++            if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>))
++            {
++                return IsSimpleType(type.GetGenericArguments()[0]);
++            }
++            return type.IsPrimitive
++                   || type.IsEnum
++                   || type == typeof(string)
++                   || type == typeof(decimal);
++        }
++
+         [Fact]
+         public void BinaryLoggerShouldSupportFilePathExplicitParameter()
+         {
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+index 6524d3a81a8..a4374b8bbdc 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+@@ -11,202 +11,71 @@
+ 
+ namespace Microsoft.Build.Logging
+ {
+-    /// <summary>
+-    /// Provides a method to read a binary log file (*.binlog) and replay all stored BuildEventArgs
+-    /// by implementing IEventSource and raising corresponding events.
+-    /// </summary>
+-    /// <remarks>The class is public so that we can call it from MSBuild.exe when replaying a log file.</remarks>
+-    public sealed class BinaryLogReplayEventSource : BinaryLogReplayEventSourceBase, IEventSource, IEmbeddedContentSource
++    internal interface IRawLogEventsSource
+     {
+-        public BinaryLogReplayEventSource()
+-            : base(true) { }
+-
+-        public bool AllowForwardCompatibility
+-        {
+-            get => AllowForwardCompatibilityInternal;
+-            set => AllowForwardCompatibilityInternal = value;
+-        }
+-
+-        public event Action<string>? OnError
+-        {
+-            add => OnErrorInternal += value;
+-            remove => OnErrorInternal -= value;
+-        }
+-
+-        public event Action<BuildEventArgs>? BuildEventReceived
+-        {
+-            add => BuildEventReceivedInternal += value;
+-            remove => BuildEventReceivedInternal -= value;
+-        }
+-
+-        /// <summary>
+-        /// This event is raised for all BuildEventArgs objects after a more type-specific event
+-        /// </summary>
+-        public event AnyEventHandler? AnyEventRaised;
+-
+-        /// <summary>
+-        /// Raised for BuildStatusEventArgs instances
+-        /// </summary>
+-        public event BuildStatusEventHandler? StatusEventRaised;
+-
+-        /// <summary>
+-        /// Raised for CustomBuildEventArgs instances
+-        /// </summary>
+-        public event CustomBuildEventHandler? CustomEventRaised;
+-
+-        /// <summary>
+-        /// Raised for BuildStartedEventArgs instances
+-        /// </summary>
+-        public event BuildStartedEventHandler? BuildStarted;
+-
+-        /// <summary>
+-        /// Raised for BuildFinishedEventArgs instances
+-        /// </summary>
+-        public event BuildFinishedEventHandler? BuildFinished;
+-
+-        /// <summary>
+-        /// Raised for ProjectStartedEventArgs instances
+-        /// </summary>
+-        public event ProjectStartedEventHandler? ProjectStarted;
+-
+-        /// <summary>
+-        /// Raised for ProjectFinishedEventArgs instances
+-        /// </summary>
+-        public event ProjectFinishedEventHandler? ProjectFinished;
+-
+-        /// <summary>
+-        /// Raised for TargetStartedEventArgs instances
+-        /// </summary>
+-        public event TargetStartedEventHandler? TargetStarted;
+-
+         /// <summary>
+-        /// Raised for TargetFinishedEventArgs instances
++        /// Event raised when non-textual log record is read.
++        /// This means all event args and key-value pairs.
++        /// Strings and Embedded files are not included.
+         /// </summary>
+-        public event TargetFinishedEventHandler? TargetFinished;
++        event Action<BinaryLogRecordKind, Stream>? LogDataSliceReceived;
+ 
+         /// <summary>
+-        /// Raised for TaskStartedEventArgs instances
++        /// Enables initialization (e.g. subscription to events) - that is deferred until Replay is triggered.
++        /// At this point all other possible subscribers should be already subscribed -
++        ///  so it can be determined if raw events or structured events should be replayed.
+         /// </summary>
+-        public event TaskStartedEventHandler? TaskStarted;
++        /// <param name="onFileFormatVersionRead"></param>
++        /// <param name="onRawReadingPossible"></param>
++        /// <param name="onStructuredReadingOnly"></param>
++        void DeferredInitialize(
++            Action<int> onFileFormatVersionRead,
++            Action onRawReadingPossible,
++            Action onStructuredReadingOnly);
++    }
+ 
+-        /// <summary>
+-        /// Raised for TaskFinishedEventArgs instances
+-        /// </summary>
+-        public event TaskFinishedEventHandler? TaskFinished;
++    /// <summary>
++    /// Interface for replaying a binary log file (*.binlog)
++    /// </summary>
++    internal interface IBinaryLogReplaySource :
++        IEventSource, IRawLogEventsSource, IBuildEventStringsReader, IEmbeddedContentSource
++    { }
+ 
+-        /// <summary>
+-        /// Raised for BuildErrorEventArgs instances
+-        /// </summary>
+-        public event BuildErrorEventHandler? ErrorRaised;
++    /// <summary>
++    /// Provides a method to read a binary log file (*.binlog) and replay all stored BuildEventArgs
++    /// by implementing IEventSource and raising corresponding events.
++    /// </summary>
++    /// <remarks>The class is public so that we can call it from MSBuild.exe when replaying a log file.</remarks>
++    public sealed class BinaryLogReplayEventSource : EventArgsDispatcher,
++        IBinaryLogReplaySource
++    {
++        /// Touches the <see cref="ItemGroupLoggingHelper"/> static constructor
++        /// to ensure it initializes <see cref="TaskParameterEventArgs.MessageGetter"/>
++        /// and <see cref="TaskParameterEventArgs.DictionaryFactory"/>
++        static BinaryLogReplayEventSource()
++        {
++            _ = ItemGroupLoggingHelper.ItemGroupIncludeLogMessagePrefix;
++        }
+ 
+         /// <summary>
+-        /// Raised for BuildWarningEventArgs instances
++        /// Unknown build events or unknown parts of known build events will be ignored if this is set to true.
+         /// </summary>
+-        public event BuildWarningEventHandler? WarningRaised;
++        public bool AllowForwardCompatibility { private get; init; } = true;
+ 
+         /// <summary>
+-        /// Raised for BuildMessageEventArgs instances
++        /// Receives recoverable errors during reading.
+         /// </summary>
+-        public event BuildMessageEventHandler? MessageRaised;
++        public event Action<string>? OnRecoverableReadError;
+ 
+         /// <summary>
+-        /// Raise one of the events that is appropriate for the type of the BuildEventArgs
++        /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
+         /// </summary>
+-        public void Dispatch(BuildEventArgs buildEvent)
+-        {
+-            if (buildEvent is BuildMessageEventArgs buildMessageEventArgs)
+-            {
+-                MessageRaised?.Invoke(null, buildMessageEventArgs);
+-            }
+-            else if (buildEvent is TaskStartedEventArgs taskStartedEventArgs)
+-            {
+-                TaskStarted?.Invoke(null, taskStartedEventArgs);
+-            }
+-            else if (buildEvent is TaskFinishedEventArgs taskFinishedEventArgs)
+-            {
+-                TaskFinished?.Invoke(null, taskFinishedEventArgs);
+-            }
+-            else if (buildEvent is TargetStartedEventArgs targetStartedEventArgs)
+-            {
+-                TargetStarted?.Invoke(null, targetStartedEventArgs);
+-            }
+-            else if (buildEvent is TargetFinishedEventArgs targetFinishedEventArgs)
+-            {
+-                TargetFinished?.Invoke(null, targetFinishedEventArgs);
+-            }
+-            else if (buildEvent is ProjectStartedEventArgs projectStartedEventArgs)
+-            {
+-                ProjectStarted?.Invoke(null, projectStartedEventArgs);
+-            }
+-            else if (buildEvent is ProjectFinishedEventArgs projectFinishedEventArgs)
+-            {
+-                ProjectFinished?.Invoke(null, projectFinishedEventArgs);
+-            }
+-            else if (buildEvent is BuildStartedEventArgs buildStartedEventArgs)
+-            {
+-                BuildStarted?.Invoke(null, buildStartedEventArgs);
+-            }
+-            else if (buildEvent is BuildFinishedEventArgs buildFinishedEventArgs)
+-            {
+-                BuildFinished?.Invoke(null, buildFinishedEventArgs);
+-            }
+-            else if (buildEvent is CustomBuildEventArgs customBuildEventArgs)
+-            {
+-                CustomEventRaised?.Invoke(null, customBuildEventArgs);
+-            }
+-            else if (buildEvent is BuildStatusEventArgs buildStatusEventArgs)
+-            {
+-                StatusEventRaised?.Invoke(null, buildStatusEventArgs);
+-            }
+-            else if (buildEvent is BuildWarningEventArgs buildWarningEventArgs)
+-            {
+-                WarningRaised?.Invoke(null, buildWarningEventArgs);
+-            }
+-            else if (buildEvent is BuildErrorEventArgs buildErrorEventArgs)
+-            {
+-                ErrorRaised?.Invoke(null, buildErrorEventArgs);
+-            }
+-
+-            AnyEventRaised?.Invoke(null, buildEvent);
+-        }
+-    }
+-
+-    public interface IRawLogEventsSource
+-    {
+-        public event Action<ArraySegment<byte>>? BuildEventReceived;
+-    }
+-
+-    public sealed class BinaryLogReplayRawEventSource : BinaryLogReplayEventSourceBase, IRawLogEventsSource
+-    {
+-        public BinaryLogReplayRawEventSource()
+-            : base(false) { }
+-
+-        public event Action<ArraySegment<byte>>? BuildEventReceived
+-        {
+-            add => RawBuildEventReceivedInternal += value;
+-            remove => RawBuildEventReceivedInternal -= value;
+-        }
+-    }
+-
+-    public class BinaryLogReplayEventSourceBase : IEmbeddedContentSource
+-    {
+-        /// Touches the <see cref="ItemGroupLoggingHelper"/> static constructor
+-        /// to ensure it initializes <see cref="TaskParameterEventArgs.MessageGetter"/>
+-        /// and <see cref="TaskParameterEventArgs.DictionaryFactory"/>
+-        static BinaryLogReplayEventSourceBase()
++        /// <param name="sourceFilePath">The full file path of the binary log file</param>
++        public void Replay(string sourceFilePath)
+         {
+-            _ = ItemGroupLoggingHelper.ItemGroupIncludeLogMessagePrefix;
++            Replay(sourceFilePath, CancellationToken.None);
+         }
+ 
+-        internal BinaryLogReplayEventSourceBase(bool isStructured)
+-            => _isStructuredReader = isStructured;
+-
+-        private bool _isStructuredReader;
+-        protected bool AllowForwardCompatibilityInternal { get; set; } = true;
+-        protected event Action<string>? OnErrorInternal;
+-        protected event Action<BuildEventArgs>? BuildEventReceivedInternal;
+-        protected event Action<ArraySegment<byte>>? RawBuildEventReceivedInternal;
+-
+         /// <summary>
+         /// Creates a <see cref="BinaryReader"/> for the provided binary log file.
+         /// Performs decompression and buffering in the optimal way.
+@@ -241,9 +110,14 @@ public static BinaryReader OpenReader(string sourceFilePath)
+         /// </summary>
+         /// <param name="binaryReader"></param>
+         /// <param name="closeInput">Indicates whether the passed BinaryReader should be closed on disposing.</param>
+-        /// <param name="allowForwardCompatibility">Indicates whether reading of future versions of logs should be allowed.</param>
++        /// <param name="allowForwardCompatibility">Unknown build events or unknown parts of known build events will be ignored if this is set to true.</param>
++        /// <param name="onRecoverableReadError">Optional handler of recoverable errors during reading.</param>
+         /// <returns>BuildEventArgsReader over the given binlog file binary reader.</returns>
+-        public static BuildEventArgsReader OpenBuildEventsReader(BinaryReader binaryReader, bool closeInput, bool allowForwardCompatibility = true)
++        public static BuildEventArgsReader OpenBuildEventsReader(
++            BinaryReader binaryReader,
++            bool closeInput,
++            bool allowForwardCompatibility = true,
++            Action<string>? onRecoverableReadError = null)
+         {
+             int fileFormatVersion = binaryReader.ReadInt32();
+ 
+@@ -255,7 +129,10 @@ public static BuildEventArgsReader OpenBuildEventsReader(BinaryReader binaryRead
+                 throw new NotSupportedException(text);
+             }
+ 
+-            return new BuildEventArgsReader(binaryReader, fileFormatVersion) { CloseInput = closeInput };
++            return new BuildEventArgsReader(binaryReader, fileFormatVersion)
++            {
++                CloseInput = closeInput,
++            };
+         }
+ 
+         /// <summary>
+@@ -272,77 +149,106 @@ public static BuildEventArgsReader OpenBuildEventsReader(string sourceFilePath)
+         /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
+         /// </summary>
+         /// <param name="sourceFilePath">The full file path of the binary log file</param>
+-        public void Replay(string sourceFilePath)
++        /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
++        public void Replay(string sourceFilePath, CancellationToken cancellationToken)
+         {
+-            Replay(sourceFilePath, CancellationToken.None);
++            using var eventsReader = OpenBuildEventsReader(sourceFilePath);
++            Replay(eventsReader, cancellationToken);
+         }
+ 
+         /// <summary>
+         /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
+         /// </summary>
+-        /// <param name="sourceFilePath">The full file path of the binary log file</param>
++        /// <param name="binaryReader">The binary log content binary reader - caller is responsible for disposing.</param>
+         /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
+-        public void Replay(string sourceFilePath, CancellationToken cancellationToken)
+-        {
+-            using var eventsReader = BinaryLogReplayEventSource.OpenBuildEventsReader(sourceFilePath);
+-            Replay(eventsReader, cancellationToken);
+-        }
++        public void Replay(BinaryReader binaryReader, CancellationToken cancellationToken)
++            => Replay(binaryReader, false, cancellationToken);
+ 
+         /// <summary>
+         /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
+         /// </summary>
+-        /// <param name="binaryReader">The binary log content binary reader - caller is responsible for disposing.</param>
++        /// <param name="binaryReader">The binary log content binary reader - caller is responsible for disposing, unless <paramref name="closeInput"/> is set to true.</param>
+         /// <param name="closeInput">Indicates whether the passed BinaryReader should be closed on disposing.</param>
+         /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
+         public void Replay(BinaryReader binaryReader, bool closeInput, CancellationToken cancellationToken)
+         {
+-            using var reader = BinaryLogReplayEventSource.OpenBuildEventsReader(binaryReader, closeInput, AllowForwardCompatibilityInternal);
++            using var reader = OpenBuildEventsReader(binaryReader, closeInput, AllowForwardCompatibility);
+             Replay(reader, cancellationToken);
+         }
+ 
++        /// <summary>
++        /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
++        /// </summary>
++        /// <param name="reader">The build events reader - caller is responsible for disposing.</param>
++        /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
+         public void Replay(BuildEventArgsReader reader, CancellationToken cancellationToken)
+         {
+-            _fileFormatVersionRead?.Invoke(reader.FileFormatVersion);
+-            reader.EmbeddedContentRead += _embeddedContentRead;
++            bool supportsForwardCompatibility = reader.FileFormatVersion >= 18;
+ 
+-            if (_isStructuredReader)
++            // Allow any possible deferred subscriptions to be registered
++            if (HasStructuredEventsSubscribers || !supportsForwardCompatibility)
+             {
+-                ReplayStructured(reader, cancellationToken);
++                _onStructuredReadingOnly?.Invoke();
+             }
+             else
+             {
+-                ReplayRaw(reader, cancellationToken);
+-            }
+-        }
+-
+-        private void ReplayStructured(BuildEventArgsReader reader, CancellationToken cancellationToken)
+-        {
+-            while (
+-                !cancellationToken.IsCancellationRequested &&
+-                reader.Read(AllowForwardCompatibilityInternal, AllowForwardCompatibilityInternal, OnErrorInternal ?? (_ => { }))
+-                    is { } instance)
+-            {
+-                BuildEventReceivedInternal?.Invoke(instance);
++                _onRawReadingPossible?.Invoke();
+             }
+-        }
+ 
+-        private void ReplayRaw(BuildEventArgsReader reader, CancellationToken cancellationToken)
+-        {
+             _fileFormatVersionRead?.Invoke(reader.FileFormatVersion);
+             reader.EmbeddedContentRead += _embeddedContentRead;
++            reader.StringReadDone += _stringReadDone;
+ 
+-            while (!cancellationToken.IsCancellationRequested && reader.ReadRaw() is { Count: > 0 } instance)
++            if (HasStructuredEventsSubscribers || !supportsForwardCompatibility)
++            {
++                if (this._logDataSliceReceived != null)
++                {
++                    throw new NotSupportedException(
++                        "Structured events and raw events cannot be replayed at the same time.");
++                }
++
++                // Forward compatibile reading makes sense only for structured events reading.
++                reader.SkipUnknownEvents = supportsForwardCompatibility && AllowForwardCompatibility;
++                reader.SkipUnknownEventParts = supportsForwardCompatibility && AllowForwardCompatibility;
++                reader.OnRecoverableReadError += OnRecoverableReadError;
++
++                while (!cancellationToken.IsCancellationRequested && reader.Read() is { } instance)
++                {
++                    Dispatch(instance);
++                }
++            }
++            else
+             {
+-                RawBuildEventReceivedInternal?.Invoke(instance);
++                if (this._logDataSliceReceived == null &&
++                    this._embeddedContentRead == null &&
++                    this._stringReadDone == null)
++                {
++                    throw new NotSupportedException(
++                        "No subscribers for any events.");
++                }
++
++                while (!cancellationToken.IsCancellationRequested && reader.ReadRaw() is { } instance &&
++                       instance.RecordKind != BinaryLogRecordKind.EndOfFile)
++                {
++                    _logDataSliceReceived?.Invoke(instance.RecordKind, instance.Stream);
++                }
+             }
+         }
+ 
+-        private Action<int>? _fileFormatVersionRead;
+-        event Action<int> ILogVersionInfo.FileFormatVersionRead
++        /// <inheritdoc cref="IRawLogEventsSource.DeferredInitialize"/>
++        void IRawLogEventsSource.DeferredInitialize(
++            Action<int> onFileFormatVersionRead,
++            Action onRawReadingPossible,
++            Action onStructuredReadingOnly)
+         {
+-            add => _fileFormatVersionRead += value;
+-            remove => _fileFormatVersionRead -= value;
++            this._fileFormatVersionRead += onFileFormatVersionRead;
++            this._onRawReadingPossible += onRawReadingPossible;
++            this._onStructuredReadingOnly += onStructuredReadingOnly;
+         }
++
++        private Action? _onRawReadingPossible;
++        private Action? _onStructuredReadingOnly;
++        private Action<int>? _fileFormatVersionRead;
+         private Action<EmbeddedContentEventArgs>? _embeddedContentRead;
+         /// <inheritdoc cref="IEmbeddedContentSource.EmbeddedContentRead"/>
+         event Action<EmbeddedContentEventArgs>? IEmbeddedContentSource.EmbeddedContentRead
+@@ -352,5 +258,21 @@ event Action<EmbeddedContentEventArgs>? IEmbeddedContentSource.EmbeddedContentRe
+             add => _embeddedContentRead += value;
+             remove => _embeddedContentRead -= value;
+         }
++
++        private Action<StringReadEventArgs>? _stringReadDone;
++        /// <inheritdoc cref="IBuildEventStringsReader.StringReadDone"/>
++        event Action<StringReadEventArgs>? IBuildEventStringsReader.StringReadDone
++        {
++            add => _stringReadDone += value;
++            remove => _stringReadDone -= value;
++        }
++
++        private Action<BinaryLogRecordKind, Stream>? _logDataSliceReceived;
++        /// <inheritdoc cref="IBuildEventStringsReader.StringReadDone"/>
++        event Action<BinaryLogRecordKind, Stream>? IRawLogEventsSource.LogDataSliceReceived
++        {
++            add => _logDataSliceReceived += value;
++            remove => _logDataSliceReceived -= value;
++        }
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogger.cs b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+index 94b28d10eb2..f1f684d2a97 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogger.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+@@ -138,9 +138,7 @@ public void Initialize(IEventSource eventSource)
+             Traits.Instance.EscapeHatches.LogProjectImports = true;
+             bool logPropertiesAndItemsAfterEvaluation = Traits.Instance.EscapeHatches.LogPropertiesAndItemsAfterEvaluation ?? true;
+ 
+-            bool replayInitialInfo;
+-            ILogVersionInfo versionInfo = null;
+-            ProcessParameters(out replayInitialInfo);
++            ProcessParameters(out bool omitInitialInfo);
+ 
+             try
+             {
+@@ -176,20 +174,6 @@ public void Initialize(IEventSource eventSource)
+                 {
+                     eventSource4.IncludeEvaluationPropertiesAndItems();
+                 }
+-
+-                if (eventSource is IEmbeddedContentSource embeddedFilesSource)
+-                {
+-                    if (CollectProjectImports == ProjectImportsCollectionMode.Replay)
+-                    {
+-                        embeddedFilesSource.EmbeddedContentRead += args =>
+-                            eventArgsWriter.WriteBlob(args.ContentKind.ToBinaryLogRecordKind(), args.ContentStream, args.Length);
+-                    }
+-
+-                    if (replayInitialInfo)
+-                    {
+-                        versionInfo = embeddedFilesSource;
+-                    }
+-                }
+             }
+             catch (Exception e)
+             {
+@@ -215,19 +199,46 @@ public void Initialize(IEventSource eventSource)
+                 eventArgsWriter.EmbedFile += EventArgsWriter_EmbedFile;
+             }
+ 
+-            if (versionInfo == null)
++            if (eventSource is IBinaryLogReplaySource replayEventsSource)
+             {
+-                binaryWriter.Write(FileFormatVersion);
+-                LogInitialInfo();
++                if (CollectProjectImports == ProjectImportsCollectionMode.Replay)
++                {
++                    replayEventsSource.EmbeddedContentRead += args =>
++                        eventArgsWriter.WriteBlob(args.ContentKind.ToBinaryLogRecordKind(), args.ContentStream);
++                }
++
++                // If raw events are provided - let's try to use the advantage.
++                // But other subscribers can later on subscribe to structured events -
++                //  for this reason we do only subscribe delayed.
++                replayEventsSource.DeferredInitialize(
++                    version => binaryWriter.Write(version),
++                    // For raw events we cannot write the initial info - as we cannot write
++                    //  at the same time as raw events are being written - this would break the deduplicated strings store.
++                    () =>
++                    {
++                        replayEventsSource.LogDataSliceReceived += RawEvents_LogDataSliceReceived;
++                        // Replay separated strings here as well (and do not deduplicate! It would skew string indexes)
++                        replayEventsSource.StringReadDone += strArg => eventArgsWriter.WriteStringRecord(strArg.StringToBeUsed);
++                    },
++                    SubscribeToStructuredEvents);
+             }
+             else
+             {
+-                versionInfo.FileFormatVersionRead += version => binaryWriter.Write(version);
++                binaryWriter.Write(FileFormatVersion);
++                SubscribeToStructuredEvents();
+             }
+ 
+-            eventSource.AnyEventRaised += EventSource_AnyEventRaised;
+-
+             KnownTelemetry.LoggingConfigurationTelemetry.BinaryLogger = true;
++
++            void SubscribeToStructuredEvents()
++            {
++                if (!omitInitialInfo)
++                {
++                    LogInitialInfo();
++                }
++
++                eventSource.AnyEventRaised += EventSource_AnyEventRaised;
++            }
+         }
+ 
+         private void EventArgsWriter_EmbedFile(string filePath)
+@@ -290,6 +301,11 @@ public void Shutdown()
+             }
+         }
+ 
++        private void RawEvents_LogDataSliceReceived(BinaryLogRecordKind recordKind, Stream stream)
++        {
++            eventArgsWriter.WriteBlob(recordKind, stream);
++        }
++
+         private void EventSource_AnyEventRaised(object sender, BuildEventArgs e)
+         {
+             Write(e);
+@@ -337,14 +353,14 @@ private void CollectImports(BuildEventArgs e)
+         /// </summary>
+         /// <exception cref="LoggerException">
+         /// </exception>
+-        private void ProcessParameters(out bool replayInitialInfo)
++        private void ProcessParameters(out bool omitInitialInfo)
+         {
+             if (Parameters == null)
+             {
+                 throw new LoggerException(ResourceUtilities.FormatResourceStringStripCodeAndKeyword("InvalidBinaryLoggerParameters", ""));
+             }
+ 
+-            replayInitialInfo = false;
++            omitInitialInfo = false;
+             var parameters = Parameters.Split(MSBuildConstants.SemicolonChar, StringSplitOptions.RemoveEmptyEntries);
+             foreach (var parameter in parameters)
+             {
+@@ -364,9 +380,9 @@ private void ProcessParameters(out bool replayInitialInfo)
+                 {
+                     CollectProjectImports = ProjectImportsCollectionMode.Replay;
+                 }
+-                else if (string.Equals(parameter, "ReplayInitialInfo", StringComparison.OrdinalIgnoreCase))
++                else if (string.Equals(parameter, "OmitInitialInfo", StringComparison.OrdinalIgnoreCase))
+                 {
+-                    replayInitialInfo = true;
++                    omitInitialInfo = true;
+                 }
+                 else if (parameter.EndsWith(".binlog", StringComparison.OrdinalIgnoreCase))
+                 {
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsDispatcher.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsDispatcher.cs
+index 4a50a3d8e8b..db24d791ed2 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsDispatcher.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsDispatcher.cs
+@@ -85,6 +85,22 @@ public class EventArgsDispatcher : IEventSource
+         /// </summary>
+         public event BuildMessageEventHandler MessageRaised;
+ 
++        internal bool HasStructuredEventsSubscribers =>
++            AnyEventRaised != null ||
++            StatusEventRaised != null ||
++            CustomEventRaised != null ||
++            BuildStarted != null ||
++            BuildFinished != null ||
++            ProjectStarted != null ||
++            ProjectFinished != null ||
++            TargetStarted != null ||
++            TargetFinished != null ||
++            TaskStarted != null ||
++            TaskFinished != null ||
++            ErrorRaised != null ||
++            WarningRaised != null ||
++            MessageRaised != null;
++
+         /// <summary>
+         /// Raise one of the events that is appropriate for the type of the BuildEventArgs
+         /// </summary>
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index 1b62948bc1d..245d9adcdd4 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -78,6 +78,24 @@ public BuildEventArgsReader(BinaryReader binaryReader, int fileFormatVersion)
+         /// </summary>
+         public bool CloseInput { private get; set; } = false;
+ 
++        /// <summary>
++        /// Indicates whether unknown BuildEvents should be silently skipped. Read returns null otherwise.
++        /// Parameter is supported only if the file format supports forward compatible reading (version is 18 or higher).
++        /// </summary>
++        public bool SkipUnknownEvents { private get; set; } = false;
++
++        /// <summary>
++        /// Indicates whether unread parts of BuildEvents (probably added in newer format of particular BuildEvent)should be silently skipped. Exception thrown otherwise.
++        /// Parameter is supported only if the file format supports forward compatible reading (version is 18 or higher).
++        /// </summary>
++        public bool SkipUnknownEventParts { private get; set; } = false;
++
++        /// <summary>
++        /// Receives recoverable errors during reading.
++        /// Applicable mainly when <see cref="SkipUnknownEvents"/> or <see cref="SkipUnknownEventParts"/> is set to true."/>
++        /// </summary>
++        public event Action<string>? OnRecoverableReadError;
++
+         public void Dispose()
+         {
+             stringStorage.Dispose();
+@@ -106,85 +124,41 @@ public void Dispose()
+         /// <inheritdoc cref="IBuildFileReader.ArchiveFileEncountered"/>
+         public event Action<ArchiveFileEventArgs>? ArchiveFileEncountered;
+ 
+-        private byte[]? _pooledBuffer;
+-        private BinaryWriter? _pooledBinaryWriter;
++        private SubStream? _lastSubStream;
+ 
+         /// <summary>
+         /// Reads the next serialized log record from the <see cref="BinaryReader"/>.
+         /// </summary>
+         /// <returns>ArraySegment containing serialized BuildEventArgs record</returns>
+-        public ArraySegment<byte> ReadRaw()
++        internal (BinaryLogRecordKind RecordKind, Stream Stream) ReadRaw()
+         {
+-            // TODO: For even better performance experiment with returning a stream
+-            //   it would need to be concatenated Stream of a MemoryStream with kind and size
+-            //   and SubStream over the binaryReader.BaseStream of the given size.
+-            //   We'd need to validate that reader reads exactly the given size, or skip rest on their behalf.
+-
+-            BinaryLogRecordKind recordKind = ReadTillNextEvent();
++            // This method is internal and condition is checked once before calling in loop,
++            //  so avoiding it here on each call.
++            // But keeping it for documentation purposes - in case someone will try to call it and debug issues.
++            ////if (fileFormatVersion < 18)
++            ////{
++            ////    throw new InvalidOperationException(
++            ////                           $"Raw data reading is not supported for file format version {fileFormatVersion} (needs >=18).");
++            ////}
+ 
+-            if (recordKind == BinaryLogRecordKind.EndOfFile)
++            if (!(_lastSubStream?.IsAtEnd ?? true))
+             {
+-                ReturnPooledBuffer();
+-                return new ArraySegment<byte>();
++                throw new InvalidDataException($"Raw data slice for record {recordNumber} was not fully read.");
+             }
+ 
+-            int serializedEventLength = ReadInt32();
+-
+-            // The BinaryLogRecordKind and size needs to be added back to the buffer.
+-            // We do not know the exact size needed to write those two upfront though,
+-            //  so we need to call memoryStream.Position to find out.
+-            (BinaryWriter binaryWriter, MemoryStream memoryStream, byte[] buffer) =
+-                RentPooledBinaryWriter(serializedEventLength + 2 * sizeof(int));
+-            binaryWriter.Write7BitEncodedInt((int)recordKind);
+-            binaryWriter.Write7BitEncodedInt(serializedEventLength);
+-
+-            binaryReader.BaseStream.ReadAtLeast(buffer, (int)memoryStream.Position, serializedEventLength, throwOnEndOfStream: true);
+-            // Size of the raw message and the preceding type and size info
+-            return new ArraySegment<byte>(buffer, 0, serializedEventLength + (int)memoryStream.Position);
+-        }
++            BinaryLogRecordKind recordKind = ReadTillNextEvent(IsTextualDataRecord);
+ 
+-        private byte[] RentPooledBuffer(int minimumBytes)
+-        {
+-            if (_pooledBuffer == null || _pooledBuffer.Length < minimumBytes)
+-            {
+-                ReturnPooledBuffer();
+-                _pooledBuffer = ArrayPool<byte>.Shared.Rent(minimumBytes);
+-            }
+-
+-            return _pooledBuffer;
+-        }
+-
+-        private (BinaryWriter binaryWriter, MemoryStream memoryStream, byte[] buffer) RentPooledBinaryWriter(int minimumBytes)
+-        {
+-            if (_pooledBuffer == null || _pooledBuffer.Length < minimumBytes)
++            if (recordKind == BinaryLogRecordKind.EndOfFile)
+             {
+-                ReturnPooledBuffer();
+-                _pooledBuffer = ArrayPool<byte>.Shared.Rent(minimumBytes);
+-                _pooledBinaryWriter = null;
++                return new(recordKind, Stream.Null);
+             }
+ 
+-            MemoryStream ms;
+-            if (_pooledBinaryWriter == null)
+-            {
+-                ms = new(_pooledBuffer);
+-                _pooledBinaryWriter = new BinaryWriter(ms);
+-            }
+-            else
+-            {
+-                ms = (_pooledBinaryWriter.BaseStream as MemoryStream)!;
+-            }
++            int serializedEventLength = ReadInt32();
++            Stream stream = binaryReader.BaseStream.Slice(serializedEventLength);
+ 
+-            return (_pooledBinaryWriter, ms, _pooledBuffer);
+-        }
++            _lastSubStream = stream as SubStream;
+ 
+-        private void ReturnPooledBuffer()
+-        {
+-            if (_pooledBuffer != null)
+-            {
+-                ArrayPool<byte>.Shared.Return(_pooledBuffer);
+-                _pooledBuffer = null;
+-                _pooledBinaryWriter = null;
+-            }
++            return new(recordKind, stream);
+         }
+ 
+         /// <summary>
+@@ -196,35 +170,30 @@ private void ReturnPooledBuffer()
+         /// </returns>
+         public BuildEventArgs? Read()
+         {
+-            return Read(skipUnknownEvents: false, skipUnknownEventParts: false, _ => { });
+-        }
++            // todo - flip this into a properties - not to check on each call and to avoid params passing
++            if ((SkipUnknownEvents || SkipUnknownEventParts) && fileFormatVersion < 18)
++            {
++                throw new InvalidOperationException(
++                    $"Forward compatible reading is not supported for file format version {fileFormatVersion} (needs >=18).");
++            }
+ 
+-        /// <summary>
+-        /// Reads the next log record from the <see cref="BinaryReader"/>.
+-        /// </summary>
+-        /// <param name="skipUnknownEvents">Indicates whether unknown BuildEvents should be silently skipped. Read returns null otherwise.</param>
+-        /// <param name="skipUnknownEventParts">Indicates whether unread parts of BuildEvents (probably added in newer format of particular BuildEvent)should be silently skipped. Exception thrown otherwise.</param>
+-        /// <param name="onError">Receives recoverable errors during reading.</param>
+-        /// <returns>
+-        /// The next <see cref="BuildEventArgs"/>.
+-        /// If there are no more records, returns <see langword="null"/>.
+-        /// </returns>
+-        /// <exception cref="InvalidDataException">Thrown based on <paramref name="skipUnknownEventParts"/> and <paramref name="skipUnknownEvents"/> arguments.</exception>
+-        public BuildEventArgs? Read(bool skipUnknownEvents, bool skipUnknownEventParts, Action<string> onError)
+-        {
+             BuildEventArgs? result = null;
+             while (result == null)
+             {
+-                BinaryLogRecordKind recordKind = ReadTillNextEvent();
++                BinaryLogRecordKind recordKind = ReadTillNextEvent(IsAuxiliaryRecord);
+ 
+                 if (recordKind == BinaryLogRecordKind.EndOfFile)
+                 {
+                     return null;
+                 }
+ 
+-                int serializedEventLength = ReadInt32(); // record length
+-
+-                long preEventPosition = _canSeek ? binaryReader.BaseStream.Position : 0;
++                int serializedEventLength = 0;
++                long preEventPosition = 0;
++                if (fileFormatVersion >= 18)
++                {
++                    serializedEventLength = ReadInt32(); // record length
++                    preEventPosition = _canSeek ? binaryReader.BaseStream.Position : 0;
++                }
+ 
+                 switch (recordKind)
+                 {
+@@ -301,9 +270,9 @@ private void ReturnPooledBuffer()
+                         result = ReadAssemblyLoadEventArgs();
+                         break;
+                     default:
+-                        onError(
+-                            $"BuildEvent record number {recordNumber} (serialized size: {serializedEventLength}) is of unsupported type: {recordKind}.{(skipUnknownEvents ? " Skipping it." : string.Empty)}");
+-                        if (skipUnknownEvents)
++                        OnRecoverableReadError?.Invoke(
++                            $"BuildEvent record number {recordNumber} (serialized size: {serializedEventLength}) is of unsupported type: {recordKind}.{(SkipUnknownEvents ? " Skipping it." : string.Empty)}");
++                        if (SkipUnknownEvents)
+                         {
+                             SkipBytes(serializedEventLength);
+                         }
+@@ -314,21 +283,24 @@ private void ReturnPooledBuffer()
+                         break;
+                 }
+ 
+-                long postEventPosition = _canSeek ? binaryReader.BaseStream.Position : serializedEventLength;
+-                int bytesRead = (int)(postEventPosition - preEventPosition);
+-                if (bytesRead != serializedEventLength)
++                if (fileFormatVersion >= 18)
+                 {
+-                    string error =
+-                        $"BuildEvent record number {recordNumber} was expected to read exactly {serializedEventLength} bytes from the stream, but read {bytesRead} instead.";
+-
+-                    if (skipUnknownEventParts && bytesRead < serializedEventLength)
++                    long postEventPosition = _canSeek ? binaryReader.BaseStream.Position : serializedEventLength;
++                    int bytesRead = (int)(postEventPosition - preEventPosition);
++                    if (bytesRead != serializedEventLength)
+                     {
+-                        onError(error);
+-                        SkipBytes(serializedEventLength - bytesRead);
+-                    }
+-                    else
+-                    {
+-                        throw new InvalidDataException(error);
++                        string error =
++                            $"BuildEvent record number {recordNumber} was expected to read exactly {serializedEventLength} bytes from the stream, but read {bytesRead} instead.";
++
++                        if (SkipUnknownEventParts && bytesRead < serializedEventLength)
++                        {
++                            OnRecoverableReadError?.Invoke(error);
++                            SkipBytes(serializedEventLength - bytesRead);
++                        }
++                        else
++                        {
++                            throw new InvalidDataException(error);
++                        }
+                     }
+                 }
+ 
+@@ -346,19 +318,19 @@ private void SkipBytes(int count)
+             }
+             else
+             {
+-                byte[] buffer = RentPooledBuffer(count);
++                byte[] buffer = ArrayPool<byte>.Shared.Rent(count);
++                using var _ = new CleanupScope(() => ArrayPool<byte>.Shared.Return(buffer));
+                 binaryReader.BaseStream.ReadAtLeast(buffer, 0, count, throwOnEndOfStream: true);
+-                ReturnPooledBuffer();
+             }
+         }
+ 
+-        private BinaryLogRecordKind ReadTillNextEvent()
++        private BinaryLogRecordKind ReadTillNextEvent(Func<BinaryLogRecordKind, bool> isPreprocessRecord)
+         {
+             BinaryLogRecordKind recordKind = (BinaryLogRecordKind)ReadInt32();
+ 
+             // Skip over data storage records since they don't result in a BuildEventArgs.
+             // just ingest their data and continue.
+-            while (IsAuxiliaryRecord(recordKind))
++            while (isPreprocessRecord(recordKind))
+             {
+                 // these are ordered by commonality
+                 if (recordKind == BinaryLogRecordKind.String)
+@@ -389,6 +361,12 @@ private static bool IsAuxiliaryRecord(BinaryLogRecordKind recordKind)
+                 || recordKind == BinaryLogRecordKind.ProjectImportArchive;
+         }
+ 
++        private static bool IsTextualDataRecord(BinaryLogRecordKind recordKind)
++        {
++            return recordKind == BinaryLogRecordKind.String
++                   || recordKind == BinaryLogRecordKind.ProjectImportArchive;
++        }
++
+         private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+         {
+             int length = ReadInt32();
+@@ -444,6 +422,7 @@ private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+                     }
+                 }
+ 
++                // Once embedded files are replayed one by one - we can send the resulting stream to subscriber
+                 if (EmbeddedContentRead != null)
+                 {
+                     projectImportsCollector!.ProcessResult(
+@@ -466,6 +445,11 @@ private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+ 
+         private void ReadNameValueList()
+         {
++            if (fileFormatVersion >= 18)
++            {
++                _ = ReadInt32(); // buffer size, not used in structured reading
++            }
++
+             int count = ReadInt32();
+ 
+             var list = new (int, int)[count];
+@@ -507,7 +491,7 @@ private IDictionary<string, string> GetNameValueList(int id)
+ 
+             // this should never happen for valid binlogs
+             throw new InvalidDataException(
+-                $"NameValueList record number {recordNumber} is invalid: index {id} is not within {stringRecords.Count}.");
++                $"NameValueList record number {recordNumber} is invalid: index {id} is not within {nameValueListRecords.Count}.");
+         }
+ 
+         private readonly StringReadEventArgs stringReadEventArgs = new StringReadEventArgs(string.Empty);
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+index a0246b5d4fe..503c185791e 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+@@ -36,6 +36,13 @@ internal class BuildEventArgsWriter
+         /// </summary>
+         private readonly MemoryStream currentRecordStream;
+ 
++        /// <summary>
++        /// For NameValueList we need to prefix the storage size
++        ///  (distinct from values count due to variable int encoding)
++        /// So using same technique as with 'currentRecordStream'.
++        /// </summary>
++        private readonly MemoryStream nameValueListStream = new MemoryStream(256);
++
+         /// <summary>
+         /// The binary writer around the originalStream.
+         /// </summary>
+@@ -135,12 +142,16 @@ public void Write(BuildEventArgs e)
+         {
+             BinaryLogRecordKind eventKind = WriteCore(e);
+ 
+-            Write(eventKind);
+-            Write((int)currentRecordStream.Length);
++            FlushRecordToFinalStream(eventKind, currentRecordStream);
++        }
+ 
+-            // flush the current record and clear the MemoryStream to prepare for next use
+-            currentRecordStream.WriteTo(originalStream);
+-            currentRecordStream.SetLength(0);
++        private void FlushRecordToFinalStream(BinaryLogRecordKind recordKind, MemoryStream recordStream)
++        {
++            using var redirectionScope = RedirectWritesToOriginalWriter();
++            Write(recordKind);
++            Write((int)recordStream.Length);
++            recordStream.WriteTo(originalStream);
++            recordStream.SetLength(0);
+         }
+ 
+         /*
+@@ -232,7 +243,7 @@ private BinaryLogRecordKind WriteCore(BuildEventArgs e)
+             }
+         }
+ 
+-        public void WriteBlob(BinaryLogRecordKind kind, Stream stream, int? length = null)
++        public void WriteBlob(BinaryLogRecordKind kind, Stream stream)
+         {
+             if (stream.CanSeek && stream.Length > int.MaxValue)
+             {
+@@ -244,8 +255,8 @@ public void WriteBlob(BinaryLogRecordKind kind, Stream stream, int? length = nul
+             using var redirection = RedirectWritesToOriginalWriter();
+ 
+             Write(kind);
+-            Write(length ?? (int)stream.Length);
+-            Write(stream, length);
++            Write((int)stream.Length);
++            Write(stream);
+         }
+ 
+         /// <summary>
+@@ -255,23 +266,13 @@ public void WriteBlob(BinaryLogRecordKind kind, Stream stream, int? length = nul
+         /// </summary>
+         private IDisposable RedirectWritesToOriginalWriter()
+         {
+-            binaryWriter = originalBinaryWriter;
+-            return new RedirectionScope(this);
++            return RedirectWritesToDifferentWriter(originalBinaryWriter, currentRecordWriter);
+         }
+ 
+-        private struct RedirectionScope : IDisposable
++        private IDisposable RedirectWritesToDifferentWriter(BinaryWriter inScopeWriter, BinaryWriter afterScopeWriter)
+         {
+-            private readonly BuildEventArgsWriter _writer;
+-
+-            public RedirectionScope(BuildEventArgsWriter buildEventArgsWriter)
+-            {
+-                _writer = buildEventArgsWriter;
+-            }
+-
+-            public void Dispose()
+-            {
+-                _writer.binaryWriter = _writer.currentRecordWriter;
+-            }
++            binaryWriter = inScopeWriter;
++            return new CleanupScope(() => binaryWriter = afterScopeWriter);
+         }
+ 
+         private BinaryLogRecordKind Write(BuildStartedEventArgs e)
+@@ -1063,19 +1064,26 @@ private void WriteNameValueList()
+         /// </summary>
+         private void WriteNameValueListRecord()
+         {
+-            // Switch the binaryWriter used by the Write* methods to the direct underlying stream writer.
+             // We want this record to precede the record we're currently writing to currentRecordWriter
+-            // which is backed by a MemoryStream buffer
+-            using var redirectionScope = RedirectWritesToOriginalWriter();
++            // We as well want to know the storage size (differs from nameValueIndexListBuffer.Count as
++            //  we use variable integer encoding).
++            // So we redirect the writes to a MemoryStream and then flush the record to the final stream.
++            // All that is redirected away from the 'currentRecordStream' - that will be flushed last
++
++            var nameValueListBw = new BinaryWriter(nameValueListStream);
+ 
+-            Write(BinaryLogRecordKind.NameValueList);
+-            Write(nameValueIndexListBuffer.Count);
+-            for (int i = 0; i < nameValueListBuffer.Count; i++)
++            using (var _ = RedirectWritesToDifferentWriter(nameValueListBw, binaryWriter))
+             {
+-                var kvp = nameValueIndexListBuffer[i];
+-                Write(kvp.Key);
+-                Write(kvp.Value);
++                Write(nameValueIndexListBuffer.Count);
++                for (int i = 0; i < nameValueListBuffer.Count; i++)
++                {
++                    var kvp = nameValueIndexListBuffer[i];
++                    Write(kvp.Key);
++                    Write(kvp.Value);
++                }
+             }
++
++            FlushRecordToFinalStream(BinaryLogRecordKind.NameValueList, nameValueListStream);
+         }
+ 
+         /// <summary>
+@@ -1124,35 +1132,10 @@ private void Write(byte[] bytes)
+             binaryWriter.Write(bytes);
+         }
+ 
+-        private void Write(Stream stream, int? length)
++        private void Write(Stream stream)
+         {
+             Stream destinationStream = binaryWriter.BaseStream;
+-            if (length == null)
+-            {
+-                stream.CopyTo(destinationStream);
+-                return;
+-            }
+-
+-            // borrowed from runtime from Stream.cs
+-            const int defaultCopyBufferSize = 81920;
+-            int bufferSize = Math.Min(defaultCopyBufferSize, length.Value);
+-
+-            byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+-            try
+-            {
+-                int bytesRead;
+-                while (
+-                    length > 0 &&
+-                    (bytesRead = stream.Read(buffer, 0, Math.Min(buffer.Length, length.Value))) != 0)
+-                {
+-                    destinationStream.Write(buffer, 0, bytesRead);
+-                    length -= bytesRead;
+-                }
+-            }
+-            finally
+-            {
+-                ArrayPool<byte>.Shared.Return(buffer);
+-            }
++            stream.CopyTo(destinationStream);
+         }
+ 
+         private void Write(byte b)
+@@ -1209,7 +1192,7 @@ private void WriteDeduplicatedString(string text)
+             return (recordId, hash);
+         }
+ 
+-        private void WriteStringRecord(string text)
++        internal void WriteStringRecord(string text)
+         {
+             using var redirectionScope = RedirectWritesToOriginalWriter();
+ 
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
+index 68969f2af4a..4ddd1ae456e 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
+@@ -8,13 +8,6 @@ namespace Microsoft.Build.Logging
+ {
+     internal sealed class EmbeddedContentEventArgs : EventArgs
+     {
+-        public EmbeddedContentEventArgs(EmbeddedContentKind contentKind, Stream contentStream, int length)
+-        {
+-            ContentKind = contentKind;
+-            ContentStream = contentStream;
+-            Length = length;
+-        }
+-
+         public EmbeddedContentEventArgs(EmbeddedContentKind contentKind, Stream contentStream)
+         {
+             ContentKind = contentKind;
+@@ -23,6 +16,5 @@ public EmbeddedContentEventArgs(EmbeddedContentKind contentKind, Stream contentS
+ 
+         public EmbeddedContentKind ContentKind { get; }
+         public Stream ContentStream { get; }
+-        public int? Length { get; }
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs
+index eb9262939fa..c07c3b2ee78 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs
+@@ -5,13 +5,7 @@
+ 
+ namespace Microsoft.Build.Logging
+ {
+-
+-    internal interface ILogVersionInfo
+-    {
+-        event Action<int> FileFormatVersionRead;
+-    }
+-
+-    internal interface IEmbeddedContentSource : ILogVersionInfo
++    internal interface IEmbeddedContentSource
+     {
+         
+         /// <summary>
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/SubStream.cs b/src/Build/Logging/BinaryLogger/Postprocessing/SubStream.cs
+index 277c9ac66c0..b35e4e7e97b 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/SubStream.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/SubStream.cs
+@@ -31,6 +31,8 @@ public SubStream(Stream stream, long length)
+             }
+         }
+ 
++        public bool IsAtEnd => _position >= _length;
++
+         public override bool CanRead => true;
+ 
+         public override bool CanSeek => false;

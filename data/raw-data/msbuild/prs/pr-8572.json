@@ -1,0 +1,135 @@
+{
+  "number": 8572,
+  "title": "Add per-file locking to ProjectRootElementCache",
+  "body": "Fixes #8567 \r\n\r\n### Context\r\n\r\nWhen evaluating projects in parallel, MSBuild is likely to need to load the same included files (Microsoft.Common.props, Microsoft.Managed.Core.targets, ...) at about the same time on multiple threads. This leads to wasted work as `ProjectRootElementCache` doesn't prevent the same xml file from being parsed multiple times.\r\n\r\n### Changes Made\r\n\r\nIntroduced per-file locking. If multiple threads need the same file and the file is not in cache, only one thread will do the actual loading and the rest will wait for it to finish.\r\n\r\nAlso encapsulated `s_getEntriesNumber` manipulation in a new `ReentrancyGuard` struct.\r\n\r\n### Testing\r\n\r\nExisting unit tests and the solution load VS scenario where this was found.\r\n\r\n### Notes\r\n\r\nI recommend reviewing with the **Hide whitespace** option activated.",
+  "state": "MERGED",
+  "createdAt": "2023-03-16T13:16:42Z",
+  "updatedAt": "2023-05-10T06:53:10Z",
+  "closedAt": "2023-03-21T01:56:34Z",
+  "mergedAt": "2023-03-21T01:56:34Z",
+  "additions": 125,
+  "deletions": 78,
+  "changedFiles": 1,
+  "headRefName": "pre-cache-locking",
+  "isDraft": false,
+  "author": {
+    "login": "ladipro"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": []
+  },
+  "labels": [
+    "merge-when-branch-open"
+  ],
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "oid": "48bd86f5a5db8ba10ee6158bc933c2dcdcbd30da",
+          "message": "Add per-file locking to ProjectRootElementCache",
+          "committedDate": "2023-03-16T13:15:47Z",
+          "author": {
+            "name": "Ladi Prosek",
+            "email": "laprosek@microsoft.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "38eb342f6d832f456edce81aabab968bd863d572",
+          "message": "Comments and tweaks",
+          "committedDate": "2023-03-16T14:38:17Z",
+          "author": {
+            "name": "Ladi Prosek",
+            "email": "laprosek@microsoft.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "28ddea496c2038efa2ff25fe17363aa9dd1f60d5",
+          "message": "Comment updates",
+          "committedDate": "2023-03-16T15:15:19Z",
+          "author": {
+            "name": "Ladi Prosek",
+            "email": "laprosek@microsoft.com"
+          }
+        }
+      }
+    ]
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "Just curious what sort of perf improvement do you see?",
+        "createdAt": "2023-03-20T20:01:24Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "> Just curious what sort of perf improvement do you see?\r\n\r\nParsing each XML file exactly once (with the previous logic it was at least once) fixes a file I/O and allocation regression flagged by VS perf tests when I started calling MSBuild \"more concurrently\".\r\n\r\nObviously, may show little user impact if nothing else on the machine needs the CPU at the moment, but I believe that parsing an XML file is expensive enough that blocking and waiting for the result is better than duplicating the work.\r\n\r\n@danmoseley, I am curious if you are aware of any attempts to make MSBuild API async. Async evaluation looks like something that would potentially make sense, this logic being an example where we could await the result instead of blocking on a lock.",
+        "createdAt": "2023-03-21T07:28:34Z",
+        "author": {
+          "login": "ladipro"
+        }
+      }
+    ]
+  },
+  "reviewThreads": {
+    "nodes": [
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "I don't understand this argument. I believe multiple Get calls can happen in separate threads, right? The ReentrancyGuard only operates in DEBUG mode. If two start at about the same time, the _fileLoadLocks will prevent the second one from starting until the first is finished. Once the first finishes, the second starts (with the same object) while the first deletes it from the ConcurrentDictionary. If a third comes along while the second is still calling GetOrLoad, that third would make a new object and jump right in. This is unlikely to be relevant in practice, since it requires one thread to be on line 266-272 and a second thread to be sitting at line 276 when a third thread executes line 288, and then the first and second thread have to both be on line 279 for there to potentially be a problem, but it feels like an unnecessary risk to me.",
+              "createdAt": "2023-03-16T23:04:22Z",
+              "path": "src/Build/Evaluation/ProjectRootElementCache.cs",
+              "diffHunk": "@@ -224,106 +250,127 @@ private bool IsInvalidEntry(string projectFile, ProjectRootElement projectRootEl\n         {\n #if DEBUG\n             // Verify that loadProjectRootElement delegate does not call ProjectRootElementCache.Get().\n-            s_getEntriesNumber++;\n+            using var reentrancyGuard = new ReentrancyGuard();\n+\n+            // Verify that we never call this with _locker held, as that would create a lock ordering inversion with the per-file lock.\n             ErrorUtilities.VerifyThrow(\n-                s_getEntriesNumber == 1,\n-                \"Reentrance to the ProjectRootElementCache.Get function detected.\");\n+                !System.Threading.Monitor.IsEntered(_locker),\n+                \"Detected lock ordering inversion in ProjectRootElementCache.\");\n+#endif\n+            // Should already have been canonicalized\n+            ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n \n-            try\n+            // First try getting the ProjectRootElement from the cache.\n+            ProjectRootElement projectRootElement = GetOrLoad(projectFile, loadProjectRootElement: null, isExplicitlyLoaded, preserveFormatting);\n+\n+            if (projectRootElement != null || loadProjectRootElement == null)\n             {\n-#endif\n-#pragma warning disable format // the release configuration fails as try-catch block is conditioned only for Debug; making the formatting in correct in Release.\n-                // Should already have been canonicalized\n-                ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n+                // If we found it or no load callback was specified, we are done.\n+                return projectRootElement;\n+            }\n \n-                ProjectRootElement projectRootElement;\n-                lock (_locker)\n+            try\n+            {\n+                // We are about to load. Take a per-file lock to prevent multiple threads from duplicating the work multiple times.\n+                object perFileLock = _fileLoadLocks.GetOrAdd(projectFile, () => new object());\n+                lock (perFileLock)\n                 {\n-                    _weakCache.TryGetValue(projectFile, out projectRootElement);\n+                    // Call GetOrLoad again, this time with the OpenProjectRootElement callback.\n+                    return GetOrLoad(projectFile, loadProjectRootElement, isExplicitlyLoaded, preserveFormatting);\n+                }\n+            }\n+            finally\n+            {\n+                // Remove the lock object as we have otherwise no good way of preventing _fileLoadLocks from growing unboundedly.",
+              "author": {
+                "login": "Forgind"
+              }
+            },
+            {
+              "body": "The rationale is that when a thread comes here and deletes the locker object from the dictionary, the project file must already be loaded (i.e. it was loaded by the first thread that took the lock, which would likely - but not necessarily - be the one doing the delete here). Therefore it is perfectly fine if other threads race to enter `GetOrLoad` simultaneously after this point, because it will be just a fast dictionary lookup, no actual loading will be taking place. In other words, we use the lock to allow only one thread to do the loading. Once loading is done, we don't care.\r\n\r\nThe alternative solutions would be:\r\n- Never delete anything from `_fileLoadLocks`. The concern is that there may be pathological scenarios where the number of project files does not have a practical limit and the process would OOM.\r\n- Hook into the `Scavenge` operation of `_weakCache`. That's where the weak cache is getting rid of entries for GC-collected items. Can be done with a callback but feels too complicated for no additional benefit.\r\n\r\nCurious to hear your thoughts, thank you!",
+              "createdAt": "2023-03-17T08:51:41Z",
+              "path": "src/Build/Evaluation/ProjectRootElementCache.cs",
+              "diffHunk": "@@ -224,106 +250,127 @@ private bool IsInvalidEntry(string projectFile, ProjectRootElement projectRootEl\n         {\n #if DEBUG\n             // Verify that loadProjectRootElement delegate does not call ProjectRootElementCache.Get().\n-            s_getEntriesNumber++;\n+            using var reentrancyGuard = new ReentrancyGuard();\n+\n+            // Verify that we never call this with _locker held, as that would create a lock ordering inversion with the per-file lock.\n             ErrorUtilities.VerifyThrow(\n-                s_getEntriesNumber == 1,\n-                \"Reentrance to the ProjectRootElementCache.Get function detected.\");\n+                !System.Threading.Monitor.IsEntered(_locker),\n+                \"Detected lock ordering inversion in ProjectRootElementCache.\");\n+#endif\n+            // Should already have been canonicalized\n+            ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n \n-            try\n+            // First try getting the ProjectRootElement from the cache.\n+            ProjectRootElement projectRootElement = GetOrLoad(projectFile, loadProjectRootElement: null, isExplicitlyLoaded, preserveFormatting);\n+\n+            if (projectRootElement != null || loadProjectRootElement == null)\n             {\n-#endif\n-#pragma warning disable format // the release configuration fails as try-catch block is conditioned only for Debug; making the formatting in correct in Release.\n-                // Should already have been canonicalized\n-                ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n+                // If we found it or no load callback was specified, we are done.\n+                return projectRootElement;\n+            }\n \n-                ProjectRootElement projectRootElement;\n-                lock (_locker)\n+            try\n+            {\n+                // We are about to load. Take a per-file lock to prevent multiple threads from duplicating the work multiple times.\n+                object perFileLock = _fileLoadLocks.GetOrAdd(projectFile, () => new object());\n+                lock (perFileLock)\n                 {\n-                    _weakCache.TryGetValue(projectFile, out projectRootElement);\n+                    // Call GetOrLoad again, this time with the OpenProjectRootElement callback.\n+                    return GetOrLoad(projectFile, loadProjectRootElement, isExplicitlyLoaded, preserveFormatting);\n+                }\n+            }\n+            finally\n+            {\n+                // Remove the lock object as we have otherwise no good way of preventing _fileLoadLocks from growing unboundedly.",
+              "author": {
+                "login": "ladipro"
+              }
+            },
+            {
+              "body": "Ah, so it sounds like it's ok for multiple threads to be inside the perFileLock as long as the cache has already been prepped. That seems reasonable. I'm trying to think through what the expected cases are, what the worst case is, and how likely that worst case is. It seems unlikely that there would be so many project files that the process would actually OOM specifically due to this lock cache, but there's also the constant incremental of having a larger dictionary to look through. Is a ConcurrentDictionary tree-based? If so, then if the average size of the ConcurrentDictionary with this implementation is 2^x, and this doubles the number of accesses, then from a time perspective, there'd have to be 2^2x projects for them to be even equally fast. From a memory, perspective, the pathological case is one in which a lot of threads manage to get past the first GetOrLoad call and stop before trying to access the lock. If they go in in pairs, there could theoretically be an extra threads/2 objects allocated. That also feels _very_ unlikely to me, though.\r\n\r\nOverall, I think I'm convinced this is a good way to avoid doing more locking than the current version does. Do you happen to have numbers on how efficient locks are vs. using the ConcurrentDictionary?\r\n\r\nI'm also starting to wonder if there's actually any reason to have a separate strong cache vs. weak cache, but I haven't looked into that difference too much yet. It feels like we're doing a lot of work to maintain a strong cache that we just use to make sure things from the weak cache don't get gc'd, which kinda defeats the point of using a weak cache...",
+              "createdAt": "2023-03-17T19:28:50Z",
+              "path": "src/Build/Evaluation/ProjectRootElementCache.cs",
+              "diffHunk": "@@ -224,106 +250,127 @@ private bool IsInvalidEntry(string projectFile, ProjectRootElement projectRootEl\n         {\n #if DEBUG\n             // Verify that loadProjectRootElement delegate does not call ProjectRootElementCache.Get().\n-            s_getEntriesNumber++;\n+            using var reentrancyGuard = new ReentrancyGuard();\n+\n+            // Verify that we never call this with _locker held, as that would create a lock ordering inversion with the per-file lock.\n             ErrorUtilities.VerifyThrow(\n-                s_getEntriesNumber == 1,\n-                \"Reentrance to the ProjectRootElementCache.Get function detected.\");\n+                !System.Threading.Monitor.IsEntered(_locker),\n+                \"Detected lock ordering inversion in ProjectRootElementCache.\");\n+#endif\n+            // Should already have been canonicalized\n+            ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n \n-            try\n+            // First try getting the ProjectRootElement from the cache.\n+            ProjectRootElement projectRootElement = GetOrLoad(projectFile, loadProjectRootElement: null, isExplicitlyLoaded, preserveFormatting);\n+\n+            if (projectRootElement != null || loadProjectRootElement == null)\n             {\n-#endif\n-#pragma warning disable format // the release configuration fails as try-catch block is conditioned only for Debug; making the formatting in correct in Release.\n-                // Should already have been canonicalized\n-                ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n+                // If we found it or no load callback was specified, we are done.\n+                return projectRootElement;\n+            }\n \n-                ProjectRootElement projectRootElement;\n-                lock (_locker)\n+            try\n+            {\n+                // We are about to load. Take a per-file lock to prevent multiple threads from duplicating the work multiple times.\n+                object perFileLock = _fileLoadLocks.GetOrAdd(projectFile, () => new object());\n+                lock (perFileLock)\n                 {\n-                    _weakCache.TryGetValue(projectFile, out projectRootElement);\n+                    // Call GetOrLoad again, this time with the OpenProjectRootElement callback.\n+                    return GetOrLoad(projectFile, loadProjectRootElement, isExplicitlyLoaded, preserveFormatting);\n+                }\n+            }\n+            finally\n+            {\n+                // Remove the lock object as we have otherwise no good way of preventing _fileLoadLocks from growing unboundedly.",
+              "author": {
+                "login": "Forgind"
+              }
+            },
+            {
+              "body": "For the worst case scenarios where leaving the lock objects in the dictionary would be a problem, I was thinking more about cases where a long-lived MSBuild process would be asked to evaluate generated projects. I.e. something generates `%TEMP%\\<guid>.proj`, asks MSBuild to evaluate/build it, then deletes it, all this in a loop. That could be problematic in practice, I think.\r\n\r\n> Do you happen to have numbers on how efficient locks are vs. using the ConcurrentDictionary?\r\n\r\nReading upon the the `ConcurrentDictionary` implementation, it looks like it should be able to satisfy reads lock-free. In our use case where the dictionary is used more or less on the slow path, I don't think the choice of the data structure is critical. Using a concurrent collection nicely communicates the intent and an avoiding another explicit lock in our code means one less place to worry about potential deadlocks.\r\n\r\nFor the weak vs. strong cache it looks like the idea is to cache N recently loaded projects + whatever manages to survive GC. I agree that it would be useful to investigate how well this performs compared to alternative designs.",
+              "createdAt": "2023-03-20T08:12:40Z",
+              "path": "src/Build/Evaluation/ProjectRootElementCache.cs",
+              "diffHunk": "@@ -224,106 +250,127 @@ private bool IsInvalidEntry(string projectFile, ProjectRootElement projectRootEl\n         {\n #if DEBUG\n             // Verify that loadProjectRootElement delegate does not call ProjectRootElementCache.Get().\n-            s_getEntriesNumber++;\n+            using var reentrancyGuard = new ReentrancyGuard();\n+\n+            // Verify that we never call this with _locker held, as that would create a lock ordering inversion with the per-file lock.\n             ErrorUtilities.VerifyThrow(\n-                s_getEntriesNumber == 1,\n-                \"Reentrance to the ProjectRootElementCache.Get function detected.\");\n+                !System.Threading.Monitor.IsEntered(_locker),\n+                \"Detected lock ordering inversion in ProjectRootElementCache.\");\n+#endif\n+            // Should already have been canonicalized\n+            ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n \n-            try\n+            // First try getting the ProjectRootElement from the cache.\n+            ProjectRootElement projectRootElement = GetOrLoad(projectFile, loadProjectRootElement: null, isExplicitlyLoaded, preserveFormatting);\n+\n+            if (projectRootElement != null || loadProjectRootElement == null)\n             {\n-#endif\n-#pragma warning disable format // the release configuration fails as try-catch block is conditioned only for Debug; making the formatting in correct in Release.\n-                // Should already have been canonicalized\n-                ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n+                // If we found it or no load callback was specified, we are done.\n+                return projectRootElement;\n+            }\n \n-                ProjectRootElement projectRootElement;\n-                lock (_locker)\n+            try\n+            {\n+                // We are about to load. Take a per-file lock to prevent multiple threads from duplicating the work multiple times.\n+                object perFileLock = _fileLoadLocks.GetOrAdd(projectFile, () => new object());\n+                lock (perFileLock)\n                 {\n-                    _weakCache.TryGetValue(projectFile, out projectRootElement);\n+                    // Call GetOrLoad again, this time with the OpenProjectRootElement callback.\n+                    return GetOrLoad(projectFile, loadProjectRootElement, isExplicitlyLoaded, preserveFormatting);\n+                }\n+            }\n+            finally\n+            {\n+                // Remove the lock object as we have otherwise no good way of preventing _fileLoadLocks from growing unboundedly.",
+              "author": {
+                "login": "ladipro"
+              }
+            },
+            {
+              "body": "That actually makes a lot of sense. I hadn't looked back to whether we clear the cache after every build, and I'd assumed we do, but it looks like we only do if the user requests it:\r\nhttps://github.com/dotnet/msbuild/blob/60ea2f733cfcc78da965ab43cf040fe5c58800fb/src/Build/BackEnd/BuildManager/BuildManager.cs#L2117-L2124\r\n\r\nI'm guessing we never actually ran that \"experiment\"; I'm wondering if we should?",
+              "createdAt": "2023-03-20T22:48:00Z",
+              "path": "src/Build/Evaluation/ProjectRootElementCache.cs",
+              "diffHunk": "@@ -224,106 +250,127 @@ private bool IsInvalidEntry(string projectFile, ProjectRootElement projectRootEl\n         {\n #if DEBUG\n             // Verify that loadProjectRootElement delegate does not call ProjectRootElementCache.Get().\n-            s_getEntriesNumber++;\n+            using var reentrancyGuard = new ReentrancyGuard();\n+\n+            // Verify that we never call this with _locker held, as that would create a lock ordering inversion with the per-file lock.\n             ErrorUtilities.VerifyThrow(\n-                s_getEntriesNumber == 1,\n-                \"Reentrance to the ProjectRootElementCache.Get function detected.\");\n+                !System.Threading.Monitor.IsEntered(_locker),\n+                \"Detected lock ordering inversion in ProjectRootElementCache.\");\n+#endif\n+            // Should already have been canonicalized\n+            ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n \n-            try\n+            // First try getting the ProjectRootElement from the cache.\n+            ProjectRootElement projectRootElement = GetOrLoad(projectFile, loadProjectRootElement: null, isExplicitlyLoaded, preserveFormatting);\n+\n+            if (projectRootElement != null || loadProjectRootElement == null)\n             {\n-#endif\n-#pragma warning disable format // the release configuration fails as try-catch block is conditioned only for Debug; making the formatting in correct in Release.\n-                // Should already have been canonicalized\n-                ErrorUtilities.VerifyThrowInternalRooted(projectFile);\n+                // If we found it or no load callback was specified, we are done.\n+                return projectRootElement;\n+            }\n \n-                ProjectRootElement projectRootElement;\n-                lock (_locker)\n+            try\n+            {\n+                // We are about to load. Take a per-file lock to prevent multiple threads from duplicating the work multiple times.\n+                object perFileLock = _fileLoadLocks.GetOrAdd(projectFile, () => new object());\n+                lock (perFileLock)\n                 {\n-                    _weakCache.TryGetValue(projectFile, out projectRootElement);\n+                    // Call GetOrLoad again, this time with the OpenProjectRootElement callback.\n+                    return GetOrLoad(projectFile, loadProjectRootElement, isExplicitlyLoaded, preserveFormatting);\n+                }\n+            }\n+            finally\n+            {\n+                // Remove the lock object as we have otherwise no good way of preventing _fileLoadLocks from growing unboundedly.",
+              "author": {
+                "login": "Forgind"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

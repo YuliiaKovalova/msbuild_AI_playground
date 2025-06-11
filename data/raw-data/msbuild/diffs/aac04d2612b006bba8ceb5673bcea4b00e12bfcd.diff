@@ -1,0 +1,1491 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index b2aae4fb743..3d2088d264c 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1332,6 +1332,7 @@ internal void ExecuteSubmission(BuildSubmission submission, bool allowMainThread
+                             _projectCacheService.InitializePluginsForVsScenario(
+                                 ProjectCacheDescriptors.Values,
+                                 resolvedConfiguration,
++                                submission.BuildRequestData.TargetNames,
+                                 _executionCancellationTokenSource.Token);
+                         }
+ 
+@@ -1953,7 +1954,7 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+ 
+             if (submission.BuildRequestData.GraphBuildOptions.Build)
+             {
+-                _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token);
++                _projectCacheService.InitializePluginsForGraph(projectGraph, submission.BuildRequestData.TargetNames, _executionCancellationTokenSource.Token);
+ 
+                 var targetListTask = projectGraph.GetTargetLists(submission.BuildRequestData.TargetNames);
+ 
+diff --git a/src/Build/BackEnd/Components/ProjectCache/CacheContext.cs b/src/Build/BackEnd/Components/ProjectCache/CacheContext.cs
+index 256102d0d86..d7b5ea98cca 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/CacheContext.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/CacheContext.cs
+@@ -1,6 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
+ using System.Collections.Generic;
+ using Microsoft.Build.FileSystem;
+ using Microsoft.Build.Graph;
+@@ -22,12 +23,23 @@ public class CacheContext
+         public IReadOnlyCollection<ProjectGraphEntryPoint>? GraphEntryPoints { get; }
+         public string? MSBuildExePath { get; }
+         public MSBuildFileSystemBase FileSystem { get; }
++        public IReadOnlyCollection<string> RequestedTargets { get; }
+ 
+         public CacheContext(
+             IReadOnlyDictionary<string, string> pluginSettings,
+             MSBuildFileSystemBase fileSystem,
+             ProjectGraph? graph = null,
+             IReadOnlyCollection<ProjectGraphEntryPoint>? graphEntryPoints = null)
++            : this(pluginSettings, fileSystem, requestedTargets: Array.Empty<string>(), graph, graphEntryPoints)
++        {
++        }
++
++        public CacheContext(
++            IReadOnlyDictionary<string, string> pluginSettings,
++            MSBuildFileSystemBase fileSystem,
++            IReadOnlyCollection<string> requestedTargets,
++            ProjectGraph? graph = null,
++            IReadOnlyCollection<ProjectGraphEntryPoint>? graphEntryPoints = null)
+         {
+             ErrorUtilities.VerifyThrow(
+                 (graph != null) ^ (graphEntryPoints != null),
+@@ -38,6 +50,7 @@ public CacheContext(
+             GraphEntryPoints = graphEntryPoints;
+             MSBuildExePath = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
+             FileSystem = fileSystem;
++            RequestedTargets = requestedTargets;
+         }
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+index 4d695e99076..e53d28292d1 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+@@ -95,7 +95,10 @@ public ProjectCacheService(
+         /// <summary>
+         /// Optimization which frontloads plugin initialization since we have an entire graph.
+         /// </summary>
+-        public void InitializePluginsForGraph(ProjectGraph projectGraph, CancellationToken cancellationToken)
++        public void InitializePluginsForGraph(
++            ProjectGraph projectGraph,
++            ICollection<string> requestedTargets,
++            CancellationToken cancellationToken)
+         {
+             EnsureNotDisposed();
+ 
+@@ -111,7 +114,7 @@ public void InitializePluginsForGraph(ProjectGraph projectGraph, CancellationTok
+                             foreach (ProjectCacheDescriptor projectCacheDescriptor in GetProjectCacheDescriptors(node.ProjectInstance))
+                             {
+                                 // Intentionally fire-and-forget to asynchronously initialize the plugin. Any exceptions will bubble up later when querying.
+-                                _ = GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph, buildRequestConfiguration: null, cancellationToken)
++                                _ = GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph, buildRequestConfiguration: null, requestedTargets, cancellationToken)
+                                     .ContinueWith(t => { }, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted);
+                             }
+                         });
+@@ -122,6 +125,7 @@ public void InitializePluginsForGraph(ProjectGraph projectGraph, CancellationTok
+         public void InitializePluginsForVsScenario(
+             IEnumerable<ProjectCacheDescriptor> projectCacheDescriptors,
+             BuildRequestConfiguration buildRequestConfiguration,
++            ICollection<string> requestedTargets,
+             CancellationToken cancellationToken)
+         {
+             EnsureNotDisposed();
+@@ -144,7 +148,7 @@ public void InitializePluginsForVsScenario(
+                         projectCacheDescriptor =>
+                         {
+                             // Intentionally fire-and-forget to asynchronously initialize the plugin. Any exceptions will bubble up later when querying.
+-                            _ = GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph: null, buildRequestConfiguration, cancellationToken)
++                            _ = GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph: null, buildRequestConfiguration, requestedTargets, cancellationToken)
+                                 .ContinueWith(t => { }, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted);
+                         });
+                 },
+@@ -155,12 +159,13 @@ private Task<ProjectCachePlugin> GetProjectCachePluginAsync(
+             ProjectCacheDescriptor projectCacheDescriptor,
+             ProjectGraph? projectGraph,
+             BuildRequestConfiguration? buildRequestConfiguration,
++            ICollection<string> requestedTargets,
+             CancellationToken cancellationToken)
+             => _projectCachePlugins.GetOrAdd(
+                 projectCacheDescriptor,
+                 // The use of Lazy is because ConcurrentDictionary doesn't guarantee the value factory executes only once if there are multiple simultaneous callers,
+                 // so this ensures that CreateAndInitializePluginAsync is only called exactly once.
+-                descriptor => new Lazy<Task<ProjectCachePlugin>>(() => CreateAndInitializePluginAsync(descriptor, projectGraph, buildRequestConfiguration, cancellationToken)))
++                descriptor => new Lazy<Task<ProjectCachePlugin>>(() => CreateAndInitializePluginAsync(descriptor, projectGraph, buildRequestConfiguration, requestedTargets, cancellationToken)))
+                .Value;
+ 
+         private IEnumerable<ProjectCacheDescriptor> GetProjectCacheDescriptors(ProjectInstance projectInstance)
+@@ -189,6 +194,7 @@ private async Task<ProjectCachePlugin> CreateAndInitializePluginAsync(
+             ProjectCacheDescriptor projectCacheDescriptor,
+             ProjectGraph? projectGraph,
+             BuildRequestConfiguration? buildRequestConfiguration,
++            ICollection<string> requestedTargets,
+             CancellationToken cancellationToken)
+         {
+             BuildEventContext buildEventContext = BuildEventContext.Invalid;
+@@ -241,6 +247,9 @@ private async Task<ProjectCachePlugin> CreateAndInitializePluginAsync(
+                 ? GetGraphEntryPoints(buildRequestConfiguration)
+                 : null;
+ 
++            // In practice, the underlying type of the ICollection is a List<string> so attempt to cast first
++            IReadOnlyList<string> requestedTargetsList = requestedTargets as List<string> ?? requestedTargets.ToList();
++
+             _loggingService.LogComment(buildEventContext, MessageImportance.High, "LoadingProjectCachePlugin", pluginTypeName);
+             MSBuildEventSource.Log.ProjectCacheBeginBuildStart(pluginTypeName);
+ 
+@@ -250,6 +259,7 @@ await pluginInstance.BeginBuildAsync(
+                     new CacheContext(
+                         projectCacheDescriptor.PluginSettings,
+                         DefaultMSBuildFileSystem.Instance,
++                        requestedTargetsList,
+                         projectGraph,
+                         graphEntryPoints),
+                     pluginLogger,
+@@ -517,7 +527,8 @@ private async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildReques
+                     continue;
+                 }
+ 
+-                ProjectCachePlugin plugin = await GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph: null, buildRequestConfiguration, cancellationToken);
++                ICollection<string> requestedTargetsList = buildRequestConfiguration.RequestedTargets as ICollection<string> ?? buildRequestConfiguration.RequestedTargets.ToList();
++                ProjectCachePlugin plugin = await GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph: null, buildRequestConfiguration, requestedTargetsList, cancellationToken);
+                 try
+                 {
+                     // Rethrow any initialization exception.
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 047911f93bf..bce0cd169f9 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">Požadované sestavení NuGet se nenašlo. Očekávaná cesta: {0}</target>
++        <target state="translated">Nepovedlo se načíst požadované sestavení NuGet {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+@@ -1500,7 +1500,7 @@
+       </trans-unit>
+       <trans-unit id="SolutionVenusProjectSkipped">
+         <source>Skipping because the "$(AspNetConfiguration)" configuration is not supported for this web project.  You can use the AspNetConfiguration property to override the configuration used for building web projects, by adding /p:AspNetConfiguration=&lt;value&gt; to the command line. Currently web projects only support Debug and Release configurations.</source>
+-        <target state="translated">Vynecháno, protože konfigurace "$(AspNetConfiguration)" není pro tento webový projekt podporována. Pomocí vlastnosti AspNetConfiguration můžete přepsat konfiguraci používanou k sestavování webových projektů, a to přidáním příkazu /p:AspNetConfiguration=&lt;hodnota&gt; do příkazového řádku. Webové projekty nyní podporují pouze konfigurace Debug a Release.</target>
++        <target state="translated">Vynecháno, protože konfigurace $(AspNetConfiguration) není pro tento webový projekt podporována. Pomocí vlastnosti AspNetConfiguration můžete přepsat konfiguraci používanou k sestavování webových projektů, a to přidáním příkazu /p:AspNetConfiguration=&lt;hodnota&gt; do příkazového řádku. Webové projekty nyní podporují pouze konfigurace Debug a Release.</target>
+         <note>
+     UE: This is not an error, so doesn't need an error code.
+     LOCALIZATION: Do NOT localize "AspNetConfiguration", "Debug", "Release".
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 9d40c5707dd..be95e6e8f12 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">Eine erforderliche NuGet-Assembly wurde nicht gefunden. Erwarteter Pfad: {0}</target>
++        <target state="translated">Eine erforderliche NuGet-Assembly "{0}" konnte nicht geladen werden.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+@@ -492,7 +492,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled
+     {0}</source>
+-        <target state="translated">Dies ist ein Ausnahmefehler in MSBuild. STIMMEN SIE EINEM VORHANDENEN ISSUE ZU, ODER ERSTELLEN SIE EIN NEUES ISSUE UNTER https://aka.ms/msbuild/unhandled
++        <target state="translated">Dies ist eine nicht behandelte Ausnahme in MSBuild. RUFEN SIE EIN VORHANDENES PROBLEM AUF, ODER ERSTELLEN SIE EIN NEUES UNTER https://aka.ms/msbuild/unhandled
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 4ad2cedbfe7..e3ab82956ad 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">No se encontró un ensamblado de NuGet necesario. Ruta de acceso esperada: {0}</target>
++        <target state="translated">No se pudo cargar un ensamblado NuGet necesario "{0}".</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 3c1431c28be..8fdb220057b 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">Un assembly NuGet obligatoire est introuvable. Chemin attendu : {0}</target>
++        <target state="translated">Impossible de charger une assemblée NuGet «{0}» requise.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+@@ -492,7 +492,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled
+     {0}</source>
+-        <target state="translated">Il s’agit d’une exception non prise en charge dans MSBuild –– VOTEZ POUR UN PROBLÈME EXISTANT OU CRÉEZ-EN UN SUR https://aka.ms/msbuild/unhandled
++        <target state="translated">Il s’agit d’une exception non gérée dans MSBuild –– VOTEZ POUR UN PROBLÈME EXISTANT OU ENTREZ UN NOUVEAU FICHIER À https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index af45d49d4d6..12f8460c1e0 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">Un assembly NuGet obbligatorio non è stato trovato. Percorso previsto: {0}</target>
++        <target state="translated">Non è stato possibile caricare un assembly NuGet obbligatorio '{0}'.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 09f3ec01754..f21702818b4 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">必要な NuGet アセンブリが見つかりませんでした。想定されるパス: {0}</target>
++        <target state="translated">必要な NuGet アセンブリ '{0}' を読み込めませんでした。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 5f21196ef4c..432ff34b4eb 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">필요한 NuGet 어셈블리를 찾을 수 없습니다. 예상 경로: {0}</target>
++        <target state="translated">필요한 NuGet 어셈블리 '{0}'을(를) 로드할 수 없습니다.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index dafb394d614..3842b13b712 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">Nie znaleziono wymaganego zestawu NuGet. Oczekiwano ścieżki {0}.</target>
++        <target state="translated">Nie można załadować wymaganego zestawu NuGet „{0}”.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+@@ -492,7 +492,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled
+     {0}</source>
+-        <target state="translated">Jest to nieobsługiwany wyjątek na platformie MSBuild -- ZAGŁOSUJ NA ISTNIEJĄCY PROBLEM LUB ZAREJESTRUJ NOWY W WITRYNIE https://aka.ms/msbuild/unhandled.
++        <target state="translated">Jest to nieobsługiwany wyjątek w aplikacji MSBuild -- ZAGŁOSUJ NA ISTNIEJĄCY PROBLEM LUB ZAGŁOSUJ NA NOWY NA https://aka.ms/msbuild/unhandled.
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index c9b2d280391..bee8a55e88d 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">Um assembly NuGet necessário não foi encontrado. Caminho Esperado: {0}</target>
++        <target state="translated">Não foi possível carregar um assembly NuGet "{0}" obrigatório.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+@@ -492,7 +492,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled
+     {0}</source>
+-        <target state="translated">Essa é uma exceção não tratada no MSBuild -- POR FAVOR, ATUALIZE UMA QUESTÃO EXISTENTE OU ENCAMINHE UMA NOVA EM https://aka.ms/msbuild/unhandled
++        <target state="translated">Esta é uma exceção não tratada no MSBuild -- POR FAVOR, APOIE UM PROBLEMA EXISTENTE OU ARQUIVE UM NOVO EM https://aka.ms/msbuild/unhandled
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 42cc6134536..40ebdbfe1e6 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">Не найдена обязательная сборка NuGet. Ожидаемый путь: {0}</target>
++        <target state="translated">Не удалось загрузить требуемую сборку NuGet "{0}".</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+@@ -492,7 +492,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled
+     {0}</source>
+-        <target state="translated">Это необработанное исключение в MSBuild. ПРОГОЛОСУЙТЕ ЗА СУЩЕСТВУЮЩУЮ ПРОБЛЕМУ ИЛИ СООБЩИТЕ О НОВУЙ НА https://aka.ms/msbuild/unhandled
++        <target state="translated">Это необработанное исключение в MSBuild. Проголосуйте за существующую проблему или сообщите о новой по адресу https://aka.ms/msbuild/unhandled
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 809c1d969fe..8eaeeb2fa66 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">Gereken NuGet derlemesi bulunamadı. Beklenen Yol: {0}</target>
++        <target state="translated">Gerekli bir NuGet '{0}' derlemesi yüklenemedi.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+@@ -492,7 +492,7 @@
+       <trans-unit id="UnhandledMSBuildError">
+         <source>This is an unhandled exception in MSBuild -- PLEASE UPVOTE AN EXISTING ISSUE OR FILE A NEW ONE AT https://aka.ms/msbuild/unhandled
+     {0}</source>
+-        <target state="translated">Bu, MSBuild'de işlenmeyen bir istisnadır -- LÜTFEN MEVCUT BİR SORUNU OYLAYIN VEYA https://aka.ms/msbuild/unhandled ADRESİNDE YENİ BİR SORUN OLUŞTURUN
++        <target state="translated">Bu, MSBuild'de işlenmeyen bir istisnadır -- LÜTFEN MEVCUT BİR SORUNU OYLAYIN VEYA https://aka.ms/msbuild/unhandled ADRESİNDE YENİ BİR SORUN DOSYALAYIN
+     {0}</target>
+         <note />
+       </trans-unit>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 89b16c2d43d..29acca521f2 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">未找到所需的 NuGet 程序集。所需路径: {0}</target>
++        <target state="translated">无法加载所需的 NuGet 程序集“{0}”。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+@@ -2421,7 +2421,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</source>
+       </trans-unit>
+       <trans-unit id="InvalidSdkFormat">
+         <source>MSB4229: The value "{0}" is not valid for an Sdk specification. The attribute should be a semicolon-delimited list of Sdk-name/minimum-version pairs, separated by a forward slash.</source>
+-        <target state="translated">MSB4229: 值“{0}”对 Sdk 规范无效。此属性应该是以分号分隔的Sdk-name/minimum-version 对 (用正斜杠分隔) 的列表。</target>
++        <target state="translated">MSB4229: 值“{0}”对 Sdk 规范无效。此属性应该是以分号分隔的Sdk-name/minimum-version 对（用正斜杠分隔）的列表。</target>
+         <note>{StrBegin="MSB4229: "}</note>
+       </trans-unit>
+       <trans-unit id="TaskInstantiationFailureNotSupported">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index a28f9eadc87..d7e86b932b4 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -223,7 +223,7 @@
+       </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly '{0}' could not be loaded.</source>
+-        <target state="needs-review-translation">找不到必要的 NuGet 元件。預期的路徑: {0}</target>
++        <target state="translated">無法載入必要的 NuGet 組件 '{0}'。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="NullReferenceFromProjectInstanceFactory">
+diff --git a/src/Directory.Build.props b/src/Directory.Build.props
+index fd9dc2a5974..554aa2b2533 100644
+--- a/src/Directory.Build.props
++++ b/src/Directory.Build.props
+@@ -24,8 +24,8 @@
+ 
+     <ProduceReferenceAssembly Condition="'$(IsTestProject)' != 'true'">true</ProduceReferenceAssembly>
+ 
+-    <!-- Set up BeforeCommon.targets -->
+-    <CustomBeforeMicrosoftCommonTargets>$(MSBuildThisFileDirectory)Directory.BeforeCommon.targets</CustomBeforeMicrosoftCommonTargets>
++    <!-- Set up BeforeCommon.targets. Arcade uses this property as well, so don't overwrite it. -->
++    <CustomBeforeMicrosoftCommonTargets>$(CustomBeforeMicrosoftCommonTargets);$(MSBuildThisFileDirectory)Directory.BeforeCommon.targets</CustomBeforeMicrosoftCommonTargets>
+ 
+     <Platforms>AnyCPU;x64;arm64</Platforms>
+ 
+diff --git a/src/MSBuild/Resources/xlf/Strings.cs.xlf b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+index bc757f96072..cbfc554f4b5 100644
+--- a/src/MSBuild/Resources/xlf/Strings.cs.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+@@ -575,17 +575,20 @@ Když se nastaví na MessageUponIsolationViolation (nebo jeho krátký
+                        -logger:XMLLogger,MyLogger,Version=1.0.2,Culture=neutral
+                        -logger:XMLLogger,C:\Loggers\MyLogger.dll;OutputAsHTML
+ </source>
+-        <target state="translated">  -logger:&lt;logger&gt;   Použít daný protokolovací nástroj k protokolování událostí nástroje MSBuild. Pokud chcete zadat 
+-                     více protokolovacích nástrojů, musíte je zadat jednotlivě.
+-                     Syntaxe hodnoty &lt;logger&gt; je:
+-                       [&lt;class&gt;,]&lt;assembly&gt;[,&lt;options&gt;][;&lt;parameters&gt;]
+-                     Syntaxe hodnoty &lt;logger class&gt; je:
+-                       [&lt;partial or full namespace&gt;.]&lt;logger class name&gt;
+-                     Syntaxe hodnoty &lt;logger assembly&gt; je:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++        <target state="translated">  -logger:&lt;protok_nást&gt;   Použít daný protokolovací nástroj k protokolování
++                     událostí nástroje MSBuild. Chcete-li zadat více protokolovacích.
++                     nástrojů, musíte je zadat jednotlivě.
++                     Syntaxe hodnoty &lt;protok_nást&gt;:
++                        [&lt;třída_protok_nást&gt;,]&lt;sestavení_protok_nást&gt;
++                        [;&lt;param_protok_nást&gt;]
++                     Syntaxe hodnoty &lt;třída_protok_nást&gt;:
++                        [&lt;část/úpl_obor_názvů&gt;.]&lt;náz_tř_protok_nást&gt;
++                     Syntaxe hodnoty &lt;sestavení_protok_nást&gt;:
++                        {&lt;název_sestavení&gt;[,&lt;strong name&gt;] | &lt;soubor_sestavení&gt;}
+                      Parametry protokolovacího nástroje určují, jak MSBuild vytvoří protokolovací nástroj.
+-                     Parametry &lt;logger parameters&gt; jsou volitelné a předávají se
+-                     protokolovacímu nástroji přesně v tom tvaru, v jakém byly zadány. (Krátký tvar: -l)
++                     Parametry &lt;param_protok_nást&gt; jsou volitelné a předávají se 
++                     protokolovacímu nástroji přesně v tom tvaru, v jakém
++                     byly zadány. (Krátký tvar: -l)
+                      Příklady:
+                        -logger:XMLLogger,MyLogger,Version=1.0.2,Culture=neutral
+                        -logger:XMLLogger,C:\Loggers\MyLogger.dll;OutputAsHTML
+@@ -854,20 +857,23 @@ Když se nastaví na MessageUponIsolationViolation (nebo jeho krátký
+                        -dl:XMLLogger,MyLogger,Version=1.0.2,Culture=neutral
+                        -dl:MyLogger,C:\My.dll*ForwardingLogger,C:\Logger.dll
+ </source>
+-        <target state="translated">  -distributedLogger:&lt;central logger&gt;*&lt;forwarding logger&gt;
+-                     Použít zadaný protokolovací nástroj pro protokolování událostí z nástroje MSBuild; ke každému uzlu připojit
+-                     jinou instanci protokolovacího nástroje. Pokud chcete zadat více
+-                     protokolovacích nástrojů, uveďte je jednotlivě.
++        <target state="translated">  -distributedlogger:&lt;centr_protok_nást&gt;*&lt;předáv_protok_nást&gt;                     
++                     Použít zadaný protokolovací nástroj pro protokolování událostí
++                     z nástroje MSBuild; ke každému uzlu připojit jinou instanci 
++                     protokolovacího nástroje. Chcete-li zadat více 
++                     protokolovacích nástrojů, uveďte je jednotlivě. 
+                      (Krátký tvar: -dl)
+-                     Syntaxe hodnoty &lt;logger&gt; je:
+-                       [&lt;class&gt;,]&lt;assembly&gt;[,&lt;options&gt;][;&lt;parameters&gt;]
+-                     Syntaxe hodnoty &lt;logger class&gt; je:
+-                       [&lt;partial or full namespace&gt;.]&lt;logger class name&gt;
+-                     Syntaxe hodnoty &lt;logger assembly&gt; je:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                     Syntaxe hodnoty &lt;protok_nást&gt;:
++                        [&lt;třída_protok_nást&gt;,]&lt;sestav_protok_nást&gt;
++                        [;&lt;param_protok_nást&gt;]
++                     Syntaxe hodnoty &lt;třída_protok_nást&gt;:
++                        [&lt;část/úpl_obor_názvů&gt;.]&lt;náz_tř_protok_nást&gt;
++                     Syntaxe hodnoty &lt;sestav_protok_nást&gt;:
++                        {&lt;název_sestavení&gt;[,&lt;strong name&gt;] | &lt;soubor_sestavení&gt;}
+                      Parametry protokolovacího nástroje určují, jak MSBuild vytvoří protokolovací nástroj.
+                      Parametry &lt;param_protok_nást&gt; jsou volitelné a předávají se
+-                     protokolovacímu nástroji přesně v zadaném tvaru. (Krátký tvar: -l)
++                     protokolovacímu nástroji přesně v zadaném tvaru.
++                     (Krátký tvar: -l)
+                      Příklady:
+                        -dl:XMLLogger,MyLogger,Version=1.0.2,Culture=neutral
+                        -dl:MyLogger,C:\My.dll*ForwardingLogger,C:\Logger.dll
+@@ -1055,7 +1061,7 @@ Když se nastaví na MessageUponIsolationViolation (nebo jeho krátký
+                                              Verbosity=diagnostic;Encoding=UTF-8
+ 
+                        -flp:Summary;Verbosity=minimal;LogFile=msbuild.sum 
+-                       -flp1:warningsonly;logfile=msbuild.wrn
++                       -flp1:warningsonly;logfile=msbuild.wrn 
+                        -flp2:errorsonly;logfile=msbuild.err
+     </target>
+         <note>
+diff --git a/src/MSBuild/Resources/xlf/Strings.de.xlf b/src/MSBuild/Resources/xlf/Strings.de.xlf
+index a21843226d1..7a1059f935d 100644
+--- a/src/MSBuild/Resources/xlf/Strings.de.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.de.xlf
+@@ -112,11 +112,12 @@
+ 
+                      This flag is experimental and may not work as intended.
+     </source>
+-        <target state="translated">  -reportFileAccesses[:True|False]
+-                     Führt dazu, dass MSBuild Dateizugriffe auf ein beliebiges konfiguriertes
+-                     Projektcache-Plug-In meldet.
++        <target state="translated">  -reportFileAccesses[:True|Falsch]
++                     Führt dazu, dass MSBuild Dateizugriffe an alle konfigurierten
++ meldet
++                     Projektcache-Plug-Ins.
+ 
+-                     Dieses Flag ist experimentell und funktioniert möglicherweise nicht wie vorgesehen.
++                     Dieses Kennzeichen ist experimentell und funktioniert möglicherweise nicht wie vorgesehen.
+     </target>
+         <note>
+       LOCALIZATION: "-reportFileAccesses" should not be localized.
+@@ -573,11 +574,11 @@ Dies ist ein restriktiverer Modus von MSBuild, da er erfordert,
+         <target state="translated">  -logger:&lt;Protokollierung&gt;   Mithilfe dieser Protokollierung werden Ereignisse von MSBuild protokolliert. Um mehrere Protokollierungen anzugeben, 
+                      wird jede Protokollierung gesondert angegeben.
+                      Die Syntax für die &lt;Protokollierung&gt; lautet:
+-                       [&lt;Klasse&gt;,]&lt;assembly&gt;[,&lt;Optionen&gt;][;&lt;Parameter&gt;]
++                       [&lt;Klasse&gt;,]&lt;Assembly&gt;[,&lt;Optionen&gt;][;&lt;Parameter&gt;]
+                      Die Syntax für die &lt;Protokollierungsklasse&gt; lautet:
+                         [&lt;Teilweiser oder vollständiger Namespace&gt;.]&lt;Name der Protokollierungsklasse&gt;
+                      Die Syntax für die &lt;Protokollierungsassembly&gt; lautet:
+-                        {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;Assemblyname&gt;[,&lt;strong name&gt;] | &lt;Assemblydatei&gt;}
+                      Die Protokollierungsoptionen geben an, wie MSBuild die Protokollierung erstellt.
+                      Die &lt;Protokollierungsparameter&gt; sind optional und werden genau 
+                      so an die Protokollierung übergeben, wie sie eingegeben wurden. (Kurzform: -l)
+@@ -855,11 +856,11 @@ Dieses Protokollierungsformat ist standardmäßig aktiviert.
+                      gesondert angegeben.
+                      (Kurzform -dl)
+                      Die Syntax für die &lt;Protokollierung&gt; lautet:
+-                       [&lt;Klasse&gt;,]&lt;assembly&gt;[,&lt;Optionen&gt;][;&lt;Parameter&gt;]
++                       [&lt;Klasse&gt;,]&lt;Assembly&gt;[,&lt;Optionen&gt;][;&lt;Parameter&gt;]
+                      Die Syntax für die &lt;Protokollierungsklasse&gt; lautet:
+                         [&lt;Teilweiser oder vollständiger Namespace&gt;.]&lt;Name der Protokollierungsklasse&gt;
+                      Die Syntax für die &lt;Protokollierungsassembly&gt; lautet:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;Assemblyname&gt;[,&lt;strong name&gt;] | &lt;Assemblydatei&gt;}
+                      Die Protokollierungsoptionen geben an, wie MSBuild die Protokollierung erstellt.
+                      Die &lt;Protokollierungsparameter&gt; sind optional und werden genau 
+                      so an die Protokollierung übergeben, wie sie eingegeben wurden. (Kurzform: -l)
+diff --git a/src/MSBuild/Resources/xlf/Strings.es.xlf b/src/MSBuild/Resources/xlf/Strings.es.xlf
+index 5e02da6973e..7360c1e9799 100644
+--- a/src/MSBuild/Resources/xlf/Strings.es.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.es.xlf
+@@ -116,7 +116,7 @@
+                      Hace que MSBuild informe de los accesos a los archivos a cualquier
+                      complemento de caché de proyectos.
+ 
+-                     Esta marca es experimental y puede que no funcione según lo previsto.
++Esta marca es experimental y puede que no funcione según lo previsto.
+     </target>
+         <note>
+       LOCALIZATION: "-reportFileAccesses" should not be localized.
+@@ -571,14 +571,18 @@
+                        -logger:XMLLogger,C:\Loggers\MyLogger.dll;OutputAsHTML
+ </source>
+         <target state="translated">  -logger:&lt;registrador&gt;   Use este registrador para registrar eventos
+-                     de MSBuild. Para especificar varios registradores, especifique cada uno de ellos por separado.
++                     de MSBuild. Para especificar varios registradores, especifique
++                     cada uno de ellos por separado.
+                      La sintaxis de &lt;registrador&gt; es:
+-                       [&lt;clase&gt;,]&lt;assembly&gt;[,&lt;opciones&gt;][;&lt;parámetros&gt;]
++                       [&lt;clase&gt;,]&lt;ensamblado&gt;[,&lt;opciones&gt;][;&lt;parámetros&gt;]
+                      La sintaxis de &lt;clase del registrador&gt; es:
+-                       [&lt;espacio de nombres parcial o completo&gt;.]&lt;nombre de clase del registrador&gt;
+-                       La sintaxis de &lt;ensamblado del registrador&gt; es:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
+-                     Las opciones del registrador especifican cómo crea MSBuild el registrador.
++                       [&lt;espacio de nombres parcial o completo&gt;.]&lt;nombre de
++                       clase del registrador&gt;
++                     La sintaxis de &lt;ensamblado del registrador&gt; es:
++                       {&lt;nombre del ensamblado&gt;[,&lt;strong name&gt;] | &lt;archivo
++                       de ensamblado&gt;}
++                     Las opciones del registrador especifican cómo crea MSBuild
++                     el registrador.
+                      Los &lt;parámetros del registrador&gt; son opcionales y se pasan
+                      al registrador tal como se escriben. (Forma corta: -l)
+                      Ejemplos:
+@@ -855,12 +859,15 @@
+                      Para especificar varios registradores, especifique cada uno
+                      de ellos por separado. (Forma corta: -dl)
+                      La sintaxis de &lt;registrador&gt; es:
+-                       [&lt;clase&gt;,]&lt;assembly&gt;[,&lt;opciones&gt;][;&lt;parámetros&gt;]
++                       [&lt;clase&gt;,]&lt;ensamblado&gt;[,&lt;opciones&gt;][;&lt;parámetros&gt;]
+                      La sintaxis de &lt;clase del registrador&gt; es:
+-                       [&lt;espacio de nombres parcial o completo&gt;.]&lt;nombre de la clase del registrador&gt;
++                       [&lt;espacio de nombres parcial o completo&gt;.]&lt;nombre
++                       de la clase del registrador&gt;
+                      La sintaxis de &lt;ensamblado del registrador&gt; es:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
+-                     Las opciones del registrador especifican cómo crea MSBuild el registrador.
++                       {&lt;nombre del ensamblado&gt;[,&lt;strong name&gt;] | &lt;archivo
++                      de ensamblado&gt;}
++                     Las opciones del registrador especifican cómo crea MSBuild
++                     el registrador.
+                      Los &lt;parámetros del registrador&gt; son opcionales y se pasan
+                      al registrador tal como se escriben. (Forma corta: -l)
+                      Ejemplos:
+diff --git a/src/MSBuild/Resources/xlf/Strings.fr.xlf b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+index 61673b8b84b..5667032596d 100644
+--- a/src/MSBuild/Resources/xlf/Strings.fr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+@@ -114,7 +114,7 @@
+     </source>
+         <target state="translated">  -reportFileAccesses[:True|False]
+                      Entraîne le signalement par MSBuild des accès par fichiers aux plug-ins
+-                     de cache de projet configurés.
++                     cache de projet configurés.
+ 
+                      Cet indicateur est expérimental et peut ne pas fonctionner comme prévu.
+     </target>
+@@ -577,7 +577,7 @@ Cet indicateur est expérimental et peut ne pas fonctionner comme prévu.
+                      Syntaxe de &lt;classe de journalisation&gt; :
+                        [&lt;espace de noms partiels ou complets&gt;.]&lt;nom de la classe de journalisation&gt;
+                      Syntaxe de &lt;assembly de journalisation&gt; :
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;nom d'assembly&gt;[,&lt;strong name&gt;] | &lt;fichier d'assembly&gt;}
+                      Les options de journalisation spécifient la façon dont MSBuild crée le journaliseur.
+                      Les &lt;paramètres de journalisation&gt; sont facultatifs. Ils sont passés
+                      au journaliseur tels que vous les avez tapés. (Forme abrégée : -l)
+@@ -859,7 +859,7 @@ Remarque : verbosité des enregistreurs d’événements de fichiers
+                      Syntaxe de &lt;classe de journalisation&gt; :
+                        [&lt;espace de noms partiels ou complets&gt;.]&lt;nom de la classe de journalisation&gt;
+                      Syntaxe de &lt;assembly de journalisation&gt; :
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;nom d'assembly&gt;[,&lt;strong name&gt;] | &lt;fichier d'assembly&gt;}
+                      Les options de journalisation spécifient la façon dont MSBuild crée le journaliseur.
+                      Les &lt;paramètres de journalisation&gt; sont facultatifs. Ils sont passés
+                      au journaliseur tels que vous les avez tapés. (Forme abrégée : -l)
+@@ -1323,7 +1323,7 @@ Remarque : verbosité des enregistreurs d’événements de fichiers
+       </trans-unit>
+       <trans-unit id="MissingGetItemError">
+         <source>MSBUILD : error MSB1014: Must provide an item name for the getItem switch.</source>
+-        <target state="translated">MSBUILD : error MSB1014: Doit fournir un nom d'élément pour le commutateur getItem.</target>
++        <target state="new">MSBUILD : error MSB1014: Must provide an item name for the getItem switch.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1014: "}UE: This happens if the user does something like "msbuild.exe -getItem". The user must pass in an actual item name
+       following the switch, as in "msbuild.exe -getItem:blah".
+@@ -1332,7 +1332,7 @@ Remarque : verbosité des enregistreurs d’événements de fichiers
+       </trans-unit>
+       <trans-unit id="MissingGetPropertyError">
+         <source>MSBUILD : error MSB1010: Must provide a property name for the getProperty switch.</source>
+-        <target state="translated">MSBUILD : error MSB1010: Doit fournir un nom de propriété pour le commutateur getProperty.</target>
++        <target state="new">MSBUILD : error MSB1010: Must provide a property name for the getProperty switch.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1010: "}UE: This happens if the user does something like "msbuild.exe -getProperty". The user must pass in an actual property name
+       following the switch, as in "msbuild.exe -getProperty:blah".
+@@ -1341,7 +1341,7 @@ Remarque : verbosité des enregistreurs d’événements de fichiers
+       </trans-unit>
+       <trans-unit id="MissingGetTargetResultError">
+         <source>MSBUILD : error MSB1017: Must provide a target name for the getTargetResult switch.</source>
+-        <target state="translated">MSBUILD : error MSB1017: Doit fournir un nom de cible pour le commutateur getTargetResult.</target>
++        <target state="new">MSBUILD : error MSB1017: Must provide a target name for the getTargetResult switch.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1017: "}UE: This happens if the user does something like "msbuild.exe -getTargetResult". The user must pass in an actual target name
+       following the switch, as in "msbuild.exe -getTargetResult:blah".
+@@ -1605,7 +1605,7 @@ Remarque : verbosité des enregistreurs d’événements de fichiers
+       </trans-unit>
+       <trans-unit id="SolutionBuildInvalidForCommandLineEvaluation">
+         <source>MSBUILD : error MSB1063: Cannot access properties or items when building solution files or solution filter files. This feature is only available when building individual projects.</source>
+-        <target state="translated">MSBUILD : error MSB1063: Impossible d'accéder aux propriétés ou aux éléments lors de la création de fichiers de solution ou de fichiers de filtre de solution. Cette fonctionnalité est disponible uniquement lors de la génération de projets individuels.</target>
++        <target state="new">MSBUILD : error MSB1063: Cannot access properties or items when building solution files or solution filter files. This feature is only available when building individual projects.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1063: "}UE: This happens if the user passes in a solution file when trying to access individual properties or items. The user must pass in a project file.
+       LOCALIZATION: The prefix "MSBUILD : error MSBxxxx:" should not be localized.
+diff --git a/src/MSBuild/Resources/xlf/Strings.it.xlf b/src/MSBuild/Resources/xlf/Strings.it.xlf
+index 03015b156c1..bf5056ca594 100644
+--- a/src/MSBuild/Resources/xlf/Strings.it.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.it.xlf
+@@ -113,10 +113,10 @@
+                      This flag is experimental and may not work as intended.
+     </source>
+         <target state="translated">  -reportFileAccesses[:True|False]
+-                     Fa in modo che MSBuild segnali gli accessi ai file a qualsiasi
++                     Fa in modo che MSBuild segnali gli accessi ai file a qualsiasi file configurato
+                      plug-in della cache del progetto.
+ 
+-                     Questo flag è sperimentale e potrebbe non funzionare come previsto.
++Questo flag è sperimentale e potrebbe non funzionare come previsto.
+     </target>
+         <note>
+       LOCALIZATION: "-reportFileAccesses" should not be localized.
+@@ -155,7 +155,7 @@
+       </trans-unit>
+       <trans-unit id="MSBuildVersionMessage">
+         <source>MSBuild version {0} for {1}</source>
+-        <target state="translated">Versione di MSBuild Ł{0} per {1}</target>
++        <target state="translated">Versione di MSBuild {0} per {1}</target>
+         <note>LOCALIZATION: {0} contains the DLL version number. {1} contains the name of a runtime, like ".NET Framework", ".NET Core", or "Mono"</note>
+       </trans-unit>
+       <trans-unit id="CurrentDirectory">
+@@ -583,8 +583,8 @@ Questo flag è sperimentale e potrebbe non funzionare come previsto.
+                        [&lt;classe&gt;,]&lt;assembly&gt;[,&lt;opzioni&gt;][;&lt;parametri&gt;]
+                      La sintassi di &lt;classe logger&gt; è la seguente:
+                        [&lt;spazio dei nomi parziale o completo&gt;.]&lt;nome classe logger&gt;
+-                     La sintassi di &lt;logger assembly&gt; è la seguente:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                     La sintassi di &lt;assembly logger&gt; è la seguente:
++                       {&lt;nome assembly&gt;[,&lt;strong name&gt;] | &lt;file di assembly&gt;}
+                      Le opzioni di logger consentono di specificare in che modo MSBuild crea il logger.
+                      I &lt;parametri logger&gt; sono facoltativi e vengono passati al
+                      logger così come vengono digitati. Forma breve: -l.
+@@ -865,8 +865,8 @@ Nota: livello di dettaglio dei logger di file
+                        [&lt;classe&gt;,]&lt;assembly&gt;[,&lt;opzioni&gt;][;&lt;parametri&gt;]
+                      La sintassi di &lt;classe logger&gt; è la seguente:
+                        [&lt;spazio dei nomi parziale o completo&gt;.]&lt;nome classe logger&gt;
+-                     La sintassi di &lt;logger assembly&gt; è la seguente:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                     La sintassi di &lt;assembly logger&gt; è la seguente:
++                       {&lt;nome assembly&gt;[,&lt;strong name&gt;] | &lt;file di assembly&gt;}
+                      Le opzioni di logger consentono di specificare in che modo MSBuild crea il logger.
+                      I &lt;parametri logger&gt; sono facoltativi e vengono passati al
+                      logger così come vengono digitati. Forma breve: -l
+@@ -985,8 +985,9 @@ Nota: livello di dettaglio dei logger di file
+                      è la directory corrente. Per impostazione predefinita, ai
+                      file viene assegnato il nome "MSBuild&lt;idnodo&gt;.log". Il
+                      percorso dei file e altri parametri di fileLogger possono
+-                     essere specificati aggiungendo l'opzione "-fileLoggerParameters".
++                     essere specificati aggiungendo l'opzione
+ 
++                     "-fileLoggerParameters".
+                      Se il nome di un file di log viene impostato con l'opzione
+                      fileLoggerParameters, il logger distribuito userà il nome
+                      file come modello e aggiungerà l'ID del nodo per creare un
+@@ -2033,15 +2034,16 @@ Esegue la profilatura della valutazione di MSBuild e scrive
+                        -restoreProperty:IsRestore=true;MyProperty=value
+     </source>
+         <target state="translated">  -restoreProperty:&lt;n&gt;=&lt;v&gt;
+-                     Imposta queste proprietà a livello di progetto o ne esegue
+-                     l'override solo durante il ripristino e non usa le
+-                     proprietà specificate con l'argomento -property.
+-                     &lt;v&gt; rappresenta il nome della proprietà e &lt;v&gt; il
+-                     valore della proprietà. Usare il punto e virgola o la
+-                     virgola per delimitare più proprietà o specificare ogni proprietà separatamente.
+-                     (Forma breve: -rp)
+-                     Esempio:
+-                       -restoreProperty:IsRestore=true;MyProperty=value
++                      Imposta queste proprietà a livello di progetto o ne esegue
++                      l'override solo durante il ripristino e non usa le
++                      proprietà specificate con l'argomento -property.
++                      &lt;v&gt; rappresenta il nome della proprietà e &lt;v&gt; il
++                      valore della proprietà. Usare il punto e virgola o la
++                      virgola per delimitare più proprietà o specificare ogni
++                      proprietà separatamente.
++                      Forma breve: -rp.
++                      Esempio:
++                        -restoreProperty:IsRestore=true;MyProperty=value
+     </target>
+         <note>
+       LOCALIZATION: "-restoreProperty" and "-rp" should not be localized.
+diff --git a/src/MSBuild/Resources/xlf/Strings.ja.xlf b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+index 533e64a7478..201adf1b476 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ja.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+@@ -114,7 +114,7 @@
+     </source>
+         <target state="translated">  -reportFileAccesses[:True|False]
+                      MSBuild が、構成されているプロジェクト キャッシュ プラグインへの
+-                     ファイル アクセスを報告するようにします。
++                     ファイル アクセスを報告します。
+ 
+                      このフラグは実験的なものであり、意図したとおりに動作しない可能性があります。
+     </target>
+@@ -135,7 +135,7 @@
+       </trans-unit>
+       <trans-unit id="InvalidTerminalLoggerValue">
+         <source>MSBUILD : error MSB1065: Terminal logger value is not valid. It should be one of 'auto', 'true', or 'false'. {0}</source>
+-        <target state="translated">MSBUILD : error MSB1065: ターミナル ロガーの値が無効です。'auto'、'true'、または 'false' のいずれかである必要があります。{0}</target>
++        <target state="translated">MSBUILD : error MSB1065: ターミナル ロガーの値が無効です。'auto'、'true'、または 'false' のいずれかである必要があります。 {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1065: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+diff --git a/src/MSBuild/Resources/xlf/Strings.ko.xlf b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+index 37618cdb38b..9f8357fdf3f 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ko.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+@@ -573,11 +573,11 @@
+         <target state="translated">  -logger:&lt;로거&gt;   이 로거를 사용하여 MSBuild의 이벤트를 기록합니다. 여러
+                      로거를 지정하려면 각 로거를 개별적으로 지정합니다.
+                      &lt;로거&gt; 구문은 다음과 같습니다.
+-                       [&lt;클래스&gt;,]&lt;assembly&gt;[,&lt;옵션&gt;][;&lt;매개 변수&gt;]
++                       [&lt;클래스&gt;,]&lt;어셈블리&gt;[,&lt;옵션&gt;][;&lt;매개 변수&gt;]
+                      &lt;로거 클래스&gt; 구문은 다음과 같습니다.
+                        [&lt;부분 또는 전체 네임스페이스&gt;.]&lt;로거 클래스 이름&gt;
+                      &lt;로거 어셈블리&gt; 구문은 다음과 같습니다.
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;어셈블리 이름&gt;[,&lt;strong name&gt;] | &lt;어셈블리 파일&gt;}
+                      로거 옵션은 MSBuild가 로거를 만드는 방법을 지정합니다.
+                      &lt;로거 매개 변수&gt;는 선택 사항이고 입력한 대로 정확히
+                      로거에 전달됩니다. (약식: -l)
+@@ -855,11 +855,11 @@
+                      로거를 지정하려면 각 로거를 개별적으로 지정합니다.
+                      (약식 -dl)
+                      &lt;로거&gt; 구문은 다음과 같습니다.
+-                       [&lt;클래스&gt;,]&lt;assembly&gt;[,&lt;옵션&gt;][;&lt;매개 변수&gt;]
++                       [&lt;클래스&gt;,]&lt;어셈블리&gt;[,&lt;옵션&gt;][;&lt;매개 변수&gt;]
+                      &lt;로거 클래스&gt; 구문은 다음과 같습니다.
+                        [&lt;부분 또는 전체 네임스페이스&gt;.]&lt;로거 클래스 이름&gt;
+                      &lt;로거 어셈블리&gt; 구문은 다음과 같습니다.
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;어셈블리 이름&gt;[,&lt;strong name&gt;] | &lt;어셈블리 파일&gt;}
+                      로거 옵션은 MSBuild가 로거를 만드는 방법을 지정합니다.
+                       &lt;로거 매개 변수&gt;는 선택 사항이고
+                      입력한 대로 정확히 로거에 전달됩니다. (약식: -l)
+diff --git a/src/MSBuild/Resources/xlf/Strings.pl.xlf b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+index f4caceb0acc..3005884206c 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pl.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+@@ -113,10 +113,10 @@
+                      This flag is experimental and may not work as intended.
+     </source>
+         <target state="translated">  -reportFileAccesses[:True|False]
+-                     Powoduje, że platforma MSBuild zgłasza dostępy do wszystkich skonfigurowanych
++                     Powoduje, że program MSBuild zgłasza dostępy do wszystkich skonfigurowanych plików
+                      wtyczek pamięci podręcznej projektu.
+ 
+-                     Ta flaga jest eksperymentalna i może nie działać zgodnie z oczekiwaniami.
++Ta flaga jest eksperymentalna i może nie działać zgodnie z oczekiwaniami.
+     </target>
+         <note>
+       LOCALIZATION: "-reportFileAccesses" should not be localized.
+@@ -575,14 +575,17 @@
+                        -logger:XMLLogger,MyLogger,Version=1.0.2,Culture=neutral
+                        -logger:XMLLogger,C:\Loggers\MyLogger.dll;OutputAsHTML
+ </source>
+-        <target state="translated">  -logger:&lt;rejestrator&gt;  Umożliwia użycie podanego rejestratora do rejestrowania zdarzeń pochodzących
+-                     z programu MSBuild. Aby określić wiele rejestratorów, określ każdy z nich osobno.
++        <target state="translated">  -logger:&lt;rejestrator&gt;  Umożliwia użycie podanego rejestratora do rejestrowania
++                         zdarzeń pochodzących z programu MSBuild. Aby określić
++                     wiele rejestratorów, określ każdy z nich osobno.
+                      Składnia elementu &lt;rejestrator&gt;:
+-                      [&lt;klasa rejestratora&gt;,]&lt;assembly&gt; [;&lt;parametry rejestratora&gt;]
++                        [&lt;klasa rejestratora&gt;,]&lt;zestaw rejestratora&gt;
++                        [;&lt;parametry rejestratora&gt;]
+                      Składnia elementu &lt;klasa rejestratora&gt;:
+-                       [&lt;częściowa lub pełna przestrzeń nazw&gt;.] &lt;nazwa klasy rejestratora&gt;
++                        [&lt;częściowa lub pełna przestrzeń nazw&gt;.]
++                        &lt;nazwa klasy rejestratora&gt;
+                      Składnia elementu &lt;zestaw rejestratora&gt;:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                        {&lt;nazwa zestawu&gt;[,&lt;strong name&gt;] | &lt;plik zestawu&gt;}
+                      Wartości &lt;parametry rejestratora&gt; są opcjonalne i są
+                      przekazywane do rejestratora dokładnie tak, jak zostały
+                      wpisane. (Krótka wersja: -l)
+@@ -861,11 +864,11 @@
+                      wiele rejestratorów, określ każdy z nich osobno.
+                      (Krótka wersja: -dl)
+                      Składnia elementu &lt;rejestrator&gt;:
+-                       [&lt;klasa rejestratora&gt;,]&lt;assembly&gt;[;&lt;parametry rejestratora&gt;]
++                       [&lt;klasa rejestratora&gt;,]&lt;zestaw rejestratora&gt;[;&lt;parametry rejestratora&gt;]
+                      Składnia elementu &lt;klasa rejestratora&gt;:
+                        [&lt;częściowa lub pełna przestrzeń nazw&gt;.]&lt;nazwa klasy rejestratora&gt;
+                      Składnia elementu &lt;zestaw rejestratora&gt;:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;nazwa zestawu&gt;[,&lt;strong name&gt;] | &lt;plik zestawu&gt;}
+                      Wartości &lt;parametry rejestratora&gt; są opcjonalne i są
+                      przekazywane do rejestratora dokładnie tak, jak zostały
+                      wpisane. (Krótka wersja: -l)
+@@ -977,11 +980,13 @@
+                      create a log file for each node.
+     </source>
+         <target state="translated">  -distributedFileLogger
+-                     Rejestruje dane wyjściowe kompilacji w wielu plikach dziennika,po jednym pliku
+-                     na węzeł programu MSBuild. Początkową lokalizacją tych plików
+-                     jest bieżący katalog. Domyślnie pliki mają nazwę
++                     Rejestruje dane wyjściowe kompilacji w wielu plikach
++                     dziennika, po jednym pliku na węzeł programu MSBuild.
++                     Początkową lokalizacją tych plików jest bieżący katalog.
++                     Domyślnie pliki mają nazwę
+                      „MSBuild&lt;identyfikator węzła&gt;.log”. Lokalizację plików
+                      i inne parametry rejestratora plików można określić
++
+                      przez dodanie przełącznika „-fileLoggerParameters”.
+ 
+                      Jeśli nazwa pliku zostanie ustawiona za pomocą przełącznika
+diff --git a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+index f84a9fbf2fa..7bc78b2a794 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+@@ -113,9 +113,8 @@
+                      This flag is experimental and may not work as intended.
+     </source>
+         <target state="translated">  -reportFileAccesses[:True|False]
+-                     Faz com que o MSBuild relate acessos a arquivos a qualquer
+- configurado
+-                     plug-ins de cache do projeto.
++                     Faz com que o MSBuild relate acessos a arquivos para qualquer plug-in
++                     de cache de projeto configurado.
+ 
+                      Este sinalizador é experimental e pode não funcionar conforme o esperado.
+     </target>
+diff --git a/src/MSBuild/Resources/xlf/Strings.ru.xlf b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+index b17262420f6..9e7bb335c03 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ru.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+@@ -79,7 +79,7 @@
+       </trans-unit>
+       <trans-unit id="DurationDisplay">
+         <source>({0:F1}s)</source>
+-        <target state="translated">({0:F1}с)</target>
++        <target state="translated">({0:F1}s)</target>
+         <note>
+         {0}: duration in seconds with 1 decimal point
+       </note>
+@@ -135,7 +135,7 @@
+       </trans-unit>
+       <trans-unit id="InvalidTerminalLoggerValue">
+         <source>MSBUILD : error MSB1065: Terminal logger value is not valid. It should be one of 'auto', 'true', or 'false'. {0}</source>
+-        <target state="translated">MSBUILD : error MSB1065: Недопустимое значение средства ведения журнала терминала. Это должно быть одно из следующих значений: "auto", "ИСТИНА" или "ЛОЖЬ". {0}</target>
++        <target state="new">MSBUILD : error MSB1065: Terminal logger value is not valid. It should be one of 'auto', 'true', or 'false'. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1065: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+diff --git a/src/MSBuild/Resources/xlf/Strings.tr.xlf b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+index aba51dfc9b3..b4b0d3b414f 100644
+--- a/src/MSBuild/Resources/xlf/Strings.tr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+@@ -573,13 +573,13 @@
+         <target state="translated">  -logger:&lt;günlükçü&gt;   MSBuild'deki olayları günlüğe almak için bu günlükçüyü kullanın. Birden fazla
+                      günlükçü belirtmek için her günlükçüyü ayrı ayrı belirtin.
+                      &lt;günlükçü&gt; söz dizimi şöyledir:
+-                       [&lt;class&gt;,]&lt;assembly&gt;[,&lt;options&gt;][;&lt;parameters&gt;]
++                       [&lt;sınıf&gt;,]&lt;derleme&gt;[,&lt;seçenekler&gt;][;&lt;parametreler&gt;]
+                      &lt;günlükçü sınıfı &gt; söz dizimi şöyledir:
+                        [&lt;kısmi veya tam ad alanı &gt;.]&lt;günlükçü sınıfı adı&gt;
+                      &lt;günlükçü derlemesi&gt; söz dizimi şöyledir:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;derleme adı&gt;[,&lt;strong name&gt;] | &lt;derleme dosyası&gt;}
+                      Günlükçü seçenekleri, MSBuild'in günlükçüyü oluşturma biçimini belirtir.
+-                     &lt;günlükçü parametreleri &gt; isteğe bağlıdır ve tam olarak
++                     &lt;günlükçü parametreleri &gt; isteğe bağlıdır ve tam olarak 
+                      yazdığınız şekliyle günlükçüye geçirilir. (Kısa biçim: -l)
+                      Örnekler:
+                        -logger:XMLLogger,MyLogger,Version=1.0.2,Culture=neutral
+@@ -855,11 +855,11 @@
+                      günlükçü belirtmek için her günlükçüyü ayrı ayrı belirtin.
+                      (Kısa biçim -dl)
+                      &lt;günlükçü&gt; söz dizimi şöyledir:
+-                       [&lt;sınıf&gt;,]&lt;assembly&gt;[,&lt;seçenekler&gt;][;&lt;parametreler&gt;]
++                       [&lt;sınıf&gt;,]&lt;derleme&gt;[,&lt;seçenekler&gt;][;&lt;parametreler&gt;]
+                      &lt;günlükçü sınıfı&gt; söz dizimi şöyledir:
+                        [&lt;kısmi veya tam ad alanı&gt;.]&lt;günlükçü sınıfı adı&gt;
+                      &lt;günlükçü derlemesi&gt; söz dizimi şöyledir:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;derleme adı&gt;[,&lt;strong name&gt;] | &lt;derleme dosyası&gt;}
+                      Günlükçü seçenekleri, MSBuild'in günlükçüyü oluşturma biçimini belirtir.
+                      &lt;günlükçü parametreleri&gt; isteğe bağlıdır ve tam olarak
+                      yazdığınız şekliyle günlükçüye geçirilir. (Kısa biçim: -l)
+@@ -886,9 +886,10 @@
+                        -ignoreProjectExtensions:.sln
+     </source>
+         <target state="translated">  -ignoreProjectExtensions:&lt;uzantılar&gt;
+-                     Hangi proje dosyasının oluşturulacağı belirlenirken
+-                     yoksayılacak uzantıların listesi. Birden çok uzantıyı
+-                     birbirinden ayırmak için noktalı virgül veya virgül kullanın.
++                     Hangi proje dosyasının oluşturulacağı belirlenirken 
++                     yoksayılacak uzantıların listesi. Birden çok uzantıyı 
++                     birbirinden ayırmak için noktalı virgül veya 
++                     virgül kullanın.
+                      (Kısa biçim: -ignore)
+                      Örnek:
+                        -ignoreProjectExtensions:.sln
+@@ -978,6 +979,7 @@
+                      Dosyaların konumu ve fileLogger'ın diğer parametreleri 
+                      "/fileLoggerParameters" anahtarının eklenmesi yoluyla
+                      belirtilebilir.
++
+                      Günlük dosyası adı fileLoggerParameters anahtarı
+                      aracılığıyla ayarlanırsa dağıtılmış günlükçü fileName 
+                      değerini şablon olarak kullanıp her düğümün günlük dosyasını
+@@ -1024,31 +1026,32 @@
+     </source>
+         <target state="translated">  -fileLoggerParameters[n]:&lt;parametreler&gt;
+                      Dosya günlükçüleri için ek parametreler sağlar.
+-                     Bu anahtarın olması karşılık gelen -fileLogger[n]
++                     Bu anahtarın olması karşılık gelen -fileLogger[n] 
+                      anahtarının olduğu anlamına gelir.
+                      "n" varsa, 1-9 arasında bir rakam olabilir.
+-                     Dağıtılmış dosya günlükçüleri varsa -fileLoggerParameters
+-                     bunlar tarafından da kullanılır; -distributedFileLogger açıklamasına bakın.
++                     Dağıtılmış dosya günlükçüleri varsa -fileLoggerParameters 
++                     bunlar tarafından da kullanılır; -distributedFileLogger 
++                     açıklamasına bakın.
+                      (Kısa biçim: -flp[n])
+-                     Konsol günlükçüsü için listelenenlerle aynı parametreler
++                     Konsol günlükçüsü için listelenenlerle aynı parametreler 
+                      kullanılabilir. Kullanılabilecek bazı ek parametreler:
+-                        LogFile--Oluşturma günlüğünün yazılacağı günlük
++                        LogFile--Oluşturma günlüğünün yazılacağı günlük 
+                             dosyasının yolu.
+-                        Append--Derleme günlüğünün gün dosyasının sonuna mı
+-                            ekleneceğini yoksa üzerine mi yazılacağını
+-                            belirler. Anahtar ayarlandığında oluşturma günlüğü
+-                            dosyanın sonuna eklenir. Anahtar ayarlanmadığında
+-                            varolan günlük dosyasının üzerine yazılır.
++                        Append--Derleme günlüğünün gün dosyasının sonuna mı 
++                            ekleneceğini yoksa üzerine mi yazılacağını 
++                            belirler. Anahtar ayarlandığında oluşturma günlüğü 
++                            dosyanın sonuna eklenir. Anahtar ayarlanmadığında 
++                            varolan günlük dosyasının üzerine yazılır. 
+                             Varsayılan: günlük dosyasının sonuna eklenmez.
+-                        Encoding--Dosyanın kodlamasını belirtir; örneğin,
++                        Encoding--Dosyanın kodlamasını belirtir; örneğin, 
+                             UTF-8, Unicode veya ASCII
+                      Varsayılan ayrıntı düzeyi ayarı Detailed'dır.
+                      Örnekler:
+                        -fileLoggerParameters:LogFile=MyLog.log;Append;
+                                            Verbosity=diagnostic;Encoding=UTF-8
+ 
+-                       -flp:Summary;Verbosity=minimal;LogFile=msbuild.sum
+-                       -flp1:warningsonly;logfile=msbuild.wrn
++                       -flp:Summary;Verbosity=minimal;LogFile=msbuild.sum 
++                       -flp1:warningsonly;logfile=msbuild.wrn 
+                        -flp2:errorsonly;logfile=msbuild.err
+     </target>
+         <note>
+@@ -1072,7 +1075,8 @@
+                        -nr:true
+     </source>
+         <target state="translated">  -nodeReuse:&lt;parametreler&gt;
+-                     MSBuild düğümlerinin yeniden kullanımını etkinleştirir veya devre dışı bırakır.
++                     MSBuild düğümlerinin yeniden kullanımını etkinleştirir
++                     veya devre dışı bırakır.
+                      Parametreler:
+                      True --Derleme tamamlandıktan sonra düğümler kalır ve
+                             izleyen derlemelerde yeniden kullanılır (varsayılan)
+@@ -1403,7 +1407,7 @@
+       </trans-unit>
+       <trans-unit id="MissingTerminalLoggerParameterError">
+         <source>MSBUILD : error MSB1066: Specify one or more parameters for the terminal logger if using the -terminalLoggerParameters switch</source>
+-        <target state="translated">MSBUILD : error MSB1066: terminalLoggerParameters anahtarı kullanılıyorsa terminal günlükçüsü için bir veya birden çok parametre belirtin</target>
++        <target state="translated">MSBUILD : error MSB1066: -terminalLoggerParameters anahtarı kullanılıyorsa terminal günlükçüsü için bir veya birden çok parametre belirtin</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1066: "}
+       UE: This happens if the user does something like "msbuild.exe -termionalLoggerParameters:". The user must pass in one or more parameters
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+index 2a4877909af..10005ca388c 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+@@ -573,11 +573,11 @@
+         <target state="translated">  -logger:&lt;記錄器&gt;   使用此記錄器可記錄 MSBuild 的事件。
+                      若要指定多個記錄器，請各別指定每個記錄器。
+                      &lt;記錄器&gt; 語法為:
+-                       [&lt;class&gt;,]&lt;assembly&gt;[,&lt;options&gt;][;&lt;parameters&gt;]
++                       [&lt;類別&gt;,]&lt;組件&gt;[,&lt;選項&gt;][;&lt;參數&gt;]
+                      &lt;記錄器類別&gt; 語法為:
+                        [&lt;一部分或完整的命名空間&gt;.]&lt;記錄器類別名稱&gt;
+                      &lt;記錄器組件&gt; 語法為:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;組件名稱&gt;[,&lt;strong name&gt;] | &lt;組件檔案&gt;}
+                      記錄器選項會指定 MSBuild 建立記錄器的方式。
+                      &lt;記錄器參數&gt; 是選擇性參數，其會依您輸入的內容，
+                      完全一樣地傳遞到記錄器。(簡短形式: -l)
+@@ -855,11 +855,11 @@
+                      若要指定多個記錄器，請各別指定每個記錄器。
+                      (簡短形式 -dl)
+                      &lt;記錄器&gt; 語法為:
+-                       [&lt;class&gt;,]&lt;assembly&gt;[,&lt;options&gt;][;&lt;parameters&gt;]
++                       [&lt;類別&gt;,]&lt;組件&gt;[,&lt;選項&gt;][;&lt;參數&gt;]
+                      &lt;記錄器類別&gt; 語法為:
+                        [&lt;一部分或完整的命名空間&gt;.]&lt;記錄器類別名稱&gt;
+                      &lt;記錄器組件&gt; 語法為:
+-                       {&lt;assembly name&gt;[,&lt;strong name&gt;] | &lt;assembly file&gt;}
++                       {&lt;組件名稱&gt;[,&lt;strong name&gt;] | &lt;組件檔案&gt;}
+                      記錄器選項會指定 MSBuild 建立記錄器的方式。
+                      &lt;記錄器參數&gt; 是選擇性參數，其會依您輸入的內容，
+                      完全一樣地傳遞到記錄器。(簡短形式: -l)
+diff --git a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+index 381fa520766..2c3e3779d45 100644
+--- a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
++++ b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+@@ -2066,12 +2066,6 @@ internal void WriteStateFile()
+             {
+                 // Either the cache is dirty (we added or updated an item) or the number of items actually used is less than what
+                 // we got by reading the state file prior to execution. Serialize the cache into the state file.
+-                if (FailIfNotIncremental)
+-                {
+-                    Log.LogErrorFromResources("ResolveAssemblyReference.WritingCacheFile", _stateFile);
+-                    return;
+-                }
+-
+                 _cache.SerializeCache(_stateFile, Log);
+             }
+         }
+diff --git a/src/Tasks/Microsoft.Common.CrossTargeting.targets b/src/Tasks/Microsoft.Common.CrossTargeting.targets
+index 07dd2aeb869..8d079e3f057 100644
+--- a/src/Tasks/Microsoft.Common.CrossTargeting.targets
++++ b/src/Tasks/Microsoft.Common.CrossTargeting.targets
+@@ -248,4 +248,9 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+ 
+   <Import Project="$(DirectoryBuildTargetsPath)" Condition="'$(ImportDirectoryBuildTargets)' == 'true' and exists('$(DirectoryBuildTargetsPath)')"/>
+ 
++  <PropertyGroup>
++    <UseMSBuildTestInfrastructure Condition="'$(UseMSBuildTestInfrastructure)' == ''">false</UseMSBuildTestInfrastructure>
++  </PropertyGroup>
++  <Import Project="$(MSBuildToolsPath)\Microsoft.Common.Test.targets" Condition="'$(UseMSBuildTestInfrastructure)' == 'true'"/>
++
+ </Project>
+diff --git a/src/Tasks/Resources/Strings.resx b/src/Tasks/Resources/Strings.resx
+index ce39286376c..d4c6d77ab34 100644
+--- a/src/Tasks/Resources/Strings.resx
++++ b/src/Tasks/Resources/Strings.resx
+@@ -1776,10 +1776,6 @@
+     <value>Assembly file '{0}' could not be opened -- PE image doesn't contain managed metadata.</value>
+     <comment></comment>
+   </data>
+-  <data name="ResolveAssemblyReference.WritingCacheFile">
+-    <value>Updating assembly cache file "{0}".</value>
+-    <comment></comment>
+-  </data>
+   <!--
+         The ResolveComReference message bucket is: MSB3281 - MSB3320
+ 
+diff --git a/src/Tasks/Resources/xlf/Strings.cs.xlf b/src/Tasks/Resources/xlf/Strings.cs.xlf
+index 3d65015a42d..117552d0067 100644
+--- a/src/Tasks/Resources/xlf/Strings.cs.xlf
++++ b/src/Tasks/Resources/xlf/Strings.cs.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: V souboru projektu byl zadán jak parametr {0}, tak parametr {1}. Nelze je však použít oba najednou. Zvolte prosím jenom jeden z nich.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -1072,7 +1072,7 @@
+       <trans-unit id="GenerateResource.BinaryFormatterUse">
+         <source>MSB3825: Resource "{0}" of type "{1}" is deserialized via BinaryFormatter at runtime. BinaryFormatter is deprecated due to possible security risks and will be removed with .NET 9. If you wish to continue using it, set property "GenerateResourceWarnOnBinaryFormatterUse" to false.
+            More information: https://aka.ms/msbuild/net8-binaryformatter</source>
+-        <target state="translated">MSB3825: Prostředek „{0}“ typu „{1}“ je deserializován prostřednictvím BinaryFormatter za běhu. BinaryFormatter je zastaralý kvůli možným bezpečnostním rizikům a odebere se s .NET 9. Pokud ho chcete používat dál, nastavte vlastnost GenerateResourceWarnOnBinaryFormatterUse na false.
++        <target state="translated">MSB3825: Prostředek „{0}“ typu „{1}“ je deserializován prostřednictvím BinaryFormatter za běhu. BinaryFormatter je zastaralý kvůli možným bezpečnostním rizikům a odebere se s .NET 9. Pokud ho chcete používat dál, nastavte vlastnost GenerateResourceWarnOnBinaryFormatterUse na false. 
+            Další informace: https://aka.ms/msbuild/net8-binaryformatter</target>
+         <note>{StrBegin="MSB3825: "}</note>
+       </trans-unit>
+@@ -2180,11 +2180,6 @@
+         <target state="translated">Název redistribučního balíčku v elementu FileList v souboru seznamu redistribučního balíčku {0} je null nebo prázdný. Název redistribučního balíčku nesmí být null ani prázdný.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Aktualizuje se soubor mezipaměti sestavení „{0}“.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">Odkaz modelu COM {0} je definiční sestavení ovládacího prvku ActiveX {1}, ale kompilátor ho označil příznakem /link. S tímto odkazem modelu COM se bude zacházet jako s odkazem a nebude propojen.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.de.xlf b/src/Tasks/Resources/xlf/Strings.de.xlf
+index 7f47881efba..11600335b91 100644
+--- a/src/Tasks/Resources/xlf/Strings.de.xlf
++++ b/src/Tasks/Resources/xlf/Strings.de.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: Sowohl "{0}" als auch "{1}" wurden als Parameter in der Projektdatei angegeben, können aber nicht zusammen verwendet werden. Wählen Sie eins oder das andere aus.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">Der Redist-Name im FileList-Element der Redistributable-Listendatei "{0}" ist NULL oder leer. Vergewissern Sie sich, dass der Redist-Name nicht NULL oder leer ist.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Aktualisiert Assemblycachedatei "{0}"</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">Der COM-Verweis "{0}" ist die Interopassembly für das ActiveX-Steuerelement "{1}". Entsprechend der Markierung ist der Verweis jedoch durch den Compiler mit dem /link-Flag verknüpft. Der COM-Verweis wird als Verweis behandelt und nicht verknüpft.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.es.xlf b/src/Tasks/Resources/xlf/Strings.es.xlf
+index 887f8b3e7fe..5c2e9732092 100644
+--- a/src/Tasks/Resources/xlf/Strings.es.xlf
++++ b/src/Tasks/Resources/xlf/Strings.es.xlf
+@@ -118,7 +118,7 @@
+       </trans-unit>
+       <trans-unit id="AxTlbBaseTask.StrongNameUtils.NoPublicKeySpecified">
+         <source>MSB3654: Delay signing requires that at least a public key be specified.  Please either supply a public key using the KeyFile or KeyContainer properties, or disable delay signing.</source>
+-        <target state="translated">MSB3654: La firma retrasada requiere que se especifique al menos una clave pública.  Proporcione una clave pública mediante las propiedades KeyFile o KeyContainer, o deshabilite la firma retrasada.</target>
++        <target state="translated">MSB3654: La firma retardada requiere que se especifique al menos una clave pública.  Proporcione una clave pública mediante las propiedades KeyFile o KeyContainer, o deshabilite la firma retardada.</target>
+         <note>{StrBegin="MSB3654: "}</note>
+       </trans-unit>
+       <trans-unit id="CombineTargetFrameworkInfoProperties.NotNullAndEmptyRootElementName">
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: "{0}" y "{1}" se especificaron como parámetros en el archivo de proyecto, pero no se pueden usar juntos. Elija una u otra.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">El archivo de lista de paquetes redistribuibles "{0}" tiene un nombre Redist NULL o vacío en el elemento FileList. Asegúrese de que el nombre Redist no sea NULL ni esté vacío.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Actualizando el archivo de caché de ensamblado "{0}".</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">La referencia COM '{0}' es el ensamblado de interoperabilidad del control ActiveX '{1}' pero estaba marcada para su vinculación por el compilador con la marca /link. Esta referencia COM se tratará como una referencia y no se vinculará.</target>
+@@ -2307,7 +2302,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveComReference.LoadingDelaySignedAssemblyWithStrongNameVerificationEnabled">
+         <source>MSB3295: Failed to load an assembly. Please make sure you have disabled strong name verification for your public key if you want to generate delay signed wrappers. {0}</source>
+-        <target state="translated">MSB3295: No se pudo cargar un ensamblado. Asegúrese de que deshabilitó la comprobación de nombres seguros para su clave pública si desea generar contenedores de firma con retraso. {0}</target>
++        <target state="translated">MSB3295: No se pudo cargar un ensamblado. Asegúrese de que deshabilitó la comprobación de nombres seguros para su clave pública si desea generar contenedores de firma retardada. {0}</target>
+         <note>{StrBegin="MSB3295: "}</note>
+       </trans-unit>
+       <trans-unit id="ResolveComReference.MissingOrUnknownComReferenceAttribute">
+@@ -2516,7 +2511,7 @@
+       </trans-unit>
+       <trans-unit id="StrongNameUtils.NoPublicKeySpecified">
+         <source>MSB3353: Public key necessary for delay signing was not specified.</source>
+-        <target state="translated">MSB3353: No se especificó la clave pública necesaria para la firma con retraso.</target>
++        <target state="translated">MSB3353: No se especificó la clave pública necesaria para la firma retardada.</target>
+         <note>{StrBegin="MSB3353: "}</note>
+       </trans-unit>
+       <trans-unit id="TaskRequiresFrameworkFailure">
+diff --git a/src/Tasks/Resources/xlf/Strings.fr.xlf b/src/Tasks/Resources/xlf/Strings.fr.xlf
+index c17ecd226fe..67ace11922c 100644
+--- a/src/Tasks/Resources/xlf/Strings.fr.xlf
++++ b/src/Tasks/Resources/xlf/Strings.fr.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: « {0} » et « {1} » ont été spécifiées comme paramètres dans le Fichier projet, mais ne peuvent pas être utilisés ensemble. Choisissez l’une ou l’autre.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">Le fichier de liste de packages redistribuables "{0}" a un nom Redist vide ou ayant une valeur null dans l'élément FileList. Vérifiez que le nom Redist n'est pas vide ou qu'il n'a pas une valeur null.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Mise à jour du fichier de cache d’assembly «{0}».</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">La référence COM '{0}' est l'assembly d'interopérabilité pour le contrôle ActiveX '{1}', mais elle a été marquée comme étant liée au compilateur avec l'indicateur /link. Cette référence COM sera traitée comme une référence, mais ne sera pas liée.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.it.xlf b/src/Tasks/Resources/xlf/Strings.it.xlf
+index 805c5e45f99..e06c1b4c72a 100644
+--- a/src/Tasks/Resources/xlf/Strings.it.xlf
++++ b/src/Tasks/Resources/xlf/Strings.it.xlf
+@@ -123,12 +123,12 @@
+       </trans-unit>
+       <trans-unit id="CombineTargetFrameworkInfoProperties.NotNullAndEmptyRootElementName">
+         <source>MSB3991: '{0}' is not set or empty. When {1} is false, make sure to set a non-empty value for '{0}'.</source>
+-        <target state="translated">MSB3991: “{0}” non è impostato o è vuoto. Quando {1} è false, assicurarsi di impostare un valore non vuoto per "{0}".</target>
++        <target state="translated">MSB3991: '{0}' non è impostato o è vuoto. Quando {1} è false, assicurarsi di impostare un valore non vuoto per '{0}'.</target>
+         <note>{StrBegin="MSB3991: "}</note>
+       </trans-unit>
+       <trans-unit id="CombineTargetFrameworkInfoProperties.NotNullRootElementName">
+         <source>MSB3992: '{0}' is not set. When {1} is true, make sure to set a value for '{0}'.</source>
+-        <target state="translated">MSB3992: "{0}" non impostato. Quando {1} è true, assicurarsi di impostare un valore per "{0}".</target>
++        <target state="translated">MSB3992: '{0}' non è impostato. Quando {1} è true, assicurarsi di impostare un valore per '{0}'.</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: i parametri "{0}" e "{1}" sono stati specificati come parametri nel file di progetto, ma non possono essere usati insieme. Scegliere uno o l'altro.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">Il file di elenco di pacchetti ridistribuibili "{0}" include un nome di Redist Null o vuoto nell'elemento FileList. Verificare che il nome di Redist non sia Null o vuoto.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Aggiornamento del file della cache di assembly "{0}".</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">Il riferimento COM '{0}' è l'assembly di interoperabilità per il controllo ActiveX '{1}', tuttavia è stato contrassegnato dal compilatore con il flag /link per il collegamento. Il riferimento COM verrà trattato come riferimento e non verrà collegato.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.ja.xlf b/src/Tasks/Resources/xlf/Strings.ja.xlf
+index cb79ec760f1..9d616e3a9e3 100644
+--- a/src/Tasks/Resources/xlf/Strings.ja.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ja.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: "{0}" と "{1}" の両方がプロジェクト ファイルのパラメーターとして指定されましたが、一緒に使用することはできません。どちらか一方を選択してください。</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">再頒布可能パッケージ リスト ファイル "{0}" の FileList 要素に null または空の再頒布可能パッケージ名があります。再頒布可能パッケージ名が null または空でないことを確認してください。</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">アセンブリ キャッシュ ファイル "{0}" を更新しています。</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">COM 参照 '{0}' は ActiveX コントロール '{1}' の相互運用アセンブリですが、コンパイラによって /link フラグでリンクされるように設定されています。この COM 参照は参照として処理され、リンクされません。</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.ko.xlf b/src/Tasks/Resources/xlf/Strings.ko.xlf
+index ff0c83ddead..0e852a33b29 100644
+--- a/src/Tasks/Resources/xlf/Strings.ko.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ko.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: "{0}" 및 "{1}" 모두 프로젝트 파일에서 매개 변수로 지정되었지만 함께 사용할 수는 없습니다. 하나 또는 다른 항목을 선택하세요.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">재배포 가능 패키지 목록 파일 "{0}"의 FileList 요소에 null이거나 비어 있는 재배포 가능 패키지 이름이 있습니다. 재배포 가능 패키지 이름이 null이거나 비어 있지 않도록 하세요.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">어셈블리 캐시 파일 "{0}"을(를) 업데이트하는 중입니다.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">COM 참조 '{0}'은(는) ActiveX 컨트롤 '{1}'에 대한 interop 어셈블리이지만 /link 플래그로 컴파일러에 의해 링크되도록 표시되어 있습니다. 이 COM 참조는 참조로 간주되지만 링크되지 않습니다.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.pl.xlf b/src/Tasks/Resources/xlf/Strings.pl.xlf
+index 538c003870a..2202834f7eb 100644
+--- a/src/Tasks/Resources/xlf/Strings.pl.xlf
++++ b/src/Tasks/Resources/xlf/Strings.pl.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: parametry „{0}” i „{1}” zostały określone jako parametry w pliku projektu, ale nie mogą być używane razem. Wybierz jeden lub drugi.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">Plik z listą pakietów redystrybucyjnych „{0}” ma nazwę Redist równą null lub pustą w elemencie FileList. Upewnij się, że nazwa Redist nie ma wartości null ani nie jest pusta.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Aktualizowanie pliku pamięci podręcznej zestawu „{0}”.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">Odwołanie COM „{0}” jest zestawem międzyoperacyjnym dla kontrolki ActiveX „{1}”, ale zostało wybrane do połączenia przez kompilator przy użyciu flagi /link. To odwołanie COM jest traktowane jako odwołanie i nie zostanie połączone.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.pt-BR.xlf b/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
+index 524b1a5dd3a..7d1700c57b8 100644
+--- a/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: "{0}" e "{1}" foram especificados como parâmetros no arquivo de projeto, mas não podem ser usados juntos. Escolha um ou outro.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">O arquivo da lista de pacote redistribuível "{0}" tem um nome de Pacote Redistribuível nulo ou vazio no elemento FileList. Verifique se o Nome do Pacote Redistribuível não é nulo nem está vazio.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Atualizando o arquivo de cache do assembly "{0}".</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">A Referência COM "{0}" é o assembly de interoperabilidade para o controle ActiveX "{1}", mas foi marcada para ser vinculada pelo compilador com o sinalizador /link. Essa referência COM será tratada como uma referência e não será vinculada.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.ru.xlf b/src/Tasks/Resources/xlf/Strings.ru.xlf
+index 92861aefb94..021f23c3c21 100644
+--- a/src/Tasks/Resources/xlf/Strings.ru.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ru.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: "{0}" и "{1}" были указаны как параметры в файле проекта, но не могут использоваться вместе. Выберите один или несколько вариантов.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">В файле списка распространяемых пакетов "{0}" имя распространяемого пакета в элементе FileList имеет пустое значение или значение NULL. Убедитесь, что имя распространяемого пакета (Redist Name) не пусто и не равно NULL.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Обновление файла кэша сборки "{0}".</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">COM-ссылка "{0}" является сборкой взаимодействия для элемента ActiveX "{1}", но была помечена на компоновку компилятором флагом /link. Эта COM-ссылка будет считаться ссылкой и не будет скомпонована.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.tr.xlf b/src/Tasks/Resources/xlf/Strings.tr.xlf
+index 6f21bc7686c..dbef7d2ebe4 100644
+--- a/src/Tasks/Resources/xlf/Strings.tr.xlf
++++ b/src/Tasks/Resources/xlf/Strings.tr.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: "{0}" ve "{1}" proje dosyasında parametre olarak belirtilmiş ancak birlikte kullanılamaz. Lütfen birini veya diğerini seçin.</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">"{0}" yeniden dağıtım liste dosyasının FileList öğesindeki Redist adı null veya boş. Redist adının null veya boş olmadığından emin olun.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">Derleme önbelleği dosyası "{0}" güncelleştiriliyor.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">'{0}' COM Başvurusu, '{1}' ActiveX denetiminin birlikte çalışma bütünleştirilmiş kodu, ancak /link bayrağıyla derleyici tarafından bağlanmak üzere işaretlenmiş. Bu COM başvurusu, başvuru olarak değerlendirilecek ve bağlanmayacak.</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf b/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
+index 5eaa6e5c033..bf9b8c54683 100644
+--- a/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: “{0}”和“{1}”均被指定为项目文件中的参数，但不能一起使用。请选择其中一个。</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">可再发行程序包列表文件“{0}”在 FileList 元素中具有 null 或空的可再发行程序包名称。请确保可再发行程序包名称不为 null 或空值。</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">正在更新程序集缓存文件“{0}”。</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">COM 引用“{0}”是 ActiveX 控件“{1}”的互操作程序集，但含有 /link 标志的编译器已将其标为已链接。系统会将此 COM 引用视为引用，并且不会链接该引用。</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf b/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
+index 1c84180067e..0a0662e6b05 100644
+--- a/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
+@@ -198,7 +198,7 @@
+       </trans-unit>
+       <trans-unit id="Copy.IncompatibleParameters">
+         <source>MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</source>
+-        <target state="new">MSB3896: Both "{0}" and "{1}" were specified as parameters in the project file but cannot be used together. Please choose one or the other.</target>
++        <target state="translated">MSB3896: "{0}" 和 "{1}" 都指定為專案檔中的參數，但不能一起使用。請選擇其中一個。</target>
+         <note>{StrBegin="MSB3896: "}</note>
+       </trans-unit>
+       <trans-unit id="Copy.LinkFailed">
+@@ -2180,11 +2180,6 @@
+         <target state="translated">可轉散發套件清單檔 "{0}" 在 FileList 項目中的 Redist 名稱為 null 或空白。請確認 Redist 名稱不為 null 或空白。</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="ResolveAssemblyReference.WritingCacheFile">
+-        <source>Updating assembly cache file "{0}".</source>
+-        <target state="translated">更新組件快取檔案 "{0}"。</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="ResolveComReference.TreatingTlbOfActiveXAsNonEmbedded">
+         <source>COM Reference '{0}' is the interop assembly for ActiveX control '{1}' but was marked to be linked by the compiler with the /link flag. This COM reference will be treated as a reference and will not be linked.</source>
+         <target state="translated">COM 參考 '{0}' 是 ActiveX 控制項 '{1}' 的 Interop 組件，但是標記為要由編譯器以 /link 旗標連結。這個 COM 參考將被視為參考，不會進行連結。</target>

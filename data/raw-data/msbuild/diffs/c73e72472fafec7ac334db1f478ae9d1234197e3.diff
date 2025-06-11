@@ -1,0 +1,175 @@
+diff --git a/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs b/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
+index 3135035b20b..b09519f9f71 100644
+--- a/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
+@@ -212,6 +212,14 @@ private void SimpleP2PBuild(BuildParameters buildParameters)
+                 .ShouldBe(3);
+         }
+ 
++        [Fact]
++        public void GraphBuildOptionsDefaults()
++        {
++            var options = new GraphBuildOptions();
++
++            options.Build.ShouldBeTrue();
++        }
++
+         /// <summary>
+         /// A simple successful graph build.
+         /// </summary>
+@@ -4279,5 +4287,35 @@ public void GraphBuildCircular()
+             result.OverallResult.ShouldBe(BuildResultCode.Failure);
+             result.CircularDependency.ShouldBeTrue();
+         }
++
++        [Fact]
++        public void GraphBuildShouldBeAbleToConstructGraphButSkipBuild()
++        {
++            var graph = Helpers.CreateProjectGraph(env: _env, dependencyEdges: new Dictionary<int, int[]> {{1, new[] {2, 3}}});
++
++            MockLogger logger = null;
++
++            using (var buildSession = new Helpers.BuildManagerSession(_env))
++            {
++                var graphResult = buildSession.BuildGraphSubmission(
++                    new GraphBuildRequestData(
++                        projectGraphEntryPoints: new[] {new ProjectGraphEntryPoint(graph.GraphRoots.First().ProjectInstance.FullPath)},
++                        targetsToBuild: new string[0],
++                        hostServices: null,
++                        flags: BuildRequestDataFlags.None,
++                        graphBuildOptions: new GraphBuildOptions {Build = false}));
++
++                graphResult.OverallResult.ShouldBe(BuildResultCode.Success);
++                logger = buildSession.Logger;
++            }
++
++            logger.EvaluationStartedEvents.Count.ShouldBe(3);
++            logger.ProjectStartedEvents.ShouldBeEmpty();
++            logger.TargetStartedEvents.ShouldBeEmpty();
++            logger.BuildStartedEvents.ShouldHaveSingleItem();
++            logger.BuildFinishedEvents.ShouldHaveSingleItem();
++            logger.FullLog.ShouldContain("Static graph loaded in");
++            logger.FullLog.ShouldContain("3 nodes, 2 edges");
++        }
+     }
+ }
+diff --git a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+index a52d2eace20..548a25b3858 100644
+--- a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
++++ b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+@@ -7,7 +7,6 @@
+ using System.IO;
+ using System.Linq;
+ using System.Text.RegularExpressions;
+-using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Execution;
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index cc6f64a7021..e071160c912 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1723,16 +1723,23 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+                         projectGraph.ConstructionMetrics.NodeCount,
+                         projectGraph.ConstructionMetrics.EdgeCount));
+ 
+-                var targetListTask = Task.Run(() => projectGraph.GetTargetLists(submission.BuildRequestData.TargetNames));
+-                var cacheServiceTask = Task.Run(() => SearchAndInitializeProjectCachePluginFromGraph(projectGraph));
++                Dictionary<ProjectGraphNode, BuildResult> resultsPerNode = null;
+ 
+-                IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetLists = targetListTask.Result;
+-                using var cacheService = cacheServiceTask.Result;
++                if (submission.BuildRequestData.GraphBuildOptions.Build)
++                {
++                    var cacheServiceTask = Task.Run(() => SearchAndInitializeProjectCachePluginFromGraph(projectGraph));
++                    var targetListTask = Task.Run(() => projectGraph.GetTargetLists(submission.BuildRequestData.TargetNames));
++
++                    using var cacheService = cacheServiceTask.Result;
+ 
+-                var resultsPerNode = BuildGraph(projectGraph, targetLists, submission);
++                    resultsPerNode = BuildGraph(projectGraph, targetListTask.Result, submission.BuildRequestData);
++                }
+ 
+                 // The overall submission is complete, so report it as complete
+-                ReportResultsToSubmission(new GraphBuildResult(submission.SubmissionId, new ReadOnlyDictionary<ProjectGraphNode, BuildResult>(resultsPerNode)));
++                ReportResultsToSubmission(
++                    new GraphBuildResult(
++                        submission.SubmissionId,
++                        new ReadOnlyDictionary<ProjectGraphNode, BuildResult>(resultsPerNode ?? new Dictionary<ProjectGraphNode, BuildResult>())));
+             }
+             catch (Exception ex) when (!ExceptionHandling.IsCriticalException(ex))
+             {
+@@ -1787,7 +1794,7 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+         private Dictionary<ProjectGraphNode, BuildResult> BuildGraph(
+             ProjectGraph projectGraph,
+             IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetsPerNode,
+-            GraphBuildSubmission graphSubmission)
++            GraphBuildRequestData graphBuildRequestData)
+         {
+             var waitHandle = new AutoResetEvent(true);
+             var graphBuildStateLock = new object();
+@@ -1823,8 +1830,8 @@ private Dictionary<ProjectGraphNode, BuildResult> BuildGraph(
+                         var request = new BuildRequestData(
+                             node.ProjectInstance,
+                             targetList.ToArray(),
+-                            graphSubmission.BuildRequestData.HostServices,
+-                            graphSubmission.BuildRequestData.Flags);
++                            graphBuildRequestData.HostServices,
++                            graphBuildRequestData.Flags);
+ 
+                         // TODO Tack onto the existing submission instead of pending a whole new submission for every node
+                         // Among other things, this makes BuildParameters.DetailedSummary produce a summary for each node, which is not desirable.
+diff --git a/src/Shared/UnitTests/MockLogger.cs b/src/Shared/UnitTests/MockLogger.cs
+index 07af5356dc7..f8a094bb442 100644
+--- a/src/Shared/UnitTests/MockLogger.cs
++++ b/src/Shared/UnitTests/MockLogger.cs
+@@ -81,6 +81,16 @@ internal sealed class MockLogger : ILogger
+         /// </summary>
+         internal List<ExternalProjectFinishedEventArgs> ExternalProjectFinishedEvents { get; } = new List<ExternalProjectFinishedEventArgs>();
+ 
++        /// <summary>
++        /// List of ProjectStarted events
++        /// </summary>
++        internal List<ProjectEvaluationStartedEventArgs> EvaluationStartedEvents { get; } = new List<ProjectEvaluationStartedEventArgs>();
++
++        /// <summary>
++        /// List of ProjectFinished events
++        /// </summary>
++        internal List<ProjectEvaluationFinishedEventArgs> EvaluationFinishedEvents { get; } = new List<ProjectEvaluationFinishedEventArgs>();
++
+         /// <summary>
+         /// List of ProjectStarted events
+         /// </summary>
+@@ -293,6 +303,16 @@ internal void LoggerEventHandler(object sender, BuildEventArgs eventArgs)
+                         ExternalProjectFinishedEvents.Add(finishedEventArgs);
+                         break;
+                     }
++                    case ProjectEvaluationStartedEventArgs evaluationStartedEventArgs:
++                    {
++                        EvaluationStartedEvents.Add(evaluationStartedEventArgs);
++                        break;
++                    }
++                    case ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs:
++                    {
++                        EvaluationFinishedEvents.Add(evaluationFinishedEventArgs);
++                        break;
++                    }
+                     case ProjectStartedEventArgs startedEventArgs:
+                     {
+                         ProjectStartedEvents.Add(startedEventArgs);
+diff --git a/src/Shared/UnitTests/ObjectModelHelpers.cs b/src/Shared/UnitTests/ObjectModelHelpers.cs
+index c20d923b67c..5c721b50c7e 100644
+--- a/src/Shared/UnitTests/ObjectModelHelpers.cs
++++ b/src/Shared/UnitTests/ObjectModelHelpers.cs
+@@ -1944,6 +1944,11 @@ public BuildResult BuildProjectFile(
+ 
+                 return buildResult;
+             }
++			
++			public GraphBuildResult BuildGraphSubmission(GraphBuildRequestData requestData)
++            {
++                return _buildManager.BuildRequest(requestData);
++            }
+ 
+             public void Dispose()
+             {

@@ -1,0 +1,117 @@
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index cd65494d68f..28d13e37127 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -1284,11 +1284,22 @@ private void UpdateStatisticsPostBuild()
+                     // E.g. _SourceLinkHasSingleProvider can be brought explicitly via nuget (Microsoft.SourceLink.GitHub) as well as sdk
+                     projectTargetInstance.Value.Location.Equals(targetResult.TargetLocation);
+ 
+-                bool isFromNuget = FileClassifier.Shared.IsInNugetCache(projectTargetInstance.Value.FullPath);
++                bool isFromNuget, isMetaprojTarget, isCustom;
+ 
+-                bool isCustom = IsCustomTargetPath(projectTargetInstance.Value.FullPath) ||
+-                                // add the isFromNuget to condition - to prevent double checking of nonnuget package
+-                                (isFromNuget && FileClassifier.Shared.IsMicrosoftPackageInNugetCache(projectTargetInstance.Value.FullPath));
++                if (IsMetaprojTargetPath(projectTargetInstance.Value.FullPath))
++                {
++                    isMetaprojTarget = true;
++                    isFromNuget = false;
++                    isCustom = false;
++                }
++                else
++                {
++                    isMetaprojTarget = false;
++                    isFromNuget = FileClassifier.Shared.IsInNugetCache(projectTargetInstance.Value.FullPath);
++                    isCustom = !FileClassifier.Shared.IsBuiltInLogic(projectTargetInstance.Value.FullPath) ||
++                               // add the isFromNuget to condition - to prevent double checking of nonnuget package
++                               (isFromNuget && FileClassifier.Shared.IsMicrosoftPackageInNugetCache(projectTargetInstance.Value.FullPath));
++                }
+ 
+                 collector.AddTarget(
+                     projectTargetInstance.Key,
+@@ -1296,6 +1307,7 @@ private void UpdateStatisticsPostBuild()
+                     //  to remember target names from ResultsByTarget from before execution
+                     wasExecuted,
+                     isCustom,
++                    isMetaprojTarget,
+                     isFromNuget);
+             }
+ 
+@@ -1325,8 +1337,8 @@ void CollectTasksStats(TaskRegistry taskRegistry)
+             }
+         }
+ 
+-        private static bool IsCustomTargetPath(string targetPath)
+-            =>  !targetPath.EndsWith(".metaproj", StringComparison.OrdinalIgnoreCase) && !FileClassifier.Shared.IsBuiltInLogic(targetPath);
++        private static bool IsMetaprojTargetPath(string targetPath)
++            => targetPath.EndsWith(".metaproj", StringComparison.OrdinalIgnoreCase);
+ 
+         /// <summary>
+         /// Saves the current operating environment.
+diff --git a/src/Build/Telemetry/ITelemetryCollector.cs b/src/Build/Telemetry/ITelemetryCollector.cs
+index b342a031794..7244ecf77a0 100644
+--- a/src/Build/Telemetry/ITelemetryCollector.cs
++++ b/src/Build/Telemetry/ITelemetryCollector.cs
+@@ -21,7 +21,7 @@ void AddTask(string name, TimeSpan cumulativeExectionTime, short executionsCount
+         bool isFromNugetCache);
+ 
+     // wasExecuted - means anytime, not necessarily from the last time target was added to telemetry
+-    void AddTarget(string name, bool wasExecuted, bool isCustom, bool isFromNugetCache);
++    void AddTarget(string name, bool wasExecuted, bool isCustom, bool isMetaproj, bool isFromNugetCache);
+ 
+     void FinalizeProcessing(LoggingContext loggingContext);
+ }
+@@ -70,18 +70,23 @@ public class TelemetryCollector : ITelemetryCollector
+ 
+         public void AddTask(string name, TimeSpan cumulativeExectionTime, short executionsCount, long totalMemoryConsumed, bool isCustom, bool isFromNugetCache)
+         {
+-            name = GetName(name, isCustom, isFromNugetCache);
++            name = GetName(name, isCustom, false, isFromNugetCache);
+             _workerNodeTelemetryData.AddTask(name, cumulativeExectionTime, executionsCount, totalMemoryConsumed);
+         }
+ 
+-        public void AddTarget(string name, bool wasExecuted, bool isCustom, bool isFromNugetCache)
++        public void AddTarget(string name, bool wasExecuted, bool isCustom, bool isMetaproj, bool isFromNugetCache)
+         {
+-            name = GetName(name, isCustom, isFromNugetCache);
++            name = GetName(name, isCustom, isMetaproj, isFromNugetCache);
+             _workerNodeTelemetryData.AddTarget(name, wasExecuted);
+         }
+ 
+-        private static string GetName(string name, bool isCustom, bool isFromNugetCache)
++        private static string GetName(string name, bool isCustom, bool isMetaproj, bool isFromNugetCache)
+         {
++            if (isMetaproj)
++            {
++                name = WorkerNodeTelemetryData.MetaProjPrefix + name;
++            }
++
+             if (isCustom)
+             {
+                 name = WorkerNodeTelemetryData.CustomPrefix + name;
+@@ -108,7 +113,7 @@ public class NullTelemetryCollector : ITelemetryCollector
+         public bool IsTelemetryCollected => false;
+ 
+         public void AddTask(string name, TimeSpan cumulativeExectionTime, short executionsCount, long totalMemoryConsumed, bool isCustom, bool isFromNugetCache) { }
+-        public void AddTarget(string name, bool wasExecuted, bool isCustom, bool isFromNugetCache) { }
++        public void AddTarget(string name, bool wasExecuted, bool isCustom, bool isMetaproj, bool isFromNugetCache) { }
+ 
+         public void FinalizeProcessing(LoggingContext loggingContext) { }
+     }
+diff --git a/src/Framework/Telemetry/WorkerNodeTelemetryEventArgs.cs b/src/Framework/Telemetry/WorkerNodeTelemetryEventArgs.cs
+index 447ad0a623f..ac59a2e83ba 100644
+--- a/src/Framework/Telemetry/WorkerNodeTelemetryEventArgs.cs
++++ b/src/Framework/Telemetry/WorkerNodeTelemetryEventArgs.cs
+@@ -29,8 +29,12 @@ internal interface IWorkerNodeTelemetryData
+ 
+ internal class WorkerNodeTelemetryData : IWorkerNodeTelemetryData
+ {
++    // Indicate custom targets/task - those must be hashed.
+     public const string CustomPrefix = "C:";
++    // Indicate targets/tasks sourced from nuget cache - those can be custom or MSFT provided ones.
+     public const string FromNugetPrefix = "N:";
++    // Indicate targets/tasks generated during build - those must be hashed (as they contain paths).
++    public const string MetaProjPrefix = "M:";
+ 
+     public WorkerNodeTelemetryData(Dictionary<string, TaskExecutionStats> tasksExecutionData, Dictionary<string, bool> targetsExecutionData)
+     {

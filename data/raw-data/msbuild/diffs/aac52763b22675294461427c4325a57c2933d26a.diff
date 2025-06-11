@@ -1,0 +1,158 @@
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index 9991bf07d1f..cf4dc1d3cdf 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -1105,9 +1105,13 @@ private async Task<BuildResult> BuildProject()
+             ErrorUtilities.VerifyThrow(_targetBuilder != null, "Target builder is null");
+ 
+             // We consider this the entrypoint for the project build for purposes of BuildCheck processing 
++            bool isRestoring = _requestEntry.RequestConfiguration.GlobalProperties[MSBuildConstants.MSBuildIsRestoring] is null;
+ 
+-            var buildCheckManager = (_componentHost.GetComponent(BuildComponentType.BuildCheckManagerProvider) as IBuildCheckManagerProvider)!.Instance;
+-            buildCheckManager.SetDataSource(BuildCheckDataSource.BuildExecution);
++            var buildCheckManager = isRestoring
++                ? (_componentHost.GetComponent(BuildComponentType.BuildCheckManagerProvider) as IBuildCheckManagerProvider)!.Instance
++                : null;
++
++            buildCheckManager?.SetDataSource(BuildCheckDataSource.BuildExecution);
+ 
+             // Make sure it is null before loading the configuration into the request, because if there is a problem
+             // we do not wand to have an invalid projectLoggingContext floating around. Also if this is null the error will be
+@@ -1121,7 +1125,7 @@ private async Task<BuildResult> BuildProject()
+                 // Load the project
+                 if (!_requestEntry.RequestConfiguration.IsLoaded)
+                 {
+-                    buildCheckManager.StartProjectEvaluation(
++                    buildCheckManager?.StartProjectEvaluation(
+                         BuildCheckDataSource.BuildExecution,
+                         new CheckLoggingContext(_nodeLoggingContext.LoggingService, _requestEntry.Request.BuildEventContext),
+                         _requestEntry.RequestConfiguration.ProjectFullPath);
+@@ -1146,13 +1150,13 @@ private async Task<BuildResult> BuildProject()
+             }
+             finally
+             {
+-                buildCheckManager.EndProjectEvaluation(
++                buildCheckManager?.EndProjectEvaluation(
+                     BuildCheckDataSource.BuildExecution,
+                     _requestEntry.Request.BuildEventContext);
+             }
+ 
+             _projectLoggingContext = _nodeLoggingContext.LogProjectStarted(_requestEntry);
+-            buildCheckManager.StartProjectRequest(
++            buildCheckManager?.StartProjectRequest(
+                 BuildCheckDataSource.BuildExecution,
+                 _requestEntry.Request.BuildEventContext,
+                 _requestEntry.RequestConfiguration.ProjectFullPath);
+@@ -1224,7 +1228,7 @@ private async Task<BuildResult> BuildProject()
+             }
+             finally
+             {
+-                buildCheckManager.EndProjectRequest(
++                buildCheckManager?.EndProjectRequest(
+                     BuildCheckDataSource.BuildExecution,
+                     new CheckLoggingContext(_nodeLoggingContext.LoggingService, _requestEntry.Request.BuildEventContext),
+                     _requestEntry.RequestConfiguration.ProjectFullPath);
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+index 82613e27f2b..8e6bd5c24cc 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+@@ -10,6 +10,7 @@
+ using Microsoft.Build.Experimental.BuildCheck.Acquisition;
+ using Microsoft.Build.Experimental.BuildCheck.Utilities;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+@@ -18,7 +19,9 @@ internal class BuildCheckBuildEventHandler
+     private readonly IBuildCheckManager _buildCheckManager;
+     private readonly ICheckContextFactory _checkContextFactory;
+ 
+-    private readonly Dictionary<Type, Action<BuildEventArgs>> _eventHandlers;
++    private Dictionary<Type, Action<BuildEventArgs>> _eventHandlers;
++    private readonly Dictionary<Type, Action<BuildEventArgs>> _eventHandlersFull;
++    private readonly Dictionary<Type, Action<BuildEventArgs>> _eventHandlersRestore;
+ 
+     internal BuildCheckBuildEventHandler(
+         ICheckContextFactory checkContextFactory,
+@@ -27,8 +30,9 @@ internal BuildCheckBuildEventHandler(
+         _buildCheckManager = buildCheckManager;
+         _checkContextFactory = checkContextFactory;
+ 
+-        _eventHandlers = new()
++        _eventHandlersFull = new()
+         {
++            { typeof(BuildSubmissionStartedEventArgs), (BuildEventArgs e) => HandleBuildSubmissionStartedEvent((BuildSubmissionStartedEventArgs)e) },
+             { typeof(ProjectEvaluationFinishedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationFinishedEvent((ProjectEvaluationFinishedEventArgs)e) },
+             { typeof(ProjectEvaluationStartedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationStartedEvent((ProjectEvaluationStartedEventArgs)e) },
+             { typeof(EnvironmentVariableReadEventArgs), (BuildEventArgs e) => HandleEnvironmentVariableReadEvent((EnvironmentVariableReadEventArgs)e) },
+@@ -41,6 +45,14 @@ internal BuildCheckBuildEventHandler(
+             { typeof(TaskParameterEventArgs), (BuildEventArgs e) => HandleTaskParameterEvent((TaskParameterEventArgs)e) },
+             { typeof(BuildFinishedEventArgs), (BuildEventArgs e) => HandleBuildFinishedEvent((BuildFinishedEventArgs)e) },
+         };
++
++        // During restore we'll wait only for restore to be done.
++        _eventHandlersRestore = new()
++        {
++            { typeof(BuildSubmissionStartedEventArgs), (BuildEventArgs e) => HandleBuildSubmissionStartedEvent((BuildSubmissionStartedEventArgs)e) },
++        };
++
++        _eventHandlers = _eventHandlersFull;
+     }
+ 
+     public void HandleBuildEvent(BuildEventArgs e)
+@@ -51,6 +63,14 @@ public void HandleBuildEvent(BuildEventArgs e)
+         }
+     }
+ 
++    private void HandleBuildSubmissionStartedEvent(BuildSubmissionStartedEventArgs eventArgs)
++    {
++        eventArgs.GlobalProperties.TryGetValue(MSBuildConstants.MSBuildIsRestoring, out string? restoreProperty);
++        bool isRestoring = restoreProperty is not null && Convert.ToBoolean(restoreProperty);
++
++        _eventHandlers = isRestoring ? _eventHandlersRestore : _eventHandlersFull;
++    }
++
+     private void HandleProjectEvaluationFinishedEvent(ProjectEvaluationFinishedEventArgs eventArgs)
+     {
+         if (!IsMetaProjFile(eventArgs.ProjectFile))
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
+index 45bd095f415..491fe92d700 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
+@@ -38,6 +38,7 @@ internal class BuildCheckForwardingLogger : IForwardingLogger
+     private HashSet<Type> _eventsToForward = new HashSet<Type>
+     {
+         typeof(EnvironmentVariableReadEventArgs),
++        typeof(BuildSubmissionStartedEventArgs),
+         typeof(ProjectEvaluationFinishedEventArgs),
+         typeof(ProjectEvaluationStartedEventArgs),
+         typeof(ProjectStartedEventArgs),
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index f1a77277d4b..69f56d71449 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -315,6 +315,23 @@ public void CustomCheckTest_WithEditorConfig(string checkCandidate, string ruleI
+         }
+     }
+ 
++    [Theory]
++    [InlineData(true)]
++    [InlineData(false)]
++    public void DoesNotRunOnRestore(bool buildInOutOfProcessNode)
++    {
++        PrepareSampleProjectsAndConfig(buildInOutOfProcessNode, out TransientTestFile projectFile, new List<(string, string)>() { ("BC0101", "warning") });
++
++        string output = RunnerUtilities.ExecBootstrapedMSBuild(
++            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -t:restore -check",
++            out bool success);
++
++        success.ShouldBeTrue();
++        output.ShouldNotContain("BC0101");
++        output.ShouldNotContain("BC0102");
++        output.ShouldNotContain("BC0103");
++    }
++
+     private void AddCustomDataSourceToNugetConfig(string checkCandidatePath)
+     {
+         var nugetTemplatePath = Path.Combine(checkCandidatePath, "nugetTemplate.config");

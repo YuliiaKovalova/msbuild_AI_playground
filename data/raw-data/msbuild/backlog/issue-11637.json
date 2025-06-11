@@ -1,0 +1,91 @@
+{
+  "number": 11637,
+  "title": "[Performance]: dotnet/dotnet repo build is slow",
+  "body": "### Issue Description\n\nInvestigate scheduling issues in https://github.com/dotnet/dotnet repository build. \n\nThe critical path is about 30% shorter than the actual builds and a lot of MSBuild nodes are not utilized efficiently.\n\nSome part of the scheduling issues could be addressed by switching to the graph build, see https://github.com/dotnet/dotnet/pull/160, but there's still some fishy scheduling going on. In particular, some of `BuildRepoReferences` targets with the graph build takes >40 minutes to complete, despite the fact that all the dependencies are already built, so cache should be able to provide the results immediately.\n\n### Steps to Reproduce\n\nBuild https://github.com/dotnet/dotnet with binary log and investigate it.\n\n### Data\n\nBinlogs available internally, ping in the issue to obtain those.\n\n### Analysis\n\n_No response_\n\n### Versions & Configurations\n\n_No response_\n\n### Regression\n\n- [ ] yes\n- [x] no\n\n### Regression Details\n\n_No response_",
+  "state": "CLOSED",
+  "createdAt": "2025-03-27T13:06:05Z",
+  "updatedAt": "2025-04-23T09:00:50Z",
+  "closedAt": "2025-04-23T08:59:53Z",
+  "author": {
+    "login": "AR-May"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": [
+      {
+        "login": "AR-May"
+      }
+    ]
+  },
+  "labels": [
+    "Area: Performance",
+    "triaged"
+  ],
+  "comments": {
+    "nodes": [
+      {
+        "body": "I added more logging to the scheduler and to the build result cache and identified the following situation happening during the build:\n- `arcade.proj` is built on the node `node_id`, the build results are put to results cache with configuration `conf_id`. Those results would be further needed for many other projects in the repo. However, there is an initial target ErrorForMissingTestRunner that is skipped during the build, since it isn't test project.\n- When other project needs results of arcade build, they create a request for the same configuration `conf_id`. Cache provides the result, but the initial target did not succeed, as it was skipped.\n- Scheduler then schedules the new build with configuration `conf_id` on node `node_id` (for build correctness all the build for all targets should be executed on the same node). \n- If the node `node_id` at the time happens to execute some other project build, the request waits in a queue, possibly for hours.\n- When the results of the build are obtained from the node `node_id`, scheduler adds them to the result cache for the configuration `conf_id`. Because we already have an entry for this configuration the results are merged with what is in the cache before. But the ErrorForMissingTestRunner target was still skipped, so nothing changes in the cache.\n- Situation repeats for all requests for arcade repo build results.\n",
+        "createdAt": "2025-04-14T11:58:56Z",
+        "author": {
+          "login": "AR-May"
+        }
+      },
+      {
+        "body": "I also noticed that another situation could result in similar behavior. If the same project would be built with one set of build flags and then with another (with the same configuration), then during the merge of the build results, build flags would not be updated. Then, when requesting the second build results with the second set of the flags, we would have cache miss too.",
+        "createdAt": "2025-04-14T13:22:27Z",
+        "author": {
+          "login": "AR-May"
+        }
+      },
+      {
+        "body": "As another idea: We have a lot of Exec tasks that takes a long time. Can we yield from them using `TaskHost.Yield`? It will allow to process cache misses as well in a more responsive way. On the other hand, it will be scheduling more projects to the same node, which is bad.",
+        "createdAt": "2025-04-14T13:24:05Z",
+        "author": {
+          "login": "AR-May"
+        }
+      },
+      {
+        "body": "We merged https://github.com/dotnet/arcade/pull/15743 to avoid the issue. \n\nDiscussing (internally) to fix this issue on the MSBuild side by accepting (by default) skipped targets when requesting the results from ResultCache. Related code is https://github.com/dotnet/msbuild/blob/56af14726886f18fb6acd3212532a034eac32c47/src/Build/BackEnd/Components/Caching/ResultsCache.cs#L166",
+        "createdAt": "2025-04-17T15:54:04Z",
+        "author": {
+          "login": "AR-May"
+        }
+      },
+      {
+        "body": "What's the perf impact of dotnet/arcade#15743 for the VMR? Does it apply to other arcade-using repos as well?",
+        "createdAt": "2025-04-17T20:46:47Z",
+        "author": {
+          "login": "baronfel"
+        }
+      },
+      {
+        "body": "I measured it locally on a graph build of VMR. Note, I have not moved the VMR repo to graph build - I am working on that, investigating pipeline failures.\n\nI have had 12 data points. Here are aggregated numbers:\n\n| Metric               | Before Fix   | After Fix    | Percentage Change |\n|----------------------|--------------|--------------|-------------------|\n| Average TotalMinutes | 92.552634    | 88.053451    | -4.86 %           |\n| Max TotalMinutes     | 107.235311   | 94.617181    | -11.77 %          |\n| Min TotalMinutes     | 72.077358    | 75.674805    | 4.99 %            |\n| Median TotalMinutes  | 92.834104    | 89.985024    | -3.07 %           |\n\n\nMy interpretation of the results: \nThe good lucky runs of the build are not very affected. The situation i described above may or not may happen during the build and good times are when we did not hit it and the build overall was scheduled nicely. But the worst-case scenarios are improved, hence we have improvement of max value, median and average.",
+        "createdAt": "2025-04-22T12:34:32Z",
+        "author": {
+          "login": "AR-May"
+        }
+      },
+      {
+        "body": "Answering your question, @baronfel, if the solution has multiple projects and many of them depend on arcade, you should see some improvement in the worst-case scenarios",
+        "createdAt": "2025-04-22T12:36:58Z",
+        "author": {
+          "login": "AR-May"
+        }
+      },
+      {
+        "body": "And in the pipeline https://dev.azure.com/dnceng/internal/_build?definitionId=1330&_a=summary for VMR I looked at the Windows x64 leg build times and here are aggregated numbers on 8 runs (that's all runs that happened with the fix)\n| Metric               | Before Fix   | After Fix    | Percentage Change |\n|----------------------|--------------|--------------|-------------------|\n| Average TotalMinutes | 238.445833   | 220.222917   | -7.64  %           |\n| Max TotalMinutes     | 260.600000   | 258.866667   | -0.67  %           |\n| Min TotalMinutes     | 215.766667   | 193.116667   | -10.50  %          |\n| Median TotalMinutes  | 236.358333   | 216.025000   | -8.60  %           |\n",
+        "createdAt": "2025-04-22T14:01:45Z",
+        "author": {
+          "login": "AR-May"
+        }
+      },
+      {
+        "body": "The VMR side of the problem is fixed. I created a separate issue to track the fix on the MSBuild side.\nI created a separate issue to track [switching to a graph build](https://github.com/dotnet/msbuild/issues/11754) and for the [yield from the exec task](https://github.com/dotnet/msbuild/issues/11755) idea.",
+        "createdAt": "2025-04-23T08:59:53Z",
+        "author": {
+          "login": "AR-May"
+        }
+      }
+    ]
+  }
+}

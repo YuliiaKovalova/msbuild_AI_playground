@@ -1,0 +1,175 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 64c8de664c3..d9794e794b4 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -2950,7 +2950,7 @@ private void OnProjectStarted(object sender, ProjectStartedEventArgs e)
+             });
+         }
+ 
+-        public void AttachBuildCheckForBinaryLogReplay(BinaryLogReplayEventSource replayEventSource)
++        public IEventSource GetMergedEventSource(BinaryLogReplayEventSource replayEventSource)
+         {
+             _buildParameters = new BuildParameters
+             {
+@@ -2962,11 +2962,23 @@ public void AttachBuildCheckForBinaryLogReplay(BinaryLogReplayEventSource replay
+ 
+             buildCheckManagerProvider!.Instance.SetDataSource(BuildCheckDataSource.EventArgs);
+ 
++            // Create BuildCheckBuildEventHandler that uses the mergedEventSource to invoke new events
++            var analysisContextFactory = new AnalysisDispatchingContextFactory();
++
+             var buildCheckEventHandler = new BuildCheckBuildEventHandler(
+-                new AnalysisDispatchingContextFactory(replayEventSource.Dispatch),
++                analysisContextFactory,
+                 buildCheckManagerProvider.Instance);
+ 
++            var mergedEventSource = new EventArgsDispatcher();
++            // Pass the events from replayEventSource to the mergedEventSource
++            replayEventSource.AnyEventRaised += (sender, e) => mergedEventSource.Dispatch(e);
++
++            // Pass the events from replayEventSource to the BuildCheckBuildEventHandler to produce new events
+             replayEventSource.AnyEventRaised += (sender, e) => buildCheckEventHandler.HandleBuildEvent(e);
++            // Pass the events produced by BuildCheck to the mergedEventSource
++            analysisContextFactory.AnyEventRaised += (sender, e) => mergedEventSource.Dispatch(e);
++
++            return mergedEventSource;
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BuildCheck/Infrastructure/AnalysisContext/AnalysisDispatchingContext.cs b/src/Build/BuildCheck/Infrastructure/AnalysisContext/AnalysisDispatchingContext.cs
+index 1ce7f1aa336..044e214923e 100644
+--- a/src/Build/BuildCheck/Infrastructure/AnalysisContext/AnalysisDispatchingContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/AnalysisContext/AnalysisDispatchingContext.cs
+@@ -9,20 +9,21 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BackEnd.Shared;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Logging;
+ using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+ internal class AnalysisDispatchingContext : IAnalysisContext
+ {
+-    private readonly Action<BuildEventArgs> _dispatch;
++    private readonly EventArgsDispatcher _eventDispatcher;
+     private readonly BuildEventContext _eventContext;
+ 
+     public AnalysisDispatchingContext(
+-        Action<BuildEventArgs> dispatch,
++        EventArgsDispatcher dispatch,
+         BuildEventContext eventContext)
+     {
+-        _dispatch = dispatch;
++        _eventDispatcher = dispatch;
+         _eventContext = eventContext;
+     }
+ 
+@@ -32,7 +33,7 @@ public void DispatchBuildEvent(BuildEventArgs buildEvent)
+     {
+         ErrorUtilities.VerifyThrow(buildEvent != null, "buildEvent is null");
+ 
+-        _dispatch!(buildEvent!);
++        _eventDispatcher.Dispatch(buildEvent);
+     }
+ 
+     public void DispatchAsComment(MessageImportance importance, string messageResourceName, params object?[] messageArgs)
+@@ -49,13 +50,13 @@ private void DispatchAsCommentFromText(BuildEventContext buildEventContext, Mess
+     {
+         BuildMessageEventArgs buildEvent = EventsCreatorHelper.CreateMessageEventFromText(buildEventContext, importance, message, messageArgs);
+ 
+-        _dispatch!(buildEvent!);
++        _eventDispatcher.Dispatch(buildEvent);
+     }
+ 
+     public void DispatchAsErrorFromText(string? subcategoryResourceName, string? errorCode, string? helpKeyword, BuildEventFileInfo file, string message)
+     {
+         BuildErrorEventArgs buildEvent = EventsCreatorHelper.CreateErrorEventFromText(_eventContext, subcategoryResourceName, errorCode, helpKeyword, file, message);
+ 
+-        _dispatch!(buildEvent!);
++        _eventDispatcher.Dispatch(buildEvent);
+     }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/AnalysisContext/AnalysisDispatchingContextFactory.cs b/src/Build/BuildCheck/Infrastructure/AnalysisContext/AnalysisDispatchingContextFactory.cs
+index bfa256be85a..f19b8e2e547 100644
+--- a/src/Build/BuildCheck/Infrastructure/AnalysisContext/AnalysisDispatchingContextFactory.cs
++++ b/src/Build/BuildCheck/Infrastructure/AnalysisContext/AnalysisDispatchingContextFactory.cs
+@@ -1,12 +1,6 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-using System;
+-using System.Collections.Concurrent;
+-using System.Collections.Generic;
+-using System.Linq;
+-using System.Text;
+-using System.Threading.Tasks;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Logging;
+ 
+@@ -14,10 +8,17 @@ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+ internal class AnalysisDispatchingContextFactory : IAnalysisContextFactory
+ {
+-    private readonly Action<BuildEventArgs> _dispatch;
++    private readonly EventArgsDispatcher _dispatcher;
+ 
+-    public AnalysisDispatchingContextFactory(Action<BuildEventArgs> dispatch) => _dispatch = dispatch;
++    public event AnyEventHandler? AnyEventRaised;
++
++    public AnalysisDispatchingContextFactory()
++    {
++        _dispatcher = new EventArgsDispatcher();
++
++        _dispatcher.AnyEventRaised += (sender, e) => AnyEventRaised?.Invoke(sender, e);
++    }
+ 
+     public IAnalysisContext CreateAnalysisContext(BuildEventContext eventContext)
+-        => new AnalysisDispatchingContext(_dispatch, eventContext);
++        => new AnalysisDispatchingContext(_dispatcher, eventContext);
+ }
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index ae8b83fade1..380069a61e0 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -4412,21 +4412,20 @@ private static void ReplayBinaryLog(
+ 
+             var replayEventSource = new BinaryLogReplayEventSource();
+ 
+-            if (isBuildCheckEnabled)
+-            {
+-                BuildManager.DefaultBuildManager.AttachBuildCheckForBinaryLogReplay(replayEventSource);
+-            }
++            var eventSource = isBuildCheckEnabled ?
++                BuildManager.DefaultBuildManager.GetMergedEventSource(replayEventSource) :
++                replayEventSource;
+ 
+             foreach (var distributedLoggerRecord in distributedLoggerRecords)
+             {
+                 ILogger centralLogger = distributedLoggerRecord.CentralLogger;
+                 if (centralLogger is INodeLogger nodeLogger)
+                 {
+-                    nodeLogger.Initialize(replayEventSource, cpuCount);
++                    nodeLogger.Initialize(eventSource, cpuCount);
+                 }
+                 else
+                 {
+-                    centralLogger?.Initialize(replayEventSource);
++                    centralLogger?.Initialize(eventSource);
+                 }
+             }
+ 
+@@ -4434,11 +4433,11 @@ private static void ReplayBinaryLog(
+             {
+                 if (logger is INodeLogger nodeLogger)
+                 {
+-                    nodeLogger.Initialize(replayEventSource, cpuCount);
++                    nodeLogger.Initialize(eventSource, cpuCount);
+                 }
+                 else
+                 {
+-                    logger.Initialize(replayEventSource);
++                    logger.Initialize(eventSource);
+                 }
+             }
+ 

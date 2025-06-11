@@ -1,0 +1,563 @@
+diff --git a/src/Build.UnitTests/BackEnd/MSBuild_Tests.cs b/src/Build.UnitTests/BackEnd/MSBuild_Tests.cs
+index 4eb2b6a1307..4da79c48909 100644
+--- a/src/Build.UnitTests/BackEnd/MSBuild_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/MSBuild_Tests.cs
+@@ -772,6 +772,90 @@ public void ItemsIncludeExcludePathsCombinations()
+             }
+         }
+ 
++        /// <summary>
++        /// Referring to an item outside of target leads to 'naturally expected' reference to the item being processed.
++        ///  No expansion occurs.
++        /// </summary>
++        [Fact]
++        public void ItemsRecursionOutsideTarget()
++        {
++            string projectFile = null;
++
++            try
++            {
++                projectFile = ObjectModelHelpers.CreateTempFileOnDisk("""
++                    <Project ToolsVersion='msbuilddefaulttoolsversion' xmlns='msbuildnamespace'>
++                     <ItemGroup>
++                        <iout1 Include='a/b.foo' TargetPath='%(Filename)%(Extension)' />
++                        <iout1 Include='c\d.foo' TargetPath='%(Filename)%(Extension)' />
++                        <iout1 Include='g\h.foo' TargetPath='%(Filename)%(Extension)' />
++                      </ItemGroup>
++                      <Target Name='a'>
++                        <Message Text="iout1=[@(iout1)]" Importance='High' />
++                        <Message Text="iout1-target-paths=[@(iout1->'%(TargetPath)')]" Importance='High' />
++                      </Target>
++                    </Project>
++                """);
++
++                MockLogger logger = new MockLogger(_testOutput);
++                ObjectModelHelpers.BuildTempProjectFileExpectSuccess(projectFile, logger);
++
++                Console.WriteLine(logger.FullLog);
++
++                logger.AssertLogContains("iout1=[a/b.foo;c\\d.foo;g\\h.foo]");
++                logger.AssertLogContains("iout1-target-paths=[b.foo;d.foo;h.foo]");
++            }
++            finally
++            {
++                File.Delete(projectFile);
++            }
++        }
++
++        /// <summary>
++        /// Referring to an item within target leads to item expansion which might be unintended behavior - hence warning.
++        /// </summary>
++        [Fact]
++        public void ItemsRecursionWithinTarget()
++        {
++            string projectFile = null;
++
++            try
++            {
++                // TargetPath="@(iin1->'%(Filename)')" is intentionally allowed - as it explicitly indicates expansion
++                projectFile = ObjectModelHelpers.CreateTempFileOnDisk("""
++                    <Project ToolsVersion='msbuilddefaulttoolsversion' xmlns='msbuildnamespace'>
++                      <Target Name='a'>
++                        <ItemGroup>
++                          <iin1 Include='a/b.foo' TargetPath='%(Filename)%(Extension)' />
++                          <iin1 Include='c\d.foo' TargetPath='%(Filename)%(Extension)' />
++                          <iin1 Include='g\h.foo' TargetPath='%(Filename)%(Extension)' />
++                        </ItemGroup>
++                        <Message Text="iin1=[@(iin1)]" Importance='High' />
++                        <Message Text="iin1-target-paths=[@(iin1->'%(TargetPath)')]" Importance='High' />
++                      </Target>
++                    </Project>
++                """);
++
++                MockLogger logger = new MockLogger(_testOutput);
++                ObjectModelHelpers.BuildTempProjectFileExpectSuccess(projectFile, logger);
++
++                Console.WriteLine(logger.FullLog);
++
++                logger.AssertLogDoesntContain("iin1=[a/b.foo;c\\d.foo;g\\h.foo]");
++                logger.AssertLogDoesntContain("iin1-target-paths=[b.foo;d.foo;h.foo]");
++                logger.AssertLogContains("iin1=[a/b.foo;c\\d.foo;g\\h.foo;g\\h.foo]");
++                logger.AssertLogContains("iin1-target-paths=[;b.foo;b.foo;d.foo]");
++
++                logger.AssertLogContains("Item 'iin1' definition within target is referencing self via metadata 'Extension'. This can lead to unintended expansion and cross-applying of pre-existing items");
++                Assert.Equal(6, logger.WarningCount);
++                Assert.Equal(0, logger.ErrorCount);
++            }
++            finally
++            {
++                File.Delete(projectFile);
++            }
++        }
++
+         /// <summary>
+         /// Check if passing different global properties via metadata works
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs b/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
+index 8dd00b2148b..325c8592a77 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
+@@ -184,7 +184,16 @@ private void ExecuteAdd(ProjectItemGroupTaskItemInstance child, ItemBucket bucke
+ 
+                 if (condition)
+                 {
+-                    string evaluatedValue = bucket.Expander.ExpandIntoStringLeaveEscaped(metadataInstance.Value, ExpanderOptions.ExpandAll, metadataInstance.Location, loggingContext);
++                    ExpanderOptions expanderOptions = ExpanderOptions.ExpandAll;
++                    ElementLocation location = metadataInstance.Location;
++                    if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_6) && bucket.BucketSequenceNumber == 0)
++                    {
++                        expanderOptions |= ExpanderOptions.WarnOnItemMetadataSelfReference;
++                        // Temporary workaround of unavailability of full Location info on metadata: https://github.com/dotnet/msbuild/issues/8579
++                        location = child.Location;
++                    }
++
++                    string evaluatedValue = bucket.Expander.ExpandIntoStringLeaveEscaped(metadataInstance.Value, expanderOptions, location, loggingContext);
+ 
+                     // This both stores the metadata so we can add it to all the items we just created later, and 
+                     // exposes this metadata to further metadata evaluations in subsequent loop iterations.
+@@ -612,7 +621,7 @@ private List<ProjectItemInstance> FindItemsMatchingMetadataSpecification(
+         /// 1. The metadata table created for the bucket, may be null.
+         /// 2. The metadata table derived from the item definition group, may be null.
+         /// </summary>
+-        private class NestedMetadataTable : IMetadataTable
++        private class NestedMetadataTable : IMetadataTable, IItemMetadata
+         {
+             /// <summary>
+             /// The table for all metadata added during expansion
+@@ -722,6 +731,8 @@ internal void SetValue(string name, string value)
+             {
+                 _addTable[name] = value;
+             }
++
++            string IItemMetadata.ItemType => _itemType;
+         }
+     }
+ }
+diff --git a/src/Build/Definition/ProjectItemDefinition.cs b/src/Build/Definition/ProjectItemDefinition.cs
+index 5cbad98cb06..0969cd8d87d 100644
+--- a/src/Build/Definition/ProjectItemDefinition.cs
++++ b/src/Build/Definition/ProjectItemDefinition.cs
+@@ -26,7 +26,7 @@ namespace Microsoft.Build.Evaluation
+     /// ProjectMetadataElement, and these can be added, removed, and modified.
+     /// </remarks>
+     [DebuggerDisplay("{_itemType} #Metadata={MetadataCount}")]
+-    public class ProjectItemDefinition : IKeyed, IMetadataTable, IItemDefinition<ProjectMetadata>, IProjectMetadataParent
++    public class ProjectItemDefinition : IKeyed, IMetadataTable, IItemDefinition<ProjectMetadata>, IProjectMetadataParent, IItemMetadata
+     {
+         /// <summary>
+         /// Project that this item definition lives in.
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 5e3147ec52f..021bb5bac32 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -88,6 +88,13 @@ internal enum ExpanderOptions
+         /// </summary>
+         Truncate = 0x40,
+ 
++        /// <summary>
++        /// Issues warning if item references unqualified or qualified metadata odf self - as this can lead to unintended expansion and
++        ///  cross-combination of other items.
++        /// TODO: add ms learn link (once the appropriate text is added there)
++        /// </summary>
++        WarnOnItemMetadataSelfReference = 0x80,
++
+         /// <summary>
+         /// Expand only properties and then item lists
+         /// </summary>
+@@ -441,7 +448,7 @@ internal string ExpandIntoStringLeaveEscaped(string expression, ExpanderOptions
+ 
+             ErrorUtilities.VerifyThrowInternalNull(elementLocation, nameof(elementLocation));
+ 
+-            string result = MetadataExpander.ExpandMetadataLeaveEscaped(expression, _metadata, options, elementLocation);
++            string result = MetadataExpander.ExpandMetadataLeaveEscaped(expression, _metadata, options, elementLocation, loggingContext);
+             result = PropertyExpander<P>.ExpandPropertiesLeaveEscaped(result, _properties, options, elementLocation, _usedUninitializedProperties, _fileSystem, loggingContext);
+             result = ItemExpander.ExpandItemVectorsIntoString<I>(this, result, _items, options, elementLocation);
+             result = FileUtilities.MaybeAdjustFilePath(result);
+@@ -863,6 +870,11 @@ void FlushCurrentArgumentToArgumentBuilder(int argumentEndIndex)
+         /// </remarks>
+         private static class MetadataExpander
+         {
++            //internal static bool HasUnqualifiedOrSelfQualifiedMetadataRef(string itemName, string expression)
++            //{
++
++            //}
++
+             /// <summary>
+             /// Expands all embedded item metadata in the given string, using the bucketed items.
+             /// Metadata may be qualified, like %(Compile.WarningLevel), or unqualified, like %(Compile).
+@@ -872,7 +884,7 @@ private static class MetadataExpander
+             /// <param name="options">Used to specify what to expand.</param>
+             /// <param name="elementLocation">The location information for error reporting purposes.</param>
+             /// <returns>The string with item metadata expanded in-place, escaped.</returns>
+-            internal static string ExpandMetadataLeaveEscaped(string expression, IMetadataTable metadata, ExpanderOptions options, IElementLocation elementLocation)
++            internal static string ExpandMetadataLeaveEscaped(string expression, IMetadataTable metadata, ExpanderOptions options, IElementLocation elementLocation, LoggingContext loggingContext = null)
+             {
+                 try
+                 {
+@@ -896,7 +908,7 @@ internal static string ExpandMetadataLeaveEscaped(string expression, IMetadataTa
+                     {
+                         // if there are no item vectors in the string
+                         // run a simpler Regex to find item metadata references
+-                        MetadataMatchEvaluator matchEvaluator = new MetadataMatchEvaluator(metadata, options);
++                        MetadataMatchEvaluator matchEvaluator = new MetadataMatchEvaluator(metadata, options, elementLocation, loggingContext);
+                         result = RegularExpressions.ItemMetadataPattern.Value.Replace(expression, new MatchEvaluator(matchEvaluator.ExpandSingleMetadata));
+                     }
+                     else
+@@ -915,7 +927,7 @@ internal static string ExpandMetadataLeaveEscaped(string expression, IMetadataTa
+                         using SpanBasedStringBuilder finalResultBuilder = Strings.GetSpanBasedStringBuilder();
+ 
+                         int start = 0;
+-                        MetadataMatchEvaluator matchEvaluator = new MetadataMatchEvaluator(metadata, options);
++                        MetadataMatchEvaluator matchEvaluator = new MetadataMatchEvaluator(metadata, options, elementLocation, loggingContext);
+ 
+                         if (itemVectorExpressions != null)
+                         {
+@@ -993,13 +1005,23 @@ private class MetadataMatchEvaluator
+                 /// </summary>
+                 private ExpanderOptions _options;
+ 
++                private IElementLocation _elementLocation;
++
++                private LoggingContext _loggingContext;
++
+                 /// <summary>
+                 /// Constructor taking a source of metadata.
+                 /// </summary>
+-                internal MetadataMatchEvaluator(IMetadataTable metadata, ExpanderOptions options)
++                internal MetadataMatchEvaluator(
++                    IMetadataTable metadata,
++                    ExpanderOptions options,
++                    IElementLocation elementLocation,
++                    LoggingContext loggingContext)
+                 {
+                     _metadata = metadata;
+-                    _options = options & (ExpanderOptions.ExpandMetadata | ExpanderOptions.Truncate);
++                    _options = options & (ExpanderOptions.ExpandMetadata | ExpanderOptions.Truncate | ExpanderOptions.WarnOnItemMetadataSelfReference);
++                    _elementLocation = elementLocation;
++                    _loggingContext = loggingContext;
+ 
+                     ErrorUtilities.VerifyThrow(options != ExpanderOptions.Invalid, "Must be expanding metadata of some kind");
+                 }
+@@ -1030,6 +1052,17 @@ internal string ExpandSingleMetadata(Match itemMetadataMatch)
+                        (!isBuiltInMetadata && ((_options & ExpanderOptions.ExpandCustomMetadata) != 0)))
+                     {
+                         metadataValue = _metadata.GetEscapedValue(itemType, metadataName);
++
++                        if ((_options & ExpanderOptions.WarnOnItemMetadataSelfReference) != 0 &&
++                            _loggingContext != null &&
++                            !string.IsNullOrEmpty(metadataName) &&
++                            _metadata is IItemMetadata itemMetadata &&
++                            (string.IsNullOrEmpty(itemType) || string.Equals(itemType, itemMetadata.ItemType, StringComparison.Ordinal)))
++                        {
++                            _loggingContext.LogWarning(null, new BuildEventFileInfo(_elementLocation),
++                                "ItemReferencingSelfInTarget", itemMetadata.ItemType, metadataName);
++                        }
++
+                         if (IsTruncationEnabled(_options) && metadataValue.Length > CharacterLimitPerExpansion)
+                         {
+                             metadataValue = metadataValue.Substring(0, CharacterLimitPerExpansion - 3) + "...";
+diff --git a/src/Build/Evaluation/IItemMetadata.cs b/src/Build/Evaluation/IItemMetadata.cs
+new file mode 100644
+index 00000000000..d86520b005c
+--- /dev/null
++++ b/src/Build/Evaluation/IItemMetadata.cs
+@@ -0,0 +1,13 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++#nullable disable
++namespace Microsoft.Build.Evaluation;
++
++internal interface IItemMetadata
++{
++    /// <summary>
++    /// The item type to which this metadata applies.
++    /// </summary>
++    string ItemType { get; }
++}
+diff --git a/src/Build/Instance/ProjectItemDefinitionInstance.cs b/src/Build/Instance/ProjectItemDefinitionInstance.cs
+index 9bde7d2db83..d8820f0784b 100644
+--- a/src/Build/Instance/ProjectItemDefinitionInstance.cs
++++ b/src/Build/Instance/ProjectItemDefinitionInstance.cs
+@@ -20,7 +20,7 @@ namespace Microsoft.Build.Execution
+     /// Immutable.
+     /// </summary>
+     [DebuggerDisplay("{_itemType} #Metadata={MetadataCount}")]
+-    public class ProjectItemDefinitionInstance : IKeyed, IMetadataTable, IItemDefinition<ProjectMetadataInstance>, ITranslatable
++    public class ProjectItemDefinitionInstance : IKeyed, IMetadataTable, IItemDefinition<ProjectMetadataInstance>, ITranslatable, IItemMetadata
+     {
+         /// <summary>
+         /// Item type, for example "Compile", that this item definition applies to
+@@ -235,5 +235,7 @@ internal static ProjectItemDefinitionInstance FactoryForDeserialization(ITransla
+ 
+             return instance;
+         }
++
++        string IItemMetadata.ItemType => _itemType;
+     }
+ }
+diff --git a/src/Build/Instance/ProjectItemInstance.cs b/src/Build/Instance/ProjectItemInstance.cs
+index 2d124f82d8d..a04ff44b1f4 100644
+--- a/src/Build/Instance/ProjectItemInstance.cs
++++ b/src/Build/Instance/ProjectItemInstance.cs
+@@ -33,7 +33,8 @@ public class ProjectItemInstance :
+         ITaskItem2,
+         IMetadataTable,
+         ITranslatable,
+-        IMetadataContainer
++        IMetadataContainer,
++        IItemMetadata
+     {
+         /// <summary>
+         /// The project instance to which this item belongs.
+@@ -2125,7 +2126,7 @@ public void SetMetadata(IEnumerable<Pair<ProjectMetadataElement, string>> metada
+             /// Also, more importantly, because typically the same regular metadata values can be shared by many items,
+             /// and keeping item-specific metadata out of it could allow it to be implemented as a copy-on-write table.
+             /// </summary>
+-            private class BuiltInMetadataTable : IMetadataTable
++            private class BuiltInMetadataTable : IMetadataTable, IItemMetadata
+             {
+                 /// <summary>
+                 /// Item type
+@@ -2183,6 +2184,8 @@ public string GetEscapedValueIfPresent(string requiredItemType, string name)
+ 
+                     return value;
+                 }
++
++                string IItemMetadata.ItemType => _itemType;
+             }
+         }
+ 
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index c2757e1ff4d..1dfaa4ca883 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -162,6 +162,7 @@
+     <Compile Include="BackEnd\Components\SdkResolution\SdkResolverException.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+     <Compile Include="FileSystem\*.cs" />
++    <Compile Include="Evaluation\IItemMetadata.cs" />
+     <Compile Include="Utilities\ReaderWriterLockSlimExtensions.cs" />
+     <Compile Include="BackEnd\Node\ConsoleOutput.cs" />
+     <Compile Include="BackEnd\Node\PartialBuildTelemetry.cs" />
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 52faacfee31..eb093eb8600 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1983,4 +1983,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+   <data name="NodeReused" xml:space="preserve">
+     <value>Reusing node {0} (PID: {1}).</value>
+   </data>
++  <data name="ItemReferencingSelfInTarget" xml:space="preserve">
++    <value>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</value>
++  </data>
+ </root>
+\ No newline at end of file
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 482f271ba03..49f3ac9d94c 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">Objekty EvaluationContext vytvořené pomocí SharingPolicy.Isolated nepodporují předávání souborového systému MSBuildFileSystemBase.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">Ukončuje se proces s pid = {0}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 35576a9f7af..ae0d2b4921a 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">Die Übergabe eines MSBuildFileSystemBase-Dateisystems an EvaluationContext-Objekte, die mit "SharingPolicy.Isolated" erstellt wurden, wird nicht unterstützt.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">Der Prozess mit PID {0} wird beendet.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 3b491802de3..3523a311a2c 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">Los objetos EvaluationContext creados con SharingPolicy.Isolated no admiten que se les pase un sistema de archivos MSBuildFileSystemBase.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">Terminando el proceso con el PID = {0}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index fbbb2252b81..e96bd79d54c 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">Les objets EvaluationContext créés avec SharingPolicy.Isolated ne prennent pas en charge le passage d'un système de fichiers MSBuildFileSystemBase.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">Arrêt du processus ayant le PID = {0}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index a3a5cb9eca1..3241d89f110 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">Agli oggetti EvaluationContext creati con SharingPolicy.Isolated non è possibile passare un file system MSBuildFileSystemBase.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">Terminazione del processo con PID = {0}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index e45710015a8..1db54211425 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">SharingPolicy.Isolated を指定して作成された EvaluationContext オブジェクトに MSBuildFileSystemBase ファイル システムを渡すことはサポートされていません。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">PID = {0} のプロセスを中止しています。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 78c2001194e..f89c2626274 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">SharingPolicy.Isolated로 만든 EvaluationContext 개체는 MSBuildFileSystemBase 파일 시스템 전달을 지원하지 않습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">pid가 {0}인 프로세스를 종료하는 중입니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index bcc1dad73ba..5a96577bb1a 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">Obiekty EvaluationContext utworzone za pomocą elementu SharingPolicy.Isolated nie obsługują przekazywania za pomocą systemu plików MSBuildFileSystemBase.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">Kasowanie procesu z identyfikatorem pid = {0}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index fcfbad3e5df..b4797bad56f 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">Os objetos EvaluationContext criados com SharingPolicy.Isolated não são compatíveis com o recebimento de um sistema de arquivos MSBuildFileSystemBase.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">Encerrando o processo com o PID = {0}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 3b33882791c..c5f4d2b12f2 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">Объекты EvaluationContext, созданные с помощью SharingPolicy.Isolated, не поддерживают передачу в файловую систему MSBuildFileSystemBase.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">Завершение процесса с идентификатором {0}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 8822dee74ae..9bde6af2b42 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">SharingPolicy.Isolated ile oluşturulan EvaluationContext nesneleri bir MSBuildFileSystemBase dosya sisteminin geçirilmesini desteklemez.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">PID = {0} işlemi sonlandırılıyor.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 198d36450b9..34694250cca 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">使用 SharingPolicy.Isolated 创建的 EvaluationContext 对象不支持通过 MSBuildFileSystemBase 文件系统传递。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">正在终止进程，pid = {0}。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 201836b008e..a3665205d92 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -154,6 +154,11 @@
+         <target state="translated">使用 SharingPolicy.Isolated 建立的 EvaluationContext 物件不支援以 MSBuildFileSystemBase 檔案系統傳遞。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ItemReferencingSelfInTarget">
++        <source>&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</source>
++        <target state="new">&lt;TODO: Warn code&gt; Item '{0}' definition within target is referencing self via metadata '{1}'. This can lead to unintended expansion and cross-applying of pre-existing items. More info: &lt;TODO: add MS learn link once documented&gt;</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="KillingProcessWithPid">
+         <source>Killing process with pid = {0}.</source>
+         <target state="translated">正在終止 pid = {0} 的處理序。</target>

@@ -1,0 +1,904 @@
+diff --git a/.vsts-dotnet.yml b/.vsts-dotnet.yml
+index 103da2378bc..d1b60b226d6 100644
+--- a/.vsts-dotnet.yml
++++ b/.vsts-dotnet.yml
+@@ -126,6 +126,9 @@ extends:
+         steps:
+         - task: NuGetToolInstaller@1
+           displayName: 'Install NuGet.exe'
++        - pwsh: Get-MpComputerStatus
++
++        - pwsh: Set-MpPreference -DisableRealtimeMonitoring $true
+ 
+         - task: PowerShell@2
+           displayName: Setup Private Feeds Credentials
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 10cf3577bf1..7e72e4ebea8 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -759,8 +759,8 @@ private static void AttachDebugger()
+ #endif
+                 case "2":
+                     // Sometimes easier to attach rather than deal with JIT prompt
+-                    Process currentProcess = Process.GetCurrentProcess();
+-                    Console.WriteLine($"Waiting for debugger to attach ({currentProcess.MainModule!.FileName} PID {currentProcess.Id}).  Press enter to continue...");
++                    Console.WriteLine($"Waiting for debugger to attach ({EnvironmentUtilities.ProcessPath} PID {EnvironmentUtilities.CurrentProcessId}).  Press enter to continue...");
++
+                     Console.ReadLine();
+                     break;
+             }
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index c23b5134407..4a496ed7f8d 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -474,7 +474,7 @@ private bool TryLaunchServer()
+                 ];
+                 NodeLauncher nodeLauncher = new NodeLauncher();
+                 CommunicationsUtilities.Trace("Starting Server...");
+-                Process msbuildProcess = nodeLauncher.Start(_msbuildLocation, string.Join(" ", msBuildServerOptions), nodeId: 0);
++                using Process msbuildProcess = nodeLauncher.Start(_msbuildLocation, string.Join(" ", msBuildServerOptions), nodeId: 0);
+                 CommunicationsUtilities.Trace("Server started with PID: {0}", msbuildProcess?.Id);
+             }
+             catch (Exception ex)
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+index 9c633d14b8c..aa90f8d1277 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+@@ -1426,7 +1426,7 @@ private void TraceEngine(string format, params object[] stuff)
+                 {
+                     FileUtilities.EnsureDirectoryExists(_debugDumpPath);
+ 
+-                    using (StreamWriter file = FileUtilities.OpenWrite(String.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, @"EngineTrace_{0}.txt"), Process.GetCurrentProcess().Id), append: true))
++                    using (StreamWriter file = FileUtilities.OpenWrite(string.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, @"EngineTrace_{0}.txt"), EnvironmentUtilities.CurrentProcessId), append: true))
+                     {
+                         string message = String.Format(CultureInfo.CurrentCulture, format, stuff);
+                         file.WriteLine("{0}({1})-{2}: {3}", Thread.CurrentThread.Name, Thread.CurrentThread.ManagedThreadId, DateTime.UtcNow.Ticks, message);
+diff --git a/src/Build/BackEnd/Components/Communications/CurrentHost.cs b/src/Build/BackEnd/Components/Communications/CurrentHost.cs
+index 37bc10fc28e..a9c8336b837 100644
+--- a/src/Build/BackEnd/Components/Communications/CurrentHost.cs
++++ b/src/Build/BackEnd/Components/Communications/CurrentHost.cs
+@@ -35,10 +35,7 @@ public static string GetCurrentHost()
+                 }
+                 else
+                 {
+-                    using (Process currentProcess = Process.GetCurrentProcess())
+-                    {
+-                        s_currentHost = currentProcess.MainModule.FileName;
+-                    }
++                    s_currentHost = EnvironmentUtilities.ProcessPath;
+                 }
+             }
+ 
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index 87602148672..ef30661bbb5 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -56,6 +56,9 @@ internal abstract class NodeProviderOutOfProcBase
+         /// </summary>
+         private const int TimeoutForWaitForExit = 30000;
+ 
++#if !FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++        private static readonly WindowsIdentity s_currentWindowsIdentity = WindowsIdentity.GetCurrent();
++#endif
+         /// <summary>
+         /// The build component host.
+         /// </summary>
+@@ -237,11 +240,12 @@ protected IList<NodeContext> GetNodes(string msbuildLocation,
+ #endif
+             ConcurrentQueue<NodeContext> nodeContexts = new();
+             ConcurrentQueue<Exception> exceptions = new();
++            int currentProcessId = EnvironmentUtilities.CurrentProcessId;
+             Parallel.For(nextNodeId, nextNodeId + numberOfNodesToCreate, (nodeId) =>
+             {
+                 try
+                 {
+-                    if (!TryReuseAnyFromPossibleRunningNodes(nodeId) && !StartNewNode(nodeId))
++                    if (!TryReuseAnyFromPossibleRunningNodes(currentProcessId, nodeId) && !StartNewNode(nodeId))
+                     {
+                         // We were unable to reuse or launch a node.
+                         CommunicationsUtilities.Trace("FAILED TO CONNECT TO A CHILD NODE");
+@@ -260,12 +264,12 @@ protected IList<NodeContext> GetNodes(string msbuildLocation,
+ 
+             return nodeContexts.ToList();
+ 
+-            bool TryReuseAnyFromPossibleRunningNodes(int nodeId)
++            bool TryReuseAnyFromPossibleRunningNodes(int currentProcessId, int nodeId)
+             {
+                 while (possibleRunningNodes != null && possibleRunningNodes.TryDequeue(out var nodeToReuse))
+                 {
+                     CommunicationsUtilities.Trace("Trying to connect to existing process {2} with id {1} to establish node {0}...", nodeId, nodeToReuse.Id, nodeToReuse.ProcessName);
+-                    if (nodeToReuse.Id == Process.GetCurrentProcess().Id)
++                    if (nodeToReuse.Id == currentProcessId)
+                     {
+                         continue;
+                     }
+@@ -421,7 +425,7 @@ private string GetProcessesToIgnoreKey(Handshake hostHandshake, int nodeProcessI
+         //  on non-Windows operating systems
+         private static void ValidateRemotePipeSecurityOnWindows(NamedPipeClientStream nodeStream)
+         {
+-            SecurityIdentifier identifier = WindowsIdentity.GetCurrent().Owner;
++            SecurityIdentifier identifier = s_currentWindowsIdentity.Owner;
+ #if FEATURE_PIPE_SECURITY
+             PipeSecurity remoteSecurity = nodeStream.GetAccessControl();
+ #else
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index 74adf85158f..e6c7331f93d 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -2569,7 +2569,7 @@ private void TraceScheduler(string format, params object[] stuff)
+                 {
+                     FileUtilities.EnsureDirectoryExists(_debugDumpPath);
+ 
+-                    using StreamWriter file = FileUtilities.OpenWrite(String.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, "SchedulerTrace_{0}.txt"), Process.GetCurrentProcess().Id), append: true);
++                    using StreamWriter file = FileUtilities.OpenWrite(string.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, "SchedulerTrace_{0}.txt"), EnvironmentUtilities.CurrentProcessId), append: true);
+                     file.Write("{0}({1})-{2}: ", Thread.CurrentThread.Name, Thread.CurrentThread.ManagedThreadId, _schedulingData.EventTime.Ticks);
+                     file.WriteLine(format, stuff);
+                     file.Flush();
+@@ -2593,7 +2593,7 @@ private void DumpSchedulerState()
+                     try
+                     {
+                         FileUtilities.EnsureDirectoryExists(_debugDumpPath);
+-                        using StreamWriter file = FileUtilities.OpenWrite(String.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, "SchedulerState_{0}.txt"), Process.GetCurrentProcess().Id), append: true);
++                        using StreamWriter file = FileUtilities.OpenWrite(string.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, "SchedulerState_{0}.txt"), EnvironmentUtilities.CurrentProcessId), append: true);
+ 
+                         file.WriteLine("Scheduler state at timestamp {0}:", _schedulingData.EventTime.Ticks);
+                         file.WriteLine("------------------------------------------------");
+@@ -2707,7 +2707,7 @@ private void DumpConfigurations()
+                 {
+                     try
+                     {
+-                        using StreamWriter file = FileUtilities.OpenWrite(String.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, "SchedulerState_{0}.txt"), Process.GetCurrentProcess().Id), append: true);
++                        using StreamWriter file = FileUtilities.OpenWrite(string.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, "SchedulerState_{0}.txt"), EnvironmentUtilities.CurrentProcessId), append: true);
+ 
+                         file.WriteLine("Configurations used during this build");
+                         file.WriteLine("-------------------------------------");
+@@ -2747,7 +2747,7 @@ private void DumpRequests()
+                 {
+                     try
+                     {
+-                        using StreamWriter file = FileUtilities.OpenWrite(String.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, "SchedulerState_{0}.txt"), Process.GetCurrentProcess().Id), append: true);
++                        using StreamWriter file = FileUtilities.OpenWrite(string.Format(CultureInfo.CurrentCulture, Path.Combine(_debugDumpPath, "SchedulerState_{0}.txt"), EnvironmentUtilities.CurrentProcessId), append: true);
+ 
+                         file.WriteLine("Requests used during the build:");
+                         file.WriteLine("-------------------------------");
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index 6a28b5e6c38..f092add506b 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -847,7 +847,8 @@ private void HandleNodeBuildComplete(NodeBuildComplete buildComplete)
+             _shutdownReason = buildComplete.PrepareForReuse ? NodeEngineShutdownReason.BuildCompleteReuse : NodeEngineShutdownReason.BuildComplete;
+             if (_shutdownReason == NodeEngineShutdownReason.BuildCompleteReuse)
+             {
+-                ProcessPriorityClass priorityClass = Process.GetCurrentProcess().PriorityClass;
++                using Process currentProcess = Process.GetCurrentProcess();
++                ProcessPriorityClass priorityClass = currentProcess.PriorityClass;
+                 if (priorityClass != ProcessPriorityClass.Normal && priorityClass != ProcessPriorityClass.BelowNormal)
+                 {
+                     // This isn't a priority class known by MSBuild. We should avoid connecting to this node.
+@@ -860,7 +861,7 @@ private void HandleNodeBuildComplete(NodeBuildComplete buildComplete)
+                     {
+                         if (!lowPriority || NativeMethodsShared.IsWindows)
+                         {
+-                            Process.GetCurrentProcess().PriorityClass = lowPriority ? ProcessPriorityClass.Normal : ProcessPriorityClass.BelowNormal;
++                            currentProcess.PriorityClass = lowPriority ? ProcessPriorityClass.Normal : ProcessPriorityClass.BelowNormal;
+                         }
+                         else
+                         {
+diff --git a/src/Build/Evaluation/ProjectRootElementCache.cs b/src/Build/Evaluation/ProjectRootElementCache.cs
+index e086298a380..d70e5648f3e 100644
+--- a/src/Build/Evaluation/ProjectRootElementCache.cs
++++ b/src/Build/Evaluation/ProjectRootElementCache.cs
+@@ -674,7 +674,7 @@ private void DebugTraceCache(string message, string param1)
+             if (s_debugLogCacheActivity)
+             {
+                 string prefix = OutOfProcNode.IsOutOfProcNode ? "C" : "P";
+-                Trace.WriteLine(prefix + " " + Process.GetCurrentProcess().Id + " | " + message + param1);
++                Trace.WriteLine(prefix + " " + EnvironmentUtilities.CurrentProcessId + " | " + message + param1);
+             }
+         }
+     }
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogger.cs b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+index adadde7eb8b..9c3fda8fec3 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogger.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+@@ -504,13 +504,6 @@ private string GetUniqueStamp()
+             => (PathParameterExpander ?? ExpandPathParameter)(string.Empty);
+ 
+         private static string ExpandPathParameter(string parameters)
+-            => $"{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss")}--{ProcessId}--{StringUtils.GenerateRandomString(6)}";
+-
+-        private static int ProcessId
+-#if NET
+-            => Environment.ProcessId;
+-#else
+-            => System.Diagnostics.Process.GetCurrentProcess().Id;
+-#endif
++            => $"{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss")}--{EnvironmentUtilities.CurrentProcessId}--{StringUtils.GenerateRandomString(6)}";
+     }
+ }
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 66d6c38d007..9d83e1304f8 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -59,9 +59,6 @@
+   </ItemGroup>
+ 
+   <ItemGroup>
+-    <Compile Include="..\Shared\EnvironmentUtilities.cs">
+-      <Link>SharedUtilities\EnvironmentUtilities.cs</Link>
+-    </Compile>
+     <Compile Include="..\Shared\BuildEnvironmentHelper.cs">
+       <Link>SharedUtilities\BuildEnvironmentHelper.cs</Link>
+     </Compile>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 1d8ff955c87..348628c5d58 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -268,7 +268,7 @@
+       </trans-unit>
+       <trans-unit id="BuildFinishedQuestionSuccess">
+         <source>Question build succeeded. Up-to-date checks passed.</source>
+-        <target state="translated">问题生成成功。已通过最新检查。</target>
++        <target state="translated">问题生成成功。最新检查已通过。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="BuildInProgress">
+diff --git a/src/Framework/FileClassifier.cs b/src/Framework/FileClassifier.cs
+index 2072633870b..0e08b5c13c6 100644
+--- a/src/Framework/FileClassifier.cs
++++ b/src/Framework/FileClassifier.cs
+@@ -6,6 +6,8 @@
+ using System.Collections.Generic;
+ using System.IO;
+ using System.Runtime.InteropServices;
++using Microsoft.Build.Shared;
++
+ #if !RUNTIME_TYPE_NETCORE
+ using System.Diagnostics;
+ using System.Linq;
+@@ -141,10 +143,10 @@ public FileClassifier()
+ 
+                 // Seems like MSBuild did not run from VS but from CLI.
+                 // Identify current process and run it
+-                string processName = Process.GetCurrentProcess().MainModule.FileName;
++                string? processName = EnvironmentUtilities.ProcessPath;
+                 string processFileName = Path.GetFileNameWithoutExtension(processName);
+ 
+-                if (string.IsNullOrEmpty(processFileName))
++                if (processName == null || string.IsNullOrEmpty(processFileName))
+                 {
+                     return null;
+                 }
+diff --git a/src/Framework/Microsoft.Build.Framework.csproj b/src/Framework/Microsoft.Build.Framework.csproj
+index 271026705ba..911198afdf5 100644
+--- a/src/Framework/Microsoft.Build.Framework.csproj
++++ b/src/Framework/Microsoft.Build.Framework.csproj
+@@ -1,4 +1,4 @@
+-<Project Sdk="Microsoft.NET.Sdk">
++﻿<Project Sdk="Microsoft.NET.Sdk">
+   <PropertyGroup>
+     <TargetFrameworks>$(LibraryTargetFrameworks)</TargetFrameworks>
+     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+@@ -40,6 +40,7 @@
+     <Compile Include="..\Shared\BinaryWriterExtensions.cs">
+       <Link>Shared\BinaryWriterExtensions.cs</Link>
+     </Compile>
++    <Compile Include="..\Shared\EnvironmentUtilities.cs" Link="EnvironmentUtilities.cs" />
+     <Compile Include="..\Shared\IMSBuildElementLocation.cs">
+       <Link>Shared\IMSBuildElementLocation.cs</Link>
+     </Compile>
+diff --git a/src/Framework/Profiler/EvaluationIdProvider.cs b/src/Framework/Profiler/EvaluationIdProvider.cs
+index e81cc016beb..573204e1e15 100644
+--- a/src/Framework/Profiler/EvaluationIdProvider.cs
++++ b/src/Framework/Profiler/EvaluationIdProvider.cs
+@@ -3,6 +3,7 @@
+ 
+ using System.Diagnostics;
+ using System.Threading;
++using Microsoft.Build.Shared;
+ 
+ #nullable disable
+ 
+@@ -14,7 +15,7 @@ namespace Microsoft.Build.Framework.Profiler
+     internal static class EvaluationIdProvider
+     {
+         private static long _sAssignedId = -1;
+-        private static readonly long ProcessId = Process.GetCurrentProcess().Id;
++        private static readonly long ProcessId = EnvironmentUtilities.CurrentProcessId;
+ 
+         /// <summary>
+         /// Returns a unique evaluation id
+diff --git a/src/MSBuild/MSBuildClientApp.cs b/src/MSBuild/MSBuildClientApp.cs
+index fbe3d349fc4..be768b58b8d 100644
+--- a/src/MSBuild/MSBuildClientApp.cs
++++ b/src/MSBuild/MSBuildClientApp.cs
+@@ -113,10 +113,7 @@ private static string GetCurrentHost()
+                 }
+                 else
+                 {
+-                    using (Process currentProcess = Process.GetCurrentProcess())
+-                    {
+-                        CurrentHost = currentProcess.MainModule?.FileName ?? throw new InvalidOperationException("Failed to retrieve process executable.");
+-                    }
++                    CurrentHost = EnvironmentUtilities.ProcessPath ?? throw new InvalidOperationException("Failed to retrieve process executable.");
+                 }
+             }
+ 
+diff --git a/src/MSBuild/OutOfProcTaskHostNode.cs b/src/MSBuild/OutOfProcTaskHostNode.cs
+index 42b71f65fe9..f862ae2adca 100644
+--- a/src/MSBuild/OutOfProcTaskHostNode.cs
++++ b/src/MSBuild/OutOfProcTaskHostNode.cs
+@@ -811,8 +811,9 @@ private NodeEngineShutdownReason HandleShutdown()
+             _taskRunnerThread?.Join();
+ 
+             using StreamWriter debugWriter = _debugCommunications
+-                ? File.CreateText(string.Format(CultureInfo.CurrentCulture, Path.Combine(FileUtilities.TempFileDirectory, @"MSBuild_NodeShutdown_{0}.txt"), Process.GetCurrentProcess().Id))
+-                : null;
++                    ? File.CreateText(string.Format(CultureInfo.CurrentCulture, Path.Combine(FileUtilities.TempFileDirectory, @"MSBuild_NodeShutdown_{0}.txt"), EnvironmentUtilities.CurrentProcessId))
++                    : null;
++
+             debugWriter?.WriteLine("Node shutting down with reason {0}.", _shutdownReason);
+ 
+ #if !CLR2COMPATIBILITY
+diff --git a/src/MSBuild/PerformanceLogEventListener.cs b/src/MSBuild/PerformanceLogEventListener.cs
+index 3eb6090cd4b..6772a6aeefc 100644
+--- a/src/MSBuild/PerformanceLogEventListener.cs
++++ b/src/MSBuild/PerformanceLogEventListener.cs
+@@ -79,7 +79,7 @@ private PerformanceLogEventListener()
+ 
+         internal void Initialize(string logDirectory)
+         {
+-            _processIDStr = Process.GetCurrentProcess().Id.ToString();
++            _processIDStr = EnvironmentUtilities.CurrentProcessId.ToString();
+ 
+             // Use a GUID disambiguator to make sure that we have a unique file name.
+             string logFilePath = Path.Combine(logDirectory, $"perf-{_processIDStr}-{Guid.NewGuid().ToString("N")}.log");
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+index 464d639afcd..4ae159fd5ff 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+@@ -94,7 +94,7 @@
+       </trans-unit>
+       <trans-unit id="DurationDisplay">
+         <source>({0:F1}s)</source>
+-        <target state="translated">({0:F1}s)</target>
++        <target state="translated">({0:F1} 秒)</target>
+         <note>
+         {0}: duration in seconds with 1 decimal point
+         's' should reflect the localized abbreviation for seconds
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index c12cd96ec57..c94490ede17 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -431,7 +431,7 @@ private static void AppendOutputFile(string path, long elapsedTime)
+         /// </comments>
+         private static void DumpCounters(bool initializeOnly)
+         {
+-            Process currentProcess = Process.GetCurrentProcess();
++            using Process currentProcess = Process.GetCurrentProcess();
+ 
+             if (!initializeOnly)
+             {
+@@ -461,7 +461,7 @@ private static void DumpCounters(bool initializeOnly)
+                 using PerformanceCounter counter = new PerformanceCounter(".NET CLR Memory", "Process ID", instance, true);
+                 try
+                 {
+-                    if ((int)counter.RawValue == currentProcess.Id)
++                    if ((int)counter.RawValue == EnvironmentUtilities.CurrentProcessId)
+                     {
+                         currentInstance = instance;
+                         break;
+@@ -627,9 +627,9 @@ private static void DebuggerLaunchCheck()
+ #endif
+                 case "2":
+                     // Sometimes easier to attach rather than deal with JIT prompt
+-                    Process currentProcess = Process.GetCurrentProcess();
+-                    Console.WriteLine($"Waiting for debugger to attach ({currentProcess.MainModule.FileName} PID {currentProcess.Id}).  Press enter to continue...");
++                    Console.WriteLine($"Waiting for debugger to attach ({EnvironmentUtilities.ProcessPath} PID {EnvironmentUtilities.CurrentProcessId}).  Press enter to continue...");
+                     Console.ReadLine();
++
+                     break;
+             }
+         }
+@@ -1742,7 +1742,7 @@ private static bool PrintTargets(string projectFile, string toolsVersion, Dictio
+                 new BuildManager.DeferredBuildMessage(
+                     ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword(
+                         "Process",
+-                        Process.GetCurrentProcess().MainModule?.FileName ?? string.Empty),
++                        EnvironmentUtilities.ProcessPath ?? string.Empty),
+                     MessageImportance.Low),
+                 new BuildManager.DeferredBuildMessage(
+                     ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword(
+@@ -2533,8 +2533,7 @@ private static bool ProcessCommandLineSwitches(
+ 
+                 if (!Debugger.IsAttached)
+                 {
+-                    Process currentProcess = Process.GetCurrentProcess();
+-                    Console.WriteLine($"Waiting for debugger to attach... ({currentProcess.MainModule.FileName} PID {currentProcess.Id})");
++                    Console.WriteLine($"Waiting for debugger to attach... ({EnvironmentUtilities.ProcessPath} PID {EnvironmentUtilities.CurrentProcessId})");
+                     while (!Debugger.IsAttached)
+                     {
+                         Thread.Sleep(100);
+@@ -2561,9 +2560,13 @@ private static bool ProcessCommandLineSwitches(
+             }
+             try
+             {
+-                if (lowPriority && Process.GetCurrentProcess().PriorityClass != ProcessPriorityClass.Idle)
++                if (lowPriority)
+                 {
+-                    Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.BelowNormal;
++                    using Process currentProcess = Process.GetCurrentProcess();
++                    if (currentProcess.PriorityClass != ProcessPriorityClass.Idle)
++                    {
++                        currentProcess.PriorityClass = ProcessPriorityClass.BelowNormal;
++                    }
+                 }
+             }
+             // We avoid increasing priority because that causes failures on mac/linux, but there is no good way to
+diff --git a/src/MSBuildTaskHost/MSBuildTaskHost.csproj b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+index da3dae7bf0f..a189f58567a 100644
+--- a/src/MSBuildTaskHost/MSBuildTaskHost.csproj
++++ b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+@@ -1,4 +1,4 @@
+-<Project Sdk="Microsoft.NET.Sdk">
++﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <!-- The .NET Core version of MSBuild doesn't support targeting .NET Framework 3.5.  So in that case, we import
+        a .props file that prevents building the project from doing much of anything. -->
+@@ -70,6 +70,7 @@
+       <Link>CopyOnWriteDictionary.cs</Link>
+     </Compile>
+     <Compile Include="..\Shared\Constants.cs" />
++    <Compile Include="..\Shared\EnvironmentUtilities.cs" Link="EnvironmentUtilities.cs" />
+     <Compile Include="..\Shared\ReadOnlyEmptyDictionary.cs" />
+     <Compile Include="..\Framework\ErrorUtilities.cs">
+       <Link>ErrorUtilities.cs</Link>
+diff --git a/src/MSBuildTaskHost/OutOfProcTaskHost.cs b/src/MSBuildTaskHost/OutOfProcTaskHost.cs
+index 0998734f9ce..90a7970b5e7 100644
+--- a/src/MSBuildTaskHost/OutOfProcTaskHost.cs
++++ b/src/MSBuildTaskHost/OutOfProcTaskHost.cs
+@@ -90,8 +90,8 @@ internal static ExitType Execute()
+ #endif
+                 case "2":
+                     // Sometimes easier to attach rather than deal with JIT prompt
+-                    Process currentProcess = Process.GetCurrentProcess();
+-                    Console.WriteLine($"Waiting for debugger to attach ({currentProcess.MainModule.FileName} PID {currentProcess.Id}).  Press enter to continue...");
++                    Console.WriteLine($"Waiting for debugger to attach ({EnvironmentUtilities.ProcessPath} PID {EnvironmentUtilities.CurrentProcessId}).  Press enter to continue...");
++
+                     Console.ReadLine();
+                     break;
+             }
+diff --git a/src/Shared/BuildEnvironmentHelper.cs b/src/Shared/BuildEnvironmentHelper.cs
+index 2f3dce9f66b..c3615e4acf6 100644
+--- a/src/Shared/BuildEnvironmentHelper.cs
++++ b/src/Shared/BuildEnvironmentHelper.cs
+@@ -431,12 +431,13 @@ private static string GetProcessFromRunningProcess()
+             // an unmanaged application (for example, using custom CLR hosting).
+             if (AssemblyUtilities.EntryAssembly == null)
+             {
+-                return Process.GetCurrentProcess().MainModule.FileName;
++                return EnvironmentUtilities.ProcessPath;
+             }
+ 
+             return AssemblyUtilities.GetAssemblyLocation(AssemblyUtilities.EntryAssembly);
+ #else
+-            return Process.GetCurrentProcess().MainModule.FileName;
++
++            return EnvironmentUtilities.ProcessPath;
+ #endif
+         }
+ 
+diff --git a/src/Shared/CommunicationsUtilities.cs b/src/Shared/CommunicationsUtilities.cs
+index d9d361df7ba..e0af8233119 100644
+--- a/src/Shared/CommunicationsUtilities.cs
++++ b/src/Shared/CommunicationsUtilities.cs
+@@ -108,7 +108,8 @@ protected internal Handshake(HandshakeOptions nodeType)
+             fileVersionMinor = fileVersion.Minor;
+             fileVersionBuild = fileVersion.Build;
+             fileVersionPrivate = fileVersion.Revision;
+-            sessionId = Process.GetCurrentProcess().SessionId;
++            using Process currentProcess = Process.GetCurrentProcess();
++            sessionId = currentProcess.SessionId;
+         }
+ 
+         // This is used as a key, so it does not need to be human readable.
+@@ -836,7 +837,7 @@ private static void TraceCore(int nodeId, string message)
+                     fileName += ".txt";
+ 
+                     using (StreamWriter file = FileUtilities.OpenWrite(
+-                        String.Format(CultureInfo.CurrentCulture, Path.Combine(s_debugDumpPath, fileName), Process.GetCurrentProcess().Id, nodeId), append: true))
++                        string.Format(CultureInfo.CurrentCulture, Path.Combine(s_debugDumpPath, fileName), EnvironmentUtilities.CurrentProcessId, nodeId), append: true))
+                     {
+                         long now = DateTime.UtcNow.Ticks;
+                         float millisecondsSinceLastLog = (float)(now - s_lastLoggedTicks) / 10000L;
+diff --git a/src/Shared/Debugging/DebugUtils.cs b/src/Shared/Debugging/DebugUtils.cs
+index de83a6de360..ed9da076678 100644
+--- a/src/Shared/Debugging/DebugUtils.cs
++++ b/src/Shared/Debugging/DebugUtils.cs
+@@ -92,13 +92,13 @@ private static bool CurrentProcessMatchesDebugName()
+         {
+             var processNameToBreakInto = Environment.GetEnvironmentVariable("MSBuildDebugProcessName");
+             var thisProcessMatchesName = string.IsNullOrWhiteSpace(processNameToBreakInto) ||
+-                                         Process.GetCurrentProcess().ProcessName.Contains(processNameToBreakInto);
++                                         EnvironmentUtilities.ProcessName.Contains(processNameToBreakInto);
+ 
+             return thisProcessMatchesName;
+         }
+ 
+         public static readonly string ProcessInfoString =
+-            $"{ProcessNodeMode.Value}_{Process.GetCurrentProcess().ProcessName}_PID={Process.GetCurrentProcess().Id}_x{(Environment.Is64BitProcess ? "64" : "86")}";
++            $"{ProcessNodeMode.Value}_{EnvironmentUtilities.ProcessName}_PID={EnvironmentUtilities.CurrentProcessId}_x{(Environment.Is64BitProcess ? "64" : "86")}";
+ 
+         public static readonly bool ShouldDebugCurrentProcess = CurrentProcessMatchesDebugName();
+ 
+diff --git a/src/Shared/EnvironmentUtilities.cs b/src/Shared/EnvironmentUtilities.cs
+index 3b275ef40b5..b64e792b53d 100644
+--- a/src/Shared/EnvironmentUtilities.cs
++++ b/src/Shared/EnvironmentUtilities.cs
+@@ -1,17 +1,100 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++#nullable enable
++
+ using System;
++using System.Diagnostics;
+ using System.Runtime.InteropServices;
++using System.Threading;
+ 
+ namespace Microsoft.Build.Shared
+ {
+     internal static partial class EnvironmentUtilities
+     {
++#if NET472_OR_GREATER || NETCOREAPP
+         public static bool Is64BitProcess => Marshal.SizeOf<IntPtr>() == 8;
+ 
+         public static bool Is64BitOperatingSystem =>
+             Environment.Is64BitOperatingSystem;
++#endif
++
++#if !NETCOREAPP
++        private static volatile int s_processId;
++        private static volatile string? s_processPath;
++#endif
++        private static volatile string? s_processName;
++
++        /// <summary>Gets the unique identifier for the current process.</summary>
++        public static int CurrentProcessId
++        {
++            get
++            {
++#if NETCOREAPP
++                return Environment.ProcessId;
++#else
++                // copied from Environment.ProcessId
++                int processId = s_processId;
++                if (processId == 0)
++                {
++                    using Process currentProcess = Process.GetCurrentProcess();
++                    s_processId = processId = currentProcess.Id;
++
++                    // Assume that process Id zero is invalid for user processes. It holds for all mainstream operating systems.
++                    Debug.Assert(processId != 0);
++                }
++
++                return processId;
++#endif
++            }
++        }
++
++        /// <summary>
++        /// Returns the path of the executable that started the currently executing process. Returns null when the path is not available.
++        /// </summary>
++        /// <returns>Path of the executable that started the currently executing process</returns>
++        /// <remarks>
++        /// If the executable is renamed or deleted before this property is first accessed, the return value is undefined and depends on the operating system.
++        /// </remarks>
++        public static string? ProcessPath
++        {
++            get
++            {
++#if NETCOREAPP
++                return Environment.ProcessPath;
++#else
++                // copied from Environment.ProcessPath
++                string? processPath = s_processPath;
++                if (processPath == null)
++                {
++                    // The value is cached both as a performance optimization and to ensure that the API always returns
++                    // the same path in a given process.
++                    using Process currentProcess = Process.GetCurrentProcess();
++                    Interlocked.CompareExchange(ref s_processPath, currentProcess.MainModule.FileName ?? "", null);
++                    processPath = s_processPath;
++                    Debug.Assert(processPath != null);
++                }
++
++                return (processPath?.Length != 0) ? processPath : null;
++#endif
++            }
++        }
++
++        public static string ProcessName
++        {
++            get
++            {
++                string? processName = s_processName;
++                if (processName == null)
++                {
++                    using Process currentProcess = Process.GetCurrentProcess();
++                    Interlocked.CompareExchange(ref s_processName, currentProcess.ProcessName, null);
++                    processName = s_processName;
++                }
++
++                return processName;
++            }
++        }
+ 
+         public static bool IsWellKnownEnvironmentDerivedProperty(string propertyName)
+         {
+diff --git a/src/Shared/ExceptionHandling.cs b/src/Shared/ExceptionHandling.cs
+index bfce3376e3e..16a19dcadc2 100644
+--- a/src/Shared/ExceptionHandling.cs
++++ b/src/Shared/ExceptionHandling.cs
+@@ -352,7 +352,7 @@ internal static void DumpExceptionToFile(Exception ex)
+                         // because we're a child node with no console to log to, so die
+                         Directory.CreateDirectory(DebugDumpPath);
+ 
+-                        var pid = Process.GetCurrentProcess().Id;
++                        var pid = EnvironmentUtilities.CurrentProcessId;
+                         // This naming pattern is assumed in ReadAnyExceptionFromFile
+                         s_dumpFileName = Path.Combine(DebugDumpPath, $"MSBuild_pid-{pid}_{guid:n}.failure.txt");
+ 
+diff --git a/src/Shared/FileUtilities.cs b/src/Shared/FileUtilities.cs
+index bbb4413632e..e8fbff8e6e3 100644
+--- a/src/Shared/FileUtilities.cs
++++ b/src/Shared/FileUtilities.cs
+@@ -128,7 +128,7 @@ internal static string GetCacheDirectory()
+         {
+             if (cacheDirectory == null)
+             {
+-                cacheDirectory = Path.Combine(TempFileDirectory, String.Format(CultureInfo.CurrentUICulture, "MSBuild{0}-{1}", Process.GetCurrentProcess().Id, AppDomain.CurrentDomain.Id));
++                cacheDirectory = Path.Combine(TempFileDirectory, string.Format(CultureInfo.CurrentUICulture, "MSBuild{0}-{1}", EnvironmentUtilities.CurrentProcessId, AppDomain.CurrentDomain.Id));
+             }
+ 
+             return cacheDirectory;
+@@ -182,7 +182,7 @@ internal static bool CanWriteToDirectory(string directory)
+                 string testFilePath = Path.Combine(directory, $"MSBuild_{Guid.NewGuid().ToString("N")}_testFile.txt");
+                 FileInfo file = new(testFilePath);
+                 file.Directory.Create(); // If the directory already exists, this method does nothing.
+-                File.WriteAllText(testFilePath, $"MSBuild process {Process.GetCurrentProcess().Id} successfully wrote to file.");
++                File.WriteAllText(testFilePath, $"MSBuild process {EnvironmentUtilities.CurrentProcessId} successfully wrote to file.");
+                 File.Delete(testFilePath);
+                 return true;
+             }
+diff --git a/src/Shared/NamedPipeUtil.cs b/src/Shared/NamedPipeUtil.cs
+index 5c5290b40c8..bf31c0193f6 100644
+--- a/src/Shared/NamedPipeUtil.cs
++++ b/src/Shared/NamedPipeUtil.cs
+@@ -12,7 +12,7 @@ internal static string GetPlatformSpecificPipeName(int? processId = null)
+         {
+             if (processId is null)
+             {
+-                processId = Process.GetCurrentProcess().Id;
++                processId = EnvironmentUtilities.CurrentProcessId;
+             }
+ 
+             string pipeName = $"MSBuild{processId}";
+diff --git a/src/Shared/Resources/xlf/Strings.shared.cs.xlf b/src/Shared/Resources/xlf/Strings.shared.cs.xlf
+index cfe5a09adce..6bafdcbb68c 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.cs.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.cs.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">Použití nezabezpečeného BinaryFormatteru během serializace vlastního typu události {0}. Tento způsob bude brzy zastaralý. Místo toho prosím použijte Extended*EventArgs. Další informace najdete zde: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.de.xlf b/src/Shared/Resources/xlf/Strings.shared.de.xlf
+index 003bf3463a6..71183cf05db 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.de.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.de.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">Verwendung eines unsicheren BinaryFormatter während der Serialisierung des benutzerdefinierten Ereignistyps '{0}'. Dies wird in Kürze eingestellt. Verwenden Sie stattdessen Extended*EventArgs. Weitere Informationen: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.es.xlf b/src/Shared/Resources/xlf/Strings.shared.es.xlf
+index 69c5c5205ab..6be9119ecfd 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.es.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.es.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">Uso de BinaryFormatter no seguro durante la serialización del tipo de evento personalizado "{0}". Esto estará en desuso pronto. En su lugar, use Extended*EventArgs. Más información: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.fr.xlf b/src/Shared/Resources/xlf/Strings.shared.fr.xlf
+index e2b50513228..aa2f2b657f6 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.fr.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.fr.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">Utilisation de BinaryFormatter non sécurisé lors de la sérialisation d’un type d’événement personnalisé '{0}'. Cette opération sera bientôt déconseillée. Utilisez Extended*EventArgs à la place. Plus d’informations : https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.it.xlf b/src/Shared/Resources/xlf/Strings.shared.it.xlf
+index 168c191f0eb..e34a15b8fb7 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.it.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.it.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">Utilizzo di BinaryFormatter non sicuro durante la serializzazione del tipo di evento personalizzato '{0}'. Questa operazione verrà presto deprecata. Usare invece Extended*EventArgs. Altre informazioni: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.ja.xlf b/src/Shared/Resources/xlf/Strings.shared.ja.xlf
+index d02c837c70b..75f3f74a19e 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.ja.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.ja.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">カスタム イベントの種類 '{0}' のシリアル化中のセキュリティで保護されていない BinaryFormatter の使用。これは間もなく非推奨になります。代わりに Extended*EventArgs を使用してください。詳細情報: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.ko.xlf b/src/Shared/Resources/xlf/Strings.shared.ko.xlf
+index 3986dbad56c..05774989ee0 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.ko.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.ko.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">사용자 지정 이벤트 유형 '{0}'의 직렬화 중 보안되지 않은 BinaryFormatter 사용. 이 항목은 곧 지원 중단될 예정입니다. 대신 Extended*EventArgs를 사용하세요. 추가 정보: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.pl.xlf b/src/Shared/Resources/xlf/Strings.shared.pl.xlf
+index aab1556b889..b12671653ad 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.pl.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.pl.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">Użycie niezabezpieczonego formatu BinaryFormatter podczas serializacji niestandardowego typu zdarzenia „{0}”. Wkrótce ta funkcja będzie przestarzała. Zamiast tego należy użyć Extended*EventArgs. Więcej informacji: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.pt-BR.xlf b/src/Shared/Resources/xlf/Strings.shared.pt-BR.xlf
+index a4b620eb1a1..c91d2db7d2e 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.pt-BR.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.pt-BR.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">Uso de BinaryFormatter não seguro durante a serialização do tipo de evento personalizado '{0}'. Isso será obsoleto em breve. Em vez disso, use Extended*EventArgs. Mais informações: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.ru.xlf b/src/Shared/Resources/xlf/Strings.shared.ru.xlf
+index 4094d3e78ea..cac43a8d1c4 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.ru.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.ru.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">Использование небезопасного BinaryFormatter во время сериализации настраиваемого типа события "{0}". Скоро этот параметр станет нерекомендуемым. Вместо этого используйте Extended*EventArgs. Дополнительные сведения: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.tr.xlf b/src/Shared/Resources/xlf/Strings.shared.tr.xlf
+index b28d0591724..59226da67c5 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.tr.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.tr.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">'{0}' özel olay türünü serileştirme işlemi sırasında güvenli olmayan BinaryFormatter kullanımı. Bu özellik yakında kullanımdan kaldırılacak. Lütfen bunun yerine Extended*EventArgs özelliğini kullanın. Daha fazla bilgi: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.zh-Hans.xlf b/src/Shared/Resources/xlf/Strings.shared.zh-Hans.xlf
+index 48bf2e62153..a62bde2684c 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.zh-Hans.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.zh-Hans.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">在自定义事件类型“{0}”的序列化期间使用了不安全的 BinaryFormatter。这将很快被弃用。请改用 Extended*EventArgs。详细信息: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Shared/Resources/xlf/Strings.shared.zh-Hant.xlf b/src/Shared/Resources/xlf/Strings.shared.zh-Hant.xlf
+index 7876a977471..3d0f74dcf0e 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.zh-Hant.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.zh-Hant.xlf
+@@ -29,7 +29,7 @@
+       </trans-unit>
+       <trans-unit id="DeprecatedEventSerialization">
+         <source>Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</source>
+-        <target state="needs-review-translation">自訂事件類型 '{0}' 序列化期間使用不安全的 BinaryFormatter。即將取代此項目。請改用 Extended*EventArgs。更多資訊: https://aka.ms/msbuild/eventargs</target>
++        <target state="new">Custom event type '{0}' is not supported as all custom event types were deprecated. Please use Extended*EventArgs instead. More info: https://aka.ms/msbuild/eventargs</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ExpectedEventToBeSerializable">
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index 9c4db39cb77..37d7cece260 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -37,9 +37,6 @@
+   </ItemGroup>
+   <ItemGroup>
+     <!-- Source Files -->
+-    <Compile Include="..\Shared\EnvironmentUtilities.cs">
+-      <Link>EnvironmentUtilities.cs</Link>
+-    </Compile>
+     <Compile Include="..\Shared\AssemblyFolders\AssemblyFoldersEx.cs">
+       <Link>AssemblyDependency\AssemblyFoldersEx.cs</Link>
+     </Compile>
+diff --git a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactoryCompilers.cs b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactoryCompilers.cs
+index 2d97134b43c..50a26f7f5f2 100644
+--- a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactoryCompilers.cs
++++ b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactoryCompilers.cs
+@@ -6,6 +6,7 @@
+ using System.Linq;
+ using System.Runtime.InteropServices;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
+ using Microsoft.Build.Utilities;
+ 
+ #nullable disable
+@@ -52,7 +53,7 @@ protected RoslynCodeTaskFactoryCompilerBase()
+             if (string.IsNullOrEmpty(_dotnetCliPath))
+             {
+                 // Fallback to get dotnet path from current process which might be dotnet executable.
+-                _dotnetCliPath = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
++                _dotnetCliPath = EnvironmentUtilities.ProcessPath;
+             }
+ 
+             // If dotnet path is not found, rely on dotnet via the system's PATH
+diff --git a/src/Utilities/Microsoft.Build.Utilities.csproj b/src/Utilities/Microsoft.Build.Utilities.csproj
+index 6b8153dbc9c..e5a0a89b595 100644
+--- a/src/Utilities/Microsoft.Build.Utilities.csproj
++++ b/src/Utilities/Microsoft.Build.Utilities.csproj
+@@ -48,9 +48,6 @@
+     <Compile Include="..\Shared\AssemblyFolders\Serialization\AssemblyFolderItem.cs">
+       <Link>Shared\AssemblyFolders\Serialization\AssemblyFolderItem.cs</Link>
+     </Compile>
+-    <Compile Include="..\Shared\EnvironmentUtilities.cs">
+-      <Link>Shared\EnvironmentUtilities.cs</Link>
+-    </Compile>
+     <Compile Include="..\Shared\BuildEnvironmentHelper.cs">
+       <Link>Shared\BuildEnvironmentHelper.cs</Link>
+     </Compile>

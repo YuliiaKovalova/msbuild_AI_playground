@@ -1,0 +1,395 @@
+diff --git a/NuGet.config b/NuGet.config
+index 9b4c6f6759c..bda8e534907 100644
+--- a/NuGet.config
++++ b/NuGet.config
+@@ -6,6 +6,8 @@
+     <add key="dotnet-public" value="https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-public/nuget/v3/index.json" />
+     <add key="dotnet-tools" value="https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-tools/nuget/v3/index.json" />
+     <add key="dotnet6" value="https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/index.json" />
++    <add key="BuildXL" value="https://pkgs.dev.azure.com/ms/BuildXL/_packaging/BuildXL/nuget/v3/index.json" />
++    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+   </packageSources>
+   <disabledPackageSources />
+ </configuration>
+diff --git a/eng/Versions.props b/eng/Versions.props
+index 49f6658c4ab..c3a952dddc8 100644
+--- a/eng/Versions.props
++++ b/eng/Versions.props
+@@ -39,7 +39,7 @@
+     <SystemReflectionMetadataVersion>7.0.0</SystemReflectionMetadataVersion>
+     <SystemResourcesExtensionsPackageVersion>7.0.0</SystemResourcesExtensionsPackageVersion>
+     <SystemSecurityPermissionsVersion>7.0.0</SystemSecurityPermissionsVersion>
+-    <SystemSecurityPrincipalWindowsVersion>5.0.0</SystemSecurityPrincipalWindowsVersion>
++    <SystemSecurityPrincipalWindowsVersion>6.0.0-preview.5.21301.5</SystemSecurityPrincipalWindowsVersion>
+     <SystemTextEncodingCodePagesVersion>7.0.0</SystemTextEncodingCodePagesVersion>
+   </PropertyGroup>
+   <!-- Toolset Dependencies -->
+diff --git a/eng/dependabot/Packages.props b/eng/dependabot/Packages.props
+index 14986a790d2..2d95f0a68b6 100644
+--- a/eng/dependabot/Packages.props
++++ b/eng/dependabot/Packages.props
+@@ -13,6 +13,9 @@
+     <PackageVersion Include="BenchmarkDotNet" Version="0.13.1" />
+     <PackageVersion Update="BenchmarkDotNet" Condition="'$(BenchmarkDotNetVersion)' != ''" Version="$(BenchmarkDotNetVersion)" />
+ 
++    <PackageVersion Include="Microsoft.BuildXL.Processes" Version="0.1.0-20230608.2" />
++    <PackageVersion Update="Microsoft.BuildXL.Processes" Condition="'$(BuildXLProcessesVersion)' != ''" Version="$(BuildXLProcessesVersion)" />
++
+     <PackageVersion Include="LargeAddressAware" Version="1.0.5" />
+     <PackageVersion Update="LargeAddressAware" Condition="'$(LargeAddressAwareVersion)' != ''" Version="$(LargeAddressAwareVersion)" />
+ 
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 9787ffe4a5c..4fb434a2d6f 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -557,6 +557,11 @@ public void BeginBuild(BuildParameters parameters)
+                     _buildParameters.OutputResultsCacheFile = FileUtilities.NormalizePath("msbuild-cache");
+                 }
+ 
++                if (_buildParameters.ReportFileAccesses)
++                {
++                    _componentFactories.ReplaceFactory(BuildComponentType.NodeLauncher, DetouredNodeLauncher.CreateComponent);
++                }
++
+                 // Initialize components.
+                 _nodeManager = ((IBuildComponentHost)this).GetComponent(BuildComponentType.NodeManager) as INodeManager;
+ 
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 693912475d0..e0782c3fbf3 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -473,7 +473,7 @@ private bool TryLaunchServer()
+                 };
+                 NodeLauncher nodeLauncher = new NodeLauncher();
+                 CommunicationsUtilities.Trace("Starting Server...");
+-                Process msbuildProcess = nodeLauncher.Start(_msbuildLocation, string.Join(" ", msBuildServerOptions));
++                Process msbuildProcess = nodeLauncher.Start(_msbuildLocation, string.Join(" ", msBuildServerOptions), nodeId: 0);
+                 CommunicationsUtilities.Trace("Server started with PID: {0}", msbuildProcess?.Id);
+             }
+             catch (Exception ex)
+diff --git a/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs b/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs
+new file mode 100644
+index 00000000000..bd5819d53ac
+--- /dev/null
++++ b/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs
+@@ -0,0 +1,223 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Linq;
++using BuildXL.Processes;
++using BuildXL.Utilities.Core;
++using Microsoft.Build.Exceptions;
++using Microsoft.Build.FileAccesses;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++using Microsoft.Build.Shared.FileSystem;
++
++#nullable disable
++
++namespace Microsoft.Build.BackEnd
++{
++    internal sealed class DetouredNodeLauncher : INodeLauncher, IBuildComponent
++    {
++        private readonly List<ISandboxedProcess> _sandboxedProcesses = new();
++
++        private IFileAccessManager _fileAccessManager;
++
++        public static IBuildComponent CreateComponent(BuildComponentType type)
++        {
++            ErrorUtilities.VerifyThrowArgumentOutOfRange(type == BuildComponentType.NodeLauncher, nameof(type));
++            return new DetouredNodeLauncher();
++        }
++
++        public void InitializeComponent(IBuildComponentHost host)
++        {
++            _fileAccessManager = (IFileAccessManager)host.GetComponent(BuildComponentType.FileAccessManager);
++        }
++
++        public void ShutdownComponent()
++        {
++            _fileAccessManager = null;
++
++            foreach (ISandboxedProcess sandboxedProcess in _sandboxedProcesses)
++            {
++                sandboxedProcess.Dispose();
++            }
++
++            _sandboxedProcesses.Clear();
++        }
++
++        /// <summary>
++        /// Creates a new MSBuild process
++        /// </summary>
++        public Process Start(string msbuildLocation, string commandLineArgs, int nodeId)
++        {
++            // Should always have been set already.
++            ErrorUtilities.VerifyThrowInternalLength(msbuildLocation, nameof(msbuildLocation));
++
++            ErrorUtilities.VerifyThrowInternalNull(_fileAccessManager, nameof(_fileAccessManager));
++
++            if (!FileSystems.Default.FileExists(msbuildLocation))
++            {
++                throw new BuildAbortedException(ResourceUtilities.FormatResourceStringStripCodeAndKeyword("CouldNotFindMSBuildExe", msbuildLocation));
++            }
++
++            // Repeat the executable name as the first token of the command line because the command line
++            // parser logic expects it and will otherwise skip the first argument
++            commandLineArgs = $"\"{msbuildLocation}\" {commandLineArgs}";
++
++            CommunicationsUtilities.Trace("Launching node from {0}", msbuildLocation);
++
++            string exeName = msbuildLocation;
++
++#if RUNTIME_TYPE_NETCORE || MONO
++            // Mono automagically uses the current mono, to execute a managed assembly
++            if (!NativeMethodsShared.IsMono)
++            {
++                // Run the child process with the same host as the currently-running process.
++                exeName = CurrentHost.GetCurrentHost();
++            }
++#endif
++
++            var eventListener = new DetoursEventListener(_fileAccessManager, nodeId);
++            eventListener.SetMessageHandlingFlags(MessageHandlingFlags.DebugMessageNotify | MessageHandlingFlags.FileAccessNotify | MessageHandlingFlags.ProcessDataNotify | MessageHandlingFlags.ProcessDetoursStatusNotify);
++
++            var info = new SandboxedProcessInfo(
++                fileStorage: null, // Don't write stdout/stderr to files
++                fileName: exeName,
++                disableConHostSharing: false,
++                detoursEventListener: eventListener,
++                createJobObjectForCurrentProcess: false)
++            {
++                SandboxKind = SandboxKind.Default,
++                PipDescription = "MSBuild",
++                PipSemiStableHash = 0,
++                Arguments = commandLineArgs,
++                EnvironmentVariables = EnvironmentalBuildParameters.Instance,
++                MaxLengthInMemory = 0, // Don't buffer any output
++            };
++
++            // FileAccessManifest.AddScope is used to define the list of files which the running process is allowed to access and what kinds of file accesses are allowed
++            // Tracker internally uses AbsolutePath.Invalid to represent the root, just like Unix '/' root.
++            // this code allows all types of accesses for all files
++            info.FileAccessManifest.AddScope(
++                AbsolutePath.Invalid,
++                FileAccessPolicy.MaskNothing,
++                FileAccessPolicy.AllowAll | FileAccessPolicy.ReportAccess);
++
++            // Support shared compilation
++            info.FileAccessManifest.ChildProcessesToBreakawayFromSandbox = new string[] { NativeMethodsShared.IsWindows ? "VBCSCompiler.exe" : "VBCSCompiler" };
++            info.FileAccessManifest.MonitorChildProcesses = true;
++            info.FileAccessManifest.IgnoreReparsePoints = true;
++            info.FileAccessManifest.UseExtraThreadToDrainNtClose = false;
++            info.FileAccessManifest.UseLargeNtClosePreallocatedList = true;
++            info.FileAccessManifest.LogProcessData = true;
++
++            // needed for logging process arguments when a new process is invoked; see DetoursEventListener.cs
++            info.FileAccessManifest.ReportProcessArgs = true;
++
++            // By default, Domino sets the timestamp of all input files to January 1, 1970
++            // This breaks some tools like Robocopy which will not copy a file to the destination if the file exists at the destination and has a timestamp that is more recent than the source file
++            info.FileAccessManifest.NormalizeReadTimestamps = false;
++
++            // If a process exits but its child processes survive, Tracker waits 30 seconds by default to wait for this process to exit.
++            // This slows down C++ builds in which mspdbsrv.exe doesn't exit when it's parent exits. Set this time to 0.
++            info.NestedProcessTerminationTimeout = TimeSpan.Zero;
++
++            ISandboxedProcess sp = SandboxedProcessFactory.StartAsync(info, forceSandboxing: false).GetAwaiter().GetResult();
++            lock (_sandboxedProcesses)
++            {
++                _sandboxedProcesses.Add(sp);
++            }
++
++            CommunicationsUtilities.Trace("Successfully launched {1} node with PID {0}", sp.ProcessId, exeName);
++            return Process.GetProcessById(sp.ProcessId);
++        }
++
++        private sealed class EnvironmentalBuildParameters : BuildParameters.IBuildParameters
++        {
++            private readonly Dictionary<string, string> _envVars;
++
++            private EnvironmentalBuildParameters()
++            {
++                var envVars = new Dictionary<string, string>();
++                foreach (DictionaryEntry baseVar in Environment.GetEnvironmentVariables())
++                {
++                    envVars.Add((string)baseVar.Key, (string)baseVar.Value);
++                }
++
++                _envVars = envVars;
++            }
++
++            private EnvironmentalBuildParameters(Dictionary<string, string> envVars)
++            {
++                _envVars = envVars;
++            }
++
++            public static EnvironmentalBuildParameters Instance { get; } = new EnvironmentalBuildParameters();
++
++            public string this[string key] => _envVars[key];
++
++            public BuildParameters.IBuildParameters Select(IEnumerable<string> keys)
++                => new EnvironmentalBuildParameters(keys.ToDictionary(key => key, key => _envVars[key]));
++
++            public BuildParameters.IBuildParameters Override(IEnumerable<KeyValuePair<string, string>> parameters)
++            {
++                var copy = new Dictionary<string, string>(_envVars);
++                foreach (KeyValuePair<string, string> param in parameters)
++                {
++                    copy[param.Key] = param.Value;
++                }
++
++                return new EnvironmentalBuildParameters(copy);
++            }
++
++            public IReadOnlyDictionary<string, string> ToDictionary() => _envVars;
++
++            public bool ContainsKey(string key) => _envVars.ContainsKey(key);
++        }
++
++        private sealed class DetoursEventListener : IDetoursEventListener
++        {
++            private readonly IFileAccessManager _fileAccessManager;
++            private readonly int _nodeId;
++
++            public DetoursEventListener(IFileAccessManager fileAccessManager, int nodeId)
++            {
++                _fileAccessManager = fileAccessManager;
++                _nodeId = nodeId;
++            }
++
++            public override void HandleDebugMessage(DebugData debugData)
++            {
++            }
++
++            public override void HandleFileAccess(FileAccessData fileAccessData) => _fileAccessManager.ReportFileAccess(
++                new Framework.FileAccess.FileAccessData(
++                    (Framework.FileAccess.ReportedFileOperation)fileAccessData.Operation,
++                    (Framework.FileAccess.RequestedAccess)fileAccessData.RequestedAccess,
++                    fileAccessData.ProcessId,
++                    fileAccessData.Error,
++                    (Framework.FileAccess.DesiredAccess)fileAccessData.DesiredAccess,
++                    (Framework.FileAccess.FlagsAndAttributes)fileAccessData.FlagsAndAttributes,
++                    fileAccessData.Path,
++                    fileAccessData.ProcessArgs,
++                    fileAccessData.IsAnAugmentedFileAccess),
++                _nodeId);
++
++            public override void HandleProcessData(ProcessData processData) => _fileAccessManager.ReportProcess(
++                new Framework.FileAccess.ProcessData(
++                    processData.ProcessName,
++                    processData.ProcessId,
++                    processData.ParentProcessId,
++                    processData.CreationDateTime,
++                    processData.ExitDateTime,
++                    processData.ExitCode),
++                _nodeId);
++
++            public override void HandleProcessDetouringStatus(ProcessDetouringStatusData data)
++            {
++            }
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Components/Communications/INodeLauncher.cs b/src/Build/BackEnd/Components/Communications/INodeLauncher.cs
+index e1c424889cc..c409c856c0b 100644
+--- a/src/Build/BackEnd/Components/Communications/INodeLauncher.cs
++++ b/src/Build/BackEnd/Components/Communications/INodeLauncher.cs
+@@ -7,6 +7,6 @@ namespace Microsoft.Build.BackEnd
+ {
+     internal interface INodeLauncher
+     {
+-        Process Start(string msbuildLocation, string commandLineArgs);
++        Process Start(string msbuildLocation, string commandLineArgs, int nodeId);
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/Communications/NodeLauncher.cs b/src/Build/BackEnd/Components/Communications/NodeLauncher.cs
+index 375dbf2bae6..ddec6d79279 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeLauncher.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeLauncher.cs
+@@ -35,7 +35,7 @@ public void ShutdownComponent()
+         /// <summary>
+         /// Creates a new MSBuild process
+         /// </summary>
+-        public Process Start(string msbuildLocation, string commandLineArgs)
++        public Process Start(string msbuildLocation, string commandLineArgs, int nodeId)
+         {
+             // Disable MSBuild server for a child process.
+             // In case of starting msbuild server it prevents an infinite recurson. In case of starting msbuild node we also do not want this variable to be set.
+@@ -195,7 +195,7 @@ private Process StartInternal(string msbuildLocation, string commandLineArgs)
+             }
+         }
+ 
+-        private Process DisableMSBuildServer(Func<Process> func)
++        private static Process DisableMSBuildServer(Func<Process> func)
+         {
+             string useMSBuildServerEnvVarValue = Environment.GetEnvironmentVariable(Traits.UseMSBuildServerEnvVarName);
+             try
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index a822dbaedb7..86849eadf2e 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -333,7 +333,7 @@ bool StartNewNode(int nodeId)
+ #endif
+                     // Create the node process
+                     INodeLauncher nodeLauncher = (INodeLauncher)_componentHost.GetComponent(BuildComponentType.NodeLauncher);
+-                    Process msbuildProcess = nodeLauncher.Start(msbuildLocation, commandLineArgs);
++                    Process msbuildProcess = nodeLauncher.Start(msbuildLocation, commandLineArgs, nodeId);
+                     _processesToIgnore.TryAdd(GetProcessesToIgnoreKey(hostHandshake, msbuildProcess.Id), default);
+ 
+                     // Note, when running under IMAGEFILEEXECUTIONOPTIONS registry key to debug, the process ID
+diff --git a/src/Build/Collections/RetrievableEntryHashSet/HashSet.cs b/src/Build/Collections/RetrievableEntryHashSet/HashSet.cs
+index eeedd7c4c1b..d4d170a32f1 100644
+--- a/src/Build/Collections/RetrievableEntryHashSet/HashSet.cs
++++ b/src/Build/Collections/RetrievableEntryHashSet/HashSet.cs
+@@ -38,6 +38,8 @@ nor unit test it directly.
+ 
+ #nullable disable
+ 
++#pragma warning disable RA001 // Do not use System.Diagnostics.Contract class.
++
+ namespace Microsoft.Build.Collections
+ {
+     /// <summary>
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 30f4252206d..be87cad1d65 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -32,6 +32,7 @@
+ 
+     <PackageReference Include="System.Collections.Immutable" />
+     <PackageReference Include="System.Configuration.ConfigurationManager" />
++    <PackageReference Include="System.Security.Principal.Windows" />
+     <PackageReference Include="System.Threading.Tasks.Dataflow" />
+     <PackageReference Include="System.Text.Json" />
+ 
+@@ -39,6 +40,8 @@
+     <PackageReference Include="System.Reflection.MetadataLoadContext" />
+ 
+     <PackageReference Include="Microsoft.IO.Redist" Condition="'$(FeatureMSIORedist)' == 'true'" />
++
++    <PackageReference Include="Microsoft.BuildXL.Processes" />
+   </ItemGroup>
+ 
+   <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework' and '$(DotNetBuildFromSource)' != 'true'">
+@@ -51,7 +54,6 @@
+ 
+   <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETStandard'">
+     <PackageReference Include="System.Reflection.Metadata" />
+-    <PackageReference Include="System.Security.Principal.Windows" />
+     <PackageReference Include="System.Text.Encoding.CodePages" />
+   </ItemGroup>
+ 
+@@ -155,6 +157,7 @@
+     <Compile Include="BackEnd\Components\Caching\ResultsCacheWithOverride.cs" />
+     <Compile Include="BackEnd\Components\ProjectCache\*.cs" />
+     <Compile Include="BackEnd\Components\Communications\CurrentHost.cs" />
++    <Compile Include="BackEnd\Components\Communications\DetouredNodeLauncher.cs" />
+     <Compile Include="BackEnd\Components\Communications\ServerNodeEndpointOutOfProc.cs" />
+     <Compile Include="BackEnd\Components\FileAccesses\FileAccessManager.cs" />
+     <Compile Include="BackEnd\Components\FileAccesses\IFileAccessManager.cs" />

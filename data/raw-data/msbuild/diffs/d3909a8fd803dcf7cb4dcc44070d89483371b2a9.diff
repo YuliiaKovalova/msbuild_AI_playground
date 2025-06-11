@@ -1,0 +1,136 @@
+diff --git a/src/Build/Definition/ProjectCollection.cs b/src/Build/Definition/ProjectCollection.cs
+index f016e922451..5d2bf851cef 100644
+--- a/src/Build/Definition/ProjectCollection.cs
++++ b/src/Build/Definition/ProjectCollection.cs
+@@ -1548,6 +1548,13 @@ public bool TryUnloadProject(ProjectRootElement projectRootElement)
+             }
+         }
+ 
++        /// <summary>
++        /// Logs a BuildFinished event. This is used specifically when a ProjectCollection is created but never actually built, yet a BuildFinished event
++        /// is still desired. As an example, if a Project is just meant to be evaluated, but a binlog is also collected, that binlog should be able to
++        /// say the build succeeded or failed. This provides a mechanism to achieve that.
++        /// </summary>
++        public void LogBuildFinishedEvent(bool success) => _loggingService.LogBuildFinished(success);
++
+         /// <summary>
+         /// Called by a Project object to load itself into this collection.
+         /// If the project was already loaded under a different name, it is unloaded.
+diff --git a/src/MSBuild/JsonOutputFormatter.cs b/src/MSBuild/JsonOutputFormatter.cs
+index aa57a67d6d7..095f0761386 100644
+--- a/src/MSBuild/JsonOutputFormatter.cs
++++ b/src/MSBuild/JsonOutputFormatter.cs
+@@ -32,6 +32,8 @@ internal void AddPropertiesInJsonFormat(string[] propertyNames, Func<string, str
+                 return;
+             }
+ 
++            ErrorUtilities.VerifyThrow(_topLevelNode["Properties"] is null, "Should not add multiple lists of properties to the json format.");
++
+             JsonNode propertiesNode = new JsonObject();
+             foreach (string property in propertyNames)
+             {
+@@ -48,6 +50,8 @@ internal void AddItemInstancesInJsonFormat(string[] itemNames, ProjectInstance p
+                 return;
+             }
+ 
++            ErrorUtilities.VerifyThrow(_topLevelNode["Items"] is null, "Should not add multiple lists of items to the json format.");
++
+             JsonNode itemsNode = new JsonObject();
+             foreach (string itemName in itemNames)
+             {
+@@ -82,6 +86,8 @@ internal void AddItemsInJsonFormat(string[] itemNames, Project project)
+                 return;
+             }
+ 
++            ErrorUtilities.VerifyThrow(_topLevelNode["Items"] is null, "Should not add multiple lists of items to the json format.");
++
+             JsonObject itemsNode = new();
+             foreach (string itemName in itemNames)
+             {
+@@ -121,6 +127,8 @@ internal void AddTargetResultsInJsonFormat(string[] targetNames, BuildResult res
+                 return;
+             }
+ 
++            ErrorUtilities.VerifyThrow(_topLevelNode["TargetResults"] is null, "Should not add multiple lists of target results to the json format.");
++
+             JsonObject targetResultsNode = new();
+             foreach (string targetName in targetNames)
+             {
+@@ -152,4 +160,4 @@ internal void AddTargetResultsInJsonFormat(string[] targetNames, BuildResult res
+             _topLevelNode["TargetResults"] = targetResultsNode;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 6c6dc27e0c0..4a20820163a 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -785,13 +785,15 @@ public static ExitType Execute(
+ 
+                     DateTime t1 = DateTime.Now;
+ 
++                    bool outputPropertiesItemsOrTargetResults = getProperty.Length > 0 || getItem.Length > 0 || getTargetResult.Length > 0;
++
+                     // If the primary file passed to MSBuild is a .binlog file, play it back into passed loggers
+                     // as if a build is happening
+                     if (FileUtilities.IsBinaryLogFilename(projectFile))
+                     {
+                         ReplayBinaryLog(projectFile, loggers, distributedLoggerRecords, cpuCount);
+                     }
+-                    else if ((getProperty.Length > 0 || getItem.Length > 0 || getTargetResult.Length > 0) && FileUtilities.IsSolutionFilename(projectFile))
++                    else if (outputPropertiesItemsOrTargetResults && FileUtilities.IsSolutionFilename(projectFile))
+                     {
+                         exitType = ExitType.BuildError;
+                         CommandLineSwitchException.Throw("SolutionBuildInvalidForCommandLineEvaluation",
+@@ -801,7 +803,12 @@ public static ExitType Execute(
+                     }
+                     else if ((getProperty.Length > 0 || getItem.Length > 0) && (targets is null || targets.Length == 0))
+                     {
+-                        exitType = OutputPropertiesAfterEvaluation(getProperty, getItem, projectFile, globalProperties, toolsVersion);
++                        using (ProjectCollection collection = new(globalProperties, loggers, ToolsetDefinitionLocations.Default))
++                        {
++                            Project project = collection.LoadProject(projectFile, globalProperties, toolsVersion);
++                            exitType = OutputPropertiesAfterEvaluation(getProperty, getItem, project);
++                            collection.LogBuildFinishedEvent(exitType == ExitType.Success);
++                        }
+                     }
+                     else // regular build
+                     {
+@@ -837,7 +844,7 @@ public static ExitType Execute(
+                                     question,
+                                     inputResultsCaches,
+                                     outputResultsCache,
+-                                    saveProjectResult: getProperty.Length > 0 || getItem.Length > 0 || getTargetResult.Length > 0,
++                                    saveProjectResult: outputPropertiesItemsOrTargetResults,
+                                     ref result,
+                                     commandLine))
+                         {
+@@ -851,7 +858,7 @@ public static ExitType Execute(
+ 
+                     string timerOutputFilename = Environment.GetEnvironmentVariable("MSBUILDTIMEROUTPUTS");
+ 
+-                    if ((getProperty.Length > 0 || getItem.Length > 0 || getTargetResult.Length > 0) && targets?.Length > 0 && result is not null)
++                    if (outputPropertiesItemsOrTargetResults && targets?.Length > 0 && result is not null)
+                     {
+                         exitType = OutputBuildInformationInJson(result, getProperty, getItem, getTargetResult, loggers, exitType);
+                     }
+@@ -1013,16 +1020,10 @@ public static ExitType Execute(
+             return exitType;
+         }
+ 
+-        private static ExitType OutputPropertiesAfterEvaluation(string[] getProperty, string[] getItem, string projectFile, Dictionary<string, string> globalProperties, string toolsVersion)
++        private static ExitType OutputPropertiesAfterEvaluation(string[] getProperty, string[] getItem, Project project)
+         {
+             try
+             {
+-                Project project = Project.FromFile(projectFile, new Definition.ProjectOptions()
+-                {
+-                    GlobalProperties = globalProperties,
+-                    ToolsVersion = toolsVersion,
+-                });
+-
+                 // Special case if the user requests exactly one property: skip json formatting
+                 if (getProperty.Length == 1 && getItem.Length == 0)
+                 {

@@ -1,0 +1,180 @@
+{
+  "number": 2502,
+  "title": "Early evaluation of invalid DefaultCompileItems recursive itemgroup performance issue during incremental builds",
+  "body": "Using the solution provided here: https://github.com/jeromelaban/MicrosoftIssues/tree/master/MsBuildEarlyEvalIssue, \r\n\r\nit is possible to determine that the first invocation of [LazyItemEvaluator.GetAllItems](https://github.com/Microsoft/msbuild/blob/dd134d0a917b870b6a6e805984909a8c341a8083/src/Build/Evaluation/LazyItemEvaluator.cs#L404) evaluates [this Compile item group](https://github.com/dotnet/sdk/blob/e83933917a2f3e3d10c6d18180ba6fab514117c8/src/Tasks/Microsoft.NET.Build.Tasks/build/Microsoft.NET.Sdk.DefaultItems.props#L26) while **DefaultLanguageSourceExtension** and **DefaultItemExcludes** are not defined.\r\n\r\nThis has the effect of recursively and unconditionally search all files in the project's folder, even in the bin and obj folders, and the **ret** variable in the GetAllItems method contains all these files.\r\n\r\nWhen building Xamarin.Android projects (because of Google SDKs java imports), or other project that a **very** deep file structure in the obj or bin folder, this recursive enumeration takes quite a long time to complete, and its result is seemingly discarded afterwards.\r\n\r\nI'm also assuming this can be a big problem perf in VS, where design-time builds reload each targetframework to evaluate its content, where in some profiling sessions, **ntfs.sys** shows up regularly in perfview.",
+  "state": "CLOSED",
+  "createdAt": "2017-09-07T20:29:43Z",
+  "updatedAt": "2024-02-21T17:16:50Z",
+  "closedAt": "2017-10-11T21:06:20Z",
+  "author": {
+    "login": "jeromelaban"
+  },
+  "labels": [
+    "Area: Performance",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": [
+      {
+        "login": "cdmihai"
+      }
+    ]
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "Help me understand this, you are saying that despite the condition being false, we're still evaluating the glob?",
+        "createdAt": "2017-09-08T04:09:57Z",
+        "updatedAt": "2017-09-08T04:09:57Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "I'm not sure about the condition evaluation. \r\n\r\nThe behavior I'm seeing is [ret](https://github.com/Microsoft/msbuild/blob/dd134d0a917b870b6a6e805984909a8c341a8083/src/Build/Evaluation/LazyItemEvaluator.cs#L410) returning a lot of files that don't match *.cs (e.g. pdb files in the obj folder) that come from [this ItemGroup](https://github.com/dotnet/sdk/blob/e83933917a2f3e3d10c6d18180ba6fab514117c8/src/Tasks/Microsoft.NET.Build.Tasks/build/Microsoft.NET.Sdk.DefaultItems.props#L26), and I'm guessing the only way this can happen is if **DefaultLanguageSourceExtension** is not set.\r\n\r\nIn a solution of mine that has a big Xamarin.Android project, this **ret** variable contains about 5000 items.\r\n\r\nThe strange part is if **DefaultLanguageSourceExtension** is not set, **EnableDefaultItems** should also not be defined, so I'm a bit confused by the behavior, because the ItemGroup should not be evaluated yet clearly is.\r\n\r\nFrom the outside though, [GetItems](https://github.com/jeromelaban/MicrosoftIssues/blob/b0c81860d6d1cc3282576f697a2aa18f6af1514c/MsBuildEarlyEvalIssue/MsBuildEarlyEvalIssue/Program.cs#L19) is behaving as expected, considering the sample sets [EnableDefaultItems to false](https://github.com/jeromelaban/MicrosoftIssues/blob/b0c81860d6d1cc3282576f697a2aa18f6af1514c/MsBuildEarlyEvalIssue/XTargetProject/XTargetProject.csproj#L5)",
+        "createdAt": "2017-09-08T12:08:19Z",
+        "updatedAt": "2017-09-08T12:08:19Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "I've tried to poke around the issue, and for using the sample solution above, loading a project that takes 1.3s with today's latest master, I'm down to 570ms.\r\n\r\nThe issue is indeed related to the evaluation of item operations for which the condition is false.\r\n\r\nSee this commit: https://github.com/jeromelaban/msbuild/commit/b476fa6801c0b1c930d85ec19181df4c0ffabe62\r\n\r\nThat being said, I'm not certain of the impact of this change, I'll dig deeper to see if it fails some tests.\r\n\r\nEdit: if I exclude the JIT Time, the processing of the same project is down from 570ms to about 50ms, on a second run of the same msbuild project loading, but in a different app domain to avoid internal msbuild caching.",
+        "createdAt": "2017-09-15T02:28:59Z",
+        "updatedAt": "2017-09-15T02:59:27Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "@jeromelaban You are right, what it appears to be doing is the following:\r\n\r\n``` C#\r\n                        // Tell the lazy evaluator to compute the items and add them to _data\r\n                        IList<LazyItemEvaluator<P, I, M, D>.ItemData> items = lazyEvaluator.GetAllItems();\r\n                        // Don't box via IEnumerator and foreach; cache count so not to evaluate via interface each iteration\r\n                        var itemsCount = items.Count;\r\n                        for (var i = 0; i < itemsCount; i++)\r\n                        {\r\n                            var itemData = items[i];\r\n                            if (itemData.ConditionResult)\r\n                            {\r\n                                _data.AddItem(itemData.Item);\r\n\r\n                                if (_data.ShouldEvaluateForDesignTime)\r\n                                {\r\n                                    _data.AddToAllEvaluatedItemsList(itemData.Item);\r\n                                }\r\n                            }\r\n\r\n                            if (_data.ShouldEvaluateForDesignTime)\r\n                            {\r\n                                _data.AddItemIgnoringCondition(itemData.Item);\r\n                            }\r\n                        }\r\n\r\n                        // lazy evaluator can be collected now, the rest of evaluation does not need it anymore\r\n                        lazyEvaluator = null;\r\n```\r\n\r\nIt looks like we should be pushing that block into GetAllItems().\r\n\r\n@cdmihai was there a reason it was written like this? ",
+        "createdAt": "2017-09-15T04:24:20Z",
+        "updatedAt": "2017-09-18T22:18:23Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "@davkean I did not notice the design-time implication of this. This may explain the very long delay I'm seeing in VS2017 when requesting a build, and that nothing happens until an msbuild process is done processing all the files (that can last about a minute). After that step, the nuget restore step starts, then the build starts.",
+        "createdAt": "2017-09-15T13:11:54Z",
+        "updatedAt": "2017-09-15T13:11:54Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "That would be something else, can you report recording it?",
+        "createdAt": "2017-09-15T21:58:08Z",
+        "updatedAt": "2017-09-18T22:15:24Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "The lazy item implementation follows the implementation that existed before. From what I can tell, \"Design Time Evaluations\" (evaluations started via the Project class) gather more evaluation data than \"Build Time Evaluation\" (evaluations triggered via the ProjectInstance class).\r\n\r\nThe current lazy item evaluator mimics the behaviour that existed before: When evaluation is done by the Project class, Project.Data.ShouldEvaluateForDesign is [hardcoded to true](https://github.com/Microsoft/msbuild/blob/v14.0.25420.1-ish/src/XMakeBuildEngine/Definition/Project.cs#L2403-L2406). This causes evaluation of itemgroups and items even when their condition is false, and also causes gathering more data. Here are snippets from the legacy code:\r\n- ItemGroup condition ignored: https://github.com/Microsoft/msbuild/blob/v14.0.25420.1-ish/src/XMakeBuildEngine/Evaluation/Evaluator.cs#L1212\r\n- Item condition ignored: https://github.com/Microsoft/msbuild/blob/v14.0.25420.1-ish/src/XMakeBuildEngine/Evaluation/Evaluator.cs#L1584\r\n- Project.ItemsIgnoringCondition, Project.AllEvaluatedItems and others (Project.ConditionedProperties, Project.AllEvaluatedItemDefinitionMetadata) get populated: https://github.com/Microsoft/msbuild/blob/v14.0.25420.1-ish/src/XMakeBuildEngine/Evaluation/Evaluator.cs#L1779-L1798\r\n\r\nI don't understand the requirements for this extra data collection. It probably enables various analysis in VS (@lifengl).\r\nIf the extra data provided by \"Design Time Evaluations\" is not needed anymore by VS, we can allow turning off Project.Data.ShouldEvaluateForDesign to avoid the CPU / memory waste.\r\n\r\nInternal usages of these APIs (MSFT internal links). Maybe they are stale and work just as well with APIs available to ProjectInstance.\r\nhttp://index/?leftProject=Microsoft.Build&leftSymbol=rxlmvtaoqs4l&file=Definition%5CProject.cs\r\nhttp://index/?leftProject=Microsoft.Build&leftSymbol=y5xmgdq1vxhm&file=Definition%5CProject.cs\r\nhttp://index/?leftProject=Microsoft.Build&leftSymbol=ezznkg6tnsyl&file=Definition%5CProject.cs\r\nhttp://index/?leftProject=Microsoft.Build&leftSymbol=cgin8wlvma8t&file=Definition%5CProject.cs",
+        "createdAt": "2017-09-18T21:28:03Z",
+        "updatedAt": "2017-09-18T21:28:03Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "[This solution](https://github.com/jeromelaban/XTargetSolution) demonstrates the issue, when loading the solution in VS after having built it once.",
+        "createdAt": "2017-09-22T14:04:08Z",
+        "updatedAt": "2017-09-22T14:04:08Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "I don't remember CPS need resolve items excluded by conditions.  I wonder it might be used by traditional projects which wants to show all items in different configurations?  + @AArnott\r\n\r\nAnyway, it sounds that some features may want to know all files listed in the project no matter the condition.  Globbings defined inside SDK are completely different beast.  A project may want to disable them, and choose their own way to include items.  Resolving them might break the expectation of those features using ItemsIgnoringCondition in a different way.",
+        "createdAt": "2017-09-22T19:40:46Z",
+        "updatedAt": "2017-09-22T19:40:46Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "As I recall, the legacy project system evaluates all items without regard to condition. CPS *does not* do this AFAIK. I can't think of any good reason why CPS should ever read items whose condition is false. \r\nI think the legacy project system did this because it couldn't handle items appearing and disappearing from evaluation without explicit changes to them by the project system. But CPS can handle it just fine.",
+        "createdAt": "2017-09-22T23:20:45Z",
+        "updatedAt": "2017-09-22T23:20:45Z",
+        "author": {
+          "login": "AArnott"
+        }
+      },
+      {
+        "body": "Thanks, Andrew.  That matches what I thought.  @davkean: maybe this can partially explain why evaluation is still slow after disabling globbings in .Net Core projects? @cdmihai , is it possible to suppress this behavior through some flags?",
+        "createdAt": "2017-09-25T21:29:12Z",
+        "updatedAt": "2017-09-25T21:29:12Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "@lifengl, running a small profiling session using the original sample of [this issue](https://github.com/dotnet/cli/issues/5918), here's what comes out of the top native contributors for the second run of \"dotnet build\":\r\n\r\n![image](https://user-images.githubusercontent.com/5839577/30835773-003cbc30-a228-11e7-98dd-379f05241736.png)\r\n\r\nThe wall clock time is 3.5 seconds for these samples.\r\n",
+        "createdAt": "2017-09-25T23:40:22Z",
+        "updatedAt": "2017-09-25T23:40:22Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "@lifengl \r\n\r\nCurrently it is hardcoded to always ignore conditions if you are evaluating via Project. The easiest way to turn this behaviour off is via a new ProjectLoadSettings value. Would this work for you?\r\nHowever, if you set this, all the data that is dependent on conditions not being evaluated (like ItemsIgnoringConditions) will be empty.",
+        "createdAt": "2017-09-26T21:59:02Z",
+        "updatedAt": "2017-09-26T21:59:02Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "I think it will work for us.  Is it possible to get a private build to test with this disabled?",
+        "createdAt": "2017-09-28T01:05:04Z",
+        "updatedAt": "2017-09-28T01:05:04Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "This has been fixed on the MSBuild side, it still needs to be consumed by CPS.",
+        "createdAt": "2017-10-11T21:21:50Z",
+        "updatedAt": "2017-10-11T21:21:50Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "I know this is old @davkean, but it was mentioned in a devcom feedback at https://developercommunity.visualstudio.com/comments/130197/view.html and I'm interested in knowing whether this ended up shipping.",
+        "createdAt": "2018-11-21T19:46:46Z",
+        "updatedAt": "2018-11-21T19:46:46Z",
+        "author": {
+          "login": "kzu"
+        }
+      },
+      {
+        "body": "We turned this on for CPS-based project. Legacy project system builds its tree ignoring all conditions, so will run into this problem.",
+        "createdAt": "2018-11-21T21:17:58Z",
+        "updatedAt": "2018-11-21T21:17:58Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Note, if you walk through the session @kzu we log evaluation times for CPS which will confirm/deny.",
+        "createdAt": "2018-11-21T21:26:25Z",
+        "updatedAt": "2018-11-21T21:26:25Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Thanks for the info, +1!\n\nOn Wed, Nov 21, 2018, 6:26 PM David Kean <notifications@github.com> wrote:\n\n> Note, if you walk through the session @kzu <https://github.com/kzu> we\n> log evaluation times for CPS which will confirm/deny.\n>\n> \u2014\n> You are receiving this because you were mentioned.\n>\n>\n> Reply to this email directly, view it on GitHub\n> <https://github.com/Microsoft/msbuild/issues/2502#issuecomment-440813380>,\n> or mute the thread\n> <https://github.com/notifications/unsubscribe-auth/AAKW6wut3qr4gB_WyQK-1DK5BsfidDnvks5uxcUMgaJpZM4PQWWV>\n> .\n>\n-- \n\n--\n@kzu from mobile\n",
+        "createdAt": "2018-11-24T05:15:23Z",
+        "updatedAt": "2018-11-24T05:15:23Z",
+        "author": {
+          "login": "kzu"
+        }
+      }
+    ]
+  }
+}

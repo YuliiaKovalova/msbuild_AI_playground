@@ -1,0 +1,155 @@
+{
+  "number": 8985,
+  "title": "[Performance]: `GetTargetPathWithTargetPlatformMoniker` and `GetTargetPath` target post-processing can take multiple minutes on large projects.",
+  "body": "### Issue Description\r\n\r\nOn large highly interdependent projects the `GetTargetPathWithTargetPlatformMoniker` and `GetTargetPath` targets (from Microsoft.Common.CurrentVersion.targets) can end up taking multiple minutes to run.  `GetTargetPathWithTargetPlatformMonike` doesn't do anything expensive, it just creates a new project Item with some metadata, but it has a `Returns` attrribute that returns `@(TargetPathWithTargetPlatformMoniker)` which due to post processing in MSBuild to handle the returns, can take a long time to execute.  Since the `GetTargetPath` target is essentially a passthrough for this value, it takes almost the exact same amount of time.  For our large project we have seen each of these targets take upwards of 3.5 minutes to run. \r\n\r\nThe behavior can be seen to a lesser effect on other projects in the solution where each target takes ~20 second or ~1 minute to run. \r\n\r\nOverall build time:\r\n![image](https://github.com/dotnet/msbuild/assets/1055021/f1b2a9dd-3e91-4b47-8fdb-00de37e53507)\r\n\r\nTime spent on the two targets (note: these targets are serial, not parallel, so it is almost minutes in total)\r\n![image](https://github.com/dotnet/msbuild/assets/1055021/b7c2b22e-cd77-4bf7-9820-21c90c53da72)\r\n\r\n### Steps to Reproduce\r\n\r\nI'm happy to privately share a binlog of the build, but the descript here should be enough to identify the source of the problem.\r\n\r\n### Data\r\n\r\nCall stack during 3minute hangs:\r\n\r\n```\r\nSystem.Collections.Immutable.dll!System.Collections.Immutable.SortedInt32KeyNode`1.Freeze+0x1a\r\nSystem.Collections.Immutable.dll!System.Collections.Immutable.SortedInt32KeyNode`1.Freeze+0xbb\r\nSystem.Collections.Immutable.dll!System.Collections.Immutable.SortedInt32KeyNode`1.Freeze+0xc9\r\nSystem.Collections.Immutable.dll!System.Collections.Immutable.SortedInt32KeyNode`1.Freeze+0xc9\r\nSystem.Collections.Immutable.dll!System.Collections.Immutable.ImmutableDictionary`2..ctor+0x7f\r\nSystem.Collections.Immutable.dll!System.Collections.Immutable.ImmutableDictionary`2.Wrap+0x5d\r\nSystem.Collections.Immutable.dll!System.Collections.Immutable.ImmutableDictionary`2.SetItem+0xb3\r\nMicrosoft.Build.dll!Microsoft.Build.Collections.CopyOnWritePropertyDictionary`1.Set+0x58\r\nMicrosoft.Build.dll!TaskItem.get_MetadataCollection+0x242\r\nMicrosoft.Build.dll!TaskItem.Equals+0x263\r\nmscorlib.dll!System.Collections.Generic.GenericEqualityComparer`1.Equals+0x56\r\nSystem.Core.dll!System.Collections.Generic.HashSet`1.Contains+0xda\r\nMicrosoft.Build.dll!<ExecuteTarget>d__44.MoveNext+0xd3f\r\nmscorlib.dll!System.Runtime.CompilerServices.AsyncTaskMethodBuilder.Start+0x80\r\nMicrosoft.Build.dll!Microsoft.Build.BackEnd.TargetEntry.ExecuteTarget+0x79\r\nMicrosoft.Build.dll!<ProcessTargetStack>d__23.MoveNext+0x911\r\nmscorlib.dll!System.Threading.ExecutionContext.RunInternal+0x172\r\nmscorlib.dll!System.Threading.ExecutionContext.Run+0x15\r\nmscorlib.dll!MoveNextRunner.Run+0x6f\r\nmscorlib.dll!<>c.<Run>b__2_0+0x36\r\nmscorlib.dll!System.Threading.Tasks.Task.Execute+0x47\r\nmscorlib.dll!System.Threading.Tasks.Task.ExecuteWithThreadLocal+0x18c\r\nmscorlib.dll!System.Threading.Tasks.Task.ExecuteEntry+0xa1\r\nMicrosoft.Build.dll!DedicatedThreadsTaskScheduler.<InjectThread>b__6_0+0x78\r\nmscorlib.dll!System.Threading.ExecutionContext.RunInternal+0x172\r\nmscorlib.dll!System.Threading.ExecutionContext.Run+0x15\r\nmscorlib.dll!System.Threading.ExecutionContext.Run+0x55\r\nmscorlib.dll!System.Threading.ThreadHelper.ThreadStart+0x55\r\n[Unmanaged to Managed Transition]\r\nclr.dll!DllCanUnloadNowInternal+0x10f3\r\nclr.dll!DllCanUnloadNowInternal+0x1000\r\nclr.dll!DllCanUnloadNowInternal+0x18b0\r\nclr.dll!MetaDataGetDispenser+0xcdaf\r\nclr.dll!DllCanUnloadNowInternal+0x2498\r\nclr.dll!DllCanUnloadNowInternal+0x2403\r\nclr.dll!DllCanUnloadNowInternal+0x2342\r\nclr.dll!DllCanUnloadNowInternal+0x2533\r\nclr.dll!MetaDataGetDispenser+0xcc99\r\nclr.dll!DllCanUnloadNowInternal+0x6015\r\nKERNEL32.dll!BaseThreadInitThunk+0x14\r\nntdll.dll!RtlUserThreadStart+0x21\r\n\r\n```\r\n\r\n### Analysis\r\n\r\n\r\nExample project structure:\r\n* Service.Stuff.csproj\r\n  * Service.Core.csproj\r\n    * Service.Interfaces.csproj\r\n      * Common.csproj \r\n  * Service.Interfaces.csproj\r\n    * Common.csproj \r\n  * Common.csproj\r\n\r\n`GetTargetPath` gets called on each of these, and because of the metadata introduced at different levels, it produces 7 different `TargetPathWithTargetPlatformMoniker` items.  For Common.csproj, these items all have the same `ItemSpec` (essentially just `\"Common.csproj\"`) but they differ in their metadata.\r\n\r\nThis example has 7 items.  In our solution with 385 projects we have a PostBuild project that references every other project.  When this runs, the `@(TargetPathWithTargetPlatformMoniker)` collection has ~50K items.  \r\n\r\nAs part of the post-processing for the target, since they have a `Returns` attribute, there is [some work done to dedupe this collection](https://github.com/dotnet/msbuild/blob/main/src/Build/BackEnd/Components/RequestBuilder/TargetEntry.cs#L604-L647).  It uses a `HashSet<TaskItem>` to do the deduping.  However, [the hashcode for the TaskItem only takes into account the ItemSpec](https://github.com/dotnet/msbuild/blob/main/src/Build/Instance/ProjectItemInstance.cs#L1498) so there ends up being a lot of hash collisions and it falls back to doing an expensive comparison which [generates and compares the entire metadata collection of the item](https://github.com/dotnet/msbuild/blob/main/src/Build/Instance/ProjectItemInstance.cs#L1519).  \r\n\r\nOur PostBuild project is the most extreme example of this, but you can see that this problem appears even in projects that are significantly smaller, but this step still ends up taking an excessively long time (we have multiple projects that take >10s for each of these targets and it compounds over all the projects).   \r\n\r\n### Versions & Configurations\r\n\r\nWe are using MSBuild 17.2.0, but i've analyzed the call paths and I don't see any changes between that version and the most recent build that would change this behavior.\r\n\r\n```\r\nMicrosoft (R) Build Engine version 17.2.1+52cd2da31 for .NET Framework\r\nCopyright (C) Microsoft Corporation. All rights reserved.\r\n\r\n17.2.1.25201\r\n```\r\n\r\n### Regression\r\n\r\n- [X] yes\r\n- [ ] no\r\n\r\n### Regression Details\r\n\r\nWe have been using this common PostBuild project for years, but apparently the slowdowns have only really started as part of modernizing to newer versions of MSBuild and .NET.",
+  "state": "OPEN",
+  "createdAt": "2023-06-30T15:36:18Z",
+  "updatedAt": "2024-01-31T08:13:56Z",
+  "closedAt": null,
+  "author": {
+    "login": "veleek"
+  },
+  "labels": [
+    "backlog",
+    "Area: Performance",
+    "Area: Engine",
+    "Priority:2",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "This is very surprising behavior. I'm pretty confused as to how materializing a one-item-long list with a few metadata could be a bottleneck like you're observing.\r\n\r\nI'd like to see the binlog--to share it only with Microsoft folks, please [open a feedback ticket instead](https://docs.microsoft.com/visualstudio/ide/feedback-options) and link it here so we can short-circuit the routing process.\r\n\r\nI'm also interested to see a test on 17.7-preview3 when it's available; I suspect #8747 would alleviate this by chopping off the top several methods of the callstack. But I suspect there's a deeper problem somewhere.\r\n",
+        "createdAt": "2023-06-30T16:03:08Z",
+        "updatedAt": "2023-06-30T16:03:08Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "@rainersigwald - The `Returns=\"@(TargetPathWithTargetPlatformMoniker)\"` doesn't resolve in a one item list.  The target executor takes the string `@(TargetPathWithTargetPlatformMoniker)` and expands it at runtime.  So each time the target gets run an additiontal item gets added to the collection.  \r\n\r\n![image](https://github.com/dotnet/msbuild/assets/1055021/8b0f03dd-1983-403e-b346-9685f61a78e2)\r\n\r\nOpening a feedback ticket shortly.  I'm setup to build MSBuild and I can try to do a drop-in replacement of a small set of the binaries if possible.  \r\n",
+        "createdAt": "2023-06-30T16:10:24Z",
+        "updatedAt": "2023-06-30T16:10:24Z",
+        "author": {
+          "login": "veleek"
+        }
+      },
+      {
+        "body": "I also tried disabling the de-dupe on the target to see if it would speed it up, but the list ended up with more than 200k items in it before it even made it to my project with all the references.\r\n\r\n```xml\r\n  <Target\r\n      Name=\"GetTargetPathWithTargetPlatformMoniker\"\r\n      BeforeTargets=\"GetTargetPath\"\r\n      DependsOnTargets=\"$(GetTargetPathWithTargetPlatformMonikerDependsOn)\"\r\n      Returns=\"@(TargetPathWithTargetPlatformMoniker)\"\r\n      KeepDuplicateOutputs=\"True\">\r\n    <ItemGroup>\r\n      <TargetPathWithTargetPlatformMoniker Include=\"$(TargetPath)\">\r\n        <TargetPlatformMoniker>$(TargetPlatformMoniker)</TargetPlatformMoniker>\r\n        <TargetPlatformIdentifier>$(TargetPlatformIdentifier)</TargetPlatformIdentifier>\r\n        <TargetFrameworkIdentifier>$(TargetFrameworkIdentifier)</TargetFrameworkIdentifier>\r\n        <TargetFrameworkVersion>$(TargetFrameworkVersion.TrimStart('vV'))</TargetFrameworkVersion>\r\n        <ReferenceAssembly Condition=\"'$(ProduceReferenceAssembly)' == 'true'\">$(TargetRefPath)</ReferenceAssembly>\r\n        <CopyUpToDateMarker>@(CopyUpToDateMarker)</CopyUpToDateMarker>\r\n      </TargetPathWithTargetPlatformMoniker>\r\n    </ItemGroup>\r\n  </Target>\r\n```",
+        "createdAt": "2023-06-30T16:14:44Z",
+        "updatedAt": "2023-06-30T16:14:44Z",
+        "author": {
+          "login": "veleek"
+        }
+      },
+      {
+        "body": "Feedback item created and binlog attached: https://developercommunity.visualstudio.com/t/Performance:-GetTargetPathWithTargetPl/10405139",
+        "createdAt": "2023-06-30T16:18:58Z",
+        "updatedAt": "2023-06-30T16:18:58Z",
+        "author": {
+          "login": "veleek"
+        }
+      },
+      {
+        "body": "> the list ended up with more than 200k items in it before it even made it to my project with all the references.\r\n\r\nWhat list exactly?\r\n\r\nThere should only be one item per project returned by GetTargetPathWithTargetPlatformMoniker/GetTargetPath, the one that is `$(TargetPath)` plus 6 metadata.\r\n\r\nHmm, actually could you share a memory dump in the feedback issue, maybe?",
+        "createdAt": "2023-06-30T16:42:10Z",
+        "updatedAt": "2023-06-30T16:42:10Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Ah, I'm seeing something interesting in the log now. Looking . . .",
+        "createdAt": "2023-06-30T16:48:33Z",
+        "updatedAt": "2023-06-30T16:48:33Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Ah, found it.\r\n\r\nThis looks like a bug to me:\r\n\r\nhttps://github.com/dotnet/msbuild/blob/39e20dce0c00a572f1fbd20a0a520d4e941bbc33/src/Tasks/Microsoft.Common.CurrentVersion.targets#L2701-L2709\r\n\r\nNothing else makes that item transitive.\r\n\r\nThis is triggered only when `$(FindInvalidProjectReferences)` is set to `true`, which it is in your `shared\\online\\source\\Online.targets`. Can you avoid setting that and see if the perf improves?",
+        "createdAt": "2023-06-30T17:13:07Z",
+        "updatedAt": "2023-06-30T17:13:07Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Success!  If that's `false` this project builds in 1:23 instead of 16+ minutes.  \r\n\r\nOkay, so you're saying `GetReferenceTargetPlatformMonikers` is outputing `TargetPathWithTargetPlatformMoniker` and as a result the `@(TargetPathWithTargetPlatformMoniker)` is growing when it's only supposed to be one item long.  Correct?  What's the long term fix for this?  And what's the impact of not using `FindInvalidProjectReferences`)?  We reference a copy of Microsoft.Common.CurrentVersion.targets in our build system (instead of a shared on in Program Files or something), so we could make temporary changes to that file if we need to.\r\n\r\nJust in case you need it, by \"the list\" I'm referring to the one here which is what gets expanded from `@(TargetPathWithTargetPlatformMoniker)` - \r\nhttps://github.com/dotnet/msbuild/blob/main/src/Build/BackEnd/Components/RequestBuilder/TargetEntry.cs#L635",
+        "createdAt": "2023-06-30T18:52:00Z",
+        "updatedAt": "2023-06-30T18:52:00Z",
+        "author": {
+          "login": "veleek"
+        }
+      },
+      {
+        "body": "> Okay, so you're saying `GetReferenceTargetPlatformMonikers` is outputing `TargetPathWithTargetPlatformMoniker` and as a result the `@(TargetPathWithTargetPlatformMoniker)` is growing when it's only supposed to be one item long. Correct?\r\n\r\nCorrect.\r\n\r\n> What's the long term fix for this?\r\n\r\nThat's a good question and will require more thought than I'm willing to put in at this time on Friday before a holiday weekend :)\r\n\r\nYou don't have _that_ many items, and we shouldn't take so long. \r\n\r\n- [ ] Is that fixed by the PR I linked? If not we should see if we can improve perf in that situation.\r\n\r\n> And what's the impact of not using `FindInvalidProjectReferences`)?\r\n\r\nHave you ever seen it fail? I suspect it's not actually helpful but am not willing to commit either way at the moment.\r\n\r\n- [ ] Audit FindInvalidProjectReferences -- does it do anything useful? Original change (internal link only): https://vstfdevdiv/DevDiv2/DevDiv/_versionControl/changeset/1033157, only message is `Add designtime or buildtime warning when referencing Dev12/WinBlue projects from Dev11/Win8 C++ projects`\r\n\r\n- [ ] If it is still useful, should it really be adding to `TargetPathWithTargetPlatformMoniker`? Would it break the functionality if it was only one level deep?\r\n\r\n\r\n",
+        "createdAt": "2023-06-30T22:00:53Z",
+        "updatedAt": "2023-06-30T22:00:53Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "> That's a good question and will require more thought than I'm willing to put in at this time on Friday before a holiday weekend :)\r\n\r\nI posted this and had a working resolution before the end of the workday.  My expectations have already been exceeded! :D  It'll take me some time to work through all of the other suggestions and I'll update when I get some more data.  Thank you for the work so far!",
+        "createdAt": "2023-07-01T16:18:19Z",
+        "updatedAt": "2023-07-01T16:18:19Z",
+        "author": {
+          "login": "veleek"
+        }
+      },
+      {
+        "body": "> However, the hashcode for the TaskItem only takes into account the ItemSpec\n\nI wonder whether this could somehow be cheaply improved as well. Do these all have the same metadata count? ",
+        "createdAt": "2023-07-01T16:39:52Z",
+        "updatedAt": "2023-07-01T16:39:52Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "> > However, the hashcode for the TaskItem only takes into account the ItemSpec\n> \n> I wonder whether this could somehow be cheaply improved as well. Do these all have the same metadata count? \n\nThey do not. It was different depending on which project it's referenced from and in our case there was a property called \"NuGetPackageId\" with the name of the referencing project, but I know there were more.  In the brief look I took there were some items with a half dozen extra properties for the same ItemSpec.  \n\nHowever, for this specific case (the de-duping logic) we could just use a custom comparer to override the get hash code logic since the hash set is ONLY used for the deduping (and immediately discarded) so there's no chance of bugs caused by the item metadata changing.  That could be a perf improvement worth doing even if we fix the reference leaking problem.  ",
+        "createdAt": "2023-07-01T17:01:29Z",
+        "updatedAt": "2023-07-01T17:01:29Z",
+        "author": {
+          "login": "veleek"
+        }
+      },
+      {
+        "body": "> * [ ]  Is that fixed by the PR I linked? If not we should see if we can improve perf in that situation.\r\n\r\nOkay, it was a little bit clunky but I was able to get it building with a build from the dev tree successfully.  I deleted the output folder and built with `FindInvalidProjectReferences=true` using new binaries and it still takes about 15 minutes to complete.  Using `FindInvalidProjectReferences=false` the build completes in under two minutes. \r\n\r\n> > And what's the impact of not using `FindInvalidProjectReferences`)?\r\n> \r\n> Have you ever seen it fail? I suspect it's not actually helpful but am not willing to commit either way at the moment.\r\n>\r\n> * [ ]  Audit FindInvalidProjectReferences -- does it do anything useful? Original change (internal link only): https://vstfdevdiv/DevDiv2/DevDiv/_versionControl/changeset/1033157, only message is `Add designtime or buildtime warning when referencing Dev12/WinBlue projects from Dev11/Win8 C++ projects`\r\n\r\n`FindInvalidProjectReferences` never fails, but it does output a few warnings.  They're mostly a result of some older projects (maybe Windows executables or something targetting Win 7) we have, referencing some newer projects that are building against .NET 6 (I think).  They're valid warnings, and they should be fixed eventually, but in our case I think we're probably fine to disable this day to day.  We can manually enable it for CI runs just to verify that we're still seeing the warnings if we need to.\r\n\r\n> * [ ]  If it is still useful, should it really be adding to `TargetPathWithTargetPlatformMoniker`? Would it break the functionality if it was only one level deep?\r\n\r\nYeah, this is definitely worth investigating more deeply.  I dunno if there's anything that depends on those objects being output.  Presumably not because you'd only see it when FindInvalidProjectReferences is enabled.",
+        "createdAt": "2023-07-05T14:54:38Z",
+        "updatedAt": "2023-07-05T15:15:24Z",
+        "author": {
+          "login": "veleek"
+        }
+      },
+      {
+        "body": "Tried out using a hashcode that includes all object metadata instead of just ItemSpec: _(warning: VERY janky code ahead)_ https://github.com/veleek/msbuild/pull/1/files?w=1.\r\n\r\nThis is definitely faster, but took about 4 minutes.  With the check disabled it takes about 1.5 minutes.  I fiddled around with a few other things like caching the hashcodes so they were only ever generated once and that didn't seem to move the needle, so it's literally just the sheer quantity of items (46k) that increases the build time.\r\n\r\n![image](https://github.com/dotnet/msbuild/assets/1055021/a01fd8f9-022b-4413-91f6-1a5515f9449d)\r\n\r\nWith the check disabled, all these `GetTargetPathWithTargetPlatformMoniker` targets still run, but they're 0ms.",
+        "createdAt": "2023-07-05T15:54:58Z",
+        "updatedAt": "2023-07-05T16:29:30Z",
+        "author": {
+          "login": "veleek"
+        }
+      },
+      {
+        "body": "I looked at adding metadata into the hashcode but it's likely to be much more expensive in the general case as it has to resolve several dictionaries. I put up a PR with just a small change that still uses only itemspec.\nPossibly it could include something of the metadata in some special cases like when there's literally none. I haven't had a chance to look at your change.",
+        "createdAt": "2023-07-05T19:41:14Z",
+        "updatedAt": "2023-07-05T19:41:14Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "Yeah, I'm not sure it makes sense to include the metadata in the general case, most because it's not immutable (I think?). \n\nIn this de-duping scenario the HashSet isn't persistent so mutability doesn't matter.  just using a custom comparator to override GetHashCode means that the object metadata is traversed at most once for each item in the list (assuming no hash collisions which should be rare) so it'd be good enough and avoid calls to `Equals` which forces the metadata enumeration for both objects.  ",
+        "createdAt": "2023-07-06T01:31:13Z",
+        "updatedAt": "2023-07-06T01:31:13Z",
+        "author": {
+          "login": "veleek"
+        }
+      }
+    ]
+  }
+}

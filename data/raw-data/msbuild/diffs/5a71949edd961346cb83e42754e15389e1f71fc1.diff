@@ -1,0 +1,794 @@
+diff --git a/documentation/specs/BuildCheck/BuildCheck-Architecture.md b/documentation/specs/BuildCheck/BuildCheck-Architecture.md
+index 367db012bce..7f243b72e79 100644
+--- a/documentation/specs/BuildCheck/BuildCheck-Architecture.md
++++ b/documentation/specs/BuildCheck/BuildCheck-Architecture.md
+@@ -106,7 +106,7 @@ Planned model:
+ 
+ # Configuration
+ 
+-**TBD** - implementation details to be amended by @f-alizada 
++[Configuration implmentation details](../../../src/Build/BuildCheck/Infrastructure/EditorConfig/README.md).
+ 
+ ## High-level logic
+ 
+diff --git a/documentation/specs/BuildCheck/BuildCheck.md b/documentation/specs/BuildCheck/BuildCheck.md
+index ea5c4f80376..68e643030c7 100644
+--- a/documentation/specs/BuildCheck/BuildCheck.md
++++ b/documentation/specs/BuildCheck/BuildCheck.md
+@@ -336,7 +336,7 @@ public class BuildAnalyzerConfiguration
+ }
+ ```
+ 
+-Values for this recognized contract, that are explicitly specified via .editorconfig files are passed only to the BuildCheck infrastructure – they are invisible to the actual analyzers (NOTE: this is a subject to likely revision).
++Values for this recognized contract, that are explicitly specified via .editorconfig files are passed both to the BuildCheck infrastructure as well as individual analyzers.
+ 
+ #### Custom configuration declaration
+ 
+@@ -351,7 +351,12 @@ public class ConfigurationContext
+     /// <summary>
+     /// Custom configuration data - per each rule that has some specified.
+     /// </summary>
+-    public CustomConfigurationData[] CustomConfigurationData { get; init; }
++    public IReadOnlyList<CustomConfigurationData> CustomConfigurationData { get; init; }
++
++    /// <summary>
++    /// Configuration data from standard declarations
++    /// </summary>
++    public IReadOnlyList<BuildAnalyzerConfiguration> BuildAnalyzerConfig { get; init; }
+ }
+ ```
+ 
+diff --git a/src/Build.UnitTests/Evaluation/Expander_Tests.cs b/src/Build.UnitTests/Evaluation/Expander_Tests.cs
+index 61fc11171d9..f137cf89960 100644
+--- a/src/Build.UnitTests/Evaluation/Expander_Tests.cs
++++ b/src/Build.UnitTests/Evaluation/Expander_Tests.cs
+@@ -1294,39 +1294,6 @@ public void StaticMethodErrorMessageHaveMethodName1()
+ 
+             Assert.True(false);
+         }
+-
+-        [Fact]
+-        public void StaticMethodWithThrowawayParameterSupported()
+-        {
+-            MockLogger logger = Helpers.BuildProjectWithNewOMExpectSuccess(@"
+-<Project>
+-  <PropertyGroup>
+-    <MyProperty>Value is $([System.Int32]::TryParse(""3"", _))</MyProperty>
+-  </PropertyGroup>
+-  <Target Name='Build'>
+-    <Message Text='$(MyProperty)' />
+-  </Target>
+-</Project>");
+-
+-            logger.FullLog.ShouldContain("Value is True");
+-        }
+-
+-        [Fact]
+-        public void StaticMethodWithThrowawayParameterSupported2()
+-        {
+-            MockLogger logger = Helpers.BuildProjectWithNewOMExpectSuccess(@"
+-<Project>
+-  <PropertyGroup>
+-    <MyProperty>Value is $([System.Int32]::TryParse(""notANumber"", _))</MyProperty>
+-  </PropertyGroup>
+-  <Target Name='Build'>
+-    <Message Text='$(MyProperty)' />
+-  </Target>
+-</Project>");
+-
+-            logger.FullLog.ShouldContain("Value is False");
+-        }
+-
+         /// <summary>
+         /// Creates a set of complicated item metadata and properties, and items to exercise
+         /// the Expander class.  The data here contains escaped characters, metadata that
+diff --git a/src/Build/BuildCheck/API/BuildAnalyzerConfiguration.cs b/src/Build/BuildCheck/API/BuildAnalyzerConfiguration.cs
+index f36ff6a0f3c..3bf35931156 100644
+--- a/src/Build/BuildCheck/API/BuildAnalyzerConfiguration.cs
++++ b/src/Build/BuildCheck/API/BuildAnalyzerConfiguration.cs
+@@ -26,6 +26,8 @@ public class BuildAnalyzerConfiguration
+ 
+     public static BuildAnalyzerConfiguration Null { get; } = new();
+ 
++    public string? RuleId { get; internal set; }
++
+     /// <summary>
+     /// This applies only to specific events, that can distinguish whether they are directly inferred from
+     ///  the current project, or from some import. If supported it can help tuning the level of detail or noise from analysis.
+diff --git a/src/Build/BuildCheck/API/ConfigurationContext.cs b/src/Build/BuildCheck/API/ConfigurationContext.cs
+index 3ecdd7c6527..8f06a14717e 100644
+--- a/src/Build/BuildCheck/API/ConfigurationContext.cs
++++ b/src/Build/BuildCheck/API/ConfigurationContext.cs
+@@ -9,22 +9,28 @@
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+ /// <summary>
+-/// Holder of an optional configuration from .editorconfig file (not recognized by the infrastructure)
++/// Holder of configuration from .editorconfig file (not recognized by the infrastructure)
+ /// </summary>
+ public class ConfigurationContext
+ {
+-    private ConfigurationContext(CustomConfigurationData[] customConfigurationData)
++    private ConfigurationContext(CustomConfigurationData[] customConfigurationData, BuildAnalyzerConfigurationEffective[] buildAnalyzerConfig)
+     {
+         CustomConfigurationData = customConfigurationData;
++        BuildAnalyzerConfig = buildAnalyzerConfig;
+     }
+ 
+-    internal static ConfigurationContext FromDataEnumeration(CustomConfigurationData[] customConfigurationData)
++    internal static ConfigurationContext FromDataEnumeration(CustomConfigurationData[] customConfigurationData, BuildAnalyzerConfigurationEffective[] buildAnalyzerConfig)
+     {
+-        return new ConfigurationContext(customConfigurationData);
++        return new ConfigurationContext(customConfigurationData, buildAnalyzerConfig);
+     }
+ 
+     /// <summary>
+     /// Custom configuration data - per each rule that has some specified.
+     /// </summary>
+     public IReadOnlyList<CustomConfigurationData> CustomConfigurationData { get; init; }
++
++    /// <summary>
++    /// Infrastructure configuration data
++    /// </summary>
++    public IReadOnlyList<BuildAnalyzerConfigurationEffective> BuildAnalyzerConfig { get; init; }
+ }
+diff --git a/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs b/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
+index 5da98f08463..8d531105a94 100644
+--- a/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
++++ b/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
+@@ -15,10 +15,11 @@ namespace Microsoft.Build.Experimental.BuildCheck.Analyzers;
+ 
+ internal sealed class SharedOutputPathAnalyzer : BuildAnalyzer
+ {
+-    public static BuildAnalyzerRule SupportedRule = new BuildAnalyzerRule("BC0101", "ConflictingOutputPath",
++    private const string RuleId = "BC0101";
++    public static BuildAnalyzerRule SupportedRule = new BuildAnalyzerRule(RuleId, "ConflictingOutputPath",
+         "Two projects should not share their OutputPath nor IntermediateOutputPath locations",
+         "Projects {0} and {1} have conflicting output paths: {2}.",
+-        new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning });
++        new BuildAnalyzerConfiguration() { RuleId = RuleId, Severity = BuildAnalyzerResultSeverity.Warning });
+ 
+     public override string FriendlyName => "MSBuild.SharedOutputPathAnalyzer";
+ 
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationInternal.cs b/src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationEffective.cs
+similarity index 85%
+rename from src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationInternal.cs
+rename to src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationEffective.cs
+index b5ecb7c3f48..2b7bbf16ebc 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationInternal.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationEffective.cs
+@@ -9,9 +9,9 @@ namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ /// <summary>
+ /// Counterpart type for BuildAnalyzerConfiguration - with all properties non-nullable
+ /// </summary>
+-internal sealed class BuildAnalyzerConfigurationInternal
++public sealed class BuildAnalyzerConfigurationEffective
+ {
+-    public BuildAnalyzerConfigurationInternal(string ruleId, EvaluationAnalysisScope evaluationAnalysisScope, BuildAnalyzerResultSeverity severity)
++    public BuildAnalyzerConfigurationEffective(string ruleId, EvaluationAnalysisScope evaluationAnalysisScope, BuildAnalyzerResultSeverity severity)
+     {
+         if (severity == BuildAnalyzerResultSeverity.Default)
+         {
+@@ -34,7 +34,7 @@ public BuildAnalyzerConfigurationInternal(string ruleId, EvaluationAnalysisScope
+     // Intentionally not checking the RuleId
+     //  as for analyzers with multiple rules, we can squash config to a single one,
+     //  if the ruleId is the only thing differing.
+-    public bool IsSameConfigurationAs(BuildAnalyzerConfigurationInternal? other) =>
++    public bool IsSameConfigurationAs(BuildAnalyzerConfigurationEffective? other) =>
+         other != null &&
+         Severity == other.Severity &&
+         EvaluationAnalysisScope == other.EvaluationAnalysisScope;
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildAnalyzerWrapper.cs b/src/Build/BuildCheck/Infrastructure/BuildAnalyzerWrapper.cs
+index 598d0be021d..46c42eaa4d1 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildAnalyzerWrapper.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildAnalyzerWrapper.cs
+@@ -27,12 +27,12 @@ public BuildAnalyzerWrapper(BuildAnalyzer buildAnalyzer)
+ 
+     // Let's optimize for the scenario where users have a single .editorconfig file that applies to the whole solution.
+     // In such case - configuration will be same for all projects. So we do not need to store it per project in a collection.
+-    internal BuildAnalyzerConfigurationInternal? CommonConfig { get; private set; }
++    internal BuildAnalyzerConfigurationEffective? CommonConfig { get; private set; }
+ 
+     // start new project
+     internal void StartNewProject(
+         string fullProjectPath,
+-        IReadOnlyList<BuildAnalyzerConfigurationInternal> userConfigs)
++        IReadOnlyList<BuildAnalyzerConfigurationEffective> userConfigs)
+     {
+         if (!_isInitialized)
+         {
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index 48d384b4923..f2269f78939 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -78,7 +78,7 @@ internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
+     internal void RunEvaluatedPropertiesActions(
+         EvaluatedPropertiesAnalysisData evaluatedPropertiesAnalysisData,
+         IAnalysisContext analysisContext,
+-        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult>
++        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationEffective[], BuildCheckResult>
+             resultHandler)
+         => RunRegisteredActions(_globalCallbacks.EvaluatedPropertiesActions, evaluatedPropertiesAnalysisData,
+             analysisContext, resultHandler);
+@@ -86,7 +86,7 @@ internal void RunEvaluatedPropertiesActions(
+     internal void RunParsedItemsActions(
+         ParsedItemsAnalysisData parsedItemsAnalysisData,
+         IAnalysisContext analysisContext,
+-        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult>
++        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationEffective[], BuildCheckResult>
+             resultHandler)
+         => RunRegisteredActions(_globalCallbacks.ParsedItemsActions, parsedItemsAnalysisData,
+             analysisContext, resultHandler);
+@@ -94,7 +94,7 @@ internal void RunParsedItemsActions(
+     internal void RunTaskInvocationActions(
+         TaskInvocationAnalysisData taskInvocationAnalysisData,
+         IAnalysisContext analysisContext,
+-        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult>
++        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationEffective[], BuildCheckResult>
+             resultHandler)
+         => RunRegisteredActions(_globalCallbacks.TaskInvocationActions, taskInvocationAnalysisData,
+             analysisContext, resultHandler);
+@@ -103,7 +103,7 @@ private void RunRegisteredActions<T>(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<T>>)> registeredCallbacks,
+         T analysisData,
+         IAnalysisContext analysisContext,
+-        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult> resultHandler)
++        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationEffective[], BuildCheckResult> resultHandler)
+     where T : AnalysisData
+     {
+         string projectFullPath = analysisData.ProjectFilePath;
+@@ -111,10 +111,10 @@ private void RunRegisteredActions<T>(
+         foreach (var analyzerCallback in registeredCallbacks)
+         {
+             // Tracing - https://github.com/dotnet/msbuild/issues/9629 - we might want to account this entire block
+-            //  to the relevant analyzer (with only the currently accounted part as being the 'core-execution' subspan)
++            //  to the relevant analyzer (with BuildAnalyzerConfigurationEffectiveonly the currently accounted part as being the 'core-execution' subspan)
+ 
+-            BuildAnalyzerConfigurationInternal? commonConfig = analyzerCallback.Item1.CommonConfig;
+-            BuildAnalyzerConfigurationInternal[] configPerRule;
++            BuildAnalyzerConfigurationEffective? commonConfig = analyzerCallback.Item1.CommonConfig;
++            BuildAnalyzerConfigurationEffective[] configPerRule;
+ 
+             if (commonConfig != null)
+             {
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 0b68ae1d1f9..18c2c4011a4 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -216,7 +216,7 @@ private void SetupSingleAnalyzer(BuildAnalyzerFactoryContext analyzerFactoryCont
+             // on others it should work similarly as disabling them.
+             // Disabled analyzer should not only post-filter results - it shouldn't even see the data 
+             BuildAnalyzerWrapper wrapper;
+-            BuildAnalyzerConfigurationInternal[] configurations;
++            BuildAnalyzerConfigurationEffective[] configurations;
+             if (analyzerFactoryContext.MaterializedAnalyzer == null)
+             {
+                 BuildAnalyzerConfiguration[] userConfigs =
+@@ -231,9 +231,12 @@ private void SetupSingleAnalyzer(BuildAnalyzerFactoryContext analyzerFactoryCont
+                 CustomConfigurationData[] customConfigData =
+                     _configurationProvider.GetCustomConfigurations(projectFullPath, analyzerFactoryContext.RuleIds);
+ 
+-                ConfigurationContext configurationContext = ConfigurationContext.FromDataEnumeration(customConfigData);
++                BuildAnalyzer uninitializedAnalyzer = analyzerFactoryContext.Factory();
++                configurations = _configurationProvider.GetMergedConfigurations(userConfigs, uninitializedAnalyzer);
+ 
+-                wrapper = analyzerFactoryContext.Factory(configurationContext);
++                ConfigurationContext configurationContext = ConfigurationContext.FromDataEnumeration(customConfigData, configurations);
++
++                wrapper = analyzerFactoryContext.Initialize(uninitializedAnalyzer, configurationContext);
+                 analyzerFactoryContext.MaterializedAnalyzer = wrapper;
+                 BuildAnalyzer analyzer = wrapper.BuildAnalyzer;
+ 
+@@ -253,8 +256,6 @@ private void SetupSingleAnalyzer(BuildAnalyzerFactoryContext analyzerFactoryCont
+                         $"The analyzer '{analyzer.FriendlyName}' exposes rules '{analyzer.SupportedRules.Select(r => r.Id).ToCsvString()}', but different rules were declared during registration: '{analyzerFactoryContext.RuleIds.ToCsvString()}'");
+                 }
+ 
+-                configurations = _configurationProvider.GetMergedConfigurations(userConfigs, analyzer);
+-
+                 // technically all analyzers rules could be disabled, but that would mean
+                 // that the provided 'IsEnabledByDefault' value wasn't correct - the only
+                 // price to be paid in that case is slight performance cost.
+@@ -438,12 +439,17 @@ private class BuildAnalyzerFactoryContext(
+             string[] ruleIds,
+             bool isEnabledByDefault)
+         {
+-            public BuildAnalyzerWrapperFactory Factory { get; init; } = configContext =>
++            public BuildAnalyzer Factory()
+             {
+                 BuildAnalyzer ba = factory();
++                return ba;
++            }
++
++            public BuildAnalyzerWrapper Initialize(BuildAnalyzer ba, ConfigurationContext configContext)
++            {
+                 ba.Initialize(configContext);
+                 return new BuildAnalyzerWrapper(ba);
+-            };
++            }
+ 
+             public BuildAnalyzerWrapper? MaterializedAnalyzer { get; set; }
+ 
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index 349824cfe4e..b159b4d187c 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -178,7 +178,7 @@ internal void ProcessTaskParameterEventArgs(
+     private static void ReportResult(
+         BuildAnalyzerWrapper analyzerWrapper,
+         IAnalysisContext analysisContext,
+-        BuildAnalyzerConfigurationInternal[] configPerRule,
++        BuildAnalyzerConfigurationEffective[] configPerRule,
+         BuildCheckResult result)
+     {
+         if (!analyzerWrapper.BuildAnalyzer.SupportedRules.Contains(result.BuildAnalyzerRule))
+@@ -189,7 +189,7 @@ private static void ReportResult(
+             return;
+         }
+ 
+-        BuildAnalyzerConfigurationInternal config = configPerRule.Length == 1
++        BuildAnalyzerConfigurationEffective config = configPerRule.Length == 1
+             ? configPerRule[0]
+             : configPerRule.First(r =>
+                 r.RuleId.Equals(result.BuildAnalyzerRule.Id, StringComparison.CurrentCultureIgnoreCase));
+diff --git a/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs b/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
+index 1a06fc08ee1..ed513636726 100644
+--- a/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
+@@ -100,7 +100,7 @@ internal void VerifyCustomConfigurationEquality(string ruleId, CustomConfigurati
+         }
+     }
+ 
+-    internal BuildAnalyzerConfigurationInternal[] GetMergedConfigurations(
++    internal BuildAnalyzerConfigurationEffective[] GetMergedConfigurations(
+         string projectFullPath,
+         BuildAnalyzer analyzer)
+         => FillConfiguration(projectFullPath, analyzer.SupportedRules, GetMergedConfiguration);
+@@ -121,11 +121,11 @@ public CustomConfigurationData[] GetCustomConfigurations(
+         IReadOnlyList<string> ruleIds)
+         => FillConfiguration(projectFullPath, ruleIds, GetCustomConfiguration);
+ 
+-    internal BuildAnalyzerConfigurationInternal[] GetMergedConfigurations(
++    internal BuildAnalyzerConfigurationEffective[] GetMergedConfigurations(
+         BuildAnalyzerConfiguration[] userConfigs,
+         BuildAnalyzer analyzer)
+     {
+-        var configurations = new BuildAnalyzerConfigurationInternal[userConfigs.Length];
++        var configurations = new BuildAnalyzerConfigurationEffective[userConfigs.Length];
+ 
+         for (int idx = 0; idx < userConfigs.Length; idx++)
+         {
+@@ -232,6 +232,7 @@ internal BuildAnalyzerConfiguration GetUserConfiguration(string projectFullPath,
+         var editorConfigValue = _buildAnalyzerConfiguration.GetOrAdd(cacheKey, (key) =>
+         {
+             BuildAnalyzerConfiguration? editorConfig = BuildAnalyzerConfiguration.Null;
++            editorConfig.RuleId = ruleId;
+             var config = GetConfiguration(projectFullPath, ruleId);
+ 
+             if (config.Any())
+@@ -252,19 +253,19 @@ internal BuildAnalyzerConfiguration GetUserConfiguration(string projectFullPath,
+     /// <param name="projectFullPath"></param>
+     /// <param name="analyzerRule"></param>
+     /// <returns></returns>
+-    internal BuildAnalyzerConfigurationInternal GetMergedConfiguration(string projectFullPath, BuildAnalyzerRule analyzerRule)
++    internal BuildAnalyzerConfigurationEffective GetMergedConfiguration(string projectFullPath, BuildAnalyzerRule analyzerRule)
+         => GetMergedConfiguration(projectFullPath, analyzerRule.Id, analyzerRule.DefaultConfiguration);
+ 
+-    internal BuildAnalyzerConfigurationInternal MergeConfiguration(
++    internal BuildAnalyzerConfigurationEffective MergeConfiguration(
+         string ruleId,
+         BuildAnalyzerConfiguration defaultConfig,
+         BuildAnalyzerConfiguration editorConfig)
+-        => new BuildAnalyzerConfigurationInternal(
++        => new BuildAnalyzerConfigurationEffective(
+             ruleId: ruleId,
+             evaluationAnalysisScope: GetConfigValue(editorConfig, defaultConfig, cfg => cfg.EvaluationAnalysisScope),
+             severity: GetSeverityValue(editorConfig, defaultConfig));
+ 
+-    private BuildAnalyzerConfigurationInternal GetMergedConfiguration(
++    private BuildAnalyzerConfigurationEffective GetMergedConfiguration(
+         string projectFullPath,
+         string ruleId,
+         BuildAnalyzerConfiguration defaultConfig)
+diff --git a/src/Build/BuildCheck/OM/BuildCheckDataContext.cs b/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
+index 01db72e1db3..f1f897b7452 100644
+--- a/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
++++ b/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
+@@ -42,14 +42,14 @@ public class BuildCheckDataContext<T> where T : AnalysisData
+ {
+     private readonly BuildAnalyzerWrapper _analyzerWrapper;
+     private readonly IAnalysisContext _analysisContext;
+-    private readonly BuildAnalyzerConfigurationInternal[] _configPerRule;
+-    private readonly Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult> _resultHandler;
++    private readonly BuildAnalyzerConfigurationEffective[] _configPerRule;
++    private readonly Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationEffective[], BuildCheckResult> _resultHandler;
+ 
+     internal BuildCheckDataContext(
+         BuildAnalyzerWrapper analyzerWrapper,
+         IAnalysisContext loggingContext,
+-        BuildAnalyzerConfigurationInternal[] configPerRule,
+-        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult> resultHandler,
++        BuildAnalyzerConfigurationEffective[] configPerRule,
++        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationEffective[], BuildCheckResult> resultHandler,
+         T data)
+     {
+         _analyzerWrapper = analyzerWrapper;
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 3f41c96969e..75f0216028f 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -3593,17 +3593,8 @@ internal object Execute(object objectInstance, IPropertyProvider<T> properties,
+                             // otherwise there is the potential of running a function twice!
+                             try
+                             {
+-                                // If there are any out parameters, try to figure out their type and create defaults for them as appropriate before calling the method.
+-                                if (args.Any(a => "_".Equals(a)))
+-                                {
+-                                    IEnumerable<MethodInfo> methods = _receiverType.GetMethods(_bindingFlags).Where(m => m.Name.Equals(_methodMethodName) && m.GetParameters().Length == args.Length);
+-                                    functionResult = GetMethodResult(objectInstance, methods, args, 0);
+-                                }
+-                                else
+-                                {
+-                                    // If there are no out parameters, use InvokeMember using the standard binder - this will match and coerce as needed
+-                                    functionResult = _receiverType.InvokeMember(_methodMethodName, _bindingFlags, Type.DefaultBinder, objectInstance, args, CultureInfo.InvariantCulture);
+-                                }
++                                // First use InvokeMember using the standard binder - this will match and coerce as needed
++                                functionResult = _receiverType.InvokeMember(_methodMethodName, _bindingFlags, Type.DefaultBinder, objectInstance, args, CultureInfo.InvariantCulture);
+                             }
+                             // If we're invoking a method, then there are deeper attempts that can be made to invoke the method.
+                             // If not, we were asked to get a property or field but found that we cannot locate it. No further argument coercion is possible, so throw.
+@@ -3678,48 +3669,6 @@ internal object Execute(object objectInstance, IPropertyProvider<T> properties,
+                 }
+             }
+ 
+-            private object GetMethodResult(object objectInstance, IEnumerable<MethodInfo> methods, object[] args, int index)
+-            {
+-                for (int i = index; i < args.Length; i++)
+-                {
+-                    if (args[i].Equals("_"))
+-                    {
+-                        object toReturn = null;
+-                        foreach (MethodInfo method in methods)
+-                        {
+-                            Type t = method.GetParameters()[i].ParameterType;
+-                            args[i] = t.IsValueType ? Activator.CreateInstance(t) : null;
+-                            object currentReturnValue = GetMethodResult(objectInstance, methods, args, i + 1);
+-                            if (currentReturnValue is not null)
+-                            {
+-                                if (toReturn is null)
+-                                {
+-                                    toReturn = currentReturnValue;
+-                                }
+-                                else if (!toReturn.Equals(currentReturnValue))
+-                                {
+-                                    // There were multiple methods that seemed viable and gave different results. We can't differentiate between them so throw.
+-                                    ErrorUtilities.ThrowArgument("CouldNotDifferentiateBetweenCompatibleMethods", _methodMethodName, args.Length);
+-                                    return null;
+-                                }
+-                            }
+-                        }
+-
+-                        return toReturn;
+-                    }
+-                }
+-
+-                try
+-                {
+-                    return _receiverType.InvokeMember(_methodMethodName, _bindingFlags, Type.DefaultBinder, objectInstance, args, CultureInfo.InvariantCulture);
+-                }
+-                catch (Exception)
+-                {
+-                    // This isn't a viable option, but perhaps another set of parameters will work.
+-                    return null;
+-                }
+-            }
+-
+             /// <summary>
+             /// Shortcut to avoid calling into binding if we recognize some most common functions.
+             /// Binding is expensive and throws first-chance MissingMethodExceptions, which is
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 1932df4be9b..741e731b9ad 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -604,9 +604,6 @@
+       LOCALIZATION: "{0}" is the expression that was bad. "{1}" is a message from an FX exception that describes why the expression is bad.
+     </comment>
+   </data>
+-  <data name="CouldNotDifferentiateBetweenCompatibleMethods">
+-    <value>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</value>
+-  </data>
+   <data name="InvalidFunctionPropertyExpression" xml:space="preserve">
+     <value>MSB4184: The expression "{0}" cannot be evaluated. {1}</value>
+     <comment>{StrBegin="MSB4184: "}
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 44e6d7cd8b4..9bb7feac68f 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">Bylo nalezeno více přetížení pro metodu {0} s tímto počtem parametrů: {1}. To v současné době není podporováno.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">Nepodařilo se najít zadané sestavení vlastního analyzátoru: {0}. Zkontrolujte prosím, jestli existuje.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 2ed2094252b..d188d5430bb 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">Es wurden mehrere Überladungen für die Methode „{0}“ mit {1} Parametern gefunden. Dies wird derzeit nicht unterstützt.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">Fehler beim Suchen der angegebenen benutzerdefinierten Analysetoolassembly: {0}. Überprüfen Sie, ob sie vorhanden ist.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index b65536dcab6..c1dac10107d 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">Encontradas múltiples sobrecargas para el método "{0}" con {1} parámetro(s). Esto no se admite actualmente.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">No se pudo encontrar el ensamblado del analizador personalizado especificado: '{0}'. Compruebe si existe.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index c758233a8e2..9e0deee0b2a 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">Plusieurs surcharges ont été trouvées pour la méthode « {0} » avec le(s) paramètre(s) {1}. Cela n’est actuellement pas pris en charge.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">Désolé... Nous n’avons pas pu trouver l’assembly d’analyseur personnalisé : « {0} ». Veuillez vérifier s’il existe.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 756348e42c3..3a11303b9de 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="new">Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">Impossibile trovare l'assembly dell'analizzatore personalizzato specificato: '{0}'. Verificare se esiste.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index f14554ef79d..ee8227044f8 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">{1} パラメーターを持つメソッド "{0}" に対して複数のオーバーロードが見つかりました。これは現在サポートされていません。</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">指定されたカスタム アナライザー アセンブリが見つかりませんでした: '{0}'。存在するかどうか確認してください。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 552f411f14d..f517d92f530 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">{1} 매개 변수가 있는 "{0}" 메서드에 오버로드가 여러 개 발견되었습니다. 이는 현재 지원되지 않습니다.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">지정한 사용자 지정 분석기 어셈블리 '{0}'을(를) 찾지 못했습니다. 있는지 확인하세요.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index f4a35ecf6fc..b7b9a18f770 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="new">Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">Nie można odnaleźć określonego zestawu analizatora niestandardowego: „{0}”. Sprawdź, czy istnieje.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index a3fc797a87c..f32f6070aff 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">Foram encontradas várias sobrecargas para o método "{0}" com parâmetros {1}. No momento, não há suporte para isso.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">Falha ao localizar o assembly do analisador personalizado especificado: "{0}". Verifique se existe.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 4c52cee8fa4..c10386abcc6 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">Обнаружено несколько перегрузок для метода "{0}" с параметрами {1}. Это сейчас не поддерживается.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">Не удалось найти указанную сборку настраиваемого анализатора "{0}". Убедитесь, что она существует.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 4e0b4061aab..d9e55e6fa7f 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">{1} parametreye sahip "{0}" yöntemi için birden çok aşırı yükleme bulundu. Bu şu anda desteklenmiyor.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">Belirtilen özel çözümleyici derlemesi: ‘{0}’ bulunamadı. Lütfen var olup olmadığını kontrol edin.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 6f1311d574e..af786a8fce0 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="new">Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">找不到指定的自定义分析器程序集 "{0}"。请检查它是否存在。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 11725f11a13..23f8fd192f6 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -217,11 +217,6 @@
+         <note>{StrBegin="MSB4006: "}UE: This message is shown when the build engine detects a target referenced in a circular manner -- a project cannot
+     request a target to build itself (perhaps via a chain of other targets).</note>
+       </trans-unit>
+-      <trans-unit id="CouldNotDifferentiateBetweenCompatibleMethods">
+-        <source>Found multiple overloads for method "{0}" with {1} parameter(s). That is currently not supported.</source>
+-        <target state="translated">在具有 {1} 參數的方法 "{0}" 發現多個多載。目前不支援此功能。</target>
+-        <note />
+-      </trans-unit>
+       <trans-unit id="CustomAnalyzerAssemblyNotExist">
+         <source>Failed to find the specified custom analyzer assembly: '{0}'. Please check if it exists.</source>
+         <target state="translated">找不到指定的自訂分析器組件: '{0}'。請確認其是否存在。</target>
+diff --git a/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationInternalTests.cs b/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationEffectiveTests.cs
+similarity index 85%
+rename from src/BuildCheck.UnitTests/BuildAnalyzerConfigurationInternalTests.cs
+rename to src/BuildCheck.UnitTests/BuildAnalyzerConfigurationEffectiveTests.cs
+index 2c559ffbe29..f604c043b62 100644
+--- a/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationInternalTests.cs
++++ b/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationEffectiveTests.cs
+@@ -9,7 +9,7 @@
+ 
+ namespace Microsoft.Build.BuildCheck.UnitTests;
+ 
+-public class BuildAnalyzerConfigurationInternalTests
++public class BuildAnalyzerConfigurationEffectiveTests
+ {
+     [Theory]
+     [InlineData("ruleId", EvaluationAnalysisScope.ProjectOnly, BuildAnalyzerResultSeverity.Warning,  true)]
+@@ -21,12 +21,12 @@ public void IsSameConfigurationAsTest(
+         BuildAnalyzerResultSeverity secondSeverity,
+         bool isExpectedToBeSame)
+     {
+-        BuildAnalyzerConfigurationInternal configuration1 = new BuildAnalyzerConfigurationInternal(
++        BuildAnalyzerConfigurationEffective configuration1 = new BuildAnalyzerConfigurationEffective(
+                        ruleId: "ruleId",
+                        evaluationAnalysisScope: EvaluationAnalysisScope.ProjectOnly,
+                        severity: BuildAnalyzerResultSeverity.Warning);
+ 
+-        BuildAnalyzerConfigurationInternal configuration2 = new BuildAnalyzerConfigurationInternal(
++        BuildAnalyzerConfigurationEffective configuration2 = new BuildAnalyzerConfigurationEffective(
+             ruleId: secondRuleId,
+             evaluationAnalysisScope: secondScope,
+             severity: secondSeverity);
+@@ -41,7 +41,7 @@ public void IsSameConfigurationAsTest(
+     [InlineData(BuildAnalyzerResultSeverity.None, false)]
+     public void BuildAnalyzerConfigurationInternal_Constructor_SeverityConfig(BuildAnalyzerResultSeverity severity, bool isEnabledExpected)
+     {
+-        BuildAnalyzerConfigurationInternal configuration = new BuildAnalyzerConfigurationInternal(
++        BuildAnalyzerConfigurationEffective configuration = new BuildAnalyzerConfigurationEffective(
+                        ruleId: "ruleId",
+                        evaluationAnalysisScope: EvaluationAnalysisScope.ProjectOnly,
+                        severity: severity);
+@@ -54,7 +54,7 @@ public void BuildAnalyzerConfigurationInternal_Constructor_SeverityConfig_Fails(
+     {
+         Should.Throw<ArgumentOutOfRangeException>(() =>
+         {
+-            new BuildAnalyzerConfigurationInternal(
++            new BuildAnalyzerConfigurationEffective(
+                         ruleId: "ruleId",
+                         evaluationAnalysisScope: EvaluationAnalysisScope.ProjectOnly,
+                         severity: BuildAnalyzerResultSeverity.Default);
+diff --git a/src/BuildCheck.UnitTests/DoubleWritesAnalyzer_Tests.cs b/src/BuildCheck.UnitTests/DoubleWritesAnalyzer_Tests.cs
+index b2d3b7bc543..f8b46df7bdd 100644
+--- a/src/BuildCheck.UnitTests/DoubleWritesAnalyzer_Tests.cs
++++ b/src/BuildCheck.UnitTests/DoubleWritesAnalyzer_Tests.cs
+@@ -41,7 +41,7 @@ public void TriggerTaskInvocationAction(TaskInvocationAnalysisData data)
+                 }
+             }
+ 
+-            private void ResultHandler(BuildAnalyzerWrapper wrapper, IAnalysisContext context, BuildAnalyzerConfigurationInternal[] configs, BuildCheckResult result)
++            private void ResultHandler(BuildAnalyzerWrapper wrapper, IAnalysisContext context, BuildAnalyzerConfigurationEffective[] configs, BuildCheckResult result)
+                 => Results.Add(result);
+         }
+ 
+diff --git a/src/Tasks/Microsoft.Common.CurrentVersion.targets b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+index 4080585a710..c4c8841f842 100644
+--- a/src/Tasks/Microsoft.Common.CurrentVersion.targets
++++ b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+@@ -2172,10 +2172,16 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </_ResolvedProjectReferencePaths>
+     </ItemGroup>
+ 
+-    <!-- Issue a warning for each non-existent project. -->
++    <!-- Issue a warning or error for each non-existent project. -->
+     <Warning
+         Text="The referenced project '%(_MSBuildProjectReferenceNonexistent.Identity)' does not exist."
+-        Condition="'@(ProjectReferenceWithConfiguration)' != '' and '@(_MSBuildProjectReferenceNonexistent)' != ''"/>
++        Code="MSB9008"
++        Condition="'@(ProjectReferenceWithConfiguration)' != '' and '@(_MSBuildProjectReferenceNonexistent)' != '' and '$(ErrorOnMissingProjectReference)' != 'True'"/>
++
++    <Error
++        Text="The referenced project '%(_MSBuildProjectReferenceNonexistent.Identity)' does not exist."
++        Code="MSB9008"
++        Condition="'@(ProjectReferenceWithConfiguration)' != '' and '@(_MSBuildProjectReferenceNonexistent)' != '' and '$(ErrorOnMissingProjectReference)' == 'True'"/>
+ 
+   </Target>
+ 

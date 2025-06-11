@@ -1,0 +1,950 @@
+diff --git a/eng/Packages.props b/eng/Packages.props
+index 48f419eeacc..494c9c064c1 100644
+--- a/eng/Packages.props
++++ b/eng/Packages.props
+@@ -44,9 +44,12 @@
+     <PackageReference Update="xunit.core" Version="$(XUnitVersion)" />
+   </ItemGroup>
+ 
++  <ItemGroup Condition="'$(DotNetBuildFromSource)' != 'true'">
++    <GlobalPackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="$(MicrosoftCodeAnalysisBannedApiAnalyzersVersion)" />
++  </ItemGroup>
++
+   <ItemGroup>
+     <GlobalPackageReference Include="Microsoft.VisualStudio.SDK.EmbedInteropTypes" Version="15.0.15" PrivateAssets="All" Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'" />
+-    <GlobalPackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="$(MicrosoftCodeAnalysisBannedApiAnalyzersVersion)" />
+   </ItemGroup>
+ 
+ </Project>
+diff --git a/src/Build.UnitTests/BackEnd/TaskBuilder_Tests.cs b/src/Build.UnitTests/BackEnd/TaskBuilder_Tests.cs
+index 486352af3f2..87152257402 100644
+--- a/src/Build.UnitTests/BackEnd/TaskBuilder_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TaskBuilder_Tests.cs
+@@ -22,6 +22,7 @@
+ using Shouldly;
+ using Xunit;
+ using Xunit.Abstractions;
++using System.Threading;
+ 
+ namespace Microsoft.Build.UnitTests.BackEnd
+ {
+@@ -107,6 +108,63 @@ public void TasksNotDiscoveredWhenTaskConditionFalse()
+             logger.AssertLogContains("Made it");
+         }
+ 
++        [Fact]
++        public void CanceledTasksDoNotLogMSB4181()
++        {
++            using (TestEnvironment env = TestEnvironment.Create(_testOutput))
++            {
++                BuildManager manager = new BuildManager();
++                ProjectCollection collection = new ProjectCollection();
++
++                string contents = @"
++                    <Project xmlns='http://schemas.microsoft.com/developer/msbuild/2003' ToolsVersion ='Current'>
++                     <Target Name='test'>
++                        <Exec Command='" + Helpers.GetSleepCommand(TimeSpan.FromSeconds(10)) + @"'/>
++                     </Target>
++                    </Project>";
++
++                MockLogger logger = new MockLogger(_testOutput);
++
++                var project = new Project(XmlReader.Create(new StringReader(contents)), null, MSBuildConstants.CurrentToolsVersion, collection)
++                {
++                    FullPath = env.CreateFile().Path
++                };
++
++                var _parameters = new BuildParameters
++                {
++                    ShutdownInProcNodeOnBuildFinish = true,
++                    Loggers = new ILogger[] { logger },
++                    EnableNodeReuse = false
++                };
++                ;
++
++                BuildRequestData data = new BuildRequestData(project.CreateProjectInstance(), new string[] { "test" }, collection.HostServices);
++                manager.BeginBuild(_parameters);
++                BuildSubmission asyncResult = manager.PendBuildRequest(data);
++                asyncResult.ExecuteAsync(null, null);
++                Thread.Sleep(500);
++                manager.CancelAllSubmissions();
++                asyncResult.WaitHandle.WaitOne();
++                BuildResult result = asyncResult.BuildResult;
++                manager.EndBuild();
++
++                // No errors from cancelling a build.
++                logger.ErrorCount.ShouldBe(0);
++                // Warn because the task is being cancelled.
++                // NOTE: This assertion will fail when debugging into it because "waiting on exec to cancel" warning will be logged.
++                logger.WarningCount.ShouldBe(1);
++                // Build failed because it was cancelled.
++                result.OverallResult.ShouldBe(BuildResultCode.Failure);
++                // Should log "Cmd being cancelled because build was cancelled" warning
++                logger.AssertLogContains("MSB5021");
++                // Should NOT log "exec failed without logging error"
++                logger.AssertLogDoesntContain("MSB4181");
++
++                collection.Dispose();
++                manager.Dispose();
++            }
++        }
++
+         /// <summary>
+         /// Verify when task outputs are overridden the override messages are correctly displayed
+         /// </summary>
+diff --git a/src/Build.UnitTests/TestComparers/ProjectInstanceModelTestComparers.cs b/src/Build.UnitTests/TestComparers/ProjectInstanceModelTestComparers.cs
+index a8a88862e4f..a9ba7b26914 100644
+--- a/src/Build.UnitTests/TestComparers/ProjectInstanceModelTestComparers.cs
++++ b/src/Build.UnitTests/TestComparers/ProjectInstanceModelTestComparers.cs
+@@ -183,6 +183,12 @@ public bool Equals(ProjectItemGroupTaskItemInstance x, ProjectItemGroupTaskItemI
+                 Assert.Equal(x.RemoveMetadataLocation, y.RemoveMetadataLocation, new Helpers.ElementLocationComparerIgnoringType());
+                 Assert.Equal(x.ConditionLocation, y.ConditionLocation, new Helpers.ElementLocationComparerIgnoringType());
+ 
++                Assert.Equal(x.MatchOnMetadata, y.MatchOnMetadata);
++                Assert.Equal(x.MatchOnMetadataLocation, y.MatchOnMetadataLocation, new Helpers.ElementLocationComparerIgnoringType());
++
++                Assert.Equal(x.MatchOnMetadataOptions, y.MatchOnMetadataOptions);
++                Assert.Equal(x.MatchOnMetadataOptionsLocation, y.MatchOnMetadataOptionsLocation, new Helpers.ElementLocationComparerIgnoringType());
++
+                 Assert.Equal(x.Metadata, y.Metadata, new TargetItemMetadataComparer());
+ 
+                 return true;
+diff --git a/src/Build.UnitTests/WarningsAsMessagesAndErrors_Tests.cs b/src/Build.UnitTests/WarningsAsMessagesAndErrors_Tests.cs
+index d83d61361fa..e8ead4b2e98 100644
+--- a/src/Build.UnitTests/WarningsAsMessagesAndErrors_Tests.cs
++++ b/src/Build.UnitTests/WarningsAsMessagesAndErrors_Tests.cs
+@@ -417,6 +417,9 @@ public void TaskReturnsFailureButDoesNotLogError_ShouldCauseBuildFailure()
+             }
+         }
+ 
++        /// <summary>
++        /// Test that a task that returns false without logging anything reports MSB4181 as a warning.
++        /// </summary>
+         [Fact]
+         public void TaskReturnsFailureButDoesNotLogError_ContinueOnError_WarnAndContinue()
+         {
+@@ -439,6 +442,31 @@ public void TaskReturnsFailureButDoesNotLogError_ContinueOnError_WarnAndContinue
+             }
+         }
+ 
++        /// <summary>
++        /// Test that a task that returns false after logging an error->warning does NOT also log MSB4181
++        /// </summary>
++        [Fact]
++        public void TaskReturnsFailureAndLogsError_ContinueOnError_WarnAndContinue()
++        {
++            using (TestEnvironment env = TestEnvironment.Create(_output))
++            {
++                TransientTestProjectWithFiles proj = env.CreateTestProjectWithFiles($@"
++                <Project>
++                    <UsingTask TaskName = ""CustomLogAndReturnTask"" AssemblyName=""Microsoft.Build.Engine.UnitTests""/>
++                    <UsingTask TaskName = ""ReturnFailureWithoutLoggingErrorTask"" AssemblyName=""Microsoft.Build.Engine.UnitTests""/>
++                    <Target Name='Build'>
++                        <CustomLogAndReturnTask Return=""false"" ErrorCode=""MSB1234"" ContinueOnError=""WarnAndContinue""/>
++                    </Target>
++                </Project>");
++
++                MockLogger logger = proj.BuildProjectExpectSuccess();
++
++                // The only warning should be the error->warning logged by the task.
++                logger.WarningCount.ShouldBe(1);
++                logger.AssertLogContains("MSB1234");
++            }
++        }
++
+         [Fact]
+         public void TaskReturnsFailureButDoesNotLogError_ContinueOnError_True()
+         {
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+index 5fdd1a3e145..c6ac1c6d297 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+@@ -938,8 +938,14 @@ private async Task<WorkUnitResult> ExecuteInstantiatedTask(ITaskExecutionHost ta
+                 // that is logged as an error. MSBuild tasks are an exception because
+                 // errors are not logged directly from them, but the tasks spawned by them.
+                 IBuildEngine be = host.TaskInstance.BuildEngine;
+-                if (taskReturned && !taskResult && !taskLoggingContext.HasLoggedErrors && (be is TaskHost th ? th.BuildRequestsSucceeded : false) && (be is IBuildEngine7 be7 ? !be7.AllowFailureWithoutError : true))
++                if (taskReturned // if the task returned
++                    && !taskResult // and it returned false
++                    && !taskLoggingContext.HasLoggedErrors // and it didn't log any errors
++                    && (be is TaskHost th ? th.BuildRequestsSucceeded : false)
++                    && (be is IBuildEngine7 be7 ? !be7.AllowFailureWithoutError : true) // and it's not allowed to fail unless it logs an error
++                    && !(_cancellationToken.CanBeCanceled && _cancellationToken.IsCancellationRequested)) // and it wasn't cancelled
+                 {
++                    // Then decide how to log MSB4181
+                     if (_continueOnError == ContinueOnError.WarnAndContinue)
+                     {
+                         taskLoggingContext.LogWarning(null,
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index 154ace42f96..0c07dae6d6f 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -455,8 +455,9 @@ public void LogErrorEvent(Microsoft.Build.Framework.BuildErrorEventArgs e)
+                 {
+                     e.BuildEventContext = _taskLoggingContext.BuildEventContext;
+                     _taskLoggingContext.LoggingService.LogBuildEvent(e);
+-                    _taskLoggingContext.HasLoggedErrors = true;
+                 }
++                
++                 _taskLoggingContext.HasLoggedErrors = true;
+             }
+         }
+ 
+diff --git a/src/Build/Evaluation/Conditionals/AndExpressionNode.cs b/src/Build/Evaluation/Conditionals/AndExpressionNode.cs
+index 7b3e099fb4c..31d790c5b3a 100644
+--- a/src/Build/Evaluation/Conditionals/AndExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/AndExpressionNode.cs
+@@ -19,14 +19,14 @@ internal sealed class AndExpressionNode : OperatorExpressionNode
+         internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+         {
+             ProjectErrorUtilities.VerifyThrowInvalidProject
+-                    (LeftChild.CanBoolEvaluate(state),
++                    (LeftChild.TryBoolEvaluate(state, out bool leftBool),
+                      state.ElementLocation,
+                      "ExpressionDoesNotEvaluateToBoolean",
+                      LeftChild.GetUnexpandedValue(state),
+                      LeftChild.GetExpandedValue(state),
+                      state.Condition);
+ 
+-            if (!LeftChild.BoolEvaluate(state))
++            if (!leftBool)
+             {
+                 // Short circuit
+                 return false;
+@@ -34,14 +34,14 @@ internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState
+             else
+             {
+                 ProjectErrorUtilities.VerifyThrowInvalidProject
+-                    (RightChild.CanBoolEvaluate(state),
++                    (RightChild.TryBoolEvaluate(state, out bool rightBool),
+                      state.ElementLocation,
+                      "ExpressionDoesNotEvaluateToBoolean",
+                      RightChild.GetUnexpandedValue(state),
+                      RightChild.GetExpandedValue(state),
+                      state.Condition);
+ 
+-                return RightChild.BoolEvaluate(state);
++                return rightBool;
+             }
+         }
+ 
+diff --git a/src/Build/Evaluation/Conditionals/GenericExpressionNode.cs b/src/Build/Evaluation/Conditionals/GenericExpressionNode.cs
+index d4862fec251..5963a4a61e7 100644
+--- a/src/Build/Evaluation/Conditionals/GenericExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/GenericExpressionNode.cs
+@@ -12,12 +12,9 @@ namespace Microsoft.Build.Evaluation
+     /// </summary>
+     internal abstract class GenericExpressionNode
+     {
+-        internal abstract bool CanBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state);
+-        internal abstract bool CanNumericEvaluate(ConditionEvaluator.IConditionEvaluationState state);
+-        internal abstract bool CanVersionEvaluate(ConditionEvaluator.IConditionEvaluationState state);
+-        internal abstract bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState state);
+-        internal abstract double NumericEvaluate(ConditionEvaluator.IConditionEvaluationState state);
+-        internal abstract Version VersionEvaluate(ConditionEvaluator.IConditionEvaluationState state);
++        internal abstract bool TryBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state, out bool result);
++        internal abstract bool TryNumericEvaluate(ConditionEvaluator.IConditionEvaluationState state, out double result);
++        internal abstract bool TryVersionEvaluate(ConditionEvaluator.IConditionEvaluationState state, out Version result);
+ 
+         /// <summary>
+         /// Returns true if this node evaluates to an empty string,
+@@ -57,13 +54,13 @@ internal virtual bool EvaluatesToEmpty(ConditionEvaluator.IConditionEvaluationSt
+         internal bool Evaluate(ConditionEvaluator.IConditionEvaluationState state)
+         {
+             ProjectErrorUtilities.VerifyThrowInvalidProject(
+-                CanBoolEvaluate(state),
++                TryBoolEvaluate(state, out bool boolValue),
+                 state.ElementLocation,
+                 "ConditionNotBooleanDetail",
+                 state.Condition,
+                 GetExpandedValue(state));
+ 
+-            return BoolEvaluate(state);
++            return boolValue;
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/Evaluation/Conditionals/MultipleComparisonExpressionNode.cs b/src/Build/Evaluation/Conditionals/MultipleComparisonExpressionNode.cs
+index 6a457794da3..18e1caad924 100644
+--- a/src/Build/Evaluation/Conditionals/MultipleComparisonExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/MultipleComparisonExpressionNode.cs
+@@ -48,36 +48,41 @@ internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState
+             // and we know which do, then we already have enough information to evaluate this expression.
+             // That means we don't have to fully expand a condition like " '@(X)' == '' " 
+             // which is a performance advantage if @(X) is a huge item list.
+-            if (LeftChild.EvaluatesToEmpty(state) || RightChild.EvaluatesToEmpty(state))
++            bool leftEmpty = LeftChild.EvaluatesToEmpty(state);
++            bool rightEmpty = RightChild.EvaluatesToEmpty(state);
++            if (leftEmpty || rightEmpty)
+             {
+                 UpdateConditionedProperties(state);
+ 
+-                return Compare(LeftChild.EvaluatesToEmpty(state), RightChild.EvaluatesToEmpty(state));
++                return Compare(leftEmpty, rightEmpty);
+             }
+-
+-            if (LeftChild.CanNumericEvaluate(state) && RightChild.CanNumericEvaluate(state))
++            else if (LeftChild.TryNumericEvaluate(state, out double leftNumericValue) && RightChild.TryNumericEvaluate(state, out double rightNumericValue))
+             {
+-                return Compare(LeftChild.NumericEvaluate(state), RightChild.NumericEvaluate(state));
++                // The left child evaluating to a number and the right child not evaluating to a number
++                // is insufficient to say they are not equal because $(MSBuildToolsVersion) evaluates to
++                // the string "Current" most of the time but when doing numeric comparisons, is treated
++                // as a version and returns "17.0" (or whatever the current tools version is). This means
++                // that if '$(MSBuildToolsVersion)' is "equal" to BOTH '17.0' and 'Current' (if 'Current'
++                // is 17.0).
++                return Compare(leftNumericValue, rightNumericValue);
+             }
+-            else if (LeftChild.CanBoolEvaluate(state) && RightChild.CanBoolEvaluate(state))
++            else if (LeftChild.TryBoolEvaluate(state, out bool leftBoolValue) && RightChild.TryBoolEvaluate(state, out bool rightBoolValue))
+             {
+-                return Compare(LeftChild.BoolEvaluate(state), RightChild.BoolEvaluate(state));
++                return Compare(leftBoolValue, rightBoolValue);
+             }
+-            else // string comparison
+-            {
+-                string leftExpandedValue = LeftChild.GetExpandedValue(state);
+-                string rightExpandedValue = RightChild.GetExpandedValue(state);
+ 
+-                ProjectErrorUtilities.VerifyThrowInvalidProject
+-                    (leftExpandedValue != null && rightExpandedValue != null,
+-                     state.ElementLocation,
+-                     "IllFormedCondition",
+-                     state.Condition);
++            string leftExpandedValue = LeftChild.GetExpandedValue(state);
++            string rightExpandedValue = RightChild.GetExpandedValue(state);
+ 
+-                UpdateConditionedProperties(state);
++            ProjectErrorUtilities.VerifyThrowInvalidProject
++                (leftExpandedValue != null && rightExpandedValue != null,
++                    state.ElementLocation,
++                    "IllFormedCondition",
++                    state.Condition);
+ 
+-                return Compare(leftExpandedValue, rightExpandedValue);
+-            }
++            UpdateConditionedProperties(state);
++
++            return Compare(leftExpandedValue, rightExpandedValue);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/Evaluation/Conditionals/NotExpressionNode.cs b/src/Build/Evaluation/Conditionals/NotExpressionNode.cs
+index 0a2521feda7..de73b72e736 100644
+--- a/src/Build/Evaluation/Conditionals/NotExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/NotExpressionNode.cs
+@@ -1,6 +1,7 @@
+ ﻿// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
++using Microsoft.Build.Shared;
+ using System.Diagnostics;
+ 
+ namespace Microsoft.Build.Evaluation
+@@ -17,12 +18,14 @@ internal sealed class NotExpressionNode : OperatorExpressionNode
+         /// </summary>
+         internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+         {
+-            return !LeftChild.BoolEvaluate(state);
+-        }
+-
+-        internal override bool CanBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            return LeftChild.CanBoolEvaluate(state);
++            ProjectErrorUtilities.VerifyThrowInvalidProject
++                    (LeftChild.TryBoolEvaluate(state, out bool boolValue),
++                     state.ElementLocation,
++                     "ExpressionDoesNotEvaluateToBoolean",
++                     LeftChild.GetUnexpandedValue(state),
++                     LeftChild.GetExpandedValue(state),
++                     state.Condition);
++            return !boolValue;
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/Evaluation/Conditionals/NumericComparisonExpressionNode.cs b/src/Build/Evaluation/Conditionals/NumericComparisonExpressionNode.cs
+index 0bd30600cbf..dec7c6e2fe2 100644
+--- a/src/Build/Evaluation/Conditionals/NumericComparisonExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/NumericComparisonExpressionNode.cs
+@@ -38,46 +38,29 @@ internal abstract class NumericComparisonExpressionNode : OperatorExpressionNode
+         /// </summary>
+         internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+         {
+-            bool isLeftNum = LeftChild.CanNumericEvaluate(state);
+-            bool isLeftVersion = LeftChild.CanVersionEvaluate(state);
+-            bool isRightNum = RightChild.CanNumericEvaluate(state);
+-            bool isRightVersion = RightChild.CanVersionEvaluate(state);
+-            bool isNumeric = isLeftNum && isRightNum;
+-            bool isVersion = isLeftVersion && isRightVersion;
+-            bool isValidComparison = isNumeric || isVersion || (isLeftNum && isRightVersion) || (isLeftVersion && isRightNum);
++            bool isLeftNum = LeftChild.TryNumericEvaluate(state, out double leftNum);
++            bool isLeftVersion = LeftChild.TryVersionEvaluate(state, out Version leftVersion);
++            bool isRightNum = RightChild.TryNumericEvaluate(state, out double rightNum);
++            bool isRightVersion = RightChild.TryVersionEvaluate(state, out Version rightVersion);
+ 
+             ProjectErrorUtilities.VerifyThrowInvalidProject
+-                (isValidComparison,
++                ((isLeftNum || isLeftVersion) && (isRightNum || isRightVersion),
+                  state.ElementLocation,
+                 "ComparisonOnNonNumericExpression",
+                  state.Condition,
+                  /* helpfully display unexpanded token and expanded result in error message */
+-                 LeftChild.CanNumericEvaluate(state) ? RightChild.GetUnexpandedValue(state) : LeftChild.GetUnexpandedValue(state),
+-                 LeftChild.CanNumericEvaluate(state) ? RightChild.GetExpandedValue(state) : LeftChild.GetExpandedValue(state));
++                 isLeftNum ? RightChild.GetUnexpandedValue(state) : LeftChild.GetUnexpandedValue(state),
++                 isLeftNum ? RightChild.GetExpandedValue(state) : LeftChild.GetExpandedValue(state));
+ 
+-            // If the values identify as numeric, make that comparison instead of the Version comparison since numeric has a stricter definition
+-            if (isNumeric)
++            return (isLeftNum, isLeftVersion, isRightNum, isRightVersion) switch
+             {
+-                return Compare(LeftChild.NumericEvaluate(state), RightChild.NumericEvaluate(state));
+-            }
+-            else if (isVersion)
+-            {
+-                return Compare(LeftChild.VersionEvaluate(state), RightChild.VersionEvaluate(state));
+-            }
+-
+-            // If the numbers are of a mixed type, call that specific Compare method
+-            if (isLeftNum && isRightVersion)
+-            {
+-                return Compare(LeftChild.NumericEvaluate(state), RightChild.VersionEvaluate(state));
+-            }
+-            else if (isLeftVersion && isRightNum)
+-            {
+-                return Compare(LeftChild.VersionEvaluate(state), RightChild.NumericEvaluate(state));
+-            }
++                (true, _, true, _) => Compare(leftNum, rightNum),
++                (_, true, _, true) => Compare(leftVersion, rightVersion),
++                (true, _, _, true) => Compare(leftNum, rightVersion),
++                (_, true, true, _) => Compare(leftVersion, rightNum),
+ 
+-            // Throw error here as this code should be unreachable
+-            ErrorUtilities.ThrowInternalErrorUnreachable();
+-            return false;
++                _ => false
++            };
+         }
+     }
+ }
+diff --git a/src/Build/Evaluation/Conditionals/NumericExpressionNode.cs b/src/Build/Evaluation/Conditionals/NumericExpressionNode.cs
+index 306db6d802b..fe21a15a1ad 100644
+--- a/src/Build/Evaluation/Conditionals/NumericExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/NumericExpressionNode.cs
+@@ -21,60 +21,20 @@ internal NumericExpressionNode(string value)
+             _value = value;
+         }
+ 
+-        /// <summary>
+-        /// Evaluate as boolean
+-        /// </summary>
+-        internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            // Should be unreachable: all calls check CanBoolEvaluate() first
+-            ErrorUtilities.VerifyThrow(false, "Can't evaluate a numeric expression as boolean.");
+-            return false;
+-        }
+-
+-        /// <summary>
+-        /// Evaluate as numeric
+-        /// </summary>
+-        internal override double NumericEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            return ConversionUtilities.ConvertDecimalOrHexToDouble(_value);
+-        }
+-
+-        /// <summary>
+-        /// Evaluate as a Version
+-        /// </summary>
+-        internal override Version VersionEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal override bool TryBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state, out bool result)
+         {
+-            return Version.Parse(_value);
+-        }
+-
+-        /// <summary>
+-        /// Whether it can be evaluated as a boolean: never allowed for numerics
+-        /// </summary>
+-        internal override bool CanBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            // Numeric expressions are never allowed to be treated as booleans.
++            result = default;
+             return false;
+         }
+ 
+-        /// <summary>
+-        /// Whether it can be evaluated as numeric
+-        /// </summary>
+-        internal override bool CanNumericEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal override bool TryNumericEvaluate(ConditionEvaluator.IConditionEvaluationState state, out double result)
+         {
+-            // It is not always possible to numerically evaluate even a numerical expression -
+-            // for example, it may overflow a double. So check here.
+-            return ConversionUtilities.ValidDecimalOrHexNumber(_value);
++            return ConversionUtilities.TryConvertDecimalOrHexToDouble(_value, out result);
+         }
+ 
+-        /// <summary>
+-        /// Whether it can be evaluated as a Version
+-        /// </summary>
+-        internal override bool CanVersionEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal override bool TryVersionEvaluate(ConditionEvaluator.IConditionEvaluationState state, out Version result)
+         {
+-            // Check if the value can be formatted as a Version number
+-            // This is needed for nodes that identify as Numeric but can't be parsed as numbers (e.g. 8.1.1.0 vs 8.1)
+-            Version unused;
+-            return Version.TryParse(_value, out unused);
++            return Version.TryParse(_value, out result);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/Evaluation/Conditionals/OperatorExpressionNode.cs b/src/Build/Evaluation/Conditionals/OperatorExpressionNode.cs
+index 918e188ff85..d5520e01bd7 100644
+--- a/src/Build/Evaluation/Conditionals/OperatorExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/OperatorExpressionNode.cs
+@@ -11,48 +11,23 @@ namespace Microsoft.Build.Evaluation
+     /// </summary>
+     internal abstract class OperatorExpressionNode : GenericExpressionNode
+     {
+-        /// <summary>
+-        /// Numeric evaluation is never allowed for operators
+-        /// </summary>
+-        internal override double NumericEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            // Should be unreachable: all calls check CanNumericEvaluate() first
+-            ErrorUtilities.VerifyThrow(false, "Cannot numeric evaluate an operator");
+-            return 0.0D;
+-        }
+-
+-        /// <summary>
+-        /// Version evaluation is never allowed for operators
+-        /// </summary>
+-        internal override Version VersionEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            ErrorUtilities.VerifyThrow(false, "Cannot version evaluate an operator");
+-            return null;
+-        }
+-
+-        /// <summary>
+-        /// Whether boolean evaluation is allowed: always allowed for operators
+-        /// </summary>
+-        internal override bool CanBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal override bool TryBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state, out bool result)
+         {
++            result = BoolEvaluate(state);
+             return true;
+         }
+ 
+-        /// <summary>
+-        /// Whether the node can be evaluated as a numeric: by default,
+-        /// this is not allowed
+-        /// </summary>
+-        internal override bool CanNumericEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal abstract bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState state);
++
++        internal override bool TryNumericEvaluate(ConditionEvaluator.IConditionEvaluationState state, out double result)
+         {
++            result = default;
+             return false;
+         }
+ 
+-        /// <summary>
+-        /// Whether the node can be evaluated as a version: by default,
+-        /// this is not allowed
+-        /// </summary>
+-        internal override bool CanVersionEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal override bool TryVersionEvaluate(ConditionEvaluator.IConditionEvaluationState state, out Version result)
+         {
++            result = default;
+             return false;
+         }
+ 
+diff --git a/src/Build/Evaluation/Conditionals/OrExpressionNode.cs b/src/Build/Evaluation/Conditionals/OrExpressionNode.cs
+index e9469f07aca..73a91600f9b 100644
+--- a/src/Build/Evaluation/Conditionals/OrExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/OrExpressionNode.cs
+@@ -19,14 +19,14 @@ internal sealed class OrExpressionNode : OperatorExpressionNode
+         internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+         {
+             ProjectErrorUtilities.VerifyThrowInvalidProject
+-                    (LeftChild.CanBoolEvaluate(state),
++                    (LeftChild.TryBoolEvaluate(state, out bool leftBool),
+                      state.ElementLocation,
+                      "ExpressionDoesNotEvaluateToBoolean",
+                      LeftChild.GetUnexpandedValue(state),
+                      LeftChild.GetExpandedValue(state),
+                      state.Condition);
+ 
+-            if (LeftChild.BoolEvaluate(state))
++            if (leftBool)
+             {
+                 // Short circuit
+                 return true;
+@@ -34,14 +34,14 @@ internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState
+             else
+             {
+                 ProjectErrorUtilities.VerifyThrowInvalidProject
+-                    (RightChild.CanBoolEvaluate(state),
++                    (RightChild.TryBoolEvaluate(state, out bool rightBool),
+                      state.ElementLocation,
+                      "ExpressionDoesNotEvaluateToBoolean",
+                      RightChild.GetUnexpandedValue(state),
+                      RightChild.GetExpandedValue(state),
+                      state.Condition);
+ 
+-                return RightChild.BoolEvaluate(state);
++                return rightBool;
+             }
+         }
+ 
+diff --git a/src/Build/Evaluation/Conditionals/StringExpressionNode.cs b/src/Build/Evaluation/Conditionals/StringExpressionNode.cs
+index 61eabd438fd..54afb1dc6b8 100644
+--- a/src/Build/Evaluation/Conditionals/StringExpressionNode.cs
++++ b/src/Build/Evaluation/Conditionals/StringExpressionNode.cs
+@@ -3,7 +3,6 @@
+ 
+ using System;
+ using System.Diagnostics;
+-
+ using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Evaluation
+@@ -29,60 +28,35 @@ internal StringExpressionNode(string value, bool expandable)
+             _expandable = expandable;
+         }
+ 
+-        /// <summary>
+-        /// Evaluate as boolean
+-        /// </summary>
+-        internal override bool BoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal override bool TryBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state, out bool result)
+         {
+-            return ConversionUtilities.ConvertStringToBool(GetExpandedValue(state));
++            return ConversionUtilities.TryConvertStringToBool(GetExpandedValue(state), out result);
+         }
+ 
+-        /// <summary>
+-        /// Evaluate as numeric
+-        /// </summary>
+-        internal override double NumericEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal override bool TryNumericEvaluate(ConditionEvaluator.IConditionEvaluationState state, out double result)
+         {
+             if (ShouldBeTreatedAsVisualStudioVersion(state))
+             {
+-                return ConversionUtilities.ConvertDecimalOrHexToDouble(MSBuildConstants.CurrentVisualStudioVersion);
++                result = ConversionUtilities.ConvertDecimalOrHexToDouble(MSBuildConstants.CurrentVisualStudioVersion);
++                return true;
+             }
+-
+-            return ConversionUtilities.ConvertDecimalOrHexToDouble(GetExpandedValue(state));
+-        }
+-
+-        internal override Version VersionEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            if (ShouldBeTreatedAsVisualStudioVersion(state))
++            else
+             {
+-                return Version.Parse(MSBuildConstants.CurrentVisualStudioVersion);
++                return ConversionUtilities.TryConvertDecimalOrHexToDouble(GetExpandedValue(state), out result);
+             }
+-
+-            return Version.Parse(GetExpandedValue(state));
+         }
+ 
+-        internal override bool CanBoolEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            return ConversionUtilities.CanConvertStringToBool(GetExpandedValue(state));
+-        }
+-
+-        internal override bool CanNumericEvaluate(ConditionEvaluator.IConditionEvaluationState state)
++        internal override bool TryVersionEvaluate(ConditionEvaluator.IConditionEvaluationState state, out Version result)
+         {
+             if (ShouldBeTreatedAsVisualStudioVersion(state))
+             {
++                result = Version.Parse(MSBuildConstants.CurrentVisualStudioVersion);
+                 return true;
+             }
+-
+-            return ConversionUtilities.ValidDecimalOrHexNumber(GetExpandedValue(state));
+-        }
+-
+-        internal override bool CanVersionEvaluate(ConditionEvaluator.IConditionEvaluationState state)
+-        {
+-            if (ShouldBeTreatedAsVisualStudioVersion(state))
++            else
+             {
+-                return true;
++                return Version.TryParse(GetExpandedValue(state), out result);
+             }
+-
+-            return Version.TryParse(GetExpandedValue(state), out _);
+         }
+ 
+         /// <summary>
+@@ -98,6 +72,25 @@ internal override bool EvaluatesToEmpty(ConditionEvaluator.IConditionEvaluationS
+             {
+                 if (_expandable)
+                 {
++                    switch (_value.Length)
++                    {
++                        case 0:
++                            _cachedExpandedValue = String.Empty;
++                            return true;
++                        // If the length is 1 or 2, it can't possibly be a property, item, or metadata, and it isn't empty.
++                        case 1:
++                        case 2:
++                            _cachedExpandedValue = _value;
++                            return false;
++                        default:
++                            if (_value[1] != '(' || (_value[0] != '$' && _value[0] != '%' && _value[0] != '@') || _value[_value.Length - 1] != ')')
++                            {
++                                // This isn't just a property, item, or metadata value, and it isn't empty.
++                                return false;
++                            }
++                            break;
++                    }
++
+                     string expandBreakEarly = state.ExpandIntoStringBreakEarly(_value);
+ 
+                     if (expandBreakEarly == null)
+diff --git a/src/Build/Evaluation/ExpressionShredder.cs b/src/Build/Evaluation/ExpressionShredder.cs
+index ffa04158d9d..1ea8786cf67 100644
+--- a/src/Build/Evaluation/ExpressionShredder.cs
++++ b/src/Build/Evaluation/ExpressionShredder.cs
+@@ -110,12 +110,14 @@ internal static List<ItemExpressionCapture> GetReferencedItemExpressions(string
+         {
+             List<ItemExpressionCapture> subExpressions = null;
+ 
+-            if (expression.IndexOf('@') < 0)
++            int startIndex = expression.IndexOf('@', start, end - start);
++
++            if (startIndex < 0)
+             {
+                 return null;
+             }
+ 
+-            for (int i = start; i < end; i++)
++            for (int i = startIndex; i < end; i++)
+             {
+                 int restartPoint;
+                 int startPoint;
+diff --git a/src/Build/Instance/ProjectItemGroupTaskItemInstance.cs b/src/Build/Instance/ProjectItemGroupTaskItemInstance.cs
+index 62f79e2d8a0..2ba9a93a0e4 100644
+--- a/src/Build/Instance/ProjectItemGroupTaskItemInstance.cs
++++ b/src/Build/Instance/ProjectItemGroupTaskItemInstance.cs
+@@ -459,6 +459,8 @@ void ITranslatable.Translate(ITranslator translator)
+             translator.Translate(ref _keepMetadataLocation, ElementLocation.FactoryForDeserialization);
+             translator.Translate(ref _removeMetadataLocation, ElementLocation.FactoryForDeserialization);
+             translator.Translate(ref _keepDuplicatesLocation, ElementLocation.FactoryForDeserialization);
++            translator.Translate(ref _matchOnMetadataLocation, ElementLocation.FactoryForDeserialization);
++            translator.Translate(ref _matchOnMetadataOptionsLocation, ElementLocation.FactoryForDeserialization);
+             translator.Translate(ref _conditionLocation, ElementLocation.FactoryForDeserialization);
+             translator.Translate(ref _metadata, ProjectItemGroupTaskMetadataInstance.FactoryForDeserialization);
+         }
+diff --git a/src/Shared/ConversionUtilities.cs b/src/Shared/ConversionUtilities.cs
+index 351b3b04e46..c2e424e322e 100644
+--- a/src/Shared/ConversionUtilities.cs
++++ b/src/Shared/ConversionUtilities.cs
+@@ -64,6 +64,21 @@ internal static string ConvertByteArrayToHex(byte[] bytes)
+             return sb.ToString();
+         }
+ 
++        internal static bool TryConvertStringToBool(string parameterValue, out bool boolValue)
++        {
++            boolValue = false;
++            if (ValidBooleanTrue(parameterValue))
++            {
++                boolValue = true;
++                return true;
++            }
++            else if (ValidBooleanFalse(parameterValue))
++            {
++                return true;
++            }
++            return false;
++        }
++
+         /// <summary>
+         /// Returns true if the string can be successfully converted to a bool,
+         /// such as "on" or "yes"
+@@ -123,30 +138,40 @@ internal static double ConvertHexToDouble(string number)
+         /// </summary>
+         internal static double ConvertDecimalOrHexToDouble(string number)
+         {
+-            if (ConversionUtilities.ValidDecimalNumber(number))
++            if (TryConvertDecimalOrHexToDouble(number, out double result))
+             {
+-                return ConversionUtilities.ConvertDecimalToDouble(number);
++                return result;
+             }
+-            else if (ConversionUtilities.ValidHexNumber(number))
++            ErrorUtilities.VerifyThrow(false, "Cannot numeric evaluate");
++            return 0.0D;
++        }
++
++        internal static bool TryConvertDecimalOrHexToDouble(string number, out double doubleValue)
++        {
++            if (ConversionUtilities.ValidDecimalNumber(number, out doubleValue))
+             {
+-                return ConversionUtilities.ConvertHexToDouble(number);
++                return true;
++            }
++            else if (ConversionUtilities.ValidHexNumber(number, out int hexValue))
++            {
++                doubleValue = (double)hexValue;
++                return true;
+             }
+             else
+             {
+-                ErrorUtilities.VerifyThrow(false, "Cannot numeric evaluate");
+-                return 0.0D;
++                return false;
+             }
+         }
+ 
+         /// <summary>
+         /// Returns true if the string is a valid hex number, like "0xABC"
+         /// </summary>
+-        private static bool ValidHexNumber(string number)
++        private static bool ValidHexNumber(string number, out int value)
+         {
+             bool canConvert = false;
++            value = 0;
+             if (number.Length >= 3 && number[0] == '0' && (number[1] == 'x' || number[1] == 'X'))
+             {
+-                int value;
+                 canConvert = Int32.TryParse(number.Substring(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture.NumberFormat, out value);
+             }
+             return canConvert;
+@@ -155,9 +180,8 @@ private static bool ValidHexNumber(string number)
+         /// <summary>
+         /// Returns true if the string is a valid decimal number, like "-123.456"
+         /// </summary>
+-        private static bool ValidDecimalNumber(string number)
++        private static bool ValidDecimalNumber(string number, out double value)
+         {
+-            double value;
+             return Double.TryParse(number, NumberStyles.AllowDecimalPoint | NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture.NumberFormat, out value) && !double.IsInfinity(value);
+         }
+ 
+@@ -166,7 +190,7 @@ private static bool ValidDecimalNumber(string number)
+         /// </summary>
+         internal static bool ValidDecimalOrHexNumber(string number)
+         {
+-            return ValidDecimalNumber(number) || ValidHexNumber(number);
++            return ValidDecimalNumber(number, out _) || ValidHexNumber(number, out _);
+         }
+     }
+ }
+diff --git a/src/Tasks.UnitTests/RemoveDir_Tests.cs b/src/Tasks.UnitTests/RemoveDir_Tests.cs
+index 7f88ef17839..0dee182082b 100644
+--- a/src/Tasks.UnitTests/RemoveDir_Tests.cs
++++ b/src/Tasks.UnitTests/RemoveDir_Tests.cs
+@@ -1,15 +1,25 @@
+ // Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
++using System.Collections.Generic;
++using System.IO;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Tasks;
+ using Microsoft.Build.Utilities;
++using Shouldly;
+ using Xunit;
++using Xunit.Abstractions;
+ 
+ namespace Microsoft.Build.UnitTests
+ {
+     sealed public class RemoveDir_Tests
+     {
++        ITestOutputHelper _output;
++        public RemoveDir_Tests(ITestOutputHelper output)
++        {
++            _output = output;
++        }
++
+         /*
+          * Method:   AttributeForwarding
+          *
+@@ -23,14 +33,42 @@ public void AttributeForwarding()
+             ITaskItem i = new TaskItem("MyNonExistentDirectory");
+             i.SetMetadata("Locale", "en-GB");
+             t.Directories = new ITaskItem[] { i };
+-            t.BuildEngine = new MockEngine();
++            t.BuildEngine = new MockEngine(_output);
+ 
+             t.Execute();
+ 
+-            Assert.Equal("en-GB", t.RemovedDirectories[0].GetMetadata("Locale"));
++            t.RemovedDirectories[0].GetMetadata("Locale").ShouldBe("en-GB");
++            t.RemovedDirectories[0].ItemSpec.ShouldBe("MyNonExistentDirectory");
++            Directory.Exists(t.RemovedDirectories[0].ItemSpec).ShouldBeFalse();
++        }
++
++        [Fact]
++        public void SimpleDelete()
++        {
++
++            using (TestEnvironment env = TestEnvironment.Create(_output))
++            {
++                List<TaskItem> list = new List<TaskItem>();
++
++                for (int i = 0; i < 20; i++)
++                {
++                    list.Add(new TaskItem(env.CreateFolder().Path));
++                }
++
++                RemoveDir t = new RemoveDir();
++
++                t.Directories = list.ToArray();
++                t.BuildEngine = new MockEngine(_output);
++
++                t.Execute().ShouldBeTrue();
++
++                t.RemovedDirectories.Length.ShouldBe(list.Count);
+ 
+-            // Output ItemSpec should not be overwritten.
+-            Assert.Equal("MyNonExistentDirectory", t.RemovedDirectories[0].ItemSpec);
++                for (int i = 0; i < 20; i++)
++                {
++                    Directory.Exists(list[i].ItemSpec).ShouldBeFalse();
++                }
++            }
+         }
+     }
+ }
+diff --git a/src/Tasks/RemoveDir.cs b/src/Tasks/RemoveDir.cs
+index f802cbfc70d..c19be8486f6 100644
+--- a/src/Tasks/RemoveDir.cs
++++ b/src/Tasks/RemoveDir.cs
+@@ -44,8 +44,6 @@ public ITaskItem[] Directories
+         //-----------------------------------------------------------------------------------
+         public override bool Execute()
+         {
+-            // Delete each directory
+-            bool overallSuccess = true;
+             // Our record of the directories that were removed
+             var removedDirectoriesList = new List<ITaskItem>();
+ 
+@@ -73,12 +71,6 @@ public override bool Execute()
+                         }
+                     }
+ 
+-                    // The current directory was not removed successfully
+-                    if (!currentSuccess)
+-                    {
+-                        overallSuccess = false;
+-                    }
+-
+                     // We successfully removed the directory, so add the removed directory to our record
+                     if (currentSuccess)
+                     {
+@@ -97,7 +89,7 @@ public override bool Execute()
+             }
+             // convert the list of deleted files into an array of ITaskItems
+             RemovedDirectories = removedDirectoriesList.ToArray();
+-            return overallSuccess;
++            return !Log.HasLoggedErrors;
+         }
+ 
+         // Core implementation of directory removal

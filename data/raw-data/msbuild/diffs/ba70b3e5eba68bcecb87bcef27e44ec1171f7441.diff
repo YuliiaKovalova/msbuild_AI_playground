@@ -1,0 +1,666 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index a78e25f2103..502898ede3b 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -2020,10 +2020,11 @@ private void PerformSchedulingActions(IEnumerable<ScheduleResponse> responses)
+ 
+         internal bool CreateRarNode()
+         {
+-            // If the _buildParametrs is not set, we are in OutOfProc mode, so continue
+-            // Else check if users specified that he want to use multiple nodes, if so use RARaaS
+-            if (_buildParameters?.MaxNodeCount == 1)
+-                return false;
++            //// If the _buildParametrs is not set, we are in OutOfProc mode, so continue
++            //// Else check if users specified that he want to use multiple nodes, if so use RARaaS
++            //if (_buildParameters?.MaxNodeCount == 1)
++            //    return false;
++
+ 
+             string nodeLocation = _buildParameters?.NodeExeLocation ?? BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
+             if (string.IsNullOrEmpty(nodeLocation))
+diff --git a/src/Build/BackEnd/Node/RarNode.cs b/src/Build/BackEnd/Node/RarNode.cs
+index bd92c14a029..2de3b71ee86 100644
+--- a/src/Build/BackEnd/Node/RarNode.cs
++++ b/src/Build/BackEnd/Node/RarNode.cs
+@@ -59,7 +59,11 @@ public NodeEngineShutdownReason Run(bool nodeReuse, bool lowPriority, out Except
+                 // - node lifetime expires
+                 index = Task.WaitAny(new Task[] { msBuildShutdown, rarTask }, cts.Token);
+             }
+-            catch (OperationCanceledException e)
++            catch (OperationCanceledException)
++            {
++                return NodeEngineShutdownReason.BuildComplete;
++            }
++            catch (Exception e)
+             {
+                 shutdownException = e;
+                 return NodeEngineShutdownReason.Error;
+@@ -83,9 +87,10 @@ private static IRarController GetController(string pipeName, Handshake handshake
+         {
+             Type rarControllerType = Type.GetType(RarControllerName);
+ 
+-            Func<string, int?, int?, int, bool, NamedPipeServerStream> streamFactory = NamedPipeUtil.CreateNamedPipeServer;
+-            Func<Handshake, NamedPipeServerStream, int, bool> validateCallback = NamedPipeUtil.ValidateHandshake;
+-            IRarController controller = Activator.CreateInstance(rarControllerType, pipeName, handshake, streamFactory, validateCallback, null) as IRarController;
++            Func<string, int?, int?, int, bool, Stream> streamFactory = NamedPipeUtil.CreateNamedPipeServer;
++            Func<NamedPipeServerStream, int, bool> validateCallback = (pipeStream, timeout) => NamedPipeUtil.ValidateHandshake(handshake, pipeStream, timeout);
++
++            IRarController controller = Activator.CreateInstance(rarControllerType, pipeName, streamFactory, validateCallback, null) as IRarController;
+ 
+             ErrorUtilities.VerifyThrow(controller != null, ResourceUtilities.GetResourceString("RarControllerReflectionError"), RarControllerName);
+             return controller;
+diff --git a/src/Tasks.UnitTests/AssemblyDependency/ResolveAssemblyReferenceAsAService_Tests.cs b/src/Tasks.UnitTests/AssemblyDependency/ResolveAssemblyReferenceAsAService_Tests.cs
+index 1b77c25c0a4..b1986fd0bc6 100644
+--- a/src/Tasks.UnitTests/AssemblyDependency/ResolveAssemblyReferenceAsAService_Tests.cs
++++ b/src/Tasks.UnitTests/AssemblyDependency/ResolveAssemblyReferenceAsAService_Tests.cs
+@@ -80,7 +80,7 @@ public void TransmitDataTest()
+             using CancellationTokenSource cts = new CancellationTokenSource();
+             (Stream serverStream, Stream clientStream) = FullDuplexStream.CreatePair();
+ 
+-            RarController controller = new RarController(string.Empty, new Build.Internal.Handshake(), null, null);
++            RarController controller = new RarController(string.Empty, null, null);
+             Task serverTask = controller.HandleClientAsync(serverStream, cts.Token);
+             RarClient client = new RarClient(new RarTestEngine(clientStream));
+             ITaskItem[] assemblyNames = new TaskItem[]
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index a7b8b616fc3..2aace9d5633 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -356,10 +356,11 @@
+     <Compile Include="ResolveAssemblyReferences\Contract\ResolveAssemblyReferenceResponse.cs" />
+     <Compile Include="ResolveAssemblyReferences\Contract\ResolveAssemblyReferenceTaskInput.cs" />
+     <Compile Include="ResolveAssemblyReferences\Contract\ResolveAssemblyReferenceTaskOutput.cs" />
+-    <Compile Include="ResolveAssemblyReferences\LazyFromattedBuildEventArgsFormatter.cs" />
++    <Compile Include="ResolveAssemblyReferences\BuildEventArgsFormatter.cs" />
+     <Compile Include="ResolveAssemblyReferences\RpcUtils.cs" />
+     <Compile Include="ResolveAssemblyReferences\Server\RarController.cs" />
+     <Compile Include="ResolveAssemblyReferences\Services\ResolveAssemblyReferenceBuildEngine.cs" />
++    <Compile Include="ResolveAssemblyReferences\Services\ResolveAssemblyReferenceComparer.cs" />
+     <Compile Include="ResolveAssemblyReferences\Services\ResolveAssemblyReferenceSerializedTaskHandler.cs" />
+     <Compile Include="ResolveAssemblyReferences\Server\ServerMutex.cs" />
+     <Compile Include="ResolveAssemblyReferences\Services\ResolveAssemblyReferenceTaskHandler.cs" />
+diff --git a/src/Tasks/ResolveAssemblyReferences/LazyFromattedBuildEventArgsFormatter.cs b/src/Tasks/ResolveAssemblyReferences/BuildEventArgsFormatter.cs
+similarity index 63%
+rename from src/Tasks/ResolveAssemblyReferences/LazyFromattedBuildEventArgsFormatter.cs
+rename to src/Tasks/ResolveAssemblyReferences/BuildEventArgsFormatter.cs
+index aedf1eae698..1039d0b61a2 100644
+--- a/src/Tasks/ResolveAssemblyReferences/LazyFromattedBuildEventArgsFormatter.cs
++++ b/src/Tasks/ResolveAssemblyReferences/BuildEventArgsFormatter.cs
+@@ -14,64 +14,73 @@
+ 
+ namespace Microsoft.Build.Tasks.ResolveAssemblyReferences
+ {
+-    internal abstract class BuildEventArgsFormatter<TArg> : IMessagePackFormatter<TArg> where TArg : BuildEventArgs
++    internal static partial class BuildEventArgsFormatter
+     {
+-        private static int? _clrVersion = null;
+-        private static int ClrVersion
+-        {
+-            get
+-            {
+-                if (!_clrVersion.HasValue)
+-                {
+-                    _clrVersion = typeof(bool).GetTypeInfo().Assembly.GetName().Version.Major;
+-                }
+-                return _clrVersion.Value;
+-            }
+-        }
+-
+         public static IMessagePackFormatter<BuildErrorEventArgs> ErrorFormatter { get; } = new BuildError();
+         public static IMessagePackFormatter<BuildWarningEventArgs> WarningFormatter { get; } = new BuildWarning();
+         public static IMessagePackFormatter<BuildMessageEventArgs> MessageFormatter { get; } = new BuildMessage();
+         public static IMessagePackFormatter<CustomBuildEventArgs> CustomFormatter { get; } = new Custom();
+ 
+ 
+-        public TArg Deserialize(ref MessagePackReader reader, MessagePackSerializerOptions options)
++        private abstract class Formatter<TArg> : IMessagePackFormatter<TArg> where TArg : BuildEventArgs
+         {
+-            ReadOnlySequence<byte>? buffer = reader.ReadBytes();
+-
+-            if (!buffer.HasValue)
+-                return null;
+-            try
++            public TArg Deserialize(ref MessagePackReader reader, MessagePackSerializerOptions options)
+             {
+-                BinaryReader binaryReader = new BinaryReader(buffer.Value.AsStream());
+-                TArg arg = GetEventArgInstance();
+-                arg.CreateFromStream(binaryReader, int.MaxValue);
+-                return arg;
++                ReadOnlySequence<byte>? buffer = reader.ReadBytes();
++
++                if (!buffer.HasValue)
++                {
++                    return null;
++                }
++
++                try
++                {
++                    BinaryReader binaryReader = new BinaryReader(buffer.Value.AsStream());
++                    TArg arg = GetEventArgInstance();
++                    // We are communicating with current MSBuild RAR node, if not something is really wrong
++                    arg.CreateFromStream(binaryReader, int.MaxValue);
++                    return arg;
++                }
++                catch (Exception)
++                {
++                    return null;
++                }
+             }
+-            catch (Exception)
++
++            public void Serialize(ref MessagePackWriter writer, TArg value, MessagePackSerializerOptions options)
+             {
+-                return null;
++                if (value is null)
++                {
++                    writer.Write((byte[])null);
++                    return;
++                }
++
++                using MemoryStream stream = new MemoryStream();
++                using BinaryWriter binaryWriter = new BinaryWriter(stream);
++
++                value.WriteToStream(binaryWriter);
++                writer.Write(stream.ToArray());
+             }
++
++            protected abstract TArg GetEventArgInstance();
+         }
+ 
+-        public void Serialize(ref MessagePackWriter writer, TArg value, MessagePackSerializerOptions options)
++        private sealed class BuildError : Formatter<BuildErrorEventArgs>, IMessagePackFormatter<BuildErrorEventArgs>
+         {
+-            if (value is null)
+-            {
+-                writer.Write((byte[])null);
+-                return;
+-            }
+-
+-            using MemoryStream stream = new MemoryStream();
+-            using BinaryWriter binaryWriter = new BinaryWriter(stream);
++            protected override BuildErrorEventArgs GetEventArgInstance() => new BuildErrorEventArgs();
++        }
+ 
+-            value.WriteToStream(binaryWriter);
+-            writer.Write(stream.ToArray());
++        private sealed class BuildMessage : Formatter<BuildMessageEventArgs>, IMessagePackFormatter<BuildMessageEventArgs>
++        {
++            protected override BuildMessageEventArgs GetEventArgInstance() => new BuildMessageEventArgs();
+         }
+ 
+-        protected abstract TArg GetEventArgInstance();
++        private sealed class BuildWarning : Formatter<BuildWarningEventArgs>, IMessagePackFormatter<BuildWarningEventArgs>
++        {
++            protected override BuildWarningEventArgs GetEventArgInstance() => new BuildWarningEventArgs();
++        }
+ 
+-        private class Custom : IMessagePackFormatter<CustomBuildEventArgs>
++        private sealed class Custom : IMessagePackFormatter<CustomBuildEventArgs>
+         {
+             private static IMessagePackFormatter<ExternalProjectFinishedEventArgs> ExternalProjectFinishedFormatter = new ExternalProjectFinished();
+             private static IMessagePackFormatter<ExternalProjectStartedEventArgs> ExternalProjectStartedFormatter = new ExternalProjectStarted();
+@@ -122,32 +131,15 @@ public void Serialize(ref MessagePackWriter writer, CustomBuildEventArgs value,
+                 }
+             }
+ 
+-            private class ExternalProjectFinished : BuildEventArgsFormatter<ExternalProjectFinishedEventArgs>, IMessagePackFormatter<ExternalProjectFinishedEventArgs>
++            private class ExternalProjectFinished : Formatter<ExternalProjectFinishedEventArgs>, IMessagePackFormatter<ExternalProjectFinishedEventArgs>
+             {
+                 protected override ExternalProjectFinishedEventArgs GetEventArgInstance() => new ExternalProjectFinishedEventArgs();
+             }
+ 
+-            private class ExternalProjectStarted : BuildEventArgsFormatter<ExternalProjectStartedEventArgs>, IMessagePackFormatter<ExternalProjectStartedEventArgs>
++            private class ExternalProjectStarted : Formatter<ExternalProjectStartedEventArgs>, IMessagePackFormatter<ExternalProjectStartedEventArgs>
+             {
+                 protected override ExternalProjectStartedEventArgs GetEventArgInstance() => new ExternalProjectStartedEventArgs();
+             }
+         }
+-
+-
+-
+-        private class BuildError : BuildEventArgsFormatter<BuildErrorEventArgs>, IMessagePackFormatter<BuildErrorEventArgs>
+-        {
+-            protected override BuildErrorEventArgs GetEventArgInstance() => new BuildErrorEventArgs();
+-        }
+-
+-        private class BuildMessage : BuildEventArgsFormatter<BuildMessageEventArgs>, IMessagePackFormatter<BuildMessageEventArgs>
+-        {
+-            protected override BuildMessageEventArgs GetEventArgInstance() => new BuildMessageEventArgs();
+-        }
+-
+-        private class BuildWarning : BuildEventArgsFormatter<BuildWarningEventArgs>, IMessagePackFormatter<BuildWarningEventArgs>
+-        {
+-            protected override BuildWarningEventArgs GetEventArgInstance() => new BuildWarningEventArgs();
+-        }
+     }
+ }
+diff --git a/src/Tasks/ResolveAssemblyReferences/RpcUtils.cs b/src/Tasks/ResolveAssemblyReferences/RpcUtils.cs
+index 311af9cc1c5..d5321377616 100644
+--- a/src/Tasks/ResolveAssemblyReferences/RpcUtils.cs
++++ b/src/Tasks/ResolveAssemblyReferences/RpcUtils.cs
+@@ -22,10 +22,10 @@ internal static IJsonRpcMessageHandler GetRarMessageHandler(Stream stream)
+             IFormatterResolver resolver = CompositeResolver.Create(
+                 new IMessagePackFormatter[]
+                 {
+-                    BuildEventArgsFormatter<CustomBuildEventArgs>.CustomFormatter,
+-                    BuildEventArgsFormatter<BuildErrorEventArgs>.ErrorFormatter,
+-                    BuildEventArgsFormatter<BuildWarningEventArgs>.WarningFormatter,
+-                    BuildEventArgsFormatter<BuildMessageEventArgs>.MessageFormatter
++                    BuildEventArgsFormatter.CustomFormatter,
++                    BuildEventArgsFormatter.ErrorFormatter,
++                    BuildEventArgsFormatter.WarningFormatter,
++                    BuildEventArgsFormatter.MessageFormatter
+                 },
+                 new[]
+                 {
+diff --git a/src/Tasks/ResolveAssemblyReferences/Server/RarController.cs b/src/Tasks/ResolveAssemblyReferences/Server/RarController.cs
+index 7105c515e3b..9b3d2a6d006 100644
+--- a/src/Tasks/ResolveAssemblyReferences/Server/RarController.cs
++++ b/src/Tasks/ResolveAssemblyReferences/Server/RarController.cs
+@@ -32,12 +32,6 @@ internal sealed class RarController : IRarController
+         /// </summary>
+         private readonly string _pipeName;
+ 
+-        /// <summary>
+-        /// Handshake used for validation of incoming connections
+-        /// </summary>
+-        private readonly Handshake _handshake;
+-
+-
+         /// <summary>
+         /// Factory callback to NamedPipeUtils.CreateNamedPipeServer
+         /// 1. arg: pipe name
+@@ -54,7 +48,7 @@ internal sealed class RarController : IRarController
+         /// 2. arg: named pipe over which we should validate the handshake
+         /// 3. arg: timeout for validation
+         /// </summary>
+-        private readonly Func<Handshake, NamedPipeServerStream, int, bool> _validateHandshakeCallback;
++        private readonly Func<NamedPipeServerStream, int, bool> _validateHandshakeCallback;
+ 
+         /// <summary>
+         /// Handler for all incoming tasks
+@@ -67,38 +61,33 @@ internal sealed class RarController : IRarController
+         private readonly TimeSpan Timeout = TimeSpan.FromMinutes(15);
+ 
+         /// <summary>
+-        /// Construcotr for <see cref="RarController"/>
++        /// Constructor for <see cref="RarController"/>
+         /// </summary>
+-        /// <param name="pipeName">Name of pipe over which all comunication should go</param>
+-        /// <param name="handshake">Handshake which will be used for validation of connection if <seealso cref="NamedPipeServerStream" /> is provided</param>
++        /// <param name="pipeName">Name of pipe over which all communication should go</param>
+         /// <param name="streamFactory">Factory for stream used in connection</param>
+         /// <param name="validateHandshakeCallback">Callback to validation of connection</param>
+         /// <param name="timeout">Timeout which should be used for communication</param>
+         public RarController(
+             string pipeName,
+-            Handshake handshake,
+-            Func<string, int?, int?, int, bool, NamedPipeServerStream> streamFactory,
+-            Func<Handshake, NamedPipeServerStream, int, bool> validateHandshakeCallback,
++            Func<string, int?, int?, int, bool, Stream> streamFactory,
++            Func<NamedPipeServerStream, int, bool> validateHandshakeCallback,
+             TimeSpan? timeout = null)
+             : this(pipeName,
+-                  handshake,
+                   streamFactory,
+                   validateHandshakeCallback,
+                   timeout: timeout,
+-                  resolveAssemblyReferenceTaskHandler: new ResolveAssemblyReferenceTaskHandler())
++                  resolveAssemblyReferenceTaskHandler: new ResolveAssemlyReferenceCacheHandler(new ResolveAssemblyReferenceTaskHandler()))
+         {
+         }
+ 
+         internal RarController(
+             string pipeName,
+-            Handshake handshake,
+-            Func<string, int?, int?, int, bool, NamedPipeServerStream> streamFactory,
+-            Func<Handshake, NamedPipeServerStream, int, bool> validateHandshakeCallback,
++            Func<string, int?, int?, int, bool, Stream> streamFactory,
++            Func<NamedPipeServerStream, int, bool> validateHandshakeCallback,
+             IResolveAssemblyReferenceTaskHandler resolveAssemblyReferenceTaskHandler,
+             TimeSpan? timeout = null)
+         {
+             _pipeName = pipeName;
+-            _handshake = handshake;
+             _streamFactory = streamFactory;
+             _validateHandshakeCallback = validateHandshakeCallback;
+             _resolveAssemblyReferenceTaskHandler = resolveAssemblyReferenceTaskHandler;
+@@ -142,21 +131,22 @@ public async Task<int> StartAsync(CancellationToken cancellationToken = default)
+         {
+             Stream serverStream = GetStream(_pipeName);
+ 
+-            if (serverStream is NamedPipeServerStream pipeServerStream)
++            if (!(serverStream is NamedPipeServerStream pipeServerStream))
+             {
+-                await pipeServerStream.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
++                return serverStream;
++            }
+ 
+-                if (!_validateHandshakeCallback(_handshake, pipeServerStream, ValidationTimeout))
+-                {
+-                    // We couldn't validate connection, so don't use this connection at all.
+-                    pipeServerStream.Dispose();
+-                    return null;
+-                }
++            await pipeServerStream.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
+ 
++            if (_validateHandshakeCallback(pipeServerStream, ValidationTimeout))
++            {
+                 return pipeServerStream;
+             }
+ 
+-            return serverStream;
++            // We couldn't validate connection, so don't use this connection at all.
++            pipeServerStream.Dispose();
++            return null;
++
+         }
+ 
+         internal async Task HandleClientAsync(Stream serverStream, CancellationToken cancellationToken = default)
+diff --git a/src/Tasks/ResolveAssemblyReferences/Services/ResolveAssemblyReferenceComparer.cs b/src/Tasks/ResolveAssemblyReferences/Services/ResolveAssemblyReferenceComparer.cs
+new file mode 100644
+index 00000000000..6c2cec9121b
+--- /dev/null
++++ b/src/Tasks/ResolveAssemblyReferences/Services/ResolveAssemblyReferenceComparer.cs
+@@ -0,0 +1,184 @@
++﻿using Microsoft.Build.Tasks.ResolveAssemblyReferences.Contract;
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.Tasks.ResolveAssemblyReferences.Services
++{
++    internal static class ResolveAssemblyReferenceComparer
++    {
++        internal static bool CompareInput(ResolveAssemblyReferenceRequest x, ResolveAssemblyReferenceRequest y)
++        {
++            if (x == y)
++            {
++                return true;
++            }
++
++            if (x == null || y == null)
++            {
++                return false;
++            }
++
++            bool fieldsEqual = y != null &&
++                   x.AppConfigFile == y.AppConfigFile &&
++                   x.AutoUnify == y.AutoUnify &&
++                   x.CopyLocalDependenciesWhenParentReferenceInGac == y.CopyLocalDependenciesWhenParentReferenceInGac &&
++                   x.DoNotCopyLocalIfInGac == y.DoNotCopyLocalIfInGac &&
++                   x.FindDependencies == y.FindDependencies &&
++                   x.FindDependenciesOfExternallyResolvedReferences == y.FindDependenciesOfExternallyResolvedReferences &&
++                   x.FindRelatedFiles == y.FindRelatedFiles &&
++                   x.FindSatellites == y.FindSatellites &&
++                   x.FindSerializationAssemblies == y.FindSerializationAssemblies &&
++                   x.IgnoreDefaultInstalledAssemblySubsetTables == y.IgnoreDefaultInstalledAssemblySubsetTables &&
++                   x.IgnoreDefaultInstalledAssemblyTables == y.IgnoreDefaultInstalledAssemblyTables &&
++                   x.IgnoreTargetFrameworkAttributeVersionMismatch == y.IgnoreTargetFrameworkAttributeVersionMismatch &&
++                   x.IgnoreVersionForFrameworkReferences == y.IgnoreVersionForFrameworkReferences &&
++                   x.ProfileName == y.ProfileName &&
++                   x.Silent == y.Silent &&
++                   x.StateFile == y.StateFile &&
++                   x.SupportsBindingRedirectGeneration == y.SupportsBindingRedirectGeneration &&
++                   x.TargetedRuntimeVersion == y.TargetedRuntimeVersion &&
++                   x.TargetFrameworkMoniker == y.TargetFrameworkMoniker &&
++                   x.TargetFrameworkMonikerDisplayName == y.TargetFrameworkMonikerDisplayName &&
++                   x.TargetFrameworkVersion == y.TargetFrameworkVersion &&
++                   x.TargetProcessorArchitecture == y.TargetProcessorArchitecture &&
++                   x.UnresolveFrameworkAssembliesFromHigherFrameworks == y.UnresolveFrameworkAssembliesFromHigherFrameworks &&
++                   x.UseResolveAssemblyReferenceService == y.UseResolveAssemblyReferenceService &&
++                   x.WarnOrErrorOnTargetArchitectureMismatch == y.WarnOrErrorOnTargetArchitectureMismatch;
++
++            return fieldsEqual &&
++                   AreStringListsEqual(x.AllowedAssemblyExtensions, y.AllowedAssemblyExtensions) &&
++                   AreStringListsEqual(x.AllowedRelatedFileExtensions, y.AllowedRelatedFileExtensions) &&
++                   AreTaskItemListsEqual(x.Assemblies, y.Assemblies) &&
++                   AreTaskItemListsEqual(x.AssemblyFiles, y.AssemblyFiles) &&
++                   AreStringListsEqual(x.CandidateAssemblyFiles, y.CandidateAssemblyFiles) &&
++                   AreTaskItemListsEqual(x.FullFrameworkAssemblyTables, y.FullFrameworkAssemblyTables) &&
++                   AreStringListsEqual(x.FullFrameworkFolders, y.FullFrameworkFolders) &&
++                   AreStringListsEqual(x.FullTargetFrameworkSubsetNames, y.FullTargetFrameworkSubsetNames) &&
++                   AreTaskItemListsEqual(x.InstalledAssemblySubsetTables, y.InstalledAssemblySubsetTables) &&
++                   AreTaskItemListsEqual(x.InstalledAssemblyTables, y.InstalledAssemblyTables) &&
++                   AreStringListsEqual(x.LatestTargetFrameworkDirectories, y.LatestTargetFrameworkDirectories) &&
++                   AreTaskItemListsEqual(x.ResolvedSDKReferences, y.ResolvedSDKReferences) &&
++                   AreStringListsEqual(x.SearchPaths, y.SearchPaths) &&
++                   AreStringListsEqual(x.TargetFrameworkDirectories, y.TargetFrameworkDirectories) &&
++                   AreStringListsEqual(x.TargetFrameworkSubsets, y.TargetFrameworkSubsets);
++        }
++
++        internal static bool CompareOutput(ResolveAssemblyReferenceResponse x, ResolveAssemblyReferenceResponse y)
++        {
++            if (x == y)
++            {
++                return true;
++            }
++
++            if (x == null || y == null)
++            {
++                return false;
++            }
++
++            return x.DependsOnNETStandard == y.DependsOnNETStandard &&
++                   x.DependsOnSystemRuntime == y.DependsOnSystemRuntime &&
++                   AreTaskItemListsEqual(x.CopyLocalFiles, y.CopyLocalFiles) &&
++                   AreTaskItemListsEqual(x.FilesWritten, y.FilesWritten) &&
++                   AreTaskItemListsEqual(x.RelatedFiles, y.RelatedFiles) &&
++                   AreTaskItemListsEqual(x.ResolvedDependencyFiles, y.ResolvedDependencyFiles) &&
++                   AreTaskItemListsEqual(x.ResolvedFiles, y.ResolvedFiles) &&
++                   AreTaskItemListsEqual(x.SatelliteFiles, y.SatelliteFiles) &&
++                   AreTaskItemListsEqual(x.ScatterFiles, y.ScatterFiles) &&
++                   AreTaskItemListsEqual(x.SerializationAssemblyFiles, y.SerializationAssemblyFiles) &&
++                   AreTaskItemListsEqual(x.SuggestedRedirects, y.SuggestedRedirects);
++        }
++
++        private static bool AreStringListsEqual(string[] x, string[] y)
++        {
++            if (x == y)
++            {
++                return true;
++            }
++
++            if (x == null || y == null)
++            {
++                return false;
++            }
++
++            if (x.Length != y.Length)
++            {
++                return false;
++            }
++
++            for (int i = 0; i < x.Length; i++)
++            {
++                if (x[i] != y[i])
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++
++        private static bool AreTaskItemListsEqual(ReadOnlyTaskItem[] x, ReadOnlyTaskItem[] y)
++        {
++            if (x == y)
++            {
++                return true;
++            }
++
++            if (x == null || y == null)
++            {
++                return false;
++            }
++
++            if (x.Length != y.Length)
++            {
++                return false;
++            }
++
++            for (int i = 0; i < x.Length; i++)
++            {
++                if (!AreTaskItemsEqual(x[i], y[i]))
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++
++        private static bool AreTaskItemsEqual(ReadOnlyTaskItem x, ReadOnlyTaskItem y)
++        {
++            if (x == y)
++            {
++                return true;
++            }
++
++            if (x == null || y == null)
++            {
++                return false;
++            }
++
++            if (x.ItemSpec != y.ItemSpec || x.MetadataNameToValue.Count != y.MetadataNameToValue.Count)
++            {
++                return false;
++            }
++
++            foreach (KeyValuePair<string, string> metadataNameWithValue in x.MetadataNameToValue)
++            {
++                string metadataName = metadataNameWithValue.Key;
++                string metadataValue = metadataNameWithValue.Value;
++
++                bool hasMetadata = y.MetadataNameToValue.TryGetValue(metadataName, out string metadataValueToCompare);
++                bool isMetadataEqual = hasMetadata && metadataValue == metadataValueToCompare;
++
++                if (!isMetadataEqual)
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++    }
++}
+diff --git a/src/Tasks/ResolveAssemblyReferences/Services/ResolveAssemblyReferenceTaskHandler.cs b/src/Tasks/ResolveAssemblyReferences/Services/ResolveAssemblyReferenceTaskHandler.cs
+index 335ef00ffd6..61e90c59173 100644
+--- a/src/Tasks/ResolveAssemblyReferences/Services/ResolveAssemblyReferenceTaskHandler.cs
++++ b/src/Tasks/ResolveAssemblyReferences/Services/ResolveAssemblyReferenceTaskHandler.cs
+@@ -1,7 +1,11 @@
+-﻿using System.Threading;
++﻿using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Threading;
+ using System.Threading.Tasks;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Tasks.ResolveAssemblyReferences.Contract;
++using Microsoft.Build.Tasks.ResolveAssemblyReferences.Server;
+ 
+ namespace Microsoft.Build.Tasks.ResolveAssemblyReferences.Services
+ {
+@@ -29,11 +33,11 @@ internal ResolveAssemblyReferenceResult Execute(ResolveAssemblyReferenceRequest
+         {
+             ResolveAssemblyReferenceTaskInput taskInput = new ResolveAssemblyReferenceTaskInput(input);
+             ResolveAssemblyReferenceBuildEngine buildEngine = new ResolveAssemblyReferenceBuildEngine();
+-            ResolveAssemblyReference task = GetResolveAssemblyReferenceTask(buildEngine);
+-            //ResolveAssemblyReference task = new ResolveAssemblyReference
+-            //{
+-            //    BuildEngine = buildEngine
+-            //};
++            //ResolveAssemblyReference task = GetResolveAssemblyReferenceTask(buildEngine);
++            ResolveAssemblyReference task = new ResolveAssemblyReference
++            {
++                BuildEngine = buildEngine
++            };
+ 
+             ResolveAssemblyReferenceResult result = task.Execute(taskInput);
+             //result.CustomBuildEvents = buildEngine.CustomBuildEvent;
+@@ -52,4 +56,82 @@ public void Dispose()
+         {
+         }
+     }
++
++    internal sealed class ResolveAssemlyReferenceCacheHandler : IResolveAssemblyReferenceTaskHandler
++    {
++        private readonly struct CacheEntry
++        {
++            public CacheEntry(ResolveAssemblyReferenceRequest request, ResolveAssemblyReferenceResult result)
++            {
++                Request = request;
++                Result = result;
++            }
++
++            public ResolveAssemblyReferenceRequest Request { get; }
++            public ResolveAssemblyReferenceResult Result { get; }
++        }
++
++        private readonly object _lock = new object();
++
++        private readonly Dictionary<string, CacheEntry> _cache;
++
++        private readonly IResolveAssemblyReferenceTaskHandler _handler;
++
++        private static int RequestNum = 0;
++
++        public ResolveAssemlyReferenceCacheHandler(IResolveAssemblyReferenceTaskHandler handler)
++        {
++            _handler = handler;
++            _cache = new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
++        }
++
++        public async Task<ResolveAssemblyReferenceResult> ExecuteAsync(ResolveAssemblyReferenceRequest input, CancellationToken cancellationToken = default)
++        {
++            Stopwatch stopwatch = new Stopwatch();
++            stopwatch.Start();
++            string projectId = input.StateFile;
++
++            int requestId = Interlocked.Increment(ref RequestNum);
++
++            lock (_lock)
++            {
++                if (_cache.ContainsKey(projectId))
++                {
++                    Console.WriteLine($"Found entry for project: '{projectId}'");
++                    CacheEntry entry = _cache[projectId];
++
++                    if (ResolveAssemblyReferenceComparer.CompareInput(input, entry.Request))
++                    {
++                        PrintDiagnostic(requestId, stopwatch, true);
++                        return entry.Result;
++                    }
++
++                    // Not matching, remove it from cache
++                    _cache.Remove(projectId);
++                }
++            }
++
++            ResolveAssemblyReferenceResult result = await _handler.ExecuteAsync(input, cancellationToken);
++
++            lock (_lock)
++            {
++                Console.WriteLine("Adding new entry to cache");
++                _cache[projectId] = new CacheEntry(input, result);
++            }
++
++            PrintDiagnostic(requestId, stopwatch, false);
++            return result;
++        }
++
++        private static void PrintDiagnostic(int requestId, Stopwatch stopwatch, bool cache)
++        {
++            stopwatch.Stop();
++            Console.WriteLine("{0}; Cached used: {1}; Elapsed: {2} ms", requestId, cache, stopwatch.ElapsedMilliseconds);
++        }
++
++        public void Dispose()
++        {
++            _handler.Dispose();
++        }
++    }
+ }

@@ -1,0 +1,639 @@
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index 9991bf07d1f..cf4dc1d3cdf 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -1105,9 +1105,13 @@ private async Task<BuildResult> BuildProject()
+             ErrorUtilities.VerifyThrow(_targetBuilder != null, "Target builder is null");
+ 
+             // We consider this the entrypoint for the project build for purposes of BuildCheck processing 
++            bool isRestoring = _requestEntry.RequestConfiguration.GlobalProperties[MSBuildConstants.MSBuildIsRestoring] is null;
+ 
+-            var buildCheckManager = (_componentHost.GetComponent(BuildComponentType.BuildCheckManagerProvider) as IBuildCheckManagerProvider)!.Instance;
+-            buildCheckManager.SetDataSource(BuildCheckDataSource.BuildExecution);
++            var buildCheckManager = isRestoring
++                ? (_componentHost.GetComponent(BuildComponentType.BuildCheckManagerProvider) as IBuildCheckManagerProvider)!.Instance
++                : null;
++
++            buildCheckManager?.SetDataSource(BuildCheckDataSource.BuildExecution);
+ 
+             // Make sure it is null before loading the configuration into the request, because if there is a problem
+             // we do not wand to have an invalid projectLoggingContext floating around. Also if this is null the error will be
+@@ -1121,7 +1125,7 @@ private async Task<BuildResult> BuildProject()
+                 // Load the project
+                 if (!_requestEntry.RequestConfiguration.IsLoaded)
+                 {
+-                    buildCheckManager.StartProjectEvaluation(
++                    buildCheckManager?.StartProjectEvaluation(
+                         BuildCheckDataSource.BuildExecution,
+                         new CheckLoggingContext(_nodeLoggingContext.LoggingService, _requestEntry.Request.BuildEventContext),
+                         _requestEntry.RequestConfiguration.ProjectFullPath);
+@@ -1146,13 +1150,13 @@ private async Task<BuildResult> BuildProject()
+             }
+             finally
+             {
+-                buildCheckManager.EndProjectEvaluation(
++                buildCheckManager?.EndProjectEvaluation(
+                     BuildCheckDataSource.BuildExecution,
+                     _requestEntry.Request.BuildEventContext);
+             }
+ 
+             _projectLoggingContext = _nodeLoggingContext.LogProjectStarted(_requestEntry);
+-            buildCheckManager.StartProjectRequest(
++            buildCheckManager?.StartProjectRequest(
+                 BuildCheckDataSource.BuildExecution,
+                 _requestEntry.Request.BuildEventContext,
+                 _requestEntry.RequestConfiguration.ProjectFullPath);
+@@ -1224,7 +1228,7 @@ private async Task<BuildResult> BuildProject()
+             }
+             finally
+             {
+-                buildCheckManager.EndProjectRequest(
++                buildCheckManager?.EndProjectRequest(
+                     BuildCheckDataSource.BuildExecution,
+                     new CheckLoggingContext(_nodeLoggingContext.LoggingService, _requestEntry.Request.BuildEventContext),
+                     _requestEntry.RequestConfiguration.ProjectFullPath);
+diff --git a/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs b/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
+index 98ad9f1f8b0..4e164d177c3 100644
+--- a/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
++++ b/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
+@@ -14,4 +14,6 @@ public interface IBuildCheckRegistrationContext
+     void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationCheckData>> taskInvocationAction);
+ 
+     void RegisterEnvironmentVariableReadAction(Action<BuildCheckDataContext<EnvironmentVariableCheckData>> environmentVariableAction);
++
++    void RegisterBuildFinishedAction(Action<BuildCheckDataContext<BuildFinishedCheckData>> buildFinishedAction);
+ }
+diff --git a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+index 13a32c74678..89f2f205848 100644
+--- a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
++++ b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using Microsoft.Build.BuildCheck.Infrastructure;
+ using Microsoft.Build.Construction;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Checks;
+@@ -26,6 +27,7 @@ internal sealed class NoEnvironmentVariablePropertyCheck : Check
+     private readonly HashSet<EnvironmentVariableIdentityKey> _environmentVariablesReported = new HashSet<EnvironmentVariableIdentityKey>();
+ 
+     private bool _isVerboseEnvVarOutput;
++    private EvaluationCheckScope _scope;
+ 
+     public override string FriendlyName => "MSBuild.NoEnvironmentVariablePropertyCheck";
+ 
+@@ -33,6 +35,7 @@ internal sealed class NoEnvironmentVariablePropertyCheck : Check
+ 
+     public override void Initialize(ConfigurationContext configurationContext)
+     {
++        _scope = configurationContext.CheckConfig[0].EvaluationCheckScope;
+         foreach (CustomConfigurationData customConfigurationData in configurationContext.CustomConfigurationData)
+         {
+             bool? isVerboseEnvVarOutput = GetVerboseEnvVarOutputConfig(customConfigurationData, RuleId);
+@@ -48,6 +51,11 @@ private void ProcessEnvironmentVariableReadAction(BuildCheckDataContext<Environm
+         {
+             foreach (var envVariableData in context.Data.EvaluatedEnvironmentVariables)
+             {
++                if (!CheckScopeClassifier.IsActionInObservedScope(_scope, envVariableData.Value.File,
++                        context.Data.ProjectFilePath))
++                {
++                    continue;
++                }
+                 EnvironmentVariableIdentityKey identityKey = new(envVariableData.Key, envVariableData.Value.File, envVariableData.Value.Line, envVariableData.Value.Column);
+                 if (!_environmentVariablesReported.Contains(identityKey))
+                 {
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+index bfd311d03dc..8e6bd5c24cc 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+@@ -10,6 +10,7 @@
+ using Microsoft.Build.Experimental.BuildCheck.Acquisition;
+ using Microsoft.Build.Experimental.BuildCheck.Utilities;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+@@ -18,7 +19,9 @@ internal class BuildCheckBuildEventHandler
+     private readonly IBuildCheckManager _buildCheckManager;
+     private readonly ICheckContextFactory _checkContextFactory;
+ 
+-    private readonly Dictionary<Type, Action<BuildEventArgs>> _eventHandlers;
++    private Dictionary<Type, Action<BuildEventArgs>> _eventHandlers;
++    private readonly Dictionary<Type, Action<BuildEventArgs>> _eventHandlersFull;
++    private readonly Dictionary<Type, Action<BuildEventArgs>> _eventHandlersRestore;
+ 
+     internal BuildCheckBuildEventHandler(
+         ICheckContextFactory checkContextFactory,
+@@ -27,8 +30,9 @@ internal BuildCheckBuildEventHandler(
+         _buildCheckManager = buildCheckManager;
+         _checkContextFactory = checkContextFactory;
+ 
+-        _eventHandlers = new()
++        _eventHandlersFull = new()
+         {
++            { typeof(BuildSubmissionStartedEventArgs), (BuildEventArgs e) => HandleBuildSubmissionStartedEvent((BuildSubmissionStartedEventArgs)e) },
+             { typeof(ProjectEvaluationFinishedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationFinishedEvent((ProjectEvaluationFinishedEventArgs)e) },
+             { typeof(ProjectEvaluationStartedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationStartedEvent((ProjectEvaluationStartedEventArgs)e) },
+             { typeof(EnvironmentVariableReadEventArgs), (BuildEventArgs e) => HandleEnvironmentVariableReadEvent((EnvironmentVariableReadEventArgs)e) },
+@@ -41,6 +45,14 @@ internal BuildCheckBuildEventHandler(
+             { typeof(TaskParameterEventArgs), (BuildEventArgs e) => HandleTaskParameterEvent((TaskParameterEventArgs)e) },
+             { typeof(BuildFinishedEventArgs), (BuildEventArgs e) => HandleBuildFinishedEvent((BuildFinishedEventArgs)e) },
+         };
++
++        // During restore we'll wait only for restore to be done.
++        _eventHandlersRestore = new()
++        {
++            { typeof(BuildSubmissionStartedEventArgs), (BuildEventArgs e) => HandleBuildSubmissionStartedEvent((BuildSubmissionStartedEventArgs)e) },
++        };
++
++        _eventHandlers = _eventHandlersFull;
+     }
+ 
+     public void HandleBuildEvent(BuildEventArgs e)
+@@ -51,6 +63,14 @@ public void HandleBuildEvent(BuildEventArgs e)
+         }
+     }
+ 
++    private void HandleBuildSubmissionStartedEvent(BuildSubmissionStartedEventArgs eventArgs)
++    {
++        eventArgs.GlobalProperties.TryGetValue(MSBuildConstants.MSBuildIsRestoring, out string? restoreProperty);
++        bool isRestoring = restoreProperty is not null && Convert.ToBoolean(restoreProperty);
++
++        _eventHandlers = isRestoring ? _eventHandlersRestore : _eventHandlersFull;
++    }
++
+     private void HandleProjectEvaluationFinishedEvent(ProjectEvaluationFinishedEventArgs eventArgs)
+     {
+         if (!IsMetaProjFile(eventArgs.ProjectFile))
+@@ -119,6 +139,8 @@ private void HandleEnvironmentVariableReadEvent(EnvironmentVariableReadEventArgs
+ 
+     private void HandleBuildFinishedEvent(BuildFinishedEventArgs eventArgs)
+     {
++        _buildCheckManager.ProcessBuildFinished(_checkContextFactory.CreateCheckContext(eventArgs.BuildEventContext!));
++
+         _stats.Merge(_buildCheckManager.CreateCheckTracingStats(), (span1, span2) => span1 + span2);
+ 
+         LogCheckStats(_checkContextFactory.CreateCheckContext(GetBuildEventContext(eventArgs)));
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index e8c36f1b31d..dffe18b24d8 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -25,10 +25,11 @@ private record CallbackRegistry(
+         List<(CheckWrapper, Action<BuildCheckDataContext<PropertyReadData>>)> PropertyReadActions,
+         List<(CheckWrapper, Action<BuildCheckDataContext<PropertyWriteData>>)> PropertyWriteActions,
+         List<(CheckWrapper, Action<BuildCheckDataContext<ProjectProcessingDoneData>>)> ProjectProcessingDoneActions,
++        List<(CheckWrapper, Action<BuildCheckDataContext<BuildFinishedCheckData>>)> BuildFinishedActions,
+         List<(CheckWrapper, Action<BuildCheckDataContext<EnvironmentVariableCheckData>>)> EnvironmentVariableCheckDataActions)
+     {
+         public CallbackRegistry()
+-            : this([], [], [], [], [], [], [])
++            : this([], [], [], [], [], [], [], [])
+         {
+         }
+ 
+@@ -39,6 +40,7 @@ internal void DeregisterCheck(CheckWrapper check)
+             PropertyReadActions.RemoveAll(a => a.Item1 == check);
+             PropertyWriteActions.RemoveAll(a => a.Item1 == check);
+             ProjectProcessingDoneActions.RemoveAll(a => a.Item1 == check);
++            BuildFinishedActions.RemoveAll(a => a.Item1 == check);
+         }
+     }
+ 
+@@ -56,6 +58,7 @@ internal void DeregisterCheck(CheckWrapper check)
+     internal bool HasPropertyReadActions => _globalCallbacks.PropertyReadActions.Count > 0;
+ 
+     internal bool HasPropertyWriteActions => _globalCallbacks.PropertyWriteActions.Count > 0;
++    internal bool HasBuildFinishedActions => _globalCallbacks.BuildFinishedActions.Count > 0;
+ 
+     internal void RegisterEnvironmentVariableReadAction(CheckWrapper check, Action<BuildCheckDataContext<EnvironmentVariableCheckData>> environmentVariableAction)
+        => RegisterAction(check, environmentVariableAction, _globalCallbacks.EnvironmentVariableCheckDataActions);
+@@ -74,6 +77,9 @@ internal void RegisterTaskInvocationAction(CheckWrapper check, Action<BuildCheck
+     internal void RegisterPropertyReadAction(CheckWrapper check, Action<BuildCheckDataContext<PropertyReadData>> propertyReadAction)
+         => RegisterAction(check, propertyReadAction, _globalCallbacks.PropertyReadActions);
+ 
++    internal void RegisterBuildFinishedAction(CheckWrapper check, Action<BuildCheckDataContext<BuildFinishedCheckData>> buildFinishedAction)
++        => RegisterAction(check, buildFinishedAction, _globalCallbacks.BuildFinishedActions);
++
+     internal void RegisterPropertyWriteAction(CheckWrapper check, Action<BuildCheckDataContext<PropertyWriteData>> propertyWriteAction)
+         => RegisterAction(check, propertyWriteAction, _globalCallbacks.PropertyWriteActions);
+ 
+@@ -155,6 +161,14 @@ internal void RunProjectProcessingDoneActions(
+         => RunRegisteredActions(_globalCallbacks.ProjectProcessingDoneActions, projectProcessingDoneData,
+             checkContext, resultHandler);
+ 
++    internal void RunBuildFinishedActions(
++        BuildFinishedCheckData buildFinishedCheckData,
++        ICheckContext checkContext,
++        Action<CheckWrapper, ICheckContext, CheckConfigurationEffective[], BuildCheckResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.BuildFinishedActions, buildFinishedCheckData,
++            checkContext, resultHandler);
++
+     private void RunRegisteredActions<T>(
+         List<(CheckWrapper, Action<BuildCheckDataContext<T>>)> registeredCallbacks,
+         T checkData,
+@@ -167,7 +181,7 @@ private void RunRegisteredActions<T>(
+         foreach (var checkCallback in registeredCallbacks)
+         {
+             // Tracing - https://github.com/dotnet/msbuild/issues/9629 - we might want to account this entire block
+-            //  to the relevant check (with BuildCheckConfigurationEffectively the currently accounted part as being the 'core-execution' subspan)
++            //  to the relevant check (with BuildCheckConfigurationEffective only the currently accounted part as being the 'core-execution' subspan)
+ 
+             CheckConfigurationEffective? commonConfig = checkCallback.Item1.CommonConfig;
+             CheckConfigurationEffective[] configPerRule;
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+index 84972841224..9fb144c7f0d 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+@@ -18,4 +18,7 @@ public void RegisterParsedItemsAction(Action<BuildCheckDataContext<ParsedItemsCh
+ 
+     public void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationCheckData>> taskInvocationAction) =>
+         buildCheckCentralContext.RegisterTaskInvocationAction(checkWrapper, taskInvocationAction);
++
++    public void RegisterBuildFinishedAction(Action<BuildCheckDataContext<BuildFinishedCheckData>> buildFinishedAction) => 
++        buildCheckCentralContext.RegisterBuildFinishedAction(checkWrapper, buildFinishedAction);
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
+index 45bd095f415..491fe92d700 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
+@@ -38,6 +38,7 @@ internal class BuildCheckForwardingLogger : IForwardingLogger
+     private HashSet<Type> _eventsToForward = new HashSet<Type>
+     {
+         typeof(EnvironmentVariableReadEventArgs),
++        typeof(BuildSubmissionStartedEventArgs),
+         typeof(ProjectEvaluationFinishedEventArgs),
+         typeof(ProjectEvaluationStartedEventArgs),
+         typeof(ProjectStartedEventArgs),
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index d768f9b0cfe..c4d18165cc4 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -365,6 +365,9 @@ public void ProcessTaskStartedEventArgs(
+             => _buildEventsProcessor
+                 .ProcessTaskStartedEventArgs(checkContext, taskStartedEventArgs);
+ 
++        public void ProcessBuildFinished(ICheckContext checkContext)
++            => _buildEventsProcessor.ProcessBuildDone(checkContext);
++
+         public void ProcessTaskFinishedEventArgs(
+             ICheckContext checkContext,
+             TaskFinishedEventArgs taskFinishedEventArgs)
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index d9629d8a555..c9f25eb37ea 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -105,6 +105,17 @@ internal void ProcessEnvironmentVariableReadEventArgs(ICheckContext checkContext
+         }
+     }
+ 
++    internal void ProcessBuildDone(ICheckContext checkContext)
++    {
++        if (!_buildCheckCentralContext.HasBuildFinishedActions)
++        {
++            // No analyzer is interested in the event -> nothing to do.
++            return;
++        }
++
++        _buildCheckCentralContext.RunBuildFinishedActions(new BuildFinishedCheckData(), checkContext, ReportResult);
++    }
++
+     internal void ProcessTaskStartedEventArgs(
+         ICheckContext checkContext,
+         TaskStartedEventArgs taskStartedEventArgs)
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+index b8bb1c15d78..fdd3e04ebcc 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+@@ -21,16 +21,30 @@ internal static bool IsActionInObservedScope(
+         EvaluationCheckScope scope,
+         IMsBuildElementLocation? location,
+         string projectFileFullPath)
++        => IsActionInObservedScope(scope, location?.File, projectFileFullPath);
++
++    /// <summary>
++    /// Indicates whether given location is in the observed scope, based on currently built project path.
++    /// </summary>
++    /// <param name="scope"></param>
++    /// <param name="filePathOfEvent"></param>
++    /// <param name="projectFileFullPath"></param>
++    /// <returns></returns>
++    /// <exception cref="ArgumentOutOfRangeException"></exception>
++    internal static bool IsActionInObservedScope(
++        EvaluationCheckScope scope,
++        string? filePathOfEvent,
++        string projectFileFullPath)
+     {
+         switch (scope)
+         {
+             case EvaluationCheckScope.ProjectFileOnly:
+-                return location != null && location.File == projectFileFullPath;
++                return filePathOfEvent == projectFileFullPath;
+             case EvaluationCheckScope.WorkTreeImports:
+                 return
+-                    location != null &&
+-                    !FileClassifier.Shared.IsNonModifiable(location.File) &&
+-                    !IsGeneratedNugetImport(location.File);
++                    filePathOfEvent != null &&
++                    !FileClassifier.Shared.IsNonModifiable(filePathOfEvent) &&
++                    !IsGeneratedNugetImport(filePathOfEvent);
+             case EvaluationCheckScope.All:
+                 return true;
+             default:
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+index 81b74bca9fb..eb12b5de287 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+@@ -55,6 +55,8 @@ void ProcessTaskParameterEventArgs(
+         ICheckContext checksContext,
+         TaskParameterEventArgs taskParameterEventArgs);
+ 
++    void ProcessBuildFinished(ICheckContext analysisContext);
++
+     void SetDataSource(BuildCheckDataSource buildCheckDataSource);
+ 
+     void ProcessCheckAcquisition(CheckAcquisitionData acquisitionData, ICheckContext checksContext);
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+index 272a25d75ad..1436bbdc6e0 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+@@ -22,6 +22,10 @@ public void ProcessEvaluationFinishedEventArgs(
+     {
+     }
+ 
++    public void ProcessBuildFinished(ICheckContext analysisContext)
++    {
++    }
++
+     public void SetDataSource(BuildCheckDataSource buildCheckDataSource)
+     {
+     }
+diff --git a/src/Build/BuildCheck/OM/BuildFinishedCheckData.cs b/src/Build/BuildCheck/OM/BuildFinishedCheckData.cs
+new file mode 100644
+index 00000000000..e22cf937908
+--- /dev/null
++++ b/src/Build/BuildCheck/OM/BuildFinishedCheckData.cs
+@@ -0,0 +1,11 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Experimental.BuildCheck;
++
++/// <summary>
++/// BuildCheck data indicating end of the build.
++/// This is the last event that can be received from the BuildCheck infrastructure.
++/// </summary>
++public class BuildFinishedCheckData() : CheckData(string.Empty, null)
++{ }
+diff --git a/src/Build/CompatibilitySuppressions.xml b/src/Build/CompatibilitySuppressions.xml
+index b90200708a7..2e51f01cc8c 100644
+--- a/src/Build/CompatibilitySuppressions.xml
++++ b/src/Build/CompatibilitySuppressions.xml
+@@ -449,6 +449,13 @@
+     <Right>ref/net8.0/Microsoft.Build.dll</Right>
+     <IsBaselineSuppression>true</IsBaselineSuppression>
+   </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0006</DiagnosticId>
++    <Target>M:Microsoft.Build.Experimental.BuildCheck.IBuildCheckRegistrationContext.RegisterBuildFinishedAction(System.Action{Microsoft.Build.Experimental.BuildCheck.BuildCheckDataContext{Microsoft.Build.Experimental.BuildCheck.BuildFinishedCheckData}})</Target>
++    <Left>lib/net472/Microsoft.Build.dll</Left>
++    <Right>lib/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
+   <Suppression>
+     <DiagnosticId>CP0006</DiagnosticId>
+     <Target>M:Microsoft.Build.Experimental.BuildCheck.IBuildCheckRegistrationContext.RegisterEvaluatedPropertiesAction(System.Action{Microsoft.Build.Experimental.BuildCheck.BuildCheckDataContext{Microsoft.Build.Experimental.BuildCheck.EvaluatedPropertiesCheckData}})</Target>
+@@ -470,6 +477,13 @@
+     <Right>lib/net472/Microsoft.Build.dll</Right>
+     <IsBaselineSuppression>true</IsBaselineSuppression>
+   </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0006</DiagnosticId>
++    <Target>M:Microsoft.Build.Experimental.BuildCheck.IBuildCheckRegistrationContext.RegisterBuildFinishedAction(System.Action{Microsoft.Build.Experimental.BuildCheck.BuildCheckDataContext{Microsoft.Build.Experimental.BuildCheck.BuildFinishedCheckData}})</Target>
++    <Left>lib/net8.0/Microsoft.Build.dll</Left>
++    <Right>lib/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
+   <Suppression>
+     <DiagnosticId>CP0006</DiagnosticId>
+     <Target>M:Microsoft.Build.Experimental.BuildCheck.IBuildCheckRegistrationContext.RegisterEvaluatedPropertiesAction(System.Action{Microsoft.Build.Experimental.BuildCheck.BuildCheckDataContext{Microsoft.Build.Experimental.BuildCheck.EvaluatedPropertiesCheckData}})</Target>
+@@ -491,6 +505,13 @@
+     <Right>lib/net8.0/Microsoft.Build.dll</Right>
+     <IsBaselineSuppression>true</IsBaselineSuppression>
+   </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0006</DiagnosticId>
++    <Target>M:Microsoft.Build.Experimental.BuildCheck.IBuildCheckRegistrationContext.RegisterBuildFinishedAction(System.Action{Microsoft.Build.Experimental.BuildCheck.BuildCheckDataContext{Microsoft.Build.Experimental.BuildCheck.BuildFinishedCheckData}})</Target>
++    <Left>ref/net8.0/Microsoft.Build.dll</Left>
++    <Right>ref/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
+   <Suppression>
+     <DiagnosticId>CP0006</DiagnosticId>
+     <Target>M:Microsoft.Build.Experimental.BuildCheck.IBuildCheckRegistrationContext.RegisterEvaluatedPropertiesAction(System.Action{Microsoft.Build.Experimental.BuildCheck.BuildCheckDataContext{Microsoft.Build.Experimental.BuildCheck.EvaluatedPropertiesCheckData}})</Target>
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 0f9e93efd4e..1ae09fc506e 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -6,6 +6,7 @@
+ using System.IO;
+ using System.Linq;
+ using System.Xml;
++using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.UnitTests;
+ using Microsoft.Build.UnitTests.Shared;
+@@ -208,11 +209,51 @@ public void NoEnvironmentVariableProperty_Test(bool? customConfigEnabled, string
+             customConfigData);
+ 
+         string output = RunnerUtilities.ExecBootstrapedMSBuild(
+-            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -check", out bool success, false, _env.Output, timeoutMilliseconds: 120_000);
++            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -check", out bool success, false, _env.Output);
+ 
+         output.ShouldContain(expectedMessage);
+     }
+ 
++    [Theory]
++    [InlineData(EvaluationCheckScope.ProjectFileOnly)]
++    [InlineData(EvaluationCheckScope.WorkTreeImports)]
++    [InlineData(EvaluationCheckScope.All)]
++    public void NoEnvironmentVariableProperty_Scoping(EvaluationCheckScope scope)
++    {
++        List<(string RuleId, (string ConfigKey, string Value) CustomConfig)>? customConfigData = null;
++
++        string editorconfigScope = scope switch
++        {
++            EvaluationCheckScope.ProjectFileOnly => "project_file",
++            EvaluationCheckScope.WorkTreeImports => "work_tree_imports",
++            EvaluationCheckScope.All => "all",
++            _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
++        };
++
++        customConfigData = new List<(string, (string, string))>()
++        {
++            ("BC0103", ("scope", editorconfigScope)),
++        };
++
++        PrepareSampleProjectsAndConfig(
++            buildInOutOfProcessNode: true,
++            out TransientTestFile projectFile,
++            new List<(string, string)>() { ("BC0103", "error") },
++            customConfigData);
++
++        string output = RunnerUtilities.ExecBootstrapedMSBuild(
++            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -check", out bool success, false, _env.Output);
++
++        if(scope == EvaluationCheckScope.ProjectFileOnly)
++        {
++            output.ShouldNotContain("Property is derived from environment variable: 'TestImported'. Properties should be passed explicitly using the /p option.");
++        }
++        else
++        {
++            output.ShouldContain("Property is derived from environment variable: 'TestImported'. Properties should be passed explicitly using the /p option.");
++        }
++    }
++
+     [Theory]
+     [InlineData("CheckCandidate", new[] { "CustomRule1", "CustomRule2" })]
+     [InlineData("CheckCandidateWithMultipleChecksInjected", new[] { "CustomRule1", "CustomRule2", "CustomRule3" }, true)]
+@@ -273,6 +314,23 @@ public void CustomCheckTest_WithEditorConfig(string checkCandidate, string ruleI
+         }
+     }
+ 
++    [Theory]
++    [InlineData(true)]
++    [InlineData(false)]
++    public void DoesNotRunOnRestore(bool buildInOutOfProcessNode)
++    {
++        PrepareSampleProjectsAndConfig(buildInOutOfProcessNode, out TransientTestFile projectFile, new List<(string, string)>() { ("BC0101", "warning") });
++
++        string output = RunnerUtilities.ExecBootstrapedMSBuild(
++            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -t:restore -check",
++            out bool success);
++
++        success.ShouldBeTrue();
++        output.ShouldNotContain("BC0101");
++        output.ShouldNotContain("BC0102");
++        output.ShouldNotContain("BC0103");
++    }
++
+     private void AddCustomDataSourceToNugetConfig(string checkCandidatePath)
+     {
+         var nugetTemplatePath = Path.Combine(checkCandidatePath, "nugetTemplate.config");
+@@ -324,9 +382,11 @@ private void PrepareSampleProjectsAndConfig(
+ 
+         string contents = ReadAndAdjustProjectContent("Project1");
+         string contents2 = ReadAndAdjustProjectContent("Project2");
++        string contentsImported = ReadAndAdjustProjectContent("ImportedFile1");
+ 
+         projectFile = _env.CreateFile(workFolder, "FooBar.csproj", contents);
+         TransientTestFile projectFile2 = _env.CreateFile(workFolder, "FooBar-Copy.csproj", contents2);
++        TransientTestFile importedFile1 = _env.CreateFile(workFolder, "ImportedFile1.props", contentsImported);
+ 
+         _env.CreateFile(workFolder, ".editorconfig", ReadEditorConfig(ruleToSeverity, ruleToCustomConfig, testAssetsFolderName));
+ 
+@@ -339,6 +399,7 @@ private void PrepareSampleProjectsAndConfig(
+         _env.SetEnvironmentVariable("MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION", "1");
+ 
+         _env.SetEnvironmentVariable("TEST", "FromEnvVariable");
++        _env.SetEnvironmentVariable("TestImported", "FromEnv");
+ 
+         string ReadAndAdjustProjectContent(string fileName) =>
+             File.ReadAllText(Path.Combine(TestAssetsRootPath, testAssetsFolderName, fileName))
+diff --git a/src/BuildCheck.UnitTests/MockBuildCheckRegistrationContext.cs b/src/BuildCheck.UnitTests/MockBuildCheckRegistrationContext.cs
+index 4c858fdf455..954f69ed050 100644
+--- a/src/BuildCheck.UnitTests/MockBuildCheckRegistrationContext.cs
++++ b/src/BuildCheck.UnitTests/MockBuildCheckRegistrationContext.cs
+@@ -22,6 +22,8 @@ public void RegisterEvaluatedPropertiesAction(Action<BuildCheckDataContext<Evalu
+         public void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationCheckData>> taskInvocationAction)
+             => _taskInvocationAction += taskInvocationAction;
+ 
++        public void RegisterBuildFinishedAction(Action<BuildCheckDataContext<BuildFinishedCheckData>> buildFinishedAction) => throw new NotImplementedException();
++
+         public void TriggerTaskInvocationAction(TaskInvocationCheckData data)
+         {
+             if (_taskInvocationAction is not null)
+diff --git a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/ImportedFile1 b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/ImportedFile1
+new file mode 100644
+index 00000000000..ff344c1d281
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/ImportedFile1
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project>
++
++    <PropertyGroup Condition="$(TestImported) == true">
++        <TestProperty>TestImported</TestProperty>
++    </PropertyGroup>
++
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project1 b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project1
+index 15f7efc4ff6..4412879248c 100644
+--- a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project1
++++ b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project1
+@@ -6,12 +6,13 @@
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+-     
++
++   <Import Project="ImportedFile1.props" />
++
+    <PropertyGroup Condition="$(Test) == true">
+        <TestProperty>Test</TestProperty>
+    </PropertyGroup>
+ 
+-
+    <Target Name="Hello">
+        <Message Importance="High" Condition="$(Test2) == true" Text="XYZABC" />
+        <Copy SourceFiles="TestFilePath" DestinationFolder="WorkFolderPath" />
+diff --git a/src/Framework/CompatibilitySuppressions.xml b/src/Framework/CompatibilitySuppressions.xml
+index 2545a39b99a..0555875eb66 100644
+--- a/src/Framework/CompatibilitySuppressions.xml
++++ b/src/Framework/CompatibilitySuppressions.xml
+@@ -1,11 +1,6 @@
+ ﻿<?xml version="1.0" encoding="utf-8"?>
+ <!-- https://learn.microsoft.com/en-us/dotnet/fundamentals/package-validation/diagnostic-ids -->
+ <Suppressions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+-  <!-- PKV004 for netstandard2.0-supporting TFs that we do not have runtime assemblies for.
+-       This is intentional, because you can only use MSBuild in the context of a .NET SDK
+-       (on net7.0, as of MSBuild 17.4) or in the context of Visual Studio (net472), but we
+-       have previously shipped netstandard2.0 packages, and if you want to support both
+-       runtime contexts it still makes sense to target that. -->
+   <Suppression>
+     <DiagnosticId>PKV004</DiagnosticId>
+     <Target>.NETCoreApp,Version=v2.0</Target>
+@@ -54,4 +49,4 @@
+     <DiagnosticId>PKV004</DiagnosticId>
+     <Target>Xamarin.XboxOne,Version=v0.0</Target>
+   </Suppression>
+-</Suppressions>
++</Suppressions>
+\ No newline at end of file
+diff --git a/template_feed/content/Microsoft.CheckTemplate/Company.CheckTemplate.props b/template_feed/content/Microsoft.CheckTemplate/Company.CheckTemplate.props
+index 050b67fb18a..167b0912cf7 100644
+--- a/template_feed/content/Microsoft.CheckTemplate/Company.CheckTemplate.props
++++ b/template_feed/content/Microsoft.CheckTemplate/Company.CheckTemplate.props
+@@ -3,7 +3,4 @@
+   <PropertyGroup>
+ 	  <MSBuildCheck>$([MSBuild]::RegisterBuildCheck($(MSBuildThisFileDirectory)Company.CheckTemplate.dll))</MSBuildCheck>
+   </PropertyGroup>
+-  <ItemGroup>
+-    <PackageVersion Include="Microsoft.Build" Version="1.0.0-MicrosoftBuildPackageVersion" />
+-  </ItemGroup>
+ </Project>
+diff --git a/template_feed/content/Microsoft.CheckTemplate/Directory.Packages.props b/template_feed/content/Microsoft.CheckTemplate/Directory.Packages.props
+new file mode 100644
+index 00000000000..c6d3f5fb1e5
+--- /dev/null
++++ b/template_feed/content/Microsoft.CheckTemplate/Directory.Packages.props
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project>
++  <ItemGroup>
++    <PackageVersion Include="Microsoft.Build" Version="1.0.0-MicrosoftBuildPackageVersion" />
++  </ItemGroup>
++</Project>
+\ No newline at end of file

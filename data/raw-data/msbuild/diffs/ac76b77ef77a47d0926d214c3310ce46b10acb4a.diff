@@ -1,0 +1,3076 @@
+diff --git a/src/Analyzers.UnitTests/EndToEndTests.cs b/src/Analyzers.UnitTests/EndToEndTests.cs
+index 5347a09b19e..7a573b23b3f 100644
+--- a/src/Analyzers.UnitTests/EndToEndTests.cs
++++ b/src/Analyzers.UnitTests/EndToEndTests.cs
+@@ -29,8 +29,10 @@ public EndToEndTests(ITestOutputHelper output)
+ 
+         public void Dispose() => _env.Dispose();
+ 
+-        [Fact]
+-        public void SampleAnalyzerIntegrationTest()
++        [Theory]
++        [InlineData(true)]
++        [InlineData(false)]
++        public void SampleAnalyzerIntegrationTest(bool buildInOutOfProcessNode)
+         {
+             string contents = $"""
+                 <Project Sdk="Microsoft.NET.Sdk" DefaultTargets="Hello">
+@@ -114,7 +116,7 @@ public void SampleAnalyzerIntegrationTest()
+             // TODO: See if there is a way of fixing it in the engine.
+             _env.SetCurrentDirectory(Path.GetDirectoryName(projectFile.Path));
+ 
+-            // env.SetEnvironmentVariable("MSBUILDNOINPROCNODE", "1");
++            _env.SetEnvironmentVariable("MSBUILDNOINPROCNODE", buildInOutOfProcessNode ? "1" : "0");
+             _env.SetEnvironmentVariable("MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION", "1");
+             // string output = RunnerUtilities.ExecMSBuild($"{projectFile.Path} /m:1 -nr:False", out bool success);
+             string output = BootstrapRunner.ExecBootstrapedMSBuild($"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -analyze", out bool success);
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 63a9b0c7ca8..aa8310d26a7 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -21,6 +21,7 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BackEnd.SdkResolution;
++using Microsoft.Build.BuildCop.Infrastructure;
+ using Microsoft.Build.BuildCop.Logging;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Eventing;
+@@ -630,7 +631,6 @@ ILoggingService InitializeLoggingService()
+             {
+                 ILoggingService loggingService = CreateLoggingService(
+                     AppendDebuggingLoggers(_buildParameters.Loggers),
+-                    _buildParameters.BuildCopLoggerFactory,
+                     _buildParameters.ForwardingLoggers,
+                     _buildParameters.WarningsAsErrors,
+                     _buildParameters.WarningsNotAsErrors,
+@@ -2948,7 +2948,6 @@ private void OnProjectStarted(object sender, ProjectStartedEventArgs e)
+         /// </summary>
+         private ILoggingService CreateLoggingService(
+             IEnumerable<ILogger> loggers,
+-            IBuildCopLoggerFactory buildCopLoggerFactory,
+             IEnumerable<ForwardingLoggerRecord> forwardingLoggers,
+             ISet<string> warningsAsErrors,
+             ISet<string> warningsNotAsErrors,
+@@ -2976,12 +2975,15 @@ private ILoggingService CreateLoggingService(
+             loggingService.WarningsNotAsErrors = warningsNotAsErrors;
+             loggingService.WarningsAsMessages = warningsAsMessages;
+ 
+-            if (buildCopLoggerFactory != null)
++            var buildCopManagerProvider =
++                ((IBuildComponentHost)this).GetComponent(BuildComponentType.BuildCop) as BuildCopManagerProvider;
++            buildCopManagerProvider!.Instance.SetDataSource(BuildCopDataSource.EventArgs);
++
++            if (((IBuildComponentHost)this).BuildParameters.IsBuildCopEnabled)
+             {
+                 loggers = (loggers ?? Enumerable.Empty<ILogger>()).Concat(new[]
+                 {
+-                    buildCopLoggerFactory.CreateBuildAnalysisLogger(
+-                        new AnalyzerLoggingContextFactory(loggingService))
++                    new BuildCopConnectorLogger(new AnalyzerLoggingContextFactory(loggingService), buildCopManagerProvider.Instance)
+                 });
+             }
+ 
+diff --git a/src/Build/BackEnd/BuildManager/BuildParameters.cs b/src/Build/BackEnd/BuildManager/BuildParameters.cs
+index a08d68a1d45..43683f7e658 100644
+--- a/src/Build/BackEnd/BuildManager/BuildParameters.cs
++++ b/src/Build/BackEnd/BuildManager/BuildParameters.cs
+@@ -209,6 +209,8 @@ public class BuildParameters : ITranslatable
+ 
+         private bool _question;
+ 
++        private bool _isBuildCopEnabled;
++
+         /// <summary>
+         /// The settings used to load the project under build
+         /// </summary>
+@@ -311,7 +313,7 @@ internal BuildParameters(BuildParameters other, bool resetEnvironment = false)
+             DiscardBuildResults = other.DiscardBuildResults;
+             LowPriority = other.LowPriority;
+             Question = other.Question;
+-            BuildCopLoggerFactory = other.BuildCopLoggerFactory;
++            IsBuildCopEnabled = other.IsBuildCopEnabled;
+             ProjectCacheDescriptor = other.ProjectCacheDescriptor;
+         }
+ 
+@@ -840,7 +842,11 @@ public bool Question
+         /// <summary>
+         /// Gets or sets a factory for build analysis infrastructure logger
+         /// </summary>
+-        public IBuildCopLoggerFactory BuildCopLoggerFactory { get; set; }
++        public bool IsBuildCopEnabled
++        {
++            get => _isBuildCopEnabled;
++            set => _isBuildCopEnabled = value;
++        }
+ 
+         /// <summary>
+         /// Gets or sets the project cache description to use for all <see cref="BuildSubmission"/> or <see cref="GraphBuildSubmission"/>
+@@ -906,6 +912,7 @@ void ITranslatable.Translate(ITranslator translator)
+             translator.TranslateEnum(ref _projectLoadSettings, (int)_projectLoadSettings);
+             translator.Translate(ref _interactive);
+             translator.Translate(ref _question);
++            translator.Translate(ref _isBuildCopEnabled);
+             translator.TranslateEnum(ref _projectIsolationMode, (int)_projectIsolationMode);
+             translator.Translate(ref _reportFileAccesses);
+ 
+diff --git a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+index 70a4bf0aeef..16a51cfb086 100644
+--- a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
++++ b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+@@ -2,8 +2,10 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using Microsoft.Build.BackEnd.Components.Caching;
+ using Microsoft.Build.BackEnd.SdkResolution;
++using Microsoft.Build.BuildCop.Infrastructure;
+ using Microsoft.Build.FileAccesses;
+ using Microsoft.Build.Shared;
+ 
+@@ -76,6 +78,8 @@ public void RegisterDefaultFactories()
+             // NodeEndpoint,
+             _componentEntriesByType[BuildComponentType.LoggingService] = new BuildComponentEntry(BuildComponentType.LoggingService, null);
+             _componentEntriesByType[BuildComponentType.RequestBuilder] = new BuildComponentEntry(BuildComponentType.RequestBuilder, RequestBuilder.CreateComponent, CreationPattern.CreateAlways);
++            // This conditionally registers real or no-op implementation based on BuildParameters
++            _componentEntriesByType[BuildComponentType.BuildCop] = new BuildComponentEntry(BuildComponentType.BuildCop, BuildCopManagerProvider.CreateComponent, CreationPattern.Singleton);
+             _componentEntriesByType[BuildComponentType.TargetBuilder] = new BuildComponentEntry(BuildComponentType.TargetBuilder, TargetBuilder.CreateComponent, CreationPattern.CreateAlways);
+             _componentEntriesByType[BuildComponentType.TaskBuilder] = new BuildComponentEntry(BuildComponentType.TaskBuilder, TaskBuilder.CreateComponent, CreationPattern.CreateAlways);
+             _componentEntriesByType[BuildComponentType.RegisteredTaskObjectCache] = new BuildComponentEntry(BuildComponentType.RegisteredTaskObjectCache, RegisteredTaskObjectCache.CreateComponent, CreationPattern.Singleton);
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+index 297ac265e0e..6b880af201a 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+@@ -10,6 +10,7 @@
+ using System.Threading;
+ using System.Threading.Tasks.Dataflow;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCop.Infrastructure;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+@@ -281,6 +282,9 @@ public void CleanupForBuild()
+                         TraceEngine("CFB: Rethrowing shutdown exceptions");
+                         throw new AggregateException(deactivateExceptions);
+                     }
++
++                    var buildCopManager = (_componentHost.GetComponent(BuildComponentType.BuildCop) as BuildCopManagerProvider)!.Instance;
++                    buildCopManager.FinalizeProcessing(_nodeLoggingContext);
+                 },
+                 isLastTask: true);
+ 
+diff --git a/src/Build/BackEnd/Components/IBuildComponentHost.cs b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+index 5ae9d947906..e7392d7d42c 100644
+--- a/src/Build/BackEnd/Components/IBuildComponentHost.cs
++++ b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+@@ -142,6 +142,11 @@ internal enum BuildComponentType
+         /// The component which launches new MSBuild nodes.
+         /// </summary>
+         NodeLauncher,
++
++        /// <summary>
++        /// The Build Analyzer Manager.
++        /// </summary>
++        BuildCop,
+     }
+ 
+     /// <summary>
+diff --git a/src/Build/BackEnd/Components/Logging/EventSourceSink.cs b/src/Build/BackEnd/Components/Logging/EventSourceSink.cs
+index 340dfafc495..5ac9a885806 100644
+--- a/src/Build/BackEnd/Components/Logging/EventSourceSink.cs
++++ b/src/Build/BackEnd/Components/Logging/EventSourceSink.cs
+@@ -2,6 +2,8 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
++using Microsoft.Build.BuildCop.Infrastructure;
++using Microsoft.Build.Experimental.BuildCop;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+@@ -98,6 +100,11 @@ internal sealed class EventSourceSink :
+         /// This event is raised to log telemetry.
+         /// </summary>
+         public event TelemetryEventHandler TelemetryLogged;
++
++        /// <summary>
++        /// This event is raised to log build cop events.
++        /// </summary>
++        public event BuildCopEventHandler BuildCopEventRaised;
+         #endregion
+ 
+         #region Properties
+@@ -263,6 +270,10 @@ public void Consume(BuildEventArgs buildEvent)
+                 case TelemetryEventArgs telemetryEvent:
+                     RaiseTelemetryEvent(null, telemetryEvent);
+                     break;
++                case BuildCopEventArgs buildCopEvent:
++                    RaiseBuildCopEvent(null, buildCopEvent);
++                    break;
++
+                 default:
+                     ErrorUtilities.ThrowInternalError("Unknown event args type.");
+                     break;
+@@ -848,6 +859,40 @@ private void RaiseStatusEvent(object sender, BuildStatusEventArgs buildEvent)
+             RaiseAnyEvent(sender, buildEvent);
+         }
+ 
++        private void RaiseBuildCopEvent(object sender, BuildCopEventArgs buildEvent)
++        {
++            if (BuildCopEventRaised != null)
++            {
++                try
++                {
++                    BuildCopEventRaised(sender, buildEvent);
++                }
++                catch (LoggerException)
++                {
++                    // if a logger has failed politely, abort immediately
++                    // first unregister all loggers, since other loggers may receive remaining events in unexpected orderings
++                    // if a fellow logger is throwing in an event handler.
++                    this.UnregisterAllEventHandlers();
++                    throw;
++                }
++                catch (Exception exception)
++                {
++                    // first unregister all loggers, since other loggers may receive remaining events in unexpected orderings
++                    // if a fellow logger is throwing in an event handler.
++                    this.UnregisterAllEventHandlers();
++
++                    if (ExceptionHandling.IsCriticalException(exception))
++                    {
++                        throw;
++                    }
++
++                    InternalLoggerException.Throw(exception, buildEvent, "FatalErrorWhileLogging", false);
++                }
++            }
++
++            RaiseAnyEvent(sender, buildEvent);
++        }
++
+         /// <summary>
+         /// Raises a catch-all build event to all registered loggers.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index 0d98b32f5a8..d1e4318702f 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -10,11 +10,13 @@
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCop.Infrastructure;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Eventing;
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Execution;
++using Microsoft.Build.Experimental.BuildCop;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+@@ -1116,6 +1118,11 @@ private void SetProjectCurrentDirectory()
+         /// </summary>
+         private async Task<BuildResult> BuildProject()
+         {
++            // We consider this the entrypoint for the project build for purposes of BuildCop processing 
++
++            var buildCopManager = (_componentHost.GetComponent(BuildComponentType.BuildCop) as BuildCopManagerProvider)!.Instance;
++            buildCopManager.SetDataSource(BuildCopDataSource.BuildExecution);
++
+             ErrorUtilities.VerifyThrow(_targetBuilder != null, "Target builder is null");
+ 
+             // Make sure it is null before loading the configuration into the request, because if there is a problem
+@@ -1130,11 +1137,21 @@ private async Task<BuildResult> BuildProject()
+                 // Load the project
+                 if (!_requestEntry.RequestConfiguration.IsLoaded)
+                 {
++                    buildCopManager.StartProjectEvaluation(
++                        BuildCopDataSource.BuildExecution,
++                        _requestEntry.Request.ParentBuildEventContext,
++                        _requestEntry.RequestConfiguration.ProjectFullPath);
++
+                     _requestEntry.RequestConfiguration.LoadProjectIntoConfiguration(
+                         _componentHost,
+                         RequestEntry.Request.BuildRequestDataFlags,
+                         RequestEntry.Request.SubmissionId,
+                         _nodeLoggingContext.BuildEventContext.NodeId);
++
++                    // todo: in a using scope (autocleanup)
++                    buildCopManager.EndProjectEvaluation(
++                        BuildCopDataSource.BuildExecution,
++                        _requestEntry.Request.ParentBuildEventContext);
+                 }
+             }
+             catch
+@@ -1150,6 +1167,9 @@ private async Task<BuildResult> BuildProject()
+             }
+ 
+             _projectLoggingContext = _nodeLoggingContext.LogProjectStarted(_requestEntry);
++            buildCopManager.StartProjectRequest(
++                BuildCopDataSource.BuildExecution,
++                _requestEntry.Request.ParentBuildEventContext);
+ 
+             // Now that the project has started, parse a few known properties which indicate warning codes to treat as errors or messages
+             //
+@@ -1202,6 +1222,10 @@ private async Task<BuildResult> BuildProject()
+                 MSBuildEventSource.Log.BuildProjectStop(_requestEntry.RequestConfiguration.ProjectFullPath, string.Join(", ", allTargets));
+             }
+ 
++            buildCopManager.EndProjectEvaluation(
++                BuildCopDataSource.BuildExecution,
++                _requestEntry.Request.ParentBuildEventContext);
++
+             return result;
+ 
+             BuildResult CopyTargetResultsFromProxyTargetsToRealTargets(BuildResult resultFromTargetBuilder)
+diff --git a/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs b/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
+index eda42874f86..75abeacda63 100644
+--- a/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
++++ b/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
+@@ -475,6 +475,10 @@ internal void LoadProjectIntoConfiguration(
+                 {
+                     projectLoadSettings |= ProjectLoadSettings.FailOnUnresolvedSdk;
+                 }
++
++                // Here - is we'll have in-execution analysis and it'll need DOM from Project,
++                //  this is the place for Project creation.
++
+                 return new ProjectInstance(
+                     ProjectFullPath,
+                     globalProperties,
+diff --git a/src/Build/BuildCop/API/BuildAnalysisContext.cs b/src/Build/BuildCop/API/BuildAnalysisContext.cs
+deleted file mode 100644
+index 4a9f578eca4..00000000000
+--- a/src/Build/BuildCop/API/BuildAnalysisContext.cs
++++ /dev/null
+@@ -1,28 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-using System.Collections.Generic;
+-using System.Linq;
+-using System.Text;
+-using System.Threading.Tasks;
+-using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCop.Infrastructure;
+-using Microsoft.Build.Experimental;
+-using Microsoft.Build.Framework;
+-
+-namespace Microsoft.Build.Experimental.BuildCop;
+-
+-public class BuildAnalysisContext
+-{
+-    private protected readonly LoggingContext _loggingContext;
+-
+-    internal BuildAnalysisContext(LoggingContext loggingContext) => _loggingContext = loggingContext;
+-
+-    public void ReportResult(BuildAnalyzerResult result)
+-    {
+-        BuildEventArgs eventArgs = result.ToEventArgs(ConfigurationProvider.GetMergedConfiguration(result.BuildAnalyzerRule).Severity);
+-        eventArgs.BuildEventContext = _loggingContext.BuildEventContext;
+-        _loggingContext.LogBuildEvent(eventArgs);
+-    }
+-}
+diff --git a/src/Build/BuildCop/API/BuildAnalyzer.cs b/src/Build/BuildCop/API/BuildAnalyzer.cs
+index f7ff0b948c2..1eac8835fa3 100644
+--- a/src/Build/BuildCop/API/BuildAnalyzer.cs
++++ b/src/Build/BuildCop/API/BuildAnalyzer.cs
+@@ -1,16 +1,21 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
++using System.Collections.Generic;
+ using System.Collections.Immutable;
+ using Microsoft.Build.BuildCop.Infrastructure;
+ 
+ namespace Microsoft.Build.Experimental.BuildCop;
+ 
+-public abstract class BuildAnalyzer
++public abstract class BuildAnalyzer : IDisposable
+ {
+     public abstract string FriendlyName { get; }
+-    public abstract ImmutableArray<BuildAnalyzerRule> SupportedRules { get; }
++    public abstract IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; }
+     public abstract void Initialize(ConfigurationContext configurationContext);
+ 
+     public abstract void RegisterActions(IBuildCopContext context);
++
++    public virtual void Dispose()
++    { }
+ }
+diff --git a/src/Build/BuildCop/API/BuildAnalyzerConfiguration.cs b/src/Build/BuildCop/API/BuildAnalyzerConfiguration.cs
+index f7a45e08031..19ab210e097 100644
+--- a/src/Build/BuildCop/API/BuildAnalyzerConfiguration.cs
++++ b/src/Build/BuildCop/API/BuildAnalyzerConfiguration.cs
+@@ -3,11 +3,19 @@
+ 
+ namespace Microsoft.Build.Experimental.BuildCop;
+ 
++/// <summary>
++/// Configuration for a build analyzer.
++/// Default values can be specified by the Analyzer in code.
++/// Users can overwrite the defaults by explicit settings in the .editorconfig file.
++/// Each rule can have its own configuration, which can differ per each project.
++/// The <see cref="EvaluationAnalysisScope"/> setting must be same for all rules in the same analyzer (but can differ between projects)
++/// </summary>
+ public class BuildAnalyzerConfiguration
+ {
++    // Defaults to be used if any configuration property is not specified neither as default
++    //  nor in the editorconfig configuration file.
+     public static BuildAnalyzerConfiguration Default { get; } = new()
+     {
+-        LifeTimeScope = BuildCop.LifeTimeScope.PerProject,
+         EvaluationAnalysisScope = BuildCop.EvaluationAnalysisScope.AnalyzedProjectOnly,
+         Severity = BuildAnalyzerResultSeverity.Info,
+         IsEnabled = false,
+@@ -15,8 +23,23 @@ public class BuildAnalyzerConfiguration
+ 
+     public static BuildAnalyzerConfiguration Null { get; } = new();
+ 
+-    public LifeTimeScope? LifeTimeScope { get; internal init; }
++    /// <summary>
++    /// This applies only to specific events, that can distinguish whether they are directly inferred from
++    ///  the current project, or from some import. If supported it can help tuning the level of detail or noise from analysis.
++    ///
++    /// If not supported by the data source - then the setting is ignored
++    /// </summary>
+     public EvaluationAnalysisScope? EvaluationAnalysisScope { get; internal init; }
++
++    /// <summary>
++    /// The severity of the result for the rule.
++    /// </summary>
+     public BuildAnalyzerResultSeverity? Severity { get; internal init; }
++
++    /// <summary>
++    /// Whether the analyzer rule is enabled.
++    /// If all rules within the analyzer are not enabled, it will not be run.
++    /// If some rules are enabled and some are not, the analyzer will be run and reports will be post-filtered.
++    /// </summary>
+     public bool? IsEnabled { get; internal init; }
+ }
+diff --git a/src/Build/BuildCop/API/BuildAnalyzerResult.cs b/src/Build/BuildCop/API/BuildAnalyzerResult.cs
+deleted file mode 100644
+index 7c348f7fa2b..00000000000
+--- a/src/Build/BuildCop/API/BuildAnalyzerResult.cs
++++ /dev/null
+@@ -1,115 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-using System.IO;
+-using Microsoft.Build.Construction;
+-using Microsoft.Build.Framework;
+-
+-namespace Microsoft.Build.Experimental.BuildCop;
+-
+-public class BuildAnalyzerResult
+-{
+-    public static BuildAnalyzerResult Create(BuildAnalyzerRule rule, ElementLocation location, params string[] messageArgs)
+-    {
+-        return new BuildAnalyzerResult(rule, location, messageArgs);
+-    }
+-
+-    public BuildAnalyzerResult(BuildAnalyzerRule buildAnalyzerRule, ElementLocation location, string[] messageArgs)
+-    {
+-        BuildAnalyzerRule = buildAnalyzerRule;
+-        Location = location;
+-        MessageArgs = messageArgs;
+-    }
+-
+-    internal BuildEventArgs ToEventArgs(BuildAnalyzerResultSeverity severity)
+-        => severity switch
+-        {
+-            BuildAnalyzerResultSeverity.Info => new BuildAnalysisResultMessage(this),
+-            BuildAnalyzerResultSeverity.Warning => new BuildAnalysisResultWarning(this),
+-            BuildAnalyzerResultSeverity.Error => new BuildAnalysisResultError(this),
+-            _ => throw new ArgumentOutOfRangeException(nameof(severity), severity, null),
+-        };
+-
+-    public BuildAnalyzerRule BuildAnalyzerRule { get; }
+-    public ElementLocation Location { get; }
+-    public string[] MessageArgs { get; }
+-
+-    private string? _message;
+-    public string Message => _message ??= $"{(Equals(Location ?? ElementLocation.EmptyLocation, ElementLocation.EmptyLocation) ? string.Empty : (Location!.LocationString + ": "))}{BuildAnalyzerRule.Id}: {string.Format(BuildAnalyzerRule.MessageFormat, MessageArgs)}";
+-}
+-
+-public sealed class BuildAnalysisResultWarning : BuildWarningEventArgs
+-{
+-    public BuildAnalysisResultWarning(BuildAnalyzerResult result)
+-    {
+-        this.Message = result.Message;
+-    }
+-
+-
+-    internal override void WriteToStream(BinaryWriter writer)
+-    {
+-        base.WriteToStream(writer);
+-
+-        writer.Write(Message!);
+-    }
+-
+-    internal override void CreateFromStream(BinaryReader reader, int version)
+-    {
+-        base.CreateFromStream(reader, version);
+-
+-        Message = reader.ReadString();
+-    }
+-
+-    public override string? Message { get; protected set; }
+-}
+-
+-public sealed class BuildAnalysisResultError : BuildErrorEventArgs
+-{
+-    public BuildAnalysisResultError(BuildAnalyzerResult result)
+-    {
+-        this.Message = result.Message;
+-    }
+-
+-
+-    internal override void WriteToStream(BinaryWriter writer)
+-    {
+-        base.WriteToStream(writer);
+-
+-        writer.Write(Message!);
+-    }
+-
+-    internal override void CreateFromStream(BinaryReader reader, int version)
+-    {
+-        base.CreateFromStream(reader, version);
+-
+-        Message = reader.ReadString();
+-    }
+-
+-    public override string? Message { get; protected set; }
+-}
+-
+-public sealed class BuildAnalysisResultMessage : BuildMessageEventArgs
+-{
+-    public BuildAnalysisResultMessage(BuildAnalyzerResult result)
+-    {
+-        this.Message = result.Message;
+-    }
+-
+-
+-    internal override void WriteToStream(BinaryWriter writer)
+-    {
+-        base.WriteToStream(writer);
+-
+-        writer.Write(Message!);
+-    }
+-
+-    internal override void CreateFromStream(BinaryReader reader, int version)
+-    {
+-        base.CreateFromStream(reader, version);
+-
+-        Message = reader.ReadString();
+-    }
+-
+-    public override string? Message { get; protected set; }
+-}
+diff --git a/src/Build/BuildCop/API/BuildCopLoggerFactory.cs b/src/Build/BuildCop/API/BuildCopLoggerFactory.cs
+deleted file mode 100644
+index d0d9c6a2e08..00000000000
+--- a/src/Build/BuildCop/API/BuildCopLoggerFactory.cs
++++ /dev/null
+@@ -1,20 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-using System.Collections.Generic;
+-using System.Linq;
+-using System.Text;
+-using System.Threading.Tasks;
+-using Microsoft.Build.BuildCop.Infrastructure;
+-using Microsoft.Build.Framework;
+-
+-namespace Microsoft.Build.Experimental.BuildCop;
+-
+-public class BuildCopLoggerFactory : IBuildCopLoggerFactory
+-{
+-    public ILogger CreateBuildAnalysisLogger(IBuildAnalysisLoggingContextFactory loggingContextFactory)
+-    {
+-        return new BuildCopConnectorLogger(loggingContextFactory, BuildCopManager.Instance);
+-    }
+-}
+diff --git a/src/Build/BuildCop/API/BuildCopResult.cs b/src/Build/BuildCop/API/BuildCopResult.cs
+new file mode 100644
+index 00000000000..9a2842178d0
+--- /dev/null
++++ b/src/Build/BuildCop/API/BuildCopResult.cs
+@@ -0,0 +1,52 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Framework;
++
++namespace Microsoft.Build.Experimental.BuildCop;
++
++/// <summary>
++/// Representation of a single report of a single finding from a BuildAnalyzer
++/// Each rule has upfront known message format - so only the concrete arguments are added
++/// Optionally a location is attached - in the near future we might need to support multiple locations
++///  (for 2 cases - a) grouped result for multiple occurrences; b) a single report for a finding resulting from combination of multiple locations)
++/// </summary>
++public sealed class BuildCopResult : IBuildCopResult
++{
++    public static BuildCopResult Create(BuildAnalyzerRule rule, ElementLocation location, params string[] messageArgs)
++    {
++        return new BuildCopResult(rule, location, messageArgs);
++    }
++
++    public BuildCopResult(BuildAnalyzerRule buildAnalyzerRule, ElementLocation location, string[] messageArgs)
++    {
++        BuildAnalyzerRule = buildAnalyzerRule;
++        Location = location;
++        MessageArgs = messageArgs;
++    }
++
++    internal BuildEventArgs ToEventArgs(BuildAnalyzerResultSeverity severity)
++        => severity switch
++        {
++            BuildAnalyzerResultSeverity.Info => new BuildCopResultMessage(this),
++            BuildAnalyzerResultSeverity.Warning => new BuildCopResultWarning(this),
++            BuildAnalyzerResultSeverity.Error => new BuildCopResultError(this),
++            _ => throw new ArgumentOutOfRangeException(nameof(severity), severity, null),
++        };
++
++    public BuildAnalyzerRule BuildAnalyzerRule { get; }
++    public ElementLocation Location { get; }
++
++    public string LocationString => Location.LocationString;
++
++    public string[] MessageArgs { get; }
++    public string MessageFormat => BuildAnalyzerRule.MessageFormat;
++
++    public string FormatMessage() =>
++        _message ??= $"{(Equals(Location ?? ElementLocation.EmptyLocation, ElementLocation.EmptyLocation) ? string.Empty : (Location!.LocationString + ": "))}{BuildAnalyzerRule.Id}: {string.Format(BuildAnalyzerRule.MessageFormat, MessageArgs)}";
++
++    private string? _message;
++}
+diff --git a/src/Build/BuildCop/API/ConfigurationContext.cs b/src/Build/BuildCop/API/ConfigurationContext.cs
+index 0aba0f87344..83fdbfdcbde 100644
+--- a/src/Build/BuildCop/API/ConfigurationContext.cs
++++ b/src/Build/BuildCop/API/ConfigurationContext.cs
+@@ -1,16 +1,40 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
+ using System.Collections.Generic;
++using System.Linq;
++using Microsoft.Build.BuildCop.Infrastructure;
+ 
+ namespace Microsoft.Build.Experimental.BuildCop;
+ 
+ /// <summary>
+-/// Holder of an optional configuration from .editorconfig file (not recognized by infrastructure)
++/// Holder of an optional configuration from .editorconfig file (not recognized by the infrastructure)
+ /// </summary>
+ public class ConfigurationContext
+ {
+-    public static ConfigurationContext Null { get; } = new();
++    private ConfigurationContext(CustomConfigurationData[] customConfigurationData)
++    {
++        CustomConfigurationData = customConfigurationData;
++    }
+ 
+-    public IReadOnlyDictionary<string, string>? ConfigurationData { get; init; }
++    public static ConfigurationContext FromDataEnumeration(CustomConfigurationData[] customConfigurationData)
++    {
++        if (!customConfigurationData.Any(BuildCop.CustomConfigurationData.NotNull))
++        {
++            return Null;
++        }
++
++        return new ConfigurationContext(
++            customConfigurationData
++                .Where(BuildCop.CustomConfigurationData.NotNull)
++                .ToArray());
++    }
++
++    public static ConfigurationContext Null { get; } = new(Array.Empty<CustomConfigurationData>());
++
++    /// <summary>
++    /// Custom configuration data - per each rule that has some specified.
++    /// </summary>
++    public CustomConfigurationData[] CustomConfigurationData { get; init; }
+ }
+diff --git a/src/Build/BuildCop/API/EvaluationAnalysisScope.cs b/src/Build/BuildCop/API/EvaluationAnalysisScope.cs
+index 843826723dc..f8979ed8257 100644
+--- a/src/Build/BuildCop/API/EvaluationAnalysisScope.cs
++++ b/src/Build/BuildCop/API/EvaluationAnalysisScope.cs
+@@ -3,10 +3,31 @@
+ 
+ namespace Microsoft.Build.Experimental.BuildCop;
+ 
++/// <summary>
++/// For datasource events that can differentiate from where exactly they originate - e.g.
++///  For a condition string or AST - was that directly in hte analyzed project or imported?
++///
++/// Ignored by infrastructure if the current datasource doesn't support this level of setting.
++/// </summary>
+ public enum EvaluationAnalysisScope
+ {
++    /// <summary>
++    /// Only the data from currently analyzed project will be sent to the analyzer. Imports will be discarded.
++    /// </summary>
+     AnalyzedProjectOnly,
++
++    /// <summary>
++    /// Only the data from currently analyzed project and imports from files under the entry project or solution will be sent to the analyzer. Other imports will be discarded.
++    /// </summary>
+     AnalyzedProjectWithImportsFromCurrentWorkTree,
++
++    /// <summary>
++    /// Imports from SDKs will not be sent to the analyzer. Other imports will be sent.
++    /// </summary>
+     AnalyzedProjectWithImportsWithoutSdks,
++
++    /// <summary>
++    /// All data will be sent to the analyzer.
++    /// </summary>
+     AnalyzedProjectWithAllImports,
+ }
+diff --git a/src/Build/BuildCop/API/LifeTimeScope.cs b/src/Build/BuildCop/API/LifeTimeScope.cs
+deleted file mode 100644
+index 485da9c1781..00000000000
+--- a/src/Build/BuildCop/API/LifeTimeScope.cs
++++ /dev/null
+@@ -1,11 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-namespace Microsoft.Build.Experimental.BuildCop;
+-
+-public enum LifeTimeScope
+-{
+-    Stateless,
+-    PerProject,
+-    PerBuild,
+-}
+diff --git a/src/Build/BuildCop/Acquisition/AnalyzerAcquisitionData.cs b/src/Build/BuildCop/Acquisition/AnalyzerAcquisitionData.cs
+new file mode 100644
+index 00000000000..1f75152284f
+--- /dev/null
++++ b/src/Build/BuildCop/Acquisition/AnalyzerAcquisitionData.cs
+@@ -0,0 +1,26 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.Experimental.BuildCop;
++
++namespace Microsoft.Build.BuildCop.Acquisition;
++
++// TODO: Acquisition
++//  define the data that will be passed to the acquisition module (and remoted if needed)
++internal class AnalyzerAcquisitionData(string data)
++{
++    public string Data { get; init; } = data;
++}
++
++internal static class AnalyzerAcquisitionDataExtensions
++{
++    public static AnalyzerAcquisitionData ToAnalyzerAcquisitionData(this BuildCopAcquisitionEventArgs eventArgs) =>
++        new(eventArgs.AcquisitionData);
++
++    public static BuildCopAcquisitionEventArgs ToBuildEventArgs(this AnalyzerAcquisitionData data) => new(data.Data);
++}
+diff --git a/src/Build/BuildCop/Acquisition/BuildCopAcquisitionModule.cs b/src/Build/BuildCop/Acquisition/BuildCopAcquisitionModule.cs
+new file mode 100644
+index 00000000000..9131be44995
+--- /dev/null
++++ b/src/Build/BuildCop/Acquisition/BuildCopAcquisitionModule.cs
+@@ -0,0 +1,22 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BuildCop.Analyzers;
++using Microsoft.Build.BuildCop.Infrastructure;
++
++namespace Microsoft.Build.BuildCop.Acquisition;
++
++internal class BuildCopAcquisitionModule
++{
++    private static T Construct<T>() where T : new() => new();
++    public BuildAnalyzerFactory CreateBuildAnalyzerFactory(AnalyzerAcquisitionData analyzerAcquisitionData)
++    {
++        // TODO: Acquisition module
++        return Construct<SharedOutputPathAnalyzer>;
++    }
++}
+diff --git a/src/Build/BuildCop/Analyzers/SharedOutputPathAnalyzer.cs b/src/Build/BuildCop/Analyzers/SharedOutputPathAnalyzer.cs
+index 298643a7ced..fcb39a80dfc 100644
+--- a/src/Build/BuildCop/Analyzers/SharedOutputPathAnalyzer.cs
++++ b/src/Build/BuildCop/Analyzers/SharedOutputPathAnalyzer.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Collections.Immutable;
++using System.Diagnostics;
+ using System.IO;
+ using Microsoft.Build.BuildCop.Infrastructure;
+ using Microsoft.Build.Construction;
+@@ -27,7 +28,7 @@ internal sealed class SharedOutputPathAnalyzer : BuildAnalyzer
+ 
+     public override string FriendlyName => "MSBuild.SharedOutputPathAnalyzer";
+ 
+-    public override ImmutableArray<BuildAnalyzerRule> SupportedRules { get; } =[SupportedRule];
++    public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } =[SupportedRule];
+ 
+     public override void Initialize(ConfigurationContext configurationContext)
+     {
+@@ -42,17 +43,17 @@ public override void RegisterActions(IBuildCopContext context)
+     private readonly Dictionary<string, string> _projectsPerOutputPath = new(StringComparer.CurrentCultureIgnoreCase);
+     private readonly HashSet<string> _projects = new(StringComparer.CurrentCultureIgnoreCase);
+ 
+-    private void EvaluatedPropertiesAction(EvaluatedPropertiesContext context)
++    private void EvaluatedPropertiesAction(BuildAnalysisContext<EvaluatedPropertiesAnalysisData> context)
+     {
+-        if (!_projects.Add(context.ProjectFilePath))
++        if (!_projects.Add(context.Data.ProjectFilePath))
+         {
+             return;
+         }
+ 
+         string? binPath, objPath;
+ 
+-        context.EvaluatedProperties.TryGetValue("OutputPath", out binPath);
+-        context.EvaluatedProperties.TryGetValue("IntermediateOutputPath", out objPath);
++        context.Data.EvaluatedProperties.TryGetValue("OutputPath", out binPath);
++        context.Data.EvaluatedProperties.TryGetValue("IntermediateOutputPath", out objPath);
+ 
+         string? absoluteBinPath = CheckAndAddFullOutputPath(binPath, context);
+         if (
+@@ -65,14 +66,14 @@ private void EvaluatedPropertiesAction(EvaluatedPropertiesContext context)
+         }
+     }
+ 
+-    private string? CheckAndAddFullOutputPath(string? path, EvaluatedPropertiesContext context)
++    private string? CheckAndAddFullOutputPath(string? path, BuildAnalysisContext<EvaluatedPropertiesAnalysisData> context)
+     {
+         if (string.IsNullOrEmpty(path))
+         {
+             return path;
+         }
+ 
+-        string projectPath = context.ProjectFilePath;
++        string projectPath = context.Data.ProjectFilePath;
+ 
+         if (!Path.IsPathRooted(path))
+         {
+@@ -81,7 +82,7 @@ private void EvaluatedPropertiesAction(EvaluatedPropertiesContext context)
+ 
+         if (_projectsPerOutputPath.TryGetValue(path!, out string? conflictingProject))
+         {
+-            context.ReportResult(BuildAnalyzerResult.Create(
++            context.ReportResult(BuildCopResult.Create(
+                 SupportedRule,
+                 // TODO: let's support transmitting locations of specific properties
+                 ElementLocation.EmptyLocation,
+diff --git a/src/Build/BuildCop/Infrastructure/AnalyzersDelegates.cs b/src/Build/BuildCop/Infrastructure/AnalyzersDelegates.cs
+deleted file mode 100644
+index 46bac4c5f64..00000000000
+--- a/src/Build/BuildCop/Infrastructure/AnalyzersDelegates.cs
++++ /dev/null
+@@ -1,8 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-namespace Microsoft.Build.Experimental.BuildCop;
+-
+-public delegate void EvaluatedPropertiesAction(EvaluatedPropertiesContext context);
+-
+-public delegate void ParsedItemsAction(ParsedItemsContext context);
+diff --git a/src/Build/BuildCop/Infrastructure/BuildAnalyzerConfigurationInternal.cs b/src/Build/BuildCop/Infrastructure/BuildAnalyzerConfigurationInternal.cs
+index 7d8f6d9ebcf..2452c7e5124 100644
+--- a/src/Build/BuildCop/Infrastructure/BuildAnalyzerConfigurationInternal.cs
++++ b/src/Build/BuildCop/Infrastructure/BuildAnalyzerConfigurationInternal.cs
+@@ -10,8 +10,25 @@ namespace Microsoft.Build.BuildCop.Infrastructure;
+ /// </summary>
+ internal sealed class BuildAnalyzerConfigurationInternal
+ {
+-    public LifeTimeScope LifeTimeScope { get; internal init; }
+-    public EvaluationAnalysisScope EvaluationAnalysisScope { get; internal init; }
+-    public BuildAnalyzerResultSeverity Severity { get; internal init; }
+-    public bool IsEnabled { get; internal init; }
++    public BuildAnalyzerConfigurationInternal(string ruleId, EvaluationAnalysisScope evaluationAnalysisScope, BuildAnalyzerResultSeverity severity, bool isEnabled)
++    {
++        RuleId = ruleId;
++        EvaluationAnalysisScope = evaluationAnalysisScope;
++        Severity = severity;
++        IsEnabled = isEnabled;
++    }
++
++    public string RuleId { get; }
++    public EvaluationAnalysisScope EvaluationAnalysisScope { get; }
++    public BuildAnalyzerResultSeverity Severity { get; }
++    public bool IsEnabled { get; }
++
++    // Intentionally not checking the RuleId
++    //  as for analyzers with multiple rules, we can squash config to a single one,
++    //  if the ruleId is the only thing differing.
++    public bool IsEqual(BuildAnalyzerConfigurationInternal? other) =>
++        other != null &&
++        Severity == other.Severity &&
++        IsEnabled == other.IsEnabled &&
++        EvaluationAnalysisScope == other.EvaluationAnalysisScope;
+ }
+diff --git a/src/Build/BuildCop/Infrastructure/BuildAnalyzerTracingWrapper.cs b/src/Build/BuildCop/Infrastructure/BuildAnalyzerTracingWrapper.cs
+deleted file mode 100644
+index da2e5181af9..00000000000
+--- a/src/Build/BuildCop/Infrastructure/BuildAnalyzerTracingWrapper.cs
++++ /dev/null
+@@ -1,31 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-using System.Diagnostics;
+-using Microsoft.Build.Experimental.BuildCop;
+-
+-namespace Microsoft.Build.BuildCop.Infrastructure;
+-
+-internal sealed class BuildAnalyzerTracingWrapper
+-{
+-    private readonly Stopwatch _stopwatch = new Stopwatch();
+-
+-    public BuildAnalyzerTracingWrapper(BuildAnalyzer buildAnalyzer)
+-        => BuildAnalyzer = buildAnalyzer;
+-
+-    internal BuildAnalyzer BuildAnalyzer { get; }
+-
+-    internal TimeSpan Elapsed => _stopwatch.Elapsed;
+-
+-    internal IDisposable StartSpan()
+-    {
+-        _stopwatch.Start();
+-        return new CleanupScope(_stopwatch.Stop);
+-    }
+-
+-    internal readonly struct CleanupScope(Action disposeAction) : IDisposable
+-    {
+-        public void Dispose() => disposeAction();
+-    }
+-}
+diff --git a/src/Build/BuildCop/Infrastructure/BuildAnalyzerWrapper.cs b/src/Build/BuildCop/Infrastructure/BuildAnalyzerWrapper.cs
+new file mode 100644
+index 00000000000..173b3e48a5a
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/BuildAnalyzerWrapper.cs
+@@ -0,0 +1,72 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Linq;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Experimental.BuildCop;
++
++namespace Microsoft.Build.BuildCop.Infrastructure;
++
++/// <summary>
++/// A wrapping, enriching class for BuildAnalyzer - so that we have additional data and functionality.
++/// </summary>
++internal sealed class BuildAnalyzerWrapper
++{
++    private readonly Stopwatch _stopwatch = new Stopwatch();
++
++    public BuildAnalyzerWrapper(BuildAnalyzer buildAnalyzer)
++    {
++        BuildAnalyzer = buildAnalyzer;
++    }
++
++    internal BuildAnalyzer BuildAnalyzer { get; }
++    private bool _isInitialized = false;
++
++    internal BuildAnalyzerConfigurationInternal? CommonConfig { get; private set; }
++
++    // start new project
++    internal void StartNewProject(
++        string fullProjectPath,
++        IReadOnlyList<BuildAnalyzerConfigurationInternal> userConfigs)
++    {
++        if (!_isInitialized)
++        {
++            _isInitialized = true;
++            CommonConfig = userConfigs[0];
++
++            if (userConfigs.Count == 1)
++            {
++                return;
++            }
++        }
++
++        if (CommonConfig == null || !userConfigs.All(t => t.IsEqual(CommonConfig)))
++        {
++            CommonConfig = null;
++        }
++    }
++
++    // to be used on eval node (BuildCopDataSource.BuildExecution)
++    internal void Uninitialize()
++    {
++        _isInitialized = false;
++    }
++
++    internal TimeSpan Elapsed => _stopwatch.Elapsed;
++
++    internal void ClearStats() => _stopwatch.Reset();
++
++    internal IDisposable StartSpan()
++    {
++        _stopwatch.Start();
++        return new CleanupScope(_stopwatch.Stop);
++    }
++
++    internal readonly struct CleanupScope(Action disposeAction) : IDisposable
++    {
++        public void Dispose() => disposeAction();
++    }
++}
+diff --git a/src/Build/BuildCop/Infrastructure/BuildCopCentralContext.cs b/src/Build/BuildCop/Infrastructure/BuildCopCentralContext.cs
+index 6e970ab6557..7ad82c37c1f 100644
+--- a/src/Build/BuildCop/Infrastructure/BuildCopCentralContext.cs
++++ b/src/Build/BuildCop/Infrastructure/BuildCopCentralContext.cs
+@@ -1,39 +1,135 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Experimental.BuildCop;
+ 
+ namespace Microsoft.Build.BuildCop.Infrastructure;
+ 
++/// <summary>
++/// A manager of the runs of the analyzers - deciding based on configuration of what to run and what to postfilter.
++/// </summary>
+ internal sealed class BuildCopCentralContext
+ {
+-    private EvaluatedPropertiesAction? _evaluatedPropertiesActions;
+-    private ParsedItemsAction? _parsedItemsActions;
++    private record CallbackRegistry(
++        List<(BuildAnalyzerWrapper, Action<BuildAnalysisContext<EvaluatedPropertiesAnalysisData>>)> EvaluatedPropertiesActions,
++        List<(BuildAnalyzerWrapper, Action<BuildAnalysisContext<ParsedItemsAnalysisData>>)> ParsedItemsActions)
++    {
++        public CallbackRegistry() : this([],[]) { }
++    }
++
++    // In a future we can have callbacks per project as well
++    private readonly CallbackRegistry _globalCallbacks = new();
+ 
+     // This we can potentially use to subscribe for receiving evaluated props in the
+     //  build event args. However - this needs to be done early on, when analyzers might not be known yet
+-    internal bool HasEvaluatedPropertiesActions => _evaluatedPropertiesActions != null;
+-    internal bool HasParsedItemsActions => _parsedItemsActions != null;
++    internal bool HasEvaluatedPropertiesActions => _globalCallbacks.EvaluatedPropertiesActions.Any();
++    internal bool HasParsedItemsActions => _globalCallbacks.ParsedItemsActions.Any();
+ 
+-    internal void RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction evaluatedPropertiesAction)
+-    {
++    internal void RegisterEvaluatedPropertiesAction(BuildAnalyzerWrapper analyzer, Action<BuildAnalysisContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction)
+         // Here we might want to communicate to node that props need to be sent.
+         //  (it was being communicated via MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION)
+-        _evaluatedPropertiesActions += evaluatedPropertiesAction;
+-    }
++        => RegisterAction(analyzer, evaluatedPropertiesAction, _globalCallbacks.EvaluatedPropertiesActions);
++
++    internal void RegisterParsedItemsAction(BuildAnalyzerWrapper analyzer, Action<BuildAnalysisContext<ParsedItemsAnalysisData>> parsedItemsAction)
++        => RegisterAction(analyzer, parsedItemsAction, _globalCallbacks.ParsedItemsActions);
+ 
+-    internal void RegisterParsedItemsAction(ParsedItemsAction parsedItemsAction)
++    private void RegisterAction<T>(
++        BuildAnalyzerWrapper wrappedAnalyzer,
++        Action<BuildAnalysisContext<T>> handler,
++        List<(BuildAnalyzerWrapper, Action<BuildAnalysisContext<T>>)> handlersRegistry)
++        where T : AnalysisData
+     {
+-        _parsedItemsActions += parsedItemsAction;
++        void WrappedHandler(BuildAnalysisContext<T> context)
++        {
++            using var _ = wrappedAnalyzer.StartSpan();
++            handler(context);
++        }
++
++        lock (handlersRegistry)
++        {
++            handlersRegistry.Add((wrappedAnalyzer, WrappedHandler));
++        }
+     }
+ 
+-    internal void RunEvaluatedPropertiesActions(EvaluatedPropertiesContext evaluatedPropertiesContext)
++    internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
+     {
+-        _evaluatedPropertiesActions?.Invoke(evaluatedPropertiesContext);
++        _globalCallbacks.EvaluatedPropertiesActions.RemoveAll(a => a.Item1 == analyzer);
++        _globalCallbacks.ParsedItemsActions.RemoveAll(a => a.Item1 == analyzer);
+     }
+ 
+-    internal void RunParsedItemsActions(ParsedItemsContext parsedItemsContext)
++    internal void RunEvaluatedPropertiesActions(
++        EvaluatedPropertiesAnalysisData evaluatedPropertiesAnalysisData,
++        LoggingContext loggingContext,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCopResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.EvaluatedPropertiesActions, evaluatedPropertiesAnalysisData,
++            loggingContext, resultHandler);
++
++    internal void RunParsedItemsActions(
++        ParsedItemsAnalysisData parsedItemsAnalysisData,
++        LoggingContext loggingContext,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCopResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.ParsedItemsActions, parsedItemsAnalysisData,
++            loggingContext, resultHandler);
++
++    private void RunRegisteredActions<T>(
++        List<(BuildAnalyzerWrapper, Action<BuildAnalysisContext<T>>)> registeredCallbacks,
++        T analysisData,
++        LoggingContext loggingContext,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCopResult> resultHandler)
++    where T : AnalysisData
+     {
+-        _parsedItemsActions?.Invoke(parsedItemsContext);
++        string projectFullPath = analysisData.ProjectFilePath;
++
++        // Alternatively we might want to actually do this all in serial, but asynchronously (blocking queue)
++        Parallel.ForEach(
++            registeredCallbacks,
++            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
++            /* (BuildAnalyzerWrapper2, Action<BuildAnalysisContext<T>>) */
++            analyzerCallback =>
++            {
++                // TODO: tracing - we might want tp account this entire block
++                //  to the relevant analyzer (with only the currently accounted part as being the 'core-execution' subspan)
++
++                BuildAnalyzerConfigurationInternal? commonConfig = analyzerCallback.Item1.CommonConfig;
++                BuildAnalyzerConfigurationInternal[] configPerRule;
++
++                if (commonConfig != null)
++                {
++                    if (!commonConfig.IsEnabled)
++                    {
++                        return;
++                    }
++
++                    configPerRule = new[] { commonConfig };
++                }
++                else
++                {
++                    configPerRule =
++                        ConfigurationProvider.GetMergedConfigurations(projectFullPath,
++                            analyzerCallback.Item1.BuildAnalyzer);
++                    if (configPerRule.All(c => !c.IsEnabled))
++                    {
++                        return;
++                    }
++                }
++
++                // TODO: if the input data supports that - check the configPerRule[0].EvaluationAnalysisScope
++
++                BuildAnalysisContext<T> context = new BuildAnalysisContext<T>(
++                    analyzerCallback.Item1,
++                    loggingContext,
++                    configPerRule,
++                    resultHandler,
++                    analysisData);
++
++                analyzerCallback.Item2(context);
++            });
+     }
+ }
+diff --git a/src/Build/BuildCop/Infrastructure/BuildCopConfigurationException.cs b/src/Build/BuildCop/Infrastructure/BuildCopConfigurationException.cs
+new file mode 100644
+index 00000000000..4580fb03b81
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/BuildCopConfigurationException.cs
+@@ -0,0 +1,21 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.BuildCop.Infrastructure;
++
++internal class BuildCopConfigurationException : Exception
++{
++    /// <summary>
++    /// Exception to communicate issues with user specified configuration - unsupported scenarios, malformations, etc.
++    /// This exception usually leads to defuncting the particular analyzer for the rest of the build (even if issue occured with a single project).
++    /// </summary>
++    public BuildCopConfigurationException(string message) : base(message)
++    {
++    }
++}
+diff --git a/src/Build/BuildCop/Infrastructure/BuildCopConnectorLogger.cs b/src/Build/BuildCop/Infrastructure/BuildCopConnectorLogger.cs
+index 174bb24373f..16bdd714ea2 100644
+--- a/src/Build/BuildCop/Infrastructure/BuildCopConnectorLogger.cs
++++ b/src/Build/BuildCop/Infrastructure/BuildCopConnectorLogger.cs
+@@ -2,11 +2,15 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
++using System.Collections.Generic;
+ using System.Diagnostics;
++using System.Linq;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCop.Acquisition;
+ using Microsoft.Build.BuildCop.Logging;
+ using Microsoft.Build.Experimental.BuildCop;
+ using Microsoft.Build.Framework;
++
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+@@ -25,9 +29,13 @@ public void Initialize(IEventSource eventSource)
+ 
+     private void EventSource_AnyEventRaised(object sender, BuildEventArgs e)
+     {
+-        if (e is ProjectEvaluationFinishedEventArgs projectEvaluationFinishedEventArgs &&
+-            !(projectEvaluationFinishedEventArgs.ProjectFile?.EndsWith(".metaproj") ?? false))
++        if (e is ProjectEvaluationFinishedEventArgs projectEvaluationFinishedEventArgs)
+         {
++            if (projectEvaluationFinishedEventArgs.ProjectFile?.EndsWith(".metaproj") ?? false)
++            {
++                return;
++            }
++
+             try
+             {
+                 buildCopManager.ProcessEvaluationFinishedEventArgs(
+@@ -40,20 +48,56 @@ private void EventSource_AnyEventRaised(object sender, BuildEventArgs e)
+                 Console.WriteLine(exception);
+                 throw;
+             }
++
++            buildCopManager.EndProjectEvaluation(BuildCopDataSource.EventArgs, e.BuildEventContext!);
++        }
++        else if (e is ProjectEvaluationStartedEventArgs projectEvaluationStartedEventArgs)
++        {
++            if (projectEvaluationStartedEventArgs.ProjectFile?.EndsWith(".metaproj") ?? false)
++            {
++                return;
++            }
++
++            buildCopManager.StartProjectEvaluation(BuildCopDataSource.EventArgs, e.BuildEventContext!,
++                projectEvaluationStartedEventArgs.ProjectFile!);
++        }
++        else if (e is ProjectStartedEventArgs projectStartedEvent)
++        {
++            buildCopManager.StartProjectRequest(BuildCopDataSource.EventArgs, e.BuildEventContext!);
++        }
++        else if (e is ProjectFinishedEventArgs projectFinishedEventArgs)
++        {
++            buildCopManager.EndProjectRequest(BuildCopDataSource.EventArgs, e.BuildEventContext!);
++        }
++        else if (e is BuildCopEventArgs buildCopBuildEventArgs)
++        {
++            if (buildCopBuildEventArgs is BuildCopTracingEventArgs tracingEventArgs)
++            {
++                _stats.Merge(tracingEventArgs.TracingData, (span1, span2) => span1 + span2);
++            }
++            else if (buildCopBuildEventArgs is BuildCopAcquisitionEventArgs acquisitionEventArgs)
++            {
++                buildCopManager.ProcessAnalyzerAcquisition(acquisitionEventArgs.ToAnalyzerAcquisitionData());
++            }
+         }
+-        // here handling of other event types
+     }
+ 
++    private readonly Dictionary<string, TimeSpan> _stats = new Dictionary<string, TimeSpan>();
++
+     private void EventSource_BuildFinished(object sender, BuildFinishedEventArgs e)
+     {
++        _stats.Merge(buildCopManager.CreateTracingStats(), (span1, span2) => span1 + span2);
++        string msg = string.Join(Environment.NewLine, _stats.Select(a => a.Key + ": " + a.Value));
++
++
+         BuildEventContext buildEventContext = e.BuildEventContext ?? new BuildEventContext(
+             BuildEventContext.InvalidNodeId, BuildEventContext.InvalidTargetId,
+             BuildEventContext.InvalidProjectContextId, BuildEventContext.InvalidTaskId);
+ 
+         LoggingContext loggingContext = loggingContextFactory.CreateLoggingContext(buildEventContext).ToLoggingContext();
+ 
+-        // TODO: here flush the tracing stats: https://github.com/dotnet/msbuild/issues/9629
+-        loggingContext.LogCommentFromText(MessageImportance.High, buildCopManager.CreateTracingStats());
++        // TODO: tracing: https://github.com/dotnet/msbuild/issues/9629
++        loggingContext.LogCommentFromText(MessageImportance.High, msg);
+     }
+ 
+     public void Shutdown()
+diff --git a/src/Build/BuildCop/Infrastructure/BuildCopContext.cs b/src/Build/BuildCop/Infrastructure/BuildCopContext.cs
+index 240468b1700..2bfa8c6eaae 100644
+--- a/src/Build/BuildCop/Infrastructure/BuildCopContext.cs
++++ b/src/Build/BuildCop/Infrastructure/BuildCopContext.cs
+@@ -1,31 +1,36 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
++using System.Threading;
+ using Microsoft.Build.Experimental.BuildCop;
+ 
+ namespace Microsoft.Build.BuildCop.Infrastructure;
+ 
+-internal sealed class BuildCopContext(BuildAnalyzerTracingWrapper analyzer, BuildCopCentralContext buildCopCentralContext) : IBuildCopContext
++internal sealed class BuildCopContext(BuildAnalyzerWrapper analyzerWrapper, BuildCopCentralContext buildCopCentralContext) : IBuildCopContext
+ {
+-    public void RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction evaluatedPropertiesAction)
++    private int _evaluatedPropertiesActionCount;
++    private int _parsedItemsActionCount;
++
++    public void RegisterEvaluatedPropertiesAction(Action<BuildAnalysisContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction)
+     {
+-        void WrappedEvaluatedPropertiesAction(EvaluatedPropertiesContext context)
++        if (Interlocked.Increment(ref _evaluatedPropertiesActionCount) > 1)
+         {
+-            using var _ = analyzer.StartSpan();
+-            evaluatedPropertiesAction(context);
++            throw new BuildCopConfigurationException(
++                $"Analyzer '{analyzerWrapper.BuildAnalyzer.FriendlyName}' attempted to call '{nameof(RegisterEvaluatedPropertiesAction)}' multiple times.");
+         }
+ 
+-        buildCopCentralContext.RegisterEvaluatedPropertiesAction(WrappedEvaluatedPropertiesAction);
++        buildCopCentralContext.RegisterEvaluatedPropertiesAction(analyzerWrapper, evaluatedPropertiesAction);
+     }
+ 
+-    public void RegisterParsedItemsAction(ParsedItemsAction parsedItemsAction)
++    public void RegisterParsedItemsAction(Action<BuildAnalysisContext<ParsedItemsAnalysisData>> parsedItemsAction)
+     {
+-        void WrappedParsedItemsAction(ParsedItemsContext context)
++        if (Interlocked.Increment(ref _parsedItemsActionCount) > 1)
+         {
+-            using var _ = analyzer.StartSpan();
+-            parsedItemsAction(context);
++            throw new BuildCopConfigurationException(
++                $"Analyzer '{analyzerWrapper.BuildAnalyzer.FriendlyName}' attempted to call '{nameof(RegisterParsedItemsAction)}' multiple times.");
+         }
+ 
+-        buildCopCentralContext.RegisterParsedItemsAction(WrappedParsedItemsAction);
++        buildCopCentralContext.RegisterParsedItemsAction(analyzerWrapper, parsedItemsAction);
+     }
+ }
+diff --git a/src/Build/BuildCop/Infrastructure/BuildCopManager.cs b/src/Build/BuildCop/Infrastructure/BuildCopManager.cs
+deleted file mode 100644
+index 984bb2dfb71..00000000000
+--- a/src/Build/BuildCop/Infrastructure/BuildCopManager.cs
++++ /dev/null
+@@ -1,101 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-using System.Collections.Generic;
+-using System.Collections.ObjectModel;
+-using System.Linq;
+-using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCop.Analyzers;
+-using Microsoft.Build.BuildCop.Logging;
+-using Microsoft.Build.Construction;
+-using Microsoft.Build.Evaluation;
+-using Microsoft.Build.Experimental.BuildCop;
+-using Microsoft.Build.Framework;
+-
+-namespace Microsoft.Build.BuildCop.Infrastructure;
+-
+-internal sealed class BuildCopManager : IBuildCopManager
+-{
+-    private readonly List<BuildAnalyzerTracingWrapper> _analyzers = new();
+-    private readonly BuildCopCentralContext _buildCopCentralContext = new();
+-
+-    private BuildCopManager() { }
+-
+-    internal static IBuildCopManager Instance => CreateBuildAnalysisManager();
+-
+-    public void RegisterAnalyzer(BuildAnalyzer analyzer)
+-    {
+-        if (!analyzer.SupportedRules.Any())
+-        {
+-            // error out
+-            return;
+-        }
+-
+-        IEnumerable<BuildAnalyzerConfigurationInternal> configuration = analyzer.SupportedRules.Select(ConfigurationProvider.GetMergedConfiguration);
+-
+-        if (configuration.All(c => !c.IsEnabled))
+-        {
+-            return;
+-        }
+-
+-        // TODO: the config module should return any possible user configurations per rule
+-        ConfigurationContext configurationContext = ConfigurationContext.Null;
+-        analyzer.Initialize(configurationContext);
+-        var wrappedAnalyzer = new BuildAnalyzerTracingWrapper(analyzer);
+-        var wrappedContext = new BuildCopContext(wrappedAnalyzer, _buildCopCentralContext);
+-        analyzer.RegisterActions(wrappedContext);
+-        _analyzers.Add(wrappedAnalyzer);
+-    }
+-
+-    // TODO: all this processing should be queued and done async. We might even want to run analyzers in parallel
+-
+-    private SimpleProjectRootElementCache _cache = new SimpleProjectRootElementCache();
+-
+-    // This requires MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION set to 1
+-    public void ProcessEvaluationFinishedEventArgs(IBuildAnalysisLoggingContext buildAnalysisContext,
+-        ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs)
+-    {
+-        LoggingContext loggingContext = buildAnalysisContext.ToLoggingContext();
+-
+-        Dictionary<string, string> propertiesLookup = new Dictionary<string, string>();
+-        Internal.Utilities.EnumerateProperties(evaluationFinishedEventArgs.Properties, propertiesLookup,
+-            static (dict, kvp) => dict.Add(kvp.Key, kvp.Value));
+-
+-        EvaluatedPropertiesContext context = new EvaluatedPropertiesContext(loggingContext,
+-            new ReadOnlyDictionary<string, string>(propertiesLookup),
+-            evaluationFinishedEventArgs.ProjectFile!);
+-
+-        _buildCopCentralContext.RunEvaluatedPropertiesActions(context);
+-
+-        if (_buildCopCentralContext.HasParsedItemsActions)
+-        {
+-            ProjectRootElement xml = ProjectRootElement.OpenProjectOrSolution(evaluationFinishedEventArgs.ProjectFile!, /*unused*/
+-                null, /*unused*/null, _cache, false /*Not explicitly loaded - unused*/);
+-
+-            ParsedItemsContext parsedItemsContext = new ParsedItemsContext(loggingContext,
+-                new ItemsHolder(xml.Items, xml.ItemGroups));
+-
+-            _buildCopCentralContext.RunParsedItemsActions(parsedItemsContext);
+-        }
+-    }
+-
+-    // TODO: tracing: https://github.com/dotnet/msbuild/issues/9629
+-    // should have infra as well, should log to BuildCopConnectorLogger upon shutdown (if requested)
+-    public string CreateTracingStats()
+-    {
+-        return string.Join(Environment.NewLine,
+-            _analyzers.Select(a => GetAnalyzerDescriptor(a.BuildAnalyzer) + ": " + a.Elapsed));
+-
+-        string GetAnalyzerDescriptor(BuildAnalyzer buildAnalyzer)
+-            => buildAnalyzer.FriendlyName + " (" + buildAnalyzer.GetType() + ")";
+-    }
+-
+-    internal static BuildCopManager CreateBuildAnalysisManager()
+-    {
+-        var buildAnalysisManager = new BuildCopManager();
+-        buildAnalysisManager.RegisterAnalyzer(new SharedOutputPathAnalyzer());
+-        // ... Register other internal analyzers
+-        return buildAnalysisManager;
+-    }
+-}
+diff --git a/src/Build/BuildCop/Infrastructure/BuildCopManagerProvider.cs b/src/Build/BuildCop/Infrastructure/BuildCopManagerProvider.cs
+new file mode 100644
+index 00000000000..c826f3854bc
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/BuildCopManagerProvider.cs
+@@ -0,0 +1,366 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Collections.ObjectModel;
++using System.Diagnostics;
++using System.Diagnostics.Tracing;
++using System.IO;
++using System.Linq;
++using System.Runtime.ConstrainedExecution;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.BackEnd.Components.Caching;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCop.Acquisition;
++using Microsoft.Build.BuildCop.Analyzers;
++using Microsoft.Build.BuildCop.Logging;
++using Microsoft.Build.Collections;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Evaluation;
++using Microsoft.Build.Experimental.BuildCop;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCop.Infrastructure;
++
++internal delegate BuildAnalyzer BuildAnalyzerFactory();
++internal delegate BuildAnalyzerWrapper BuildAnalyzerWrapperFactory(ConfigurationContext configurationContext);
++
++internal sealed class BuildCopManagerProvider : IBuildComponent
++{
++    private static bool s_isInitialized = false;
++    private static IBuildCopManager s_globalInstance = new NullBuildCopManager();
++    internal static IBuildCopManager GlobalInstance => s_isInitialized ? s_globalInstance : throw new InvalidOperationException("BuildCopManagerProvider not initialized");
++
++    internal IBuildCopManager Instance => GlobalInstance;
++
++    internal static IBuildComponent CreateComponent(BuildComponentType type)
++    {
++        ErrorUtilities.VerifyThrow(type == BuildComponentType.BuildCop, "Cannot create components of type {0}", type);
++        return new BuildCopManagerProvider();
++    }
++
++    public void InitializeComponent(IBuildComponentHost host)
++    {
++        ErrorUtilities.VerifyThrow(host != null, "BuildComponentHost was null");
++
++        if (s_isInitialized)
++        {
++            throw new InvalidOperationException("BuildCopManagerProvider is already initialized");
++        }
++        s_isInitialized = true;
++
++        if (host!.BuildParameters.IsBuildCopEnabled)
++        {
++            s_globalInstance = new BuildCopManager(host.LoggingService);
++        }
++        else
++        {
++            s_globalInstance = new NullBuildCopManager();
++        }
++    }
++
++    public void ShutdownComponent() => GlobalInstance.Shutdown();
++
++
++    private sealed class BuildCopManager : IBuildCopManager
++    {
++        private readonly TracingReporter _tracingReporter = new TracingReporter();
++        private readonly BuildCopCentralContext _buildCopCentralContext = new();
++        private readonly ILoggingService _loggingService;
++        private readonly List<BuildAnalyzerFactoryContext> _analyzersRegistry =[];
++        private readonly bool[] _enabledDataSources = new bool[(int)BuildCopDataSource.ValuesCount];
++        private readonly BuildEventsProcessor _buildEventsProcessor;
++        private readonly BuildCopAcquisitionModule _acquisitionModule = new();
++
++        private bool IsInProcNode => _enabledDataSources[(int)BuildCopDataSource.EventArgs] &&
++                                     _enabledDataSources[(int)BuildCopDataSource.BuildExecution];
++
++        /// <summary>
++        /// Notifies the manager that the data source will be used -
++        ///   so it should register the built-in analyzers for the source if it hasn't been done yet.
++        /// </summary>
++        /// <param name="buildCopDataSource"></param>
++        public void SetDataSource(BuildCopDataSource buildCopDataSource)
++        {
++            if (!_enabledDataSources[(int)buildCopDataSource])
++            {
++                _enabledDataSources[(int)buildCopDataSource] = true;
++                RegisterBuiltInAnalyzers(buildCopDataSource);
++            }
++        }
++
++        public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData)
++        {
++            if (IsInProcNode)
++            {
++                var factory = _acquisitionModule.CreateBuildAnalyzerFactory(acquisitionData);
++                RegisterCustomAnalyzer(BuildCopDataSource.EventArgs, factory);
++            }
++            else
++            {
++                BuildCopAcquisitionEventArgs eventArgs = acquisitionData.ToBuildEventArgs();
++
++                // TODO: We may want to pass the real context here (from evaluation)
++                eventArgs.BuildEventContext = new BuildEventContext(
++                    BuildEventContext.InvalidNodeId,
++                    BuildEventContext.InvalidProjectInstanceId,
++                    BuildEventContext.InvalidProjectContextId,
++                    BuildEventContext.InvalidTargetId,
++                    BuildEventContext.InvalidTaskId);
++            }
++        }
++
++        internal BuildCopManager(ILoggingService loggingService)
++        {
++            _loggingService = loggingService;
++            _buildEventsProcessor = new(_buildCopCentralContext);
++        }
++
++        private static T Construct<T>() where T : new() => new();
++        private static readonly (string[] ruleIds, bool defaultEnablement, BuildAnalyzerFactory factory)[][] s_builtInFactoriesPerDataSource =
++        [
++            // BuildCopDataSource.EventArgs
++            [
++                ([SharedOutputPathAnalyzer.SupportedRule.Id], SharedOutputPathAnalyzer.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<SharedOutputPathAnalyzer>)
++            ],
++            // BuildCopDataSource.Execution
++            []
++        ];
++
++        private void RegisterBuiltInAnalyzers(BuildCopDataSource buildCopDataSource)
++        {
++            _analyzersRegistry.AddRange(
++                s_builtInFactoriesPerDataSource[(int)buildCopDataSource]
++                    .Select(v => new BuildAnalyzerFactoryContext(v.factory, v.ruleIds, v.defaultEnablement)));
++        }
++
++        /// <summary>
++        /// To be used by acquisition module
++        /// Registeres the custom analyzer, the construction of analyzer is deferred until the first using project is encountered
++        /// </summary>
++        internal void RegisterCustomAnalyzer(
++            BuildCopDataSource buildCopDataSource,
++            BuildAnalyzerFactory factory,
++            string[] ruleIds,
++            bool defaultEnablement)
++        {
++            if (_enabledDataSources[(int)buildCopDataSource])
++            {
++                _analyzersRegistry.Add(new BuildAnalyzerFactoryContext(factory, ruleIds, defaultEnablement));
++            }
++        }
++
++        /// <summary>
++        /// To be used by acquisition module
++        /// Registeres the custom analyzer, the construction of analyzer is needed during registration
++        /// </summary>
++        internal void RegisterCustomAnalyzer(
++            BuildCopDataSource buildCopDataSource,
++            BuildAnalyzerFactory factory)
++        {
++            if (_enabledDataSources[(int)buildCopDataSource])
++            {
++                var instance = factory();
++                _analyzersRegistry.Add(new BuildAnalyzerFactoryContext(factory,
++                    instance.SupportedRules.Select(r => r.Id).ToArray(),
++                    instance.SupportedRules.Any(r => r.DefaultConfiguration.IsEnabled == true)));
++            }
++        }
++
++        private void SetupSingleAnalyzer(BuildAnalyzerFactoryContext analyzerFactoryContext, string projectFullPath, BuildEventContext buildEventContext)
++        {
++            // TODO: For user analyzers - it should run only on projects where referenced
++            //  on others it should work similarly as disabling them.
++            // Disabled analyzer should not only post-filter results - it shouldn't even see the data 
++
++            BuildAnalyzerWrapper wrapper;
++            BuildAnalyzerConfigurationInternal[] configurations;
++            if (analyzerFactoryContext.MaterializedAnalyzer == null)
++            {
++                BuildAnalyzerConfiguration[] userConfigs =
++                    ConfigurationProvider.GetUserConfigurations(projectFullPath, analyzerFactoryContext.RuleIds);
++
++                if (userConfigs.All(c => !(c.IsEnabled ?? analyzerFactoryContext.IsEnabledByDefault)))
++                {
++                    // the analyzer was not yet instantiated nor mounted - so nothing to do here now.
++                    return;
++                }
++
++                CustomConfigurationData[] customConfigData =
++                    ConfigurationProvider.GetCustomConfigurations(projectFullPath, analyzerFactoryContext.RuleIds);
++
++                ConfigurationContext configurationContext = ConfigurationContext.FromDataEnumeration(customConfigData);
++
++                wrapper = analyzerFactoryContext.Factory(configurationContext);
++                analyzerFactoryContext.MaterializedAnalyzer = wrapper;
++                BuildAnalyzer analyzer = wrapper.BuildAnalyzer;
++
++                if (
++                    analyzer.SupportedRules.Count != analyzerFactoryContext.RuleIds.Length
++                    ||
++                    !analyzer.SupportedRules.Select(r => r.Id)
++                        .SequenceEqual(analyzerFactoryContext.RuleIds, StringComparer.CurrentCultureIgnoreCase)
++                )
++                {
++                    throw new BuildCopConfigurationException(
++                        $"The analyzer '{analyzer.FriendlyName}' exposes rules '{analyzer.SupportedRules.Select(r => r.Id).ToCsvString()}', but different rules were declared during registration: '{analyzerFactoryContext.RuleIds.ToCsvString()}'");
++                }
++
++                configurations = ConfigurationProvider.GetMergedConfigurations(userConfigs, analyzer);
++
++                // technically all analyzers rules could be disabled, but that would mean
++                // that the provided 'IsEnabledByDefault' value wasn't correct - the only
++                // price to be paid in that case is slight performance cost.
++
++                // Create the wrapper and register to central context
++                wrapper.StartNewProject(projectFullPath, configurations);
++                var wrappedContext = new BuildCopContext(wrapper, _buildCopCentralContext);
++                analyzer.RegisterActions(wrappedContext);
++            }
++            else
++            {
++                wrapper = analyzerFactoryContext.MaterializedAnalyzer;
++
++                configurations = ConfigurationProvider.GetMergedConfigurations(projectFullPath, wrapper.BuildAnalyzer);
++
++                ConfigurationProvider.CheckCustomConfigurationDataValidity(projectFullPath,
++                    analyzerFactoryContext.RuleIds[0]);
++
++                // Update the wrapper
++                wrapper.StartNewProject(projectFullPath, configurations);
++            }
++
++            if (configurations.GroupBy(c => c.EvaluationAnalysisScope).Count() > 1)
++            {
++                throw new BuildCopConfigurationException(
++                    string.Format("All rules for a single analyzer should have the same EvaluationAnalysisScope for a single project (violating rules: [{0}], project: {1})",
++                        analyzerFactoryContext.RuleIds.ToCsvString(),
++                        projectFullPath));
++            }
++        }
++
++        private void SetupAnalyzersForNewProject(string projectFullPath, BuildEventContext buildEventContext)
++        {
++            // Only add analyzers here
++            // On an execution node - we might remove and dispose the analyzers once project is done
++
++            // If it's already constructed - just control the custom settings do not differ
++
++            List<BuildAnalyzerFactoryContext> analyzersToRemove = new();
++            foreach (BuildAnalyzerFactoryContext analyzerFactoryContext in _analyzersRegistry)
++            {
++                try
++                {
++                    SetupSingleAnalyzer(analyzerFactoryContext, projectFullPath, buildEventContext);
++                }
++                catch (BuildCopConfigurationException e)
++                {
++                    _loggingService.LogErrorFromText(buildEventContext, null, null, null,
++                        new BuildEventFileInfo(projectFullPath),
++                        e.Message);
++                    _loggingService.LogCommentFromText(buildEventContext, MessageImportance.High, $"Dismounting analyzer '{analyzerFactoryContext.FriendlyName}'");
++                    analyzersToRemove.Add(analyzerFactoryContext);
++                }
++            }
++
++            analyzersToRemove.ForEach(c => _analyzersRegistry.Remove(c));
++            foreach (var analyzerToRemove in analyzersToRemove.Select(a => a.MaterializedAnalyzer).Where(a => a != null))
++            {
++                _buildCopCentralContext.DeregisterAnalyzer(analyzerToRemove!);
++                _tracingReporter.AddStats(analyzerToRemove!.BuildAnalyzer.FriendlyName, analyzerToRemove.Elapsed);
++                analyzerToRemove.BuildAnalyzer.Dispose();
++            }
++        }
++
++
++        public void ProcessEvaluationFinishedEventArgs(
++            IBuildAnalysisLoggingContext buildAnalysisContext,
++            ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs)
++            => _buildEventsProcessor
++                .ProcessEvaluationFinishedEventArgs(buildAnalysisContext, evaluationFinishedEventArgs);
++
++        // TODO: tracing: https://github.com/dotnet/msbuild/issues/9629
++        public Dictionary<string, TimeSpan> CreateTracingStats()
++        {
++            foreach (BuildAnalyzerFactoryContext analyzerFactoryContext in _analyzersRegistry)
++            {
++                if (analyzerFactoryContext.MaterializedAnalyzer != null)
++                {
++                    _tracingReporter.AddStats(analyzerFactoryContext.FriendlyName,
++                        analyzerFactoryContext.MaterializedAnalyzer.Elapsed);
++                    analyzerFactoryContext.MaterializedAnalyzer.ClearStats();
++                }
++            }
++
++            return _tracingReporter.TracingStats;
++        }
++
++        public void FinalizeProcessing(LoggingContext loggingContext)
++        {
++            if (IsInProcNode)
++            {
++                // We do not want to send tracing stats from in-proc node
++                return;
++            }
++
++            BuildCopTracingEventArgs eventArgs =
++                new(CreateTracingStats()) { BuildEventContext = loggingContext.BuildEventContext };
++            loggingContext.LogBuildEvent(eventArgs);
++        }
++
++        public void StartProjectEvaluation(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext,
++            string fullPath)
++        {
++            if (buildCopDataSource == BuildCopDataSource.EventArgs && IsInProcNode)
++            {
++                // Skipping this event - as it was already handled by the in-proc node.
++                // This is because in-proc node has the BuildEventArgs source and BuildExecution source
++                //  both in a single manager. The project started is first encountered by the execution before the EventArg is sent
++                return;
++            }
++
++            SetupAnalyzersForNewProject(fullPath, buildEventContext);
++        }
++
++        /*
++         *
++         * Following methods are for future use (should we decide to approach in-execution analysis)
++         *
++         */
++
++
++        public void EndProjectEvaluation(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext)
++        {
++        }
++
++        public void StartProjectRequest(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext)
++        {
++        }
++
++        public void EndProjectRequest(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext)
++        {
++        }
++
++        public void Shutdown()
++        { /* Too late here for any communication to the main node or for logging anything */ }
++
++        private class BuildAnalyzerFactoryContext(
++            BuildAnalyzerFactory factory,
++            string[] ruleIds,
++            bool isEnabledByDefault)
++        {
++            public BuildAnalyzerWrapperFactory Factory { get; init; } = configContext =>
++            {
++                BuildAnalyzer ba = factory();
++                ba.Initialize(configContext);
++                return new BuildAnalyzerWrapper(ba);
++            };
++            public BuildAnalyzerWrapper? MaterializedAnalyzer { get; set; }
++            public string[] RuleIds { get; init; } = ruleIds;
++            public bool IsEnabledByDefault { get; init; } = isEnabledByDefault;
++            public string FriendlyName => MaterializedAnalyzer?.BuildAnalyzer.FriendlyName ?? factory().FriendlyName;
++        }
++    }
++}
+diff --git a/src/Build/BuildCop/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCop/Infrastructure/BuildEventsProcessor.cs
+new file mode 100644
+index 00000000000..b3299f9624d
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/BuildEventsProcessor.cs
+@@ -0,0 +1,88 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Collections.ObjectModel;
++using System.Diagnostics;
++using System.Diagnostics.Tracing;
++using System.IO;
++using System.Linq;
++using System.Runtime.ConstrainedExecution;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.BackEnd.Components.Caching;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCop.Analyzers;
++using Microsoft.Build.BuildCop.Logging;
++using Microsoft.Build.Collections;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Evaluation;
++using Microsoft.Build.Experimental.BuildCop;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCop.Infrastructure;
++
++internal class BuildEventsProcessor(BuildCopCentralContext buildCopCentralContext)
++{
++    private readonly SimpleProjectRootElementCache _cache = new SimpleProjectRootElementCache();
++    private readonly BuildCopCentralContext _buildCopCentralContext = buildCopCentralContext;
++
++    // This requires MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION set to 1
++    public void ProcessEvaluationFinishedEventArgs(
++        IBuildAnalysisLoggingContext buildAnalysisContext,
++        ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs)
++    {
++        LoggingContext loggingContext = buildAnalysisContext.ToLoggingContext();
++
++        Dictionary<string, string> propertiesLookup = new Dictionary<string, string>();
++        Internal.Utilities.EnumerateProperties(evaluationFinishedEventArgs.Properties, propertiesLookup,
++            static (dict, kvp) => dict.Add(kvp.Key, kvp.Value));
++
++        EvaluatedPropertiesAnalysisData analysisData =
++            new(evaluationFinishedEventArgs.ProjectFile!, propertiesLookup);
++
++        _buildCopCentralContext.RunEvaluatedPropertiesActions(analysisData, loggingContext, ReportResult);
++
++        if (_buildCopCentralContext.HasParsedItemsActions)
++        {
++            ProjectRootElement xml = ProjectRootElement.OpenProjectOrSolution(
++                evaluationFinishedEventArgs.ProjectFile!, /*unused*/
++                null, /*unused*/null, _cache, false /*Not explicitly loaded - unused*/);
++
++            ParsedItemsAnalysisData itemsAnalysisData = new(evaluationFinishedEventArgs.ProjectFile!,
++                new ItemsHolder(xml.Items, xml.ItemGroups));
++
++            _buildCopCentralContext.RunParsedItemsActions(itemsAnalysisData, loggingContext, ReportResult);
++        }
++    }
++
++    private static void ReportResult(
++        BuildAnalyzerWrapper analyzerWrapper,
++        LoggingContext loggingContext,
++        BuildAnalyzerConfigurationInternal[] configPerRule,
++        BuildCopResult result)
++    {
++        if (!analyzerWrapper.BuildAnalyzer.SupportedRules.Contains(result.BuildAnalyzerRule))
++        {
++            loggingContext.LogErrorFromText(null, null, null,
++                BuildEventFileInfo.Empty,
++                $"The analyzer '{analyzerWrapper.BuildAnalyzer.FriendlyName}' reported a result for a rule '{result.BuildAnalyzerRule.Id}' that it does not support.");
++            return;
++        }
++
++        BuildAnalyzerConfigurationInternal config = configPerRule.Length == 1
++            ? configPerRule[0]
++            : configPerRule.First(r =>
++                r.RuleId.Equals(result.BuildAnalyzerRule.Id, StringComparison.CurrentCultureIgnoreCase));
++
++        if (!config.IsEnabled)
++        {
++            return;
++        }
++
++        BuildEventArgs eventArgs = result.ToEventArgs(config.Severity);
++        eventArgs.BuildEventContext = loggingContext.BuildEventContext;
++        loggingContext.LogBuildEvent(eventArgs);
++    }
++}
+diff --git a/src/Build/BuildCop/Infrastructure/ConfigurationProvider.cs b/src/Build/BuildCop/Infrastructure/ConfigurationProvider.cs
+index a1fe319f80c..48db5678d98 100644
+--- a/src/Build/BuildCop/Infrastructure/ConfigurationProvider.cs
++++ b/src/Build/BuildCop/Infrastructure/ConfigurationProvider.cs
+@@ -10,10 +10,13 @@
+ using System.Text.Json.Serialization;
+ using System.Text.Json;
+ using Microsoft.Build.Experimental.BuildCop;
++using System.Configuration;
+ 
+ namespace Microsoft.Build.BuildCop.Infrastructure;
+ 
++
+ // TODO: https://github.com/dotnet/msbuild/issues/9628
++//  Let's flip form statics to instance, with exposed interface (so that we can easily swap implementations)
+ internal static class ConfigurationProvider
+ {
+     // TODO: This module should have a mechanism for removing unneeded configurations
+@@ -68,44 +71,136 @@ private static Dictionary<string, BuildAnalyzerConfiguration> LoadConfiguration(
+     }
+ 
+     /// <summary>
+-    /// Gets effective configuration for the given analyzer rule.
+-    /// The configuration values are guaranteed to be non-null upon this merge operation.
++    /// Gets the user specified unrecognized configuration for the given analyzer rule.
++    /// 
++    /// The configuration module should as well check that CustomConfigurationData
++    ///  for a particular rule is equal across the whole build (for all projects)  - otherwise it should error out.
++    /// This should apply to all rules for which the configuration is fetched.
+     /// </summary>
+-    /// <param name="analyzerRule"></param>
++    /// <param name="projectFullPath"></param>
++    /// <param name="ruleId"></param>
++    /// <returns></returns>
++    public static CustomConfigurationData GetCustomConfiguration(string projectFullPath, string ruleId)
++    {
++        return CustomConfigurationData.Null;
++    }
++
++    /// <summary>
++    /// 
++    /// </summary>
++    /// <param name="projectFullPath"></param>
++    /// <param name="ruleId"></param>
++    /// <throws><see cref="BuildCopConfigurationException"/> If CustomConfigurationData differs in a build for a same ruleId</throws>
+     /// <returns></returns>
+-    public static BuildAnalyzerConfigurationInternal GetMergedConfiguration(BuildAnalyzerRule analyzerRule)
++    public static void CheckCustomConfigurationDataValidity(string projectFullPath, string ruleId)
++    {
++        // TBD
++    }
++
++    public static BuildAnalyzerConfigurationInternal[] GetMergedConfigurations(
++        string projectFullPath,
++        BuildAnalyzer analyzer)
++        => FillConfiguration(projectFullPath, analyzer.SupportedRules, GetMergedConfiguration);
++
++    public static BuildAnalyzerConfiguration[] GetUserConfigurations(
++        string projectFullPath,
++        IReadOnlyList<string> ruleIds)
++        => FillConfiguration(projectFullPath, ruleIds, GetUserConfiguration);
++
++    public static CustomConfigurationData[] GetCustomConfigurations(
++        string projectFullPath,
++        IReadOnlyList<string> ruleIds)
++        => FillConfiguration(projectFullPath, ruleIds, GetCustomConfiguration);
++
++    public static BuildAnalyzerConfigurationInternal[] GetMergedConfigurations(
++        BuildAnalyzerConfiguration[] userConfigs,
++        BuildAnalyzer analyzer)
+     {
+-        if (!_editorConfig.TryGetValue(analyzerRule.Id, out BuildAnalyzerConfiguration? editorConfig))
++        var configurations = new BuildAnalyzerConfigurationInternal[userConfigs.Length];
++
++        for (int idx = 0; idx < userConfigs.Length; idx++)
+         {
+-            editorConfig = BuildAnalyzerConfiguration.Null;
++            configurations[idx] = ConfigurationProvider.MergeConfiguration(
++                analyzer.SupportedRules[idx].Id,
++                analyzer.SupportedRules[idx].DefaultConfiguration,
++                userConfigs[idx]);
+         }
+ 
+-        var defaultConfig = analyzerRule.DefaultConfiguration;
++        return configurations;
++    }
+ 
+-        return new BuildAnalyzerConfigurationInternal()
++    private static TConfig[] FillConfiguration<TConfig, TRule>(string projectFullPath, IReadOnlyList<TRule> ruleIds, Func<string, TRule, TConfig> configurationProvider)
++    {
++        TConfig[] configurations = new TConfig[ruleIds.Count];
++        for (int i = 0; i < ruleIds.Count; i++)
+         {
+-            EvaluationAnalysisScope = GetConfigValue(editorConfig, defaultConfig, cfg => cfg.EvaluationAnalysisScope),
+-            IsEnabled = GetConfigValue(editorConfig, defaultConfig, cfg => cfg.IsEnabled),
+-            LifeTimeScope = GetConfigValue(editorConfig, defaultConfig, cfg => cfg.LifeTimeScope),
+-            Severity = GetConfigValue(editorConfig, defaultConfig, cfg => cfg.Severity)
+-        };
+-
+-        T GetConfigValue<T>(
+-            BuildAnalyzerConfiguration editorConfigValue,
+-            BuildAnalyzerConfiguration defaultValue,
+-            Func<BuildAnalyzerConfiguration, T?> propertyGetter) where T : struct
+-            => propertyGetter(editorConfigValue) ??
+-               propertyGetter(defaultValue) ??
+-               EnsureNonNull(propertyGetter(BuildAnalyzerConfiguration.Default));
+-
+-        T EnsureNonNull<T>(T? value) where T : struct
++            configurations[i] = configurationProvider(projectFullPath, ruleIds[i]);
++        }
++
++        return configurations;
++    }
++
++    /// <summary>
++    /// Gets effective user specified (or default) configuration for the given analyzer rule.
++    /// The configuration values CAN be null upon this operation.
++    /// 
++    /// The configuration module should as well check that BuildAnalyzerConfigurationInternal.EvaluationAnalysisScope
++    ///  for all rules is equal - otherwise it should error out.
++    /// </summary>
++    /// <param name="projectFullPath"></param>
++    /// <param name="ruleId"></param>
++    /// <returns></returns>
++    public static BuildAnalyzerConfiguration GetUserConfiguration(string projectFullPath, string ruleId)
++    {
++        if (!_editorConfig.TryGetValue(ruleId, out BuildAnalyzerConfiguration? editorConfig))
+         {
+-            if (value is null)
+-            {
+-                throw new InvalidOperationException("Value is null");
+-            }
++            editorConfig = BuildAnalyzerConfiguration.Null;
++        }
++
++        return editorConfig;
++    }
+ 
+-            return value.Value;
++    /// <summary>
++    /// Gets effective configuration for the given analyzer rule.
++    /// The configuration values are guaranteed to be non-null upon this merge operation.
++    /// </summary>
++    /// <param name="projectFullPath"></param>
++    /// <param name="analyzerRule"></param>
++    /// <returns></returns>
++    public static BuildAnalyzerConfigurationInternal GetMergedConfiguration(string projectFullPath, BuildAnalyzerRule analyzerRule)
++        => GetMergedConfiguration(projectFullPath, analyzerRule.Id, analyzerRule.DefaultConfiguration);
++
++    public static BuildAnalyzerConfigurationInternal MergeConfiguration(
++        string ruleId,
++        BuildAnalyzerConfiguration defaultConfig,
++        BuildAnalyzerConfiguration editorConfig)
++        => new BuildAnalyzerConfigurationInternal(
++            ruleId: ruleId,
++            evaluationAnalysisScope: GetConfigValue(editorConfig, defaultConfig, cfg => cfg.EvaluationAnalysisScope),
++            isEnabled: GetConfigValue(editorConfig, defaultConfig, cfg => cfg.IsEnabled),
++            severity: GetConfigValue(editorConfig, defaultConfig, cfg => cfg.Severity));
++
++    private static BuildAnalyzerConfigurationInternal GetMergedConfiguration(
++        string projectFullPath,
++        string ruleId,
++        BuildAnalyzerConfiguration defaultConfig)
++        => MergeConfiguration(ruleId, defaultConfig, GetUserConfiguration(projectFullPath, ruleId));
++
++    private static T GetConfigValue<T>(
++        BuildAnalyzerConfiguration editorConfigValue,
++        BuildAnalyzerConfiguration defaultValue,
++        Func<BuildAnalyzerConfiguration, T?> propertyGetter) where T : struct
++        => propertyGetter(editorConfigValue) ??
++           propertyGetter(defaultValue) ??
++           EnsureNonNull(propertyGetter(BuildAnalyzerConfiguration.Default));
++
++    private static T EnsureNonNull<T>(T? value) where T : struct
++    {
++        if (value is null)
++        {
++            throw new InvalidOperationException("Value is null");
+         }
++
++        return value.Value;
+     }
+ }
+diff --git a/src/Build/BuildCop/Infrastructure/CustomConfigurationData.cs b/src/Build/BuildCop/Infrastructure/CustomConfigurationData.cs
+new file mode 100644
+index 00000000000..75834e1305a
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/CustomConfigurationData.cs
+@@ -0,0 +1,45 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Diagnostics.CodeAnalysis;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.Experimental.BuildCop;
++
++public class CustomConfigurationData(string ruleId)
++{
++    public static CustomConfigurationData Null { get; } = new(string.Empty);
++
++    public static bool NotNull(CustomConfigurationData data) => !Null.Equals(data);
++
++    public string RuleId { get; init; } = ruleId;
++    public IReadOnlyDictionary<string, string>? ConfigurationData { get; init; }
++
++    public override bool Equals(object? obj)
++    {
++        if (ReferenceEquals(null, obj))
++        {
++            return false;
++        }
++
++        if (ReferenceEquals(this, obj))
++        {
++            return true;
++        }
++
++        if (obj.GetType() != this.GetType())
++        {
++            return false;
++        }
++
++        return Equals((CustomConfigurationData)obj);
++    }
++
++    protected bool Equals(CustomConfigurationData other) => Equals(ConfigurationData, other.ConfigurationData);
++
++    public override int GetHashCode() => (ConfigurationData != null ? ConfigurationData.GetHashCode() : 0);
++}
+diff --git a/src/Build/BuildCop/Infrastructure/IBuildCopContext.cs b/src/Build/BuildCop/Infrastructure/IBuildCopContext.cs
+index 22cefa9e976..9ce8c8c65a8 100644
+--- a/src/Build/BuildCop/Infrastructure/IBuildCopContext.cs
++++ b/src/Build/BuildCop/Infrastructure/IBuildCopContext.cs
+@@ -1,12 +1,13 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
+ using Microsoft.Build.Experimental.BuildCop;
+ 
+ namespace Microsoft.Build.BuildCop.Infrastructure;
+ 
+ public interface IBuildCopContext
+ {
+-    void RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction evaluatedPropertiesAction);
+-    void RegisterParsedItemsAction(ParsedItemsAction parsedItemsAction);
++    void RegisterEvaluatedPropertiesAction(Action<BuildAnalysisContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction);
++    void RegisterParsedItemsAction(Action<BuildAnalysisContext<ParsedItemsAnalysisData>> parsedItemsAction);
+ }
+diff --git a/src/Build/BuildCop/Infrastructure/IBuildCopManager.cs b/src/Build/BuildCop/Infrastructure/IBuildCopManager.cs
+new file mode 100644
+index 00000000000..9d5d8c89f5a
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/IBuildCopManager.cs
+@@ -0,0 +1,51 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCop.Acquisition;
++using Microsoft.Build.BuildCop.Infrastructure;
++using Microsoft.Build.Framework;
++using static Microsoft.Build.BuildCop.Infrastructure.BuildCopManagerProvider;
++
++namespace Microsoft.Build.Experimental.BuildCop;
++
++internal enum BuildCopDataSource
++{
++    EventArgs,
++    BuildExecution,
++
++    ValuesCount = BuildExecution + 1
++}
++
++internal interface IBuildCopManager
++{
++    void ProcessEvaluationFinishedEventArgs(
++        IBuildAnalysisLoggingContext buildAnalysisContext,
++        ProjectEvaluationFinishedEventArgs projectEvaluationFinishedEventArgs);
++
++    void SetDataSource(BuildCopDataSource buildCopDataSource);
++
++    void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData);
++
++    Dictionary<string, TimeSpan> CreateTracingStats();
++
++    void FinalizeProcessing(LoggingContext loggingContext);
++
++    // All those to be called from RequestBuilder,
++    //  but as well from the ConnectorLogger - as even if interleaved, it gives the info
++    //  to manager about what analyzers need to be materialized and configuration fetched.
++    // No unloading of analyzers is yet considered - once loaded it stays for whole build.
++
++    void StartProjectEvaluation(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext, string fullPath);
++    void EndProjectEvaluation(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext);
++    void StartProjectRequest(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext);
++    void EndProjectRequest(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext);
++
++    void Shutdown();
++}
+diff --git a/src/Build/BuildCop/Infrastructure/NullBuildCopManager.cs b/src/Build/BuildCop/Infrastructure/NullBuildCopManager.cs
+new file mode 100644
+index 00000000000..bfcf6e7be2c
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/NullBuildCopManager.cs
+@@ -0,0 +1,50 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCop.Acquisition;
++using Microsoft.Build.Experimental.BuildCop;
++using Microsoft.Build.Framework;
++
++namespace Microsoft.Build.BuildCop.Infrastructure;
++
++internal class NullBuildCopManager : IBuildCopManager
++{
++    public void Shutdown() { }
++
++    public void ProcessEvaluationFinishedEventArgs(IBuildAnalysisLoggingContext buildAnalysisContext,
++        ProjectEvaluationFinishedEventArgs projectEvaluationFinishedEventArgs)
++    { }
++
++    public void SetDataSource(BuildCopDataSource buildCopDataSource) { }
++    public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData) { }
++
++    public Dictionary<string, TimeSpan> CreateTracingStats() => throw new NotImplementedException();
++
++    public void FinalizeProcessing(LoggingContext loggingContext)
++    { }
++
++    public void StartProjectEvaluation(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext,
++        string fullPath)
++    { }
++
++    public void EndProjectEvaluation(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext)
++    { }
++
++    public void StartProjectRequest(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext)
++    { }
++
++    public void EndProjectRequest(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext)
++    { }
++
++    public void YieldProject(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext)
++    { }
++
++    public void ResumeProject(BuildCopDataSource buildCopDataSource, BuildEventContext buildEventContext)
++    { }
++}
+diff --git a/src/Build/BuildCop/Infrastructure/TracingReporter.cs b/src/Build/BuildCop/Infrastructure/TracingReporter.cs
+new file mode 100644
+index 00000000000..434ac882d7c
+--- /dev/null
++++ b/src/Build/BuildCop/Infrastructure/TracingReporter.cs
+@@ -0,0 +1,28 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.BuildCop.Infrastructure;
++
++internal class TracingReporter
++{
++    internal const string INFRA_STAT_NAME = "Infrastructure";
++    internal Dictionary<string, TimeSpan> TracingStats { get; } = new();
++
++    public void AddStats(string name, TimeSpan subtotal)
++    {
++        if (TracingStats.TryGetValue(name, out TimeSpan existing))
++        {
++            TracingStats[name] = existing + subtotal;
++        }
++        else
++        {
++            TracingStats[name] = subtotal;
++        }
++    }
++}
+diff --git a/src/Framework/BuildCop/IBuildAnalysisLoggingContext.cs b/src/Build/BuildCop/Logging/IBuildAnalysisLoggingContext.cs
+similarity index 100%
+rename from src/Framework/BuildCop/IBuildAnalysisLoggingContext.cs
+rename to src/Build/BuildCop/Logging/IBuildAnalysisLoggingContext.cs
+diff --git a/src/Framework/BuildCop/IBuildAnalysisLoggingContextFactory.cs b/src/Build/BuildCop/Logging/IBuildAnalysisLoggingContextFactory.cs
+similarity index 100%
+rename from src/Framework/BuildCop/IBuildAnalysisLoggingContextFactory.cs
+rename to src/Build/BuildCop/Logging/IBuildAnalysisLoggingContextFactory.cs
+diff --git a/src/Build/BuildCop/OM/BuildAnalysisContext.cs b/src/Build/BuildCop/OM/BuildAnalysisContext.cs
+new file mode 100644
+index 00000000000..f6b85906a53
+--- /dev/null
++++ b/src/Build/BuildCop/OM/BuildAnalysisContext.cs
+@@ -0,0 +1,60 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCop.Infrastructure;
++using Microsoft.Build.Experimental;
++using Microsoft.Build.Framework;
++
++namespace Microsoft.Build.Experimental.BuildCop;
++
++/// <summary>
++/// Base for a data passed from infrastructure to build analyzers.
++/// </summary>
++/// <param name="projectFilePath">Currently build project.</param>
++public abstract class AnalysisData(string projectFilePath)
++{
++    /// <summary>
++    /// Full path to the project file being built.
++    /// </summary>
++    public string ProjectFilePath { get; } = projectFilePath;
++}
++
++public class BuildAnalysisContext<T> where T : AnalysisData
++{
++    private readonly BuildAnalyzerWrapper _analyzerWrapper;
++    private readonly LoggingContext _loggingContext;
++    private readonly BuildAnalyzerConfigurationInternal[] _configPerRule;
++    private readonly Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCopResult> _resultHandler;
++
++    internal BuildAnalysisContext(
++        BuildAnalyzerWrapper analyzerWrapper,
++        LoggingContext loggingContext,
++        BuildAnalyzerConfigurationInternal[] configPerRule,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCopResult> resultHandler,
++        T data)
++    {
++        _analyzerWrapper = analyzerWrapper;
++        _loggingContext = loggingContext;
++        _configPerRule = configPerRule;
++        _resultHandler = resultHandler;
++        Data = data;
++    }
++
++    /// <summary>
++    /// Method for reporting the result of the build analyzer rule.
++    /// </summary>
++    /// <param name="result"></param>
++    public void ReportResult(BuildCopResult result)
++        => _resultHandler(_analyzerWrapper, _loggingContext, _configPerRule, result);
++
++    /// <summary>
++    /// Data to be analyzed.
++    /// </summary>
++    public T Data { get; }
++}
+diff --git a/src/Build/BuildCop/OM/EvaluatedPropertiesAnalysisData.cs b/src/Build/BuildCop/OM/EvaluatedPropertiesAnalysisData.cs
+new file mode 100644
+index 00000000000..fda8d3ffdf6
+--- /dev/null
++++ b/src/Build/BuildCop/OM/EvaluatedPropertiesAnalysisData.cs
+@@ -0,0 +1,16 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System.Collections.Generic;
++using Microsoft.Build.BackEnd.Logging;
++
++namespace Microsoft.Build.Experimental.BuildCop;
++public class EvaluatedPropertiesAnalysisData : AnalysisData
++{
++    internal EvaluatedPropertiesAnalysisData(
++        string projectFilePath,
++        IReadOnlyDictionary<string, string> evaluatedProperties) :
++        base(projectFilePath) => EvaluatedProperties = evaluatedProperties;
++
++    public IReadOnlyDictionary<string, string> EvaluatedProperties { get; }
++}
+diff --git a/src/Build/BuildCop/OM/EvaluatedPropertiesContext.cs b/src/Build/BuildCop/OM/EvaluatedPropertiesContext.cs
+deleted file mode 100644
+index d219e825c2e..00000000000
+--- a/src/Build/BuildCop/OM/EvaluatedPropertiesContext.cs
++++ /dev/null
+@@ -1,20 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System.Collections.Generic;
+-using Microsoft.Build.BackEnd.Logging;
+-
+-namespace Microsoft.Build.Experimental.BuildCop;
+-public class EvaluatedPropertiesContext : BuildAnalysisContext
+-{
+-    internal EvaluatedPropertiesContext(
+-        LoggingContext loggingContext,
+-        IReadOnlyDictionary<string, string> evaluatedProperties,
+-        string projectFilePath) :
+-        base(loggingContext) => (EvaluatedProperties, ProjectFilePath) =
+-        (evaluatedProperties, projectFilePath);
+-
+-    public IReadOnlyDictionary<string, string> EvaluatedProperties { get; }
+-
+-    public string ProjectFilePath { get; }
+-}
+diff --git a/src/Build/BuildCop/OM/ParsedItemsContext.cs b/src/Build/BuildCop/OM/ParsedItemsAnalysisData.cs
+similarity index 86%
+rename from src/Build/BuildCop/OM/ParsedItemsContext.cs
+rename to src/Build/BuildCop/OM/ParsedItemsAnalysisData.cs
+index e65a176f3ca..043491ee4f1 100644
+--- a/src/Build/BuildCop/OM/ParsedItemsContext.cs
++++ b/src/Build/BuildCop/OM/ParsedItemsAnalysisData.cs
+@@ -32,12 +32,12 @@ public IEnumerable<ProjectItemElement> GetItemsOfType(string itemType)
+     }
+ }
+ 
+-public class ParsedItemsContext : BuildAnalysisContext
++public class ParsedItemsAnalysisData : AnalysisData
+ {
+-    internal ParsedItemsContext(
+-        LoggingContext loggingContext,
++    internal ParsedItemsAnalysisData(
++        string projectFilePath,
+         ItemsHolder itemsHolder) :
+-        base(loggingContext) => ItemsHolder = itemsHolder;
++        base(projectFilePath) => ItemsHolder = itemsHolder;
+ 
+     public ItemsHolder ItemsHolder { get; }
+ }
+diff --git a/src/Build/BuildCop/Utilities/EnumerableExtensions.cs b/src/Build/BuildCop/Utilities/EnumerableExtensions.cs
+new file mode 100644
+index 00000000000..70b95b22f51
+--- /dev/null
++++ b/src/Build/BuildCop/Utilities/EnumerableExtensions.cs
+@@ -0,0 +1,65 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.Experimental.BuildCop;
++
++internal static class EnumerableExtensions
++{
++    /// <summary>
++    /// Concatenates items of input sequence into csv string.
++    /// </summary>
++    /// <typeparam name="T"></typeparam>
++    /// <param name="source">Sequence to be turned into csv string.</param>
++    /// <param name="useSpace">Indicates whether space should be inserted between comas and following items.</param>
++    /// <returns>Csv string.</returns>
++    public static string ToCsvString<T>(this IEnumerable<T>? source, bool useSpace = true)
++    {
++        return source == null ? "<NULL>" : string.Join("," + (useSpace ? " " : string.Empty), source);
++    }
++
++    /// <summary>
++    /// Performs an action for each element in given sequence.
++    /// </summary>
++    /// <param name="sequence"></param>
++    /// <param name="action"></param>
++    /// <typeparam name="T"></typeparam>
++    public static void ForEach<T>(this IEnumerable<T> sequence, Action<T> action)
++    {
++        foreach (T element in sequence)
++        {
++            action(element);
++        }
++    }
++
++    /// <summary>
++    /// Adds a content of given dictionary to current dictionary.
++    /// </summary>
++    /// <typeparam name="TKey"></typeparam>
++    /// <typeparam name="TValue"></typeparam>
++    /// <param name="dict">Dictionary to receive another values.</param>
++    /// <param name="another">Dictionary to be merged into current.</param>
++    /// <param name="mergeValues">Way of resolving keys conflicts.</param>
++    public static void Merge<TKey, TValue>(
++        this IDictionary<TKey, TValue> dict,
++        IReadOnlyDictionary<TKey, TValue> another,
++        Func<TValue, TValue, TValue> mergeValues)
++    {
++        foreach (var pair in another)
++        {
++            if (!dict.ContainsKey(pair.Key))
++            {
++                dict[pair.Key] = pair.Value;
++            }
++            else
++            {
++                dict[pair.Key] = mergeValues(dict[pair.Key], pair.Value);
++            }
++        }
++    }
++}
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 5c9fec8bc7b..024368af5f9 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -153,28 +153,36 @@
+     <Compile Include="BackEnd\Components\SdkResolution\SdkResolverException.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+     <Compile Include="FileSystem\*.cs" />
++    <Compile Include="BuildCop\Acquisition\AnalyzerAcquisitionData.cs" />
++    <Compile Include="BuildCop\Acquisition\BuildCopAcquisitionModule.cs" />
+     <Compile Include="BuildCop\Analyzers\SharedOutputPathAnalyzer.cs" />
+-    <Compile Include="BuildCop\API\BuildAnalysisContext.cs" />
++    <Compile Include="BuildCop\Infrastructure\BuildCopConfigurationException.cs" />
++    <Compile Include="BuildCop\Infrastructure\BuildEventsProcessor.cs" />
++    <Compile Include="BuildCop\Infrastructure\NullBuildCopManager.cs" />
++    <Compile Include="BuildCop\Infrastructure\TracingReporter.cs" />
++    <Compile Include="BuildCop\OM\BuildAnalysisContext.cs" />
+     <Compile Include="BuildCop\API\BuildAnalyzer.cs" />
+     <Compile Include="BuildCop\API\BuildAnalyzerConfiguration.cs" />
+-    <Compile Include="BuildCop\API\BuildAnalyzerResult.cs" />
++    <Compile Include="BuildCop\API\BuildCopResult.cs" />
+     <Compile Include="BuildCop\API\BuildAnalyzerResultSeverity.cs" />
+     <Compile Include="BuildCop\API\BuildAnalyzerRule.cs" />
+-    <Compile Include="BuildCop\API\BuildCopLoggerFactory.cs" />
+     <Compile Include="BuildCop\API\ConfigurationContext.cs" />
+     <Compile Include="BuildCop\API\EvaluationAnalysisScope.cs" />
+-    <Compile Include="BuildCop\API\LifeTimeScope.cs" />
+-    <Compile Include="BuildCop\Infrastructure\AnalyzersDelegates.cs" />
+     <Compile Include="BuildCop\Infrastructure\BuildAnalyzerConfigurationInternal.cs" />
+-    <Compile Include="BuildCop\Infrastructure\BuildAnalyzerTracingWrapper.cs" />
++    <Compile Include="BuildCop\Infrastructure\BuildAnalyzerWrapper.cs" />
+     <Compile Include="BuildCop\Infrastructure\BuildCopCentralContext.cs" />
+     <Compile Include="BuildCop\Infrastructure\BuildCopConnectorLogger.cs" />
+     <Compile Include="BuildCop\Infrastructure\BuildCopContext.cs" />
+-    <Compile Include="BuildCop\Infrastructure\BuildCopManager.cs" />
++    <Compile Include="BuildCop\Infrastructure\BuildCopManagerProvider.cs" />
+     <Compile Include="BuildCop\Infrastructure\ConfigurationProvider.cs" />
++    <Compile Include="BuildCop\Infrastructure\CustomConfigurationData.cs" />
+     <Compile Include="BuildCop\Infrastructure\IBuildCopContext.cs" />
+-    <Compile Include="BuildCop\OM\EvaluatedPropertiesContext.cs" />
+-    <Compile Include="BuildCop\OM\ParsedItemsContext.cs" />
++    <Compile Include="BuildCop\Infrastructure\IBuildCopManager.cs" />
++    <Compile Include="BuildCop\Logging\IBuildAnalysisLoggingContext.cs" />
++    <Compile Include="BuildCop\Logging\IBuildAnalysisLoggingContextFactory.cs" />
++    <Compile Include="BuildCop\OM\EvaluatedPropertiesAnalysisData.cs" />
++    <Compile Include="BuildCop\OM\ParsedItemsAnalysisData.cs" />
++    <Compile Include="BuildCop\Utilities\EnumerableExtensions.cs" />
+     <Compile Include="BuildCop\Utilities\IsExternalInit.cs" />
+     <Compile Include="Evaluation\IItemTypeDefinition.cs" />
+     <Compile Include="FileAccess\DesiredAccess.cs" />
+diff --git a/src/Framework/BuildCop/BuildCopEventArgs.cs b/src/Framework/BuildCop/BuildCopEventArgs.cs
+new file mode 100644
+index 00000000000..d7051e2689a
+--- /dev/null
++++ b/src/Framework/BuildCop/BuildCopEventArgs.cs
+@@ -0,0 +1,150 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Experimental.BuildCop;
++
++public abstract class BuildCopEventArgs : BuildEventArgs
++{ }
++
++public sealed class BuildCopTracingEventArgs(Dictionary<string, TimeSpan> tracingData) : BuildCopEventArgs
++{
++    internal BuildCopTracingEventArgs() : this(new Dictionary<string, TimeSpan>())
++    { }
++
++    public Dictionary<string, TimeSpan> TracingData { get; private set; } = tracingData;
++
++    internal override void WriteToStream(BinaryWriter writer)
++    {
++        base.WriteToStream(writer);
++
++        writer.Write7BitEncodedInt(TracingData.Count);
++        foreach (KeyValuePair<string, TimeSpan> kvp in TracingData)
++        {
++            writer.Write(kvp.Key);
++            writer.Write(kvp.Value.Ticks);
++        }
++    }
++
++    internal override void CreateFromStream(BinaryReader reader, int version)
++    {
++        base.CreateFromStream(reader, version);
++
++        int count = reader.Read7BitEncodedInt();
++        TracingData = new Dictionary<string, TimeSpan>(count);
++        for (int i = 0; i < count; i++)
++        {
++            string key = reader.ReadString();
++            TimeSpan value = TimeSpan.FromTicks(reader.ReadInt64());
++
++            TracingData.Add(key, value);
++        }
++    }
++}
++
++public sealed class BuildCopAcquisitionEventArgs(string acquisitionData) : BuildCopEventArgs
++{
++    internal BuildCopAcquisitionEventArgs() : this(string.Empty)
++    { }
++
++    public string AcquisitionData { get; private set; } = acquisitionData;
++
++    internal override void WriteToStream(BinaryWriter writer)
++    {
++        base.WriteToStream(writer);
++
++        writer.Write(AcquisitionData);
++    }
++
++    internal override void CreateFromStream(BinaryReader reader, int version)
++    {
++        base.CreateFromStream(reader, version);
++
++        AcquisitionData = reader.ReadString();
++    }
++}
++public sealed class BuildCopResultWarning : BuildWarningEventArgs
++{
++    public BuildCopResultWarning(IBuildCopResult result)
++    {
++        this.Message = result.FormatMessage();
++    }
++
++    internal BuildCopResultWarning() { }
++
++    internal override void WriteToStream(BinaryWriter writer)
++    {
++        base.WriteToStream(writer);
++
++        writer.Write(Message!);
++    }
++
++    internal override void CreateFromStream(BinaryReader reader, int version)
++    {
++        base.CreateFromStream(reader, version);
++
++        Message = reader.ReadString();
++    }
++
++    public override string? Message { get; protected set; }
++}
++
++public sealed class BuildCopResultError : BuildErrorEventArgs
++{
++    public BuildCopResultError(IBuildCopResult result)
++    {
++        this.Message = result.FormatMessage();
++    }
++
++    internal BuildCopResultError() { }
++
++    internal override void WriteToStream(BinaryWriter writer)
++    {
++        base.WriteToStream(writer);
++
++        writer.Write(Message!);
++    }
++
++    internal override void CreateFromStream(BinaryReader reader, int version)
++    {
++        base.CreateFromStream(reader, version);
++
++        Message = reader.ReadString();
++    }
++
++    public override string? Message { get; protected set; }
++}
++
++public sealed class BuildCopResultMessage : BuildMessageEventArgs
++{
++    public BuildCopResultMessage(IBuildCopResult result)
++    {
++        this.Message = result.FormatMessage();
++    }
++
++    internal BuildCopResultMessage() { }
++
++    internal override void WriteToStream(BinaryWriter writer)
++    {
++        base.WriteToStream(writer);
++
++        writer.Write(Message!);
++    }
++
++    internal override void CreateFromStream(BinaryReader reader, int version)
++    {
++        base.CreateFromStream(reader, version);
++
++        Message = reader.ReadString();
++    }
++
++    public override string? Message { get; protected set; }
++}
+diff --git a/src/Framework/BuildCop/IBuildCopLoggerFactory.cs b/src/Framework/BuildCop/IBuildCopLoggerFactory.cs
+deleted file mode 100644
+index 2fb4e2d0ffb..00000000000
+--- a/src/Framework/BuildCop/IBuildCopLoggerFactory.cs
++++ /dev/null
+@@ -1,11 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using Microsoft.Build.Framework;
+-
+-namespace Microsoft.Build.Experimental.BuildCop;
+-
+-public interface IBuildCopLoggerFactory
+-{
+-    ILogger CreateBuildAnalysisLogger(IBuildAnalysisLoggingContextFactory loggingContextFactory);
+-}
+diff --git a/src/Framework/BuildCop/IBuildCopManager.cs b/src/Framework/BuildCop/IBuildCopManager.cs
+deleted file mode 100644
+index 30e076b2395..00000000000
+--- a/src/Framework/BuildCop/IBuildCopManager.cs
++++ /dev/null
+@@ -1,20 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-using System.Collections.Generic;
+-using System.Linq;
+-using System.Text;
+-using System.Threading.Tasks;
+-using Microsoft.Build.Framework;
+-
+-namespace Microsoft.Build.Experimental.BuildCop;
+-
+-public interface IBuildCopManager
+-{
+-    void ProcessEvaluationFinishedEventArgs(
+-        IBuildAnalysisLoggingContext buildAnalysisContext,
+-        ProjectEvaluationFinishedEventArgs projectEvaluationFinishedEventArgs);
+-
+-    string CreateTracingStats();
+-}
+diff --git a/src/Framework/BuildCop/IBuildCopResult.cs b/src/Framework/BuildCop/IBuildCopResult.cs
+new file mode 100644
+index 00000000000..c47e03c5365
+--- /dev/null
++++ b/src/Framework/BuildCop/IBuildCopResult.cs
+@@ -0,0 +1,25 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.Experimental.BuildCop;
++
++/// <summary>
++/// Holder for the reported result of a build cop rule.
++/// </summary>
++public interface IBuildCopResult
++{
++    /// <summary>
++    /// Optional location of the finding (in near future we might need to support multiple locations).
++    /// </summary>
++    string LocationString { get; }
++    string[] MessageArgs { get; }
++    string MessageFormat { get; }
++
++    string FormatMessage();
++}
+diff --git a/src/Framework/IEventSource.cs b/src/Framework/IEventSource.cs
+index 187c105d386..18be5acb2c0 100644
+--- a/src/Framework/IEventSource.cs
++++ b/src/Framework/IEventSource.cs
+@@ -3,6 +3,8 @@
+ 
+ #nullable disable
+ 
++using Microsoft.Build.Experimental.BuildCop;
++
+ namespace Microsoft.Build.Framework
+ {
+     /// <summary>
+@@ -75,6 +77,11 @@ namespace Microsoft.Build.Framework
+     /// </summary>
+     public delegate void AnyEventHandler(object sender, BuildEventArgs e);
+ 
++    /// <summary>
++    /// Type of handler for BuildCopEventRaised events
++    /// </summary>
++    public delegate void BuildCopEventHandler(object sender, BuildCopEventArgs e);
++
+     /// <summary>
+     /// This interface defines the events raised by the build engine.
+     /// Loggers use this interface to subscribe to the events they
+diff --git a/src/MSBuild.UnitTests/CommandLineSwitches_Tests.cs b/src/MSBuild.UnitTests/CommandLineSwitches_Tests.cs
+index 35d2241c072..df213d22248 100644
+--- a/src/MSBuild.UnitTests/CommandLineSwitches_Tests.cs
++++ b/src/MSBuild.UnitTests/CommandLineSwitches_Tests.cs
+@@ -1185,7 +1185,7 @@ public void InvalidToolsVersionErrors()
+                                         graphBuildOptions: null,
+                                         lowPriority: false,
+                                         question: false,
+-                                        buildCopLoggerFactory: null,
++                                        isBuildCopEnabled: false,
+                                         inputResultsCaches: null,
+                                         outputResultsCache: null,
+                                         saveProjectResult: false,
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 433d06e9011..e3a99e1eff0 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -25,7 +25,6 @@
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Experimental;
+-using Microsoft.Build.Experimental.BuildCop;
+ using Microsoft.Build.Experimental.ProjectCache;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Framework.Telemetry;
+@@ -718,7 +717,7 @@ public static ExitType Execute(
+                 string[] inputResultsCaches = null;
+                 string outputResultsCache = null;
+                 bool question = false;
+-                IBuildCopLoggerFactory buildCopLoggerFactory = null;
++                bool isBuildCopEnabled = false;
+                 string[] getProperty = Array.Empty<string>();
+                 string[] getItem = Array.Empty<string>();
+                 string[] getTargetResult = Array.Empty<string>();
+@@ -765,7 +764,7 @@ public static ExitType Execute(
+ #endif
+                                             ref lowPriority,
+                                             ref question,
+-                                            ref buildCopLoggerFactory,
++                                            ref isBuildCopEnabled,
+                                             ref getProperty,
+                                             ref getItem,
+                                             ref getTargetResult,
+@@ -866,7 +865,7 @@ public static ExitType Execute(
+                                     graphBuildOptions,
+                                     lowPriority,
+                                     question,
+-                                    buildCopLoggerFactory,
++                                    isBuildCopEnabled,
+                                     inputResultsCaches,
+                                     outputResultsCache,
+                                     saveProjectResult: outputPropertiesItemsOrTargetResults,
+@@ -1248,7 +1247,7 @@ internal static bool BuildProject(
+             GraphBuildOptions graphBuildOptions,
+             bool lowPriority,
+             bool question,
+-            IBuildCopLoggerFactory buildCopLoggerFactory,
++            bool isBuildCopEnabled,
+             string[] inputResultsCaches,
+             string outputResultsCache,
+             bool saveProjectResult,
+@@ -1450,7 +1449,7 @@ internal static bool BuildProject(
+                     parameters.InputResultsCacheFiles = inputResultsCaches;
+                     parameters.OutputResultsCacheFile = outputResultsCache;
+                     parameters.Question = question;
+-                    parameters.BuildCopLoggerFactory = buildCopLoggerFactory;
++                    parameters.IsBuildCopEnabled = isBuildCopEnabled;
+ #if FEATURE_REPORTFILEACCESSES
+                     parameters.ReportFileAccesses = reportFileAccesses;
+ #endif
+@@ -2422,7 +2421,7 @@ private static bool ProcessCommandLineSwitches(
+ #endif
+             ref bool lowPriority,
+             ref bool question,
+-            ref IBuildCopLoggerFactory buildCopLoggerFactory,
++            ref bool isBuildCopEnabled,
+             ref string[] getProperty,
+             ref string[] getItem,
+             ref string[] getTargetResult,
+@@ -2564,7 +2563,7 @@ private static bool ProcessCommandLineSwitches(
+ #endif
+                                                            ref lowPriority,
+                                                            ref question,
+-                                                           ref buildCopLoggerFactory,
++                                                           ref isBuildCopEnabled,
+                                                            ref getProperty,
+                                                            ref getItem,
+                                                            ref getTargetResult,
+@@ -2646,7 +2645,7 @@ private static bool ProcessCommandLineSwitches(
+ 
+                     question = commandLineSwitches.IsParameterizedSwitchSet(CommandLineSwitches.ParameterizedSwitch.Question);
+ 
+-                    buildCopLoggerFactory = ProcessBuildAnalysisLoggerFactorySwitch(commandLineSwitches);
++                    isBuildCopEnabled = IsBuildCopEnabled(commandLineSwitches);
+ 
+                     inputResultsCaches = ProcessInputResultsCaches(commandLineSwitches);
+ 
+@@ -2722,11 +2721,11 @@ private static bool ProcessCommandLineSwitches(
+             return invokeBuild;
+         }
+ 
+-        private static IBuildCopLoggerFactory ProcessBuildAnalysisLoggerFactorySwitch(CommandLineSwitches commandLineSwitches)
++        private static bool IsBuildCopEnabled(CommandLineSwitches commandLineSwitches)
+         {
+             // todo: opt-in behavior: https://github.com/dotnet/msbuild/issues/9723
+             bool isAnalysisEnabled = commandLineSwitches.IsParameterizedSwitchSet(CommandLineSwitches.ParameterizedSwitch.Analyze);
+-            return isAnalysisEnabled ? new BuildCopLoggerFactory() : null;
++            return isAnalysisEnabled;
+         }
+ 
+         private static bool ProcessTerminalLoggerConfiguration(CommandLineSwitches commandLineSwitches, out string aggregatedParameters)
+diff --git a/src/Shared/LogMessagePacketBase.cs b/src/Shared/LogMessagePacketBase.cs
+index 92cc46106f0..5c5748939c9 100644
+--- a/src/Shared/LogMessagePacketBase.cs
++++ b/src/Shared/LogMessagePacketBase.cs
+@@ -9,6 +9,11 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Framework;
+ 
++#if !TASKHOST
++using Microsoft.Build.Experimental.BuildCop;
++using Microsoft.Build.BuildCop.Infrastructure;
++#endif
++
+ #if !TASKHOST && !MSBUILDENTRYPOINTEXE
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Framework.Profiler;
+@@ -205,6 +210,31 @@ internal enum LoggingEventType : int
+         /// Event is <see cref="ExtendedCriticalBuildMessageEventArgs"/>
+         /// </summary>
+         ExtendedCriticalBuildMessageEvent = 33,
++
++        /// <summary>
++        /// Event is <see cref="BuildCopResultMessage"/>
++        /// </summary>
++        BuildCopMessageEvent = 34,
++
++        /// <summary>
++        /// Event is <see cref="BuildCopResultWarning"/>
++        /// </summary>
++        BuildCopWarningEvent = 35,
++
++        /// <summary>
++        /// Event is <see cref="BuildCopResultError"/>
++        /// </summary>
++        BuildCopErrorEvent = 36,
++
++        /// <summary>
++        /// Event is <see cref="BuildCopTracingEventArgs"/>
++        /// </summary>
++        BuildCopTracingEvent = 37,
++
++        /// <summary>
++        /// Event is <see cref="BuildCopAcquisitionEventArgs"/>
++        /// </summary>
++        BuildCopAcquisitionEvent = 38,
+     }
+     #endregion
+ 
+@@ -610,6 +640,11 @@ private BuildEventArgs GetBuildEventArgFromId()
+                 LoggingEventType.PropertyInitialValueSet => new PropertyInitialValueSetEventArgs(),
+                 LoggingEventType.PropertyReassignment => new PropertyReassignmentEventArgs(),
+                 LoggingEventType.UninitializedPropertyRead => new UninitializedPropertyReadEventArgs(),
++                LoggingEventType.BuildCopMessageEvent => new BuildCopResultMessage(),
++                LoggingEventType.BuildCopWarningEvent => new BuildCopResultWarning(),
++                LoggingEventType.BuildCopErrorEvent => new BuildCopResultError(),
++                LoggingEventType.BuildCopAcquisitionEvent => new BuildCopAcquisitionEventArgs(),
++                LoggingEventType.BuildCopTracingEvent => new BuildCopTracingEventArgs(),
+ #endif
+                 _ => throw new InternalErrorException("Should not get to the default of GetBuildEventArgFromId ID: " + _eventType)
+             };
+@@ -721,6 +756,26 @@ private LoggingEventType GetLoggingEventId(BuildEventArgs eventArg)
+             {
+                 return LoggingEventType.UninitializedPropertyRead;
+             }
++            else if (eventType == typeof(BuildCopResultMessage))
++            {
++                return LoggingEventType.BuildCopMessageEvent;
++            }
++            else if (eventType == typeof(BuildCopResultWarning))
++            {
++                return LoggingEventType.BuildCopWarningEvent;
++            }
++            else if (eventType == typeof(BuildCopResultError))
++            {
++                return LoggingEventType.BuildCopErrorEvent;
++            }
++            else if (eventType == typeof(BuildCopAcquisitionEventArgs))
++            {
++                return LoggingEventType.BuildCopAcquisitionEvent;
++            }
++            else if (eventType == typeof(BuildCopTracingEventArgs))
++            {
++                return LoggingEventType.BuildCopTracingEvent;
++            }
+ #endif
+             else if (eventType == typeof(TargetStartedEventArgs))
+             {

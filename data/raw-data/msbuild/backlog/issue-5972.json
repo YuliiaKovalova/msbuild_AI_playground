@@ -1,0 +1,63 @@
+{
+  "number": 5972,
+  "title": "Investigate improvements to our disk usage on file timestamp checks",
+  "body": "One option brought up for improving performance has been to reduce the amount that we check files on disks. We discussed possibly having a file watcher or using one that's already out there like facebook/watchman.  We could also potentially share watchers with the various IDEs we plug into as they already have watchers so alternatively we could build a way for them to plug into that and share their results with other tools through MSBuild.\r\n\r\nThis will require a lot more investigation so posting the summary for now for tracking.",
+  "state": "CLOSED",
+  "createdAt": "2020-12-14T23:28:04Z",
+  "updatedAt": "2024-02-21T17:02:02Z",
+  "closedAt": "2021-10-08T07:53:29Z",
+  "author": {
+    "login": "marcpopMSFT"
+  },
+  "labels": [
+    "Area: Performance",
+    "Priority:1",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": [
+      {
+        "login": "ladipro"
+      }
+    ]
+  },
+  "milestone": {
+    "title": "VS 17.1"
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "From #6001 \r\n-------\r\nBy @KirillOsenkov \r\nhttps://source.dot.net/#Microsoft.Build.Tasks.Core/Copy.cs,8c737dc13878fc22\r\n\r\nI've been profiling and IsMatchingSizeAndTimeStamp is showing up a lot:\r\n![image](https://user-images.githubusercontent.com/679326/103505522-45f39780-4e0f-11eb-9e7e-a1dff25976e0.png)\r\n\r\nWe should investigate if we can use a single file system call that gets both existence and timestamp in a single call.\r\n\r\nOn Windows calling FindFirstFile is almost sure to be way faster and with lower overhead.",
+        "createdAt": "2021-01-06T16:59:11Z",
+        "updatedAt": "2021-01-06T16:59:11Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "> We should investigate if we can use a single file system call that gets both existence and timestamp in a single call.\r\n> \r\n> On Windows calling FindFirstFile is almost sure to be way faster and with lower overhead.\r\n\r\n@KirillOsenkov `IsMatchingSizeAndTimeStamp` it is currently using:\r\nhttps://github.com/dotnet/msbuild/blob/2f1e9cad51097aec5d7268a4afdf7ad9bc6864b9/src/Tasks/FileState.cs#L104\r\n\r\nTraces show more than one stack because there are multiple ways to initialize the `Lazy`, but under the covers it is always this one single call per file.\r\n\r\n![image](https://user-images.githubusercontent.com/12206368/134364243-edacbdb0-0e2a-45f0-b715-3880cc165d6a.png)\r\n\r\n^ we're spending ~6 seconds of CPU here when building OrchardCore, definitely something to improve.",
+        "createdAt": "2021-09-22T14:38:23Z",
+        "updatedAt": "2021-09-22T14:38:23Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "Do we know if we're calling these multiple times for the same file? Are they cached? If they're called multiple times, how many times per file? Should we perhaps scan entire directories and then answer these questions based on the info we read from the file system? The assumption is that it could be better to scan a directory once, keep the file lists, sizes and timestamps in memory, and then answer questions off of that table (at least during evaluation where presumably the underlying file system shouldn't change).",
+        "createdAt": "2021-09-24T05:56:23Z",
+        "updatedAt": "2021-09-24T05:56:23Z",
+        "author": {
+          "login": "KirillOsenkov"
+        }
+      },
+      {
+        "body": "I have prototyped a cache with `FileSystemWatcher`-based invalidation to measure the impact on incremental build. The cache is called from the biggest offenders in terms of file metadata checks (existence, timestamp, size, attributes):\r\n- `NativeMethodsShared.GetLastWriteFileUtcTime`\r\n- `NativeMethodsShared.GetLastWriteDirectoryUtcTime`\r\n- `FileState.FileDirInfo` (as used by the `Copy` task)\r\n\r\nThe following table summarizes the CPU time burned when doing a no-change incremental build of OrchardCore. It is a cold scenario where no MSBuild process is running when the build is initiated (i.e. in-memory caches are empty).\r\n\r\n|   | CPU total | CPU in kernel32!GetFileAttributesEx | CPU overhead of caching |\r\n|---|---|---|---|\r\n| Baseline | 230 s | 79 s | - |\r\n| Immutable files in static cache (#6761) | 185 s | 35 s | < 1 s |\r\n| Immutable files in static cache + mutable files in file watcher cache | 165 s | 14 s | < 1 s |\r\n\r\nWatchers were set up on demand for each directory with at least one affected file. At the end of the build MSBuild was watching 3400 directories and had cached metadata on 33000 files total. There was no attempt to unify/coalesce directories to reduce the number of directories watched.\r\n\r\nThe perf numbers are great but there's a major catch. File watcher notifications come asynchronously on a separate thread and there are no guarantees that a notification for a file arrives and is processed before we make a build decision based on the file.\r\n\r\nHere's a simple program demonstrating the asynchrony:\r\n\r\n```C#\r\n        static volatile bool fileExists = false;\r\n        static void Main(string[] args)\r\n        {\r\n            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());\r\n            Directory.CreateDirectory(tempDir);\r\n            try\r\n            {\r\n                FileSystemWatcher watcher = new FileSystemWatcher(tempDir);\r\n                watcher.Created += (object sender, FileSystemEventArgs e) => fileExists = true;\r\n                watcher.Deleted += (object sender, FileSystemEventArgs e) => fileExists = false;\r\n                watcher.EnableRaisingEvents = true;\r\n\r\n                string tempFile = Path.Combine(tempDir, \"File.txt\");\r\n                using (var fileStream = File.Create(tempFile))\r\n                {\r\n                    Console.WriteLine($\"File exists after Create: {fileExists}\");\r\n                }\r\n                File.Delete(tempFile);\r\n                Console.WriteLine($\"File exists after Delete: {fileExists}\");\r\n            }\r\n            finally\r\n            {\r\n                Directory.Delete(tempDir, true);\r\n            }\r\n            Console.ReadLine();\r\n        }\r\n```\r\n\r\nOn my Windows machine the program usually prints:\r\n\r\n```\r\nFile exists after Create: False\r\nFile exists after Delete: True\r\n```\r\n\r\nwhich is exactly the opposite of the correct output. We are not aware of the file immediately after it was created and we believe that it's still there right after deleting it. In this simple example the race window is small but there are no guarantees that it couldn't get much larger on a different platform, on a loaded system, or with other I/O patterns. This is a no-go for MSBuild. Our I/O has to be synchronous, or at least we would need a way to issue an \"I/O barrier\" before each metadata check to make sure that all watchers queued to run for I/O writes that happened before the current point in time have actually finished running.\r\n\r\nEven for evaluation which is supposed to be a read-only operation so it's OK to take a snapshot and ignore changes, we would be running into races if we attempted to cache metadata using watchers _between_ evaluations.\r\n\r\nI am closing the issue based on the information above.\r\n\r\n@KirillOsenkov:\r\n> Do we know if we're calling these multiple times for the same file? Are they cached? If they're called multiple times, how many times per file?\r\n\r\nPlease see https://github.com/dotnet/msbuild/issues/6822#issuecomment-918385285 for data on this.\r\n\r\n> The assumption is that it could be better to scan a directory once, keep the file lists, sizes and timestamps in memory, and then answer questions off of that table (at least during evaluation where presumably the underlying file system shouldn't change).\r\n\r\nYes, it should be possible during evaluation. Outside of evaluation I'm afraid we could be running into same races as above. We are tracking it in #3586.",
+        "createdAt": "2021-10-08T07:53:29Z",
+        "updatedAt": "2021-10-08T07:53:29Z",
+        "author": {
+          "login": "ladipro"
+        }
+      }
+    ]
+  }
+}

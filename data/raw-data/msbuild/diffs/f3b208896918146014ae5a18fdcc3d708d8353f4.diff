@@ -1,0 +1,924 @@
+diff --git a/documentation/wiki/Binary-Log.md b/documentation/wiki/Binary-Log.md
+index bb924f2b441..a30f478cf7c 100644
+--- a/documentation/wiki/Binary-Log.md
++++ b/documentation/wiki/Binary-Log.md
+@@ -121,15 +121,6 @@ logReader.AnyEventRaised += (_, e) =>
+     // ...
+ };
+ 
+-// Those can be raised only during forward compatibility reading mode.
+-logReader.OnRecoverableReadError += (errorType, recordKind, message) =>
+-{
+-    // ...
+-
+-    // e.g. we can decide to ignore the error and continue reading or break reading
+-    //  based on the type of the error or/and type of the record
+-};
+-
+ // Starts the synchronous log reading loop.
+ logReader.Replay(path_to_binlog_file);
+ 
+@@ -144,9 +135,40 @@ The unknown events and event parts are regarded as recoverable errors, since the
+ To allow the calling code to decide - based on the type of error, type of events getting the error, or the number of errors - the `OnRecoverableReadError` event is exposed (from both `BinaryLogReplayEventSource` and `BuildEventArgsReader`).
+ 
+ ```csharp
++/// <summary>
++/// Materializes the error message.
++/// Until it's called the error message is not materialized and no string allocations are made.
++/// </summary>
++/// <returns>The error message.</returns>
++public delegate string FormatErrorMessage();
++
+ /// <summary>
+ /// Receives recoverable errors during reading.
+ /// Communicates type of the error, kind of the record that encountered the error and the message detailing the error.
++/// The error message is returned as a function to avoid unnecessary string allocations in case the error is not logged.
+ /// </summary>
+-event Action<ReaderErrorType, BinaryLogRecordKind, Func<string>>? OnRecoverableReadError;
++event Action<ReaderErrorType, BinaryLogRecordKind, FormatErrorMessage>? OnRecoverableReadError;
+ ```
++
++Our sample usage of the [Reading API](#reading-api) can be enhanced with recoverable errors handling e.g. as such:
++
++```csharp
++
++// Those can be raised only during forward compatibility reading mode.
++logReader.OnRecoverableReadError += (errorType, recordKind, messageFactory) =>
++{
++    // ...
++
++    // e.g. we can decide to ignore the error and continue reading or break reading
++    //  based on the type of the error or/and type of the record or/and the frequency of the error
++
++    // Would we decide to completely ignore some errors - we can aid better performance by not materializing the actual error message.
++    // Otherwise the error message can be materialized via the provided delegate:
++    Console.WriteLine($"Recoverable reader error: {messageFactory()}");
++};
++
++```
++
++When authoring changes to the specific BuildEventArg types - it is always strongly recommended to **prefer append-only changes**. 
++
++This prevents the possibility of collision where some fields are removed in one version and then different fields with same binary size are added in future version. Such a sequence of format changes might not be caught by the decoder and might lead to unnoticed corrupt interpretation of data. For this reason the author of specific OM changes should always check whether there is a possibility of unrecognizable format collision (same binary size, different representation) within binlog versions of a same [minimum reader version support](#forward-compatibility-reading). If this is possible, the [minimum reader version support](#forward-compatibility-reading) should be incremented.
+\ No newline at end of file
+diff --git a/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs b/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
+index 678dce0a538..a07ed031429 100644
+--- a/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
++++ b/src/Build.UnitTests/BuildEventArgsSerialization_Tests.cs
+@@ -891,15 +891,7 @@ public void ReadingCorruptedStreamThrows()
+                 var binaryReader = new BinaryReader(memoryStream);
+                 using var buildEventArgsReader = new BuildEventArgsReader(binaryReader, BinaryLogger.FileFormatVersion);
+ 
+-                try
+-                {
+-                    buildEventArgsReader.Read();
+-                }
+-                catch (Exception e)
+-                {
+-                    // if the EndOfStreamException is received during EventArgs parsing - the parsing code will translate it to InvalidDataException
+-                    Assert.True(e is InvalidDataException or EndOfStreamException, "Abruptly ended stream should lead to InvalidDataException or EndOfStreamException");
+-                }
++                Assert.Throws<EndOfStreamException>(() => buildEventArgsReader.Read());
+             }
+         }
+ 
+@@ -1121,9 +1113,7 @@ public void ForwardCompatibleRead_HandleRemovalOfDataFromEventDefinition()
+             readerErrors.Count.ShouldBe(1);
+             readerErrors[0].errorType.ShouldBe(ReaderErrorType.UnknownFormatOfEventData);
+             readerErrors[0].recordKind.ShouldBe(BinaryLogRecordKind.Error);
+-            // Expect StreamChunkOverReadException or EndOfStreamException - based on the implementation
+-            //  of indicating attempt to overread in the TransparentReadStream.
+-            readerErrors[0].error.ShouldContain("StreamChunkOverReadException");
++            readerErrors[0].error.ShouldContain("EndOfStreamException");
+ 
+             deserializedEvent.Should().BeEquivalentTo(finished);
+ 
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+index 26ffcbee75a..ec287f36b6a 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+@@ -40,6 +40,7 @@ internal interface IBinaryLogReplaySource :
+         IRawLogEventsSource,
+         IBuildEventStringsReader,
+         IEmbeddedContentSource,
++        IBuildFileReader,
+         IBinlogReaderErrors
+     { }
+ 
+@@ -62,10 +63,10 @@ static BinaryLogReplayEventSource()
+         /// <summary>
+         /// Unknown build events or unknown parts of known build events will be ignored if this is set to true.
+         /// </summary>
+-        public bool AllowForwardCompatibility { private get; init; } = true;
++        public bool AllowForwardCompatibility { private get; init; }
+ 
+         /// <inheritdoc cref="IBinlogReaderErrors.OnRecoverableReadError"/>
+-        public event Action<ReaderErrorType, BinaryLogRecordKind, Func<string>>? OnRecoverableReadError;
++        public event Action<ReaderErrorType, BinaryLogRecordKind, FormatErrorMessage>? OnRecoverableReadError;
+ 
+         /// <summary>
+         /// WARNING: This event is under low support and low maintenance - please use events directly exposed by <see cref="BinaryLogReplayEventSource"/> instead. 
+@@ -204,6 +205,7 @@ public void Replay(BuildEventArgsReader reader, CancellationToken cancellationTo
+             }
+ 
+             reader.EmbeddedContentRead += _embeddedContentRead;
++            reader.ArchiveFileEncountered += _archiveFileEncountered;
+             reader.StringReadDone += _stringReadDone;
+             reader.StringEncountered += _stringEncountered;
+ 
+@@ -230,6 +232,7 @@ public void Replay(BuildEventArgsReader reader, CancellationToken cancellationTo
+                 if (this._rawLogRecordReceived == null &&
+                     this._embeddedContentRead == null &&
+                     this._stringReadDone == null &&
++                    this._archiveFileEncountered == null &&
+                     this._stringEncountered == null)
+                 {
+                     throw new NotSupportedException(
+@@ -273,6 +276,14 @@ event Action<StringReadEventArgs>? IBuildEventStringsReader.StringReadDone
+             remove => _stringReadDone -= value;
+         }
+ 
++        private Action<ArchiveFileEventArgs>? _archiveFileEncountered;
++        /// <inheritdoc cref="IBuildFileReader.ArchiveFileEncountered"/>
++        event Action<ArchiveFileEventArgs>? IBuildFileReader.ArchiveFileEncountered
++        {
++            add => _archiveFileEncountered += value;
++            remove => _archiveFileEncountered -= value;
++        }
++
+         private Action? _stringEncountered;
+         /// <inheritdoc cref="IBuildEventStringsReader.StringEncountered"/>
+         event Action? IBuildEventStringsReader.StringEncountered
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogger.cs b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+index a211abea99d..15d67806298 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogger.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+@@ -204,7 +204,7 @@ public void Initialize(IEventSource eventSource)
+                 if (CollectProjectImports == ProjectImportsCollectionMode.Embed)
+                 {
+                     replayEventsSource.EmbeddedContentRead += args =>
+-                        eventArgsWriter.WriteBlob(args.ContentKind.ToBinaryLogRecordKind(), args.ContentStream);
++                        eventArgsWriter.WriteBlob(args.ContentKind, args.ContentStream);
+                 }
+                 else if (CollectProjectImports == ProjectImportsCollectionMode.ZipFile)
+                 {
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index e5959f2b2e4..e6b9a6b8c20 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -128,7 +128,7 @@ private void EnsureForwardCompatibleReadingSupported()
+         /// Receives recoverable errors during reading. See <see cref="IBinlogReaderErrors.OnRecoverableReadError"/> for documentation on arguments.
+         /// Applicable mainly when <see cref="SkipUnknownEvents"/> or <see cref="SkipUnknownEventParts"/> is set to true."/>
+         /// </summary>
+-        public event Action<ReaderErrorType, BinaryLogRecordKind, Func<string>>? OnRecoverableReadError;
++        public event Action<ReaderErrorType, BinaryLogRecordKind, FormatErrorMessage>? OnRecoverableReadError;
+ 
+         public void Dispose()
+         {
+@@ -228,9 +228,8 @@ internal RawRecord ReadRaw()
+                     e is InvalidDataException ||
+                     // Thrown when BinaryReader is unable to deserialize binary data into expected type.
+                     e is FormatException ||
+-                    // Following 2 are thrown when we attempt to read more bytes than what is in the next event chunk.
+-                    e is StreamChunkOverReadException ||
+-                    e is EndOfStreamException)
++                    // Thrown when we attempt to read more bytes than what is in the next event chunk.
++                    (e is EndOfStreamException && _readStream.BytesCountAllowedToReadRemaining <= 0))
+                 {
+                     hasError = true;
+ 
+@@ -268,7 +267,7 @@ string ErrorFactory() => ResourceUtilities.FormatResourceStringStripCodeAndKeywo
+ 
+             return result;
+ 
+-            void HandleError(Func<string> msgFactory, bool noThrow, ReaderErrorType readerErrorType, BinaryLogRecordKind recordKind, Exception? innerException = null)
++            void HandleError(FormatErrorMessage msgFactory, bool noThrow, ReaderErrorType readerErrorType, BinaryLogRecordKind recordKind, Exception? innerException = null)
+             {
+                 if (noThrow)
+                 {
+@@ -421,7 +420,7 @@ private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+                 if (EmbeddedContentRead != null)
+                 {
+                     projectImportsCollector!.ProcessResult(
+-                        streamToEmbed => EmbeddedContentRead(new EmbeddedContentEventArgs(EmbeddedContentKind.ProjectImportArchive, streamToEmbed)),
++                        streamToEmbed => EmbeddedContentRead(new EmbeddedContentEventArgs(recordKind, streamToEmbed)),
+                         error => throw new InvalidDataException(error));
+                     projectImportsCollector.DeleteArchive();
+                 }
+@@ -429,7 +428,7 @@ private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+             else if (EmbeddedContentRead != null)
+             {
+                 EmbeddedContentRead(new EmbeddedContentEventArgs(
+-                    recordKind.ToEmbeddedContentKind(),
++                    recordKind,
+                     _binaryReader.BaseStream.Slice(length)));
+             }
+             else
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
+index 4ddd1ae456e..123d927dd12 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
+@@ -8,13 +8,13 @@ namespace Microsoft.Build.Logging
+ {
+     internal sealed class EmbeddedContentEventArgs : EventArgs
+     {
+-        public EmbeddedContentEventArgs(EmbeddedContentKind contentKind, Stream contentStream)
++        public EmbeddedContentEventArgs(BinaryLogRecordKind contentKind, Stream contentStream)
+         {
+             ContentKind = contentKind;
+             ContentStream = contentStream;
+         }
+ 
+-        public EmbeddedContentKind ContentKind { get; }
++        public BinaryLogRecordKind ContentKind { get; }
+         public Stream ContentStream { get; }
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKind.cs b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKind.cs
+deleted file mode 100644
+index 592733afbff..00000000000
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKind.cs
++++ /dev/null
+@@ -1,11 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-namespace Microsoft.Build.Logging
+-{
+-    internal enum EmbeddedContentKind
+-    {
+-        Unknown = -1,
+-        ProjectImportArchive = BinaryLogRecordKind.ProjectImportArchive,
+-    }
+-}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKindExtensions.cs b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKindExtensions.cs
+deleted file mode 100644
+index 73e9251cd77..00000000000
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKindExtensions.cs
++++ /dev/null
+@@ -1,22 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-namespace Microsoft.Build.Logging
+-{
+-    internal static class EmbeddedContentKindExtensions
+-    {
+-        internal static EmbeddedContentKind ToEmbeddedContentKind(this BinaryLogRecordKind kind)
+-        {
+-            return kind == BinaryLogRecordKind.ProjectImportArchive
+-                ? EmbeddedContentKind.ProjectImportArchive
+-                : EmbeddedContentKind.Unknown;
+-        }
+-
+-        internal static BinaryLogRecordKind ToBinaryLogRecordKind(this EmbeddedContentKind kind)
+-        {
+-            return kind == EmbeddedContentKind.ProjectImportArchive
+-                ? BinaryLogRecordKind.ProjectImportArchive
+-                : (BinaryLogRecordKind)EmbeddedContentKind.Unknown;
+-        }
+-    }
+-}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IBinlogReaderErrors.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IBinlogReaderErrors.cs
+index a1fb525a885..66af288aecb 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/IBinlogReaderErrors.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IBinlogReaderErrors.cs
+@@ -10,14 +10,6 @@ namespace Microsoft.Build.Logging
+     /// </summary>
+     public enum ReaderErrorType
+     {
+-        /// <summary>
+-        /// The file format of the binlog is not supported by the current reader.
+-        /// Despite the logs should be supported by older readers - there might be certain format updates that prevent
+-        ///  such forward compatibility. The binlog file contains the info about the minimum required reader version
+-        ///  to detect this case.
+-        /// </summary>
+-        UnsupportedFileFormat,
+-
+         /// <summary>
+         /// The encountered event is completely unknown to the reader. It cannot interpret neither a part of it.
+         /// </summary>
+@@ -38,6 +30,13 @@ public enum ReaderErrorType
+         UnknownFormatOfEventData,
+     }
+ 
++    /// <summary>
++    /// Materializes the error message.
++    /// Until it's called the error message is not materialized and no string allocations are made.
++    /// </summary>
++    /// <returns>The error message.</returns>
++    public delegate string FormatErrorMessage();
++
+     public interface IBinlogReaderErrors
+     {
+         /// <summary>
+@@ -45,6 +44,6 @@ public interface IBinlogReaderErrors
+         /// Communicates type of the error, kind of the record that encountered the error and the message detailing the error.
+         /// The error message is returned as a function to avoid unnecessary string allocations in case the error is not logged.
+         /// </summary>
+-        event Action<ReaderErrorType, BinaryLogRecordKind, Func<string>>? OnRecoverableReadError;
++        event Action<ReaderErrorType, BinaryLogRecordKind, FormatErrorMessage>? OnRecoverableReadError;
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/StreamChunkOverreadException.cs b/src/Build/Logging/BinaryLogger/Postprocessing/StreamChunkOverreadException.cs
+deleted file mode 100644
+index 265a888062a..00000000000
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/StreamChunkOverreadException.cs
++++ /dev/null
+@@ -1,22 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-
+-namespace Microsoft.Build.Logging
+-{
+-    public class StreamChunkOverReadException : Exception
+-    {
+-        public StreamChunkOverReadException()
+-        {
+-        }
+-
+-        public StreamChunkOverReadException(string message) : base(message)
+-        {
+-        }
+-
+-        public StreamChunkOverReadException(string message, Exception inner) : base(message, inner)
+-        {
+-        }
+-    }
+-}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/TransparentReadStream.cs b/src/Build/Logging/BinaryLogger/Postprocessing/TransparentReadStream.cs
+index 4e1452f299d..7bccdbcf8c7 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/TransparentReadStream.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/TransparentReadStream.cs
+@@ -79,9 +79,7 @@ public override int Read(byte[] buffer, int offset, int count)
+         {
+             if (_position + count > _maxAllowedPosition)
+             {
+-                throw new StreamChunkOverReadException(
+-                    ResourceUtilities.FormatResourceStringStripCodeAndKeyword("Binlog_StreamUtils_OverRead", count,
+-                        _maxAllowedPosition - _position));
++                count = (int)(_maxAllowedPosition - _position);
+             }
+ 
+             int cnt = _stream.Read(buffer, offset, count);
+diff --git a/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs b/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
+index f17f403e3e5..92563b63b4f 100644
+--- a/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
++++ b/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
+@@ -69,7 +69,7 @@ public ProjectImportsCollector(
+                 // Archive file will be temporarily stored in MSBuild cache folder and deleted when no longer needed
+                 _archiveFilePath = Path.Combine(
+                     cacheDirectory,
+-                    Path.ChangeExtension(
++                    GetArchiveFilePath(
+                         Path.GetFileName(logFilePath),
+                         sourcesArchiveExtension));
+             }
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 8e08168d03a..f849a6c4d7d 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -2029,7 +2029,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>Skipping the record.</value>
+   </data>
+   <data name="Binlog_ReaderMismatchedRead" xml:space="preserve">
+-    <value>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</value>
++    <value>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</value>
+     <comment>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </comment>
+@@ -2058,12 +2058,6 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+   <data name="Binlog_StreamUtils_MustBeReadable" xml:space="preserve">
+     <value>Stream must be readable.</value>
+   </data>
+-  <data name="Binlog_StreamUtils_OverRead" xml:space="preserve">
+-    <value>Attempt to read {0} bytes, when only {1} are allowed to be read.</value>
+-    <comment>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </comment>
+-  </data>
+   <data name="Binlog_StreamUtils_SeekNonOrigin" xml:space="preserve">
+     <value>Only seeking from SeekOrigin.Current is supported.</value>
+   </data>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 53ce292bf2b..16373c26ca1 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Využití:          Průměrné využití {0}: {1:###.0}</target>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index fbbca67469e..1880babd08f 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Auslastung:          {0} Durchschnittliche Auslastung: {1:###.0}</target>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 7079ce4ebdc..bdcaabb5712 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilización:          Utilización media de {0}: {1:###.0}</target>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 7708dacc3b2..d743afd968d 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilisation :          {0} Utilisation moyenne : {1:###.0}</target>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 05381e061a4..88d352c0746 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilizzo:          {0} Utilizzo medio: {1:###.0}</target>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index c234fa53fad..fc498eb167b 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilization:          {0} Average Utilization: {1:###.0}</source>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 43c944f4ced..96f7f65655a 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilization:          {0} Average Utilization: {1:###.0}</source>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 3b40011cbfa..6e3cfd8f092 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Wykorzystanie:          Średnie wykorzystanie {0}: {1:###.0}</target>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index bb60bd2c319..6c8fda317ae 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilização:          {0} Utilização Média: {1:###.0}</target>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 29d529b9051..3d8f9fecc84 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilization:          {0} Average Utilization: {1:###.0}</source>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index bea7658233e..4b84f0229d3 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Kullanım:             {0} Ortalama Kullanım: {1:###.0}</target>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index bca9a1aba44..238748cd1f6 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilization:          {0} Average Utilization: {1:###.0}</source>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 8822f29c44b..e5210d41355 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -61,8 +61,8 @@
+     </note>
+       </trans-unit>
+       <trans-unit id="Binlog_ReaderMismatchedRead">
+-        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</source>
+-        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}:{3}).</target>
++        <source>BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</source>
++        <target state="new">BuildEvent record number {0} (serialized size: {1}) attempted to perform disallowed reads (details: {2}: {3}).</target>
+         <note>
+       LOCALIZATION: {0} is an integer number denoting order. {1} is an integer denoting size. {2} is an exception type and {3} the exception message string.
+     </note>
+@@ -106,13 +106,6 @@
+         <target state="new">Stream must be readable.</target>
+         <note />
+       </trans-unit>
+-      <trans-unit id="Binlog_StreamUtils_OverRead">
+-        <source>Attempt to read {0} bytes, when only {1} are allowed to be read.</source>
+-        <target state="new">Attempt to read {0} bytes, when only {1} are allowed to be read.</target>
+-        <note>
+-      LOCALIZATION: {0} and {1} are integer numbers denoting number of bytes.
+-    </note>
+-      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_SeekNonOrigin">
+         <source>Only seeking from SeekOrigin.Current is supported.</source>
+         <target state="new">Only seeking from SeekOrigin.Current is supported.</target>
+@@ -2584,8 +2577,8 @@ Utilization:          {0} Average Utilization: {1:###.0}</source>
+         <note>{StrBegin="MSB4238: "}</note>
+       </trans-unit>
+       <trans-unit id="UnsupportedLogFileFormat">
+-        <source>MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
+-        <target state="new">MSB4235: The log file format version is {0} and minimum required read version is {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
++        <source>MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</source>
++        <target state="new">MSB4235: The log file format version is {0} with minimum required read version {1}, whereas this version of MSBuild only supports versions up to {2}.</target>
+         <note>{StrBegin="MSB4235: "}</note>
+       </trans-unit>
+       <trans-unit id="ProjectEvaluationPerformanceSummary">

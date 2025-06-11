@@ -1,0 +1,267 @@
+diff --git a/src/MSBuild/TerminalLogger/EvaluationData.cs b/src/MSBuild/TerminalLogger/EvaluationData.cs
+new file mode 100644
+index 00000000000..228268a1c82
+--- /dev/null
++++ b/src/MSBuild/TerminalLogger/EvaluationData.cs
+@@ -0,0 +1,30 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++internal sealed class EvaluationData
++{
++    /// <summary>
++    /// Captures data that comes from project evaluation, is assumed to not change through execution,
++    /// and is referenced for rendering purposes throughout the execution of the build.
++    /// </summary>
++    /// <param name="targetFramework"></param>
++    public EvaluationData(string? targetFramework)
++    {
++        TargetFramework = targetFramework;
++    }
++
++    /// <summary>
++    /// The target framework of the project or null if not multi-targeting.
++    /// </summary>
++    public string? TargetFramework { get; }
++
++    /// <summary>
++    /// This property is true when the project would prefer to have full paths in the logs and/or for processing tasks.
++    /// </summary>
++    /// <remarks>
++    /// There's an MSBuild property called GenerateFullPaths that would be a great knob to use for this, but the Common
++    /// Targets set it to true if not set, and setting it to false completely destroys the terminal logger output.
++    /// That's why this value is hardcoded to false for now, until we define a better mechanism.
++    /// </remarks>
++    public bool GenerateFullPaths { get; } = false;
++}
+diff --git a/src/MSBuild/TerminalLogger/Project.cs b/src/MSBuild/TerminalLogger/Project.cs
+index 27da2e6b7c2..6bcc23fb69a 100644
+--- a/src/MSBuild/TerminalLogger/Project.cs
++++ b/src/MSBuild/TerminalLogger/Project.cs
+@@ -22,10 +22,8 @@ internal sealed class Project
+     /// Initialized a new <see cref="Project"/> with the given <paramref name="targetFramework"/>.
+     /// </summary>
+     /// <param name="targetFramework">The target framework of the project or null if not multi-targeting.</param>
+-    public Project(string? targetFramework, StopwatchAbstraction? stopwatch)
++    public Project(StopwatchAbstraction? stopwatch)
+     {
+-        TargetFramework = targetFramework;
+-
+         if (stopwatch is not null)
+         {
+             stopwatch.Start();
+@@ -52,11 +50,6 @@ public Project(string? targetFramework, StopwatchAbstraction? stopwatch)
+     /// </summary>
+     public DirectoryInfo? SourceRoot { get; set; }
+ 
+-    /// <summary>
+-    /// The target framework of the project or null if not multi-targeting.
+-    /// </summary>
+-    public string? TargetFramework { get; }
+-
+     /// <summary>
+     /// True when the project has run target with name "_TestRunStart" defined in <see cref="TerminalLogger._testStartTarget"/>.
+     /// </summary>
+diff --git a/src/MSBuild/TerminalLogger/TerminalLogger.cs b/src/MSBuild/TerminalLogger/TerminalLogger.cs
+index 86e65f1e3e5..6c36c106f07 100644
+--- a/src/MSBuild/TerminalLogger/TerminalLogger.cs
++++ b/src/MSBuild/TerminalLogger/TerminalLogger.cs
+@@ -61,6 +61,16 @@ public ProjectContext(BuildEventContext context)
+         { }
+     }
+ 
++    /// <summary>
++    /// A wrapper over the eval context ID passed to us in <see cref="IEventSource"/> logger events.
++    /// </summary>
++    internal record struct EvalContext(int Id)
++    {
++        public EvalContext(BuildEventContext context)
++            : this(context.EvaluationId)
++        { }
++    }
++
+     /// <summary>
+     /// The indentation to use for all build output.
+     /// </summary>
+@@ -97,6 +107,14 @@ public ProjectContext(BuildEventContext context)
+     /// </remarks>
+     private readonly Dictionary<ProjectContext, Project> _projects = new();
+ 
++    /// <summary>
++    /// Tracks the status of all relevant projects seen so far.
++    /// </summary>
++    /// <remarks>
++    /// Keyed by an ID that gets passed to logger callbacks, this allows us to quickly look up the corresponding project.
++    /// </remarks>
++    private readonly Dictionary<EvalContext, EvaluationData> _evaluations = new();
++
+     /// <summary>
+     /// Tracks the work currently being done by build nodes. Null means the node is not doing any work worth reporting.
+     /// </summary>
+@@ -402,15 +420,30 @@ private bool TryApplyShowCommandLineParameter(string? parameterValue)
+         return null;
+     }
+ 
+-    private Project? CreateProject(BuildEventContext? context, System.Collections.IEnumerable? globalProperties, System.Collections.IEnumerable? properties)
++    private EvaluationData? CreateEvaluationData(BuildEventContext? context, System.Collections.IEnumerable? globalProperties, System.Collections.IEnumerable? properties)
++    {
++        if (context is not null)
++        {
++            var evalContext = new EvalContext(context);
++            if (!_evaluations.TryGetValue(evalContext, out EvaluationData? evalData))
++            {
++                string? tfm = DetectTFM(globalProperties, properties);
++                evalData = new(tfm);
++                _evaluations.Add(evalContext, evalData);
++            }
++            return evalData;
++        }
++        return null;
++    }
++
++    private Project? CreateProject(BuildEventContext? context)
+     {
+         if (context is not null)
+         {
+             var projectContext = new ProjectContext(context);
+             if (!_projects.TryGetValue(projectContext, out Project? project))
+             {
+-                string? tfm = DetectTFM(globalProperties, properties);
+-                project = new(tfm, CreateStopwatch?.Invoke());
++                project = new(CreateStopwatch?.Invoke());
+                 _projects.Add(projectContext, project);
+             }
+             return project;
+@@ -459,6 +492,7 @@ private void BuildFinished(object sender, BuildFinishedEventArgs e)
+         _refresher?.Join();
+ 
+         _projects.Clear();
++        _evaluations.Clear();
+ 
+         Terminal.BeginUpdate();
+         try
+@@ -535,10 +569,7 @@ private void StatusEventRaised(object sender, BuildStatusEventArgs e)
+         else if (e is ProjectEvaluationFinishedEventArgs evalFinished
+             && evalFinished.BuildEventContext is not null)
+         {
+-            if (CreateProject(evalFinished.BuildEventContext, evalFinished.GlobalProperties, evalFinished.Properties) is Project project)
+-            {
+-                TryDetectGenerateFullPaths(evalFinished, project);
+-            }
++            CreateEvaluationData(evalFinished.BuildEventContext, evalFinished.GlobalProperties, evalFinished.Properties);
+         }
+     }
+ 
+@@ -553,34 +584,20 @@ private void ProjectStarted(object sender, ProjectStartedEventArgs e)
+             return;
+         }
+ 
+-        CreateProject(e.BuildEventContext, e.Properties, e.GlobalProperties);
++        CreateProject(e.BuildEventContext);
+         ProjectContext c = new ProjectContext(buildEventContext);
+-        if (_restoreContext is null)
++        if (_restoreContext is null && _projects.TryGetValue(c, out var project))
+         {
+             // First ever restore in the build is starting.
+             if (e.TargetNames == "Restore" && !_restoreFinished)
+             {
+                 _restoreContext = c;
+                 int nodeIndex = NodeIndexForContext(buildEventContext);
+-                _nodes[nodeIndex] = new NodeStatus(e.ProjectFile!, null, "Restore", _projects[c].Stopwatch);
++                _nodes[nodeIndex] = new NodeStatus(e.ProjectFile!, null, "Restore", project.Stopwatch);
+             }
+         }
+     }
+ 
+-    private void TryDetectGenerateFullPaths(ProjectEvaluationFinishedEventArgs e, Project project)
+-    {
+-        if (TryGetValue(e.GlobalProperties, "GenerateFullPaths") is string generateFullPathsGPString
+-            && bool.TryParse(generateFullPathsGPString, out bool generateFullPathsValue))
+-        {
+-            project.GenerateFullPaths = generateFullPathsValue;
+-        }
+-        else if (TryGetValue(e.Properties, "GenerateFullPaths") is string generateFullPathsPString
+-            && bool.TryParse(generateFullPathsPString, out bool generateFullPathsPropertyValue))
+-        {
+-            project.GenerateFullPaths = generateFullPathsPropertyValue;
+-        }
+-    }
+-
+     /// <summary>
+     /// The <see cref="IEventSource.ProjectFinished"/> callback.
+     /// </summary>
+@@ -605,8 +622,9 @@ private void ProjectFinished(object sender, ProjectFinishedEventArgs e)
+         }
+ 
+         ProjectContext c = new(buildEventContext);
++        EvalContext evalContext = new(buildEventContext);
+ 
+-        if (_projects.TryGetValue(c, out Project? project))
++        if (_projects.TryGetValue(c, out Project? project) && _evaluations.TryGetValue(evalContext, out EvaluationData? evaluation))
+         {
+             lock (_lock)
+             {
+@@ -665,7 +683,7 @@ private void ProjectFinished(object sender, ProjectFinishedEventArgs e)
+                         // Show project build complete and its output
+                         if (project.IsTestProject)
+                         {
+-                            if (string.IsNullOrEmpty(project.TargetFramework))
++                            if (string.IsNullOrEmpty(evaluation.TargetFramework))
+                             {
+                                 Terminal.Write(ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword("TestProjectFinished_NoTF",
+                                     Indentation,
+@@ -678,14 +696,14 @@ private void ProjectFinished(object sender, ProjectFinishedEventArgs e)
+                                 Terminal.Write(ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword("TestProjectFinished_WithTF",
+                                     Indentation,
+                                     projectFile,
+-                                    AnsiCodes.Colorize(project.TargetFramework, TargetFrameworkColor),
++                                    AnsiCodes.Colorize(evaluation.TargetFramework, TargetFrameworkColor),
+                                     buildResult,
+                                     duration));
+                             }
+                         }
+                         else
+                         {
+-                            if (string.IsNullOrEmpty(project.TargetFramework))
++                            if (string.IsNullOrEmpty(evaluation.TargetFramework))
+                             {
+                                 Terminal.Write(ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword("ProjectFinished_NoTF",
+                                     Indentation,
+@@ -698,7 +716,7 @@ private void ProjectFinished(object sender, ProjectFinishedEventArgs e)
+                                 Terminal.Write(ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword("ProjectFinished_WithTF",
+                                     Indentation,
+                                     projectFile,
+-                                    AnsiCodes.Colorize(project.TargetFramework, TargetFrameworkColor),
++                                    AnsiCodes.Colorize(evaluation.TargetFramework, TargetFrameworkColor),
+                                     buildResult,
+                                     duration));
+                             }
+@@ -729,7 +747,7 @@ private void ProjectFinished(object sender, ProjectFinishedEventArgs e)
+                             }
+ 
+                             string? resolvedPathToOutput = null;
+-                            if (project.GenerateFullPaths)
++                            if (evaluation.GenerateFullPaths)
+                             {
+                                 resolvedPathToOutput = outputPathSpan.ToString();
+                             }
+@@ -826,7 +844,9 @@ private static bool IsChildOf(FileInfo file, DirectoryInfo parent)
+     private void TargetStarted(object sender, TargetStartedEventArgs e)
+     {
+         var buildEventContext = e.BuildEventContext;
+-        if (_restoreContext is null && buildEventContext is not null && _projects.TryGetValue(new ProjectContext(buildEventContext), out Project? project))
++        if (_restoreContext is null && buildEventContext is not null
++            && _projects.TryGetValue(new(buildEventContext), out Project? project)
++            && _evaluations.TryGetValue(new(buildEventContext), out EvaluationData? evaluation))
+         {
+             project.Stopwatch.Start();
+ 
+@@ -852,7 +872,7 @@ private void TargetStarted(object sender, TargetStartedEventArgs e)
+                 project.IsTestProject = true;
+             }
+ 
+-            NodeStatus nodeStatus = new(projectFile, project.TargetFramework, targetName, project.Stopwatch);
++            NodeStatus nodeStatus = new(projectFile, evaluation.TargetFramework, targetName, project.Stopwatch);
+             UpdateNodeStatus(buildEventContext, nodeStatus);
+         }
+     }

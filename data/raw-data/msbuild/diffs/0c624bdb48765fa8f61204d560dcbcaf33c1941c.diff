@@ -1,0 +1,703 @@
+diff --git a/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs b/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
+index 3776eacbda1..d54cac2e63f 100644
+--- a/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
++++ b/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
+@@ -484,8 +484,8 @@ public void ProjectCacheByVSWorkaroundWorks(GraphCacheResponse testData, BuildPa
+                         currentBuildEnvironment.Mode,
+                         currentBuildEnvironment.CurrentMSBuildExePath,
+                         currentBuildEnvironment.RunningTests,
+-                        true,
+-                        currentBuildEnvironment.VisualStudioInstallRootDirectory));
++                        runningInVisualStudio: true,
++                        visualStudioPath: currentBuildEnvironment.VisualStudioInstallRootDirectory));
+ 
+                 BuildManager.ProjectCacheItems.ShouldBeEmpty();
+ 
+@@ -502,12 +502,13 @@ public void ProjectCacheByVSWorkaroundWorks(GraphCacheResponse testData, BuildPa
+                         node.ProjectInstance.FullPath,
+                         globalProperties:
+                             new Dictionary<string, string> {{"SolutionPath", graph.GraphRoots.First().ProjectInstance.FullPath}});
++
+                     buildResult.OverallResult.ShouldBe(BuildResultCode.Success);
+ 
+                     nodesToBuildResults[node] = buildResult;
+                 }
+ 
+-                buildSession.Logger.FullLog.ShouldContain("Graph entrypoint based");
++                buildSession.Logger.FullLog.ShouldContain("Visual Studio Workaround based");
+ 
+                 AssertCacheBuild(graph, testData, null, buildSession.Logger, nodesToBuildResults);
+             }
+@@ -746,7 +747,7 @@ public void CacheViaBuildParametersCanDiscoverAndLoadPluginFromAssembly()
+ 
+             graphResult.OverallResult.ShouldBe(BuildResultCode.Success);
+ 
+-            buildSession.Logger.FullLog.ShouldContain("Graph entrypoint based");
++            buildSession.Logger.FullLog.ShouldContain("Explicit entry-point based");
+ 
+             AssertCacheBuild(graph, testData, null, buildSession.Logger, graphResult.ResultsByNode);
+         }
+@@ -893,7 +894,7 @@ public static IEnumerable<object[]> CacheExceptionLocationsTestData
+                 // Plugin constructors cannot log errors, they can only throw exceptions.
+                 yield return new object[] { ErrorLocations.Constructor, ErrorKind.Exception };
+ 
+-                foreach (var errorKind in new[]{ErrorKind.Exception, ErrorKind.LoggedError})
++                foreach (var errorKind in new[] { ErrorKind.Exception, ErrorKind.LoggedError })
+                 {
+                     yield return new object[] { ErrorLocations.BeginBuildAsync, errorKind };
+                     yield return new object[] { ErrorLocations.BeginBuildAsync | ErrorLocations.GetCacheResultAsync, errorKind };
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index e5333934947..031ac1c5f10 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -244,7 +244,6 @@ public class BuildManager : INodePacketHandler, IBuildComponentHost, IDisposable
+ 
+         private IEnumerable<DeferredBuildMessage> _deferredBuildMessages;
+         private Task<ProjectCacheService> _projectCacheService;
+-        private bool _projectCacheServiceInstantiatedByVSWorkaround;
+ 
+ #if DEBUG
+         /// <summary>
+@@ -1091,86 +1090,97 @@ internal void ExecuteSubmission(BuildSubmission submission, bool allowMainThread
+                         return;
+                     }
+ 
+-                    AddBuildRequestToSubmission(submission, newConfiguration.ConfigurationId);
+-                    IssueBuildSubmissionToScheduler(submission, allowMainThreadBuild);
++                    if (ProjectCacheIsPresent())
++                    {
++                        IssueCacheRequestForBuildSubmission(new CacheRequest(submission, newConfiguration));
++                    }
++                    else
++                    {
++                        AddBuildRequestToSubmission(submission, newConfiguration.ConfigurationId);
++                        IssueBuildRequestForBuildSubmission(submission, allowMainThreadBuild);
++                    }
+                 }
+                 catch (Exception ex) when (!ExceptionHandling.IsCriticalException(ex))
+                 {
+-                    HandleExecuteSubmissionException(submission, ex);
++                    HandleSubmissionException(submission, ex);
+                     throw;
+                 }
+             }
+         }
+ 
+-        private void AutomaticallyDetectAndInstantiateProjectCacheServiceForVisualStudio(
+-            BuildSubmission submission,
+-            BuildRequestConfiguration config)
++        bool ProjectCacheIsPresent()
++        {
++            return _projectCacheService != null ||
++                   _buildParameters.ProjectCacheDescriptor != null ||
++                   ProjectCachePresentViaVisualStudioWorkaround();
++        }
++
++        private static bool ProjectCachePresentViaVisualStudioWorkaround()
++        {
++            return BuildEnvironmentHelper.Instance.RunningInVisualStudio && ProjectCacheItems.Count > 0;
++        }
++
++        private void IssueCacheRequestForBuildSubmission(CacheRequest cacheRequest)
+         {
+             Debug.Assert(Monitor.IsEntered(_syncLock));
+ 
+-            if (BuildEnvironmentHelper.Instance.RunningInVisualStudio &&
+-                ProjectCacheItems.Count > 0 &&
+-                !_projectCacheServiceInstantiatedByVSWorkaround &&
+-                _projectCacheService == null &&
+-                _buildParameters.ProjectCacheDescriptor == null)
++            _workQueue.Post(() =>
+             {
+-                _projectCacheServiceInstantiatedByVSWorkaround = true;
+-
+-                if (ProjectCacheItems.Count != 1)
++                try
+                 {
+-                    ProjectCacheException.ThrowForMSBuildIssueWithTheProjectCache(
+-                        "OnlyOneCachePluginMustBeSpecified",
+-                        string.Join("; ", ProjectCacheItems.Values.Select(c => c.PluginPath)));
++                    GetProjectCacheService().PostCacheRequest(cacheRequest);
+                 }
+-
+-                // Plugin needs the graph root (aka top BuildSubmission path, aka the solution path when in VS) which, under VS, is accessible
+-                // only by evaluating the submission and retrieving the 'SolutionPath' property set by VS. This is also the reason why
+-                // this method cannot be called from BeginBuild, because no build submissions are available there to extract the solution path from.
+-                LoadSubmissionProjectIntoConfiguration(submission, config);
+-
+-                if (IsDesignTimeBuild(config.Project))
++                catch (Exception e)
+                 {
+-                    // Design time builds do not use the project cache.
+-                    return;
++                    CompleteSubmissionWithException(cacheRequest.Submission, cacheRequest.Configuration, e);
+                 }
++            });
+ 
+-                var solutionPath = config.Project.GetPropertyValue(SolutionProjectGenerator.SolutionPathPropertyName);
+-
+-                ErrorUtilities.VerifyThrow(
+-                    solutionPath != null && !string.IsNullOrWhiteSpace(solutionPath) && solutionPath != "*Undefined*",
+-                    $"Expected VS to set a valid SolutionPath property but got: {solutionPath}");
+-
+-                ErrorUtilities.VerifyThrow(
+-                    FileSystems.Default.FileExists(solutionPath),
+-                    $"Solution file does not exist: {solutionPath}");
+-
+-                var projectCacheItem = ProjectCacheItems.First().Value;
++            ProjectCacheService GetProjectCacheService()
++            {
++                // TODO: remove after we change VS to set the cache descriptor via build parameters.
++                AutomaticallyDetectAndInstantiateProjectCacheServiceForVisualStudio();
+ 
+-                InitializeProjectCacheService(
+-                    ProjectCacheDescriptor.FromAssemblyPath(
+-                        projectCacheItem.PluginPath,
+-                        new[]
+-                        {
+-                            new ProjectGraphEntryPoint(
+-                                solutionPath,
+-                                config.Project.GlobalProperties)
+-                        },
+-                        null,
+-                        projectCacheItem.PluginSettings),
+-                    CancellationToken.None);
++                try
++                {
++                    return _projectCacheService.Result;
++                }
++                catch
++                {
++                    // These are exceptions thrown during project cache startup (assembly load issues or cache BeginBuild exceptions).
++                    // Set to null so that EndBuild does not try to shut it down and thus rethrow the exception.
++                    Interlocked.Exchange(ref _projectCacheService, null);
++                    throw;
++                }
+             }
++        }
+ 
+-            static bool IsDesignTimeBuild(ProjectInstance project)
++        private void AutomaticallyDetectAndInstantiateProjectCacheServiceForVisualStudio()
++        {
++            if (BuildEnvironmentHelper.Instance.RunningInVisualStudio &&
++                ProjectCacheItems.Count > 0 &&
++                _projectCacheService == null &&
++                _buildParameters.ProjectCacheDescriptor == null)
+             {
+-                var designTimeBuild = project.GetPropertyValue(DesignTimeProperties.DesignTimeBuild);
+-                var buildingProject = project.GlobalPropertiesDictionary[DesignTimeProperties.BuildingProject]?.EvaluatedValue;
++                lock (_syncLock)
++                {
++                    if (_projectCacheService != null)
++                    {
++                        return;
++                    }
+ 
+-                return MSBuildStringIsTrue(designTimeBuild) ||
+-                       buildingProject != null && !MSBuildStringIsTrue(buildingProject);
+-            }
++                    if (ProjectCacheItems.Count != 1)
++                    {
++                        ProjectCacheException.ThrowForMSBuildIssueWithTheProjectCache(
++                            "OnlyOneCachePluginMustBeSpecified",
++                            string.Join("; ", ProjectCacheItems.Values.Select(c => c.PluginPath)));
++                    }
++
++                    var projectCacheItem = ProjectCacheItems.First().Value;
+ 
+-            static bool MSBuildStringIsTrue(string msbuildString) =>
+-                ConversionUtilities.ConvertStringToBool(msbuildString, nullOrWhitespaceIsFalse: true);
++                    InitializeProjectCacheService(ProjectCacheDescriptor.FromVisualStudioWorkaround(projectCacheItem), CancellationToken.None);
++                }
++            }
+         }
+ 
+         /// <summary>
+@@ -1211,7 +1221,7 @@ internal void ExecuteSubmission(GraphBuildSubmission submission)
+                             }
+                             catch (Exception ex) when (!ExceptionHandling.IsCriticalException(ex))
+                             {
+-                                HandleExecuteSubmissionException(submission, ex);
++                                HandleSubmissionException(submission, ex);
+                             }
+                         },
+                         _graphSchedulingCancellationSource.Token,
+@@ -1220,7 +1230,7 @@ internal void ExecuteSubmission(GraphBuildSubmission submission)
+                 }
+                 catch (Exception ex) when (!ExceptionHandling.IsCriticalException(ex))
+                 {
+-                    HandleExecuteSubmissionException(submission, ex);
++                    HandleSubmissionException(submission, ex);
+                     throw;
+                 }
+             }
+@@ -1416,10 +1426,23 @@ private void ProcessPacket(int node, INodePacket packet)
+             }
+         }
+ 
++        private void CompleteSubmissionWithException(BuildSubmission submission, BuildRequestConfiguration configuration, Exception exception)
++        {
++            lock (_syncLock)
++            {
++                if (submission.BuildRequest is null)
++                {
++                    AddBuildRequestToSubmission(submission, configuration.ConfigurationId);
++                }
++
++                HandleSubmissionException(submission, exception);
++            }
++        }
++
+         /// <summary>
+-        /// Deals with exceptions that may be thrown as a result of ExecuteSubmission.
++        /// Deals with exceptions that may be thrown when handling a submission.
+         /// </summary>
+-        private void HandleExecuteSubmissionException(BuildSubmission submission, Exception ex)
++        private void HandleSubmissionException(BuildSubmission submission, Exception ex)
+         {
+             if (ex is AggregateException ae && ae.InnerExceptions.Count == 1)
+             {
+@@ -1453,7 +1476,7 @@ private void HandleExecuteSubmissionException(BuildSubmission submission, Except
+         /// <summary>
+         /// Deals with exceptions that may be thrown as a result of ExecuteSubmission.
+         /// </summary>
+-        private void HandleExecuteSubmissionException(GraphBuildSubmission submission, Exception ex)
++        private void HandleSubmissionException(GraphBuildSubmission submission, Exception ex)
+         {
+             if (ex is InvalidProjectFileException projectException)
+             {
+@@ -1495,11 +1518,23 @@ private static void AddBuildRequestToSubmission(BuildSubmission submission, int
+                 submission.BuildRequestData.RequestedProjectState);
+         }
+ 
++        private static void AddProxyBuildRequestToSubmission(BuildSubmission submission, int configurationId, ProxyTargets proxyTargets)
++        {
++            submission.BuildRequest = new BuildRequest(
++                submission.SubmissionId,
++                BackEnd.BuildRequest.InvalidNodeRequestId,
++                configurationId,
++                proxyTargets,
++                submission.BuildRequestData.HostServices,
++                submission.BuildRequestData.Flags,
++                submission.BuildRequestData.RequestedProjectState);
++        }
++
+         /// <summary>
+         /// The submission is a top level build request entering the BuildManager.
+         /// Sends the request to the scheduler with optional legacy threading semantics behavior.
+         /// </summary>
+-        private void IssueBuildSubmissionToScheduler(BuildSubmission submission, bool allowMainThreadBuild = false)
++        private void IssueBuildRequestForBuildSubmission(BuildSubmission submission, bool allowMainThreadBuild = false)
+         {
+             _workQueue.Post(
+                 () =>
+@@ -1518,7 +1553,7 @@ private void IssueBuildSubmissionToScheduler(BuildSubmission submission, bool al
+                     }
+                     catch (Exception ex) when (!ExceptionHandling.IsCriticalException(ex))
+                     {
+-                        HandleExecuteSubmissionException(submission, ex);
++                        HandleSubmissionException(submission, ex);
+                     }
+                 });
+ 
+@@ -1984,7 +2019,6 @@ private void Reset()
+             _workQueue = null;
+             _graphSchedulingCancellationSource = null;
+             _projectCacheService = null;
+-            _projectCacheServiceInstantiatedByVSWorkaround = false;
+             _acquiredProjectRootElementCacheFromProjectInstance = false;
+ 
+             _unnamedProjectInstanceToNames.Clear();
+@@ -2091,6 +2125,74 @@ private BuildRequestConfiguration AddNewConfiguration(BuildRequestConfiguration
+             return newConfiguration;
+         }
+ 
++        internal void PostCacheResult(CacheRequest cacheRequest, CacheResult cacheResult)
++        {
++            _workQueue.Post(() =>
++            {
++                if (cacheResult.Exception is not null)
++                {
++                    CompleteSubmissionWithException(cacheRequest.Submission, cacheRequest.Configuration, cacheResult.Exception);
++                    return;
++                }
++
++                HandleCacheResult();
++            });
++
++            void HandleCacheResult()
++            {
++                lock (_syncLock)
++                {
++                    try
++                    {
++                        if (_projectCacheService?.Result.DesignTimeBuildsDetected)
++                        {
++                            throw new NotImplementedException();
++                            _projectCacheService.Result.ShutDown().GetAwaiter().GetResult();
++                            _projectCacheService = null;
++                        }
++
++                        var submission = cacheRequest.Submission;
++                        var configuration = cacheRequest.Configuration;
++
++                        if (cacheResult.ResultType != CacheResultType.CacheHit)
++                        {
++                            // Issue the real build request.
++                            AddBuildRequestToSubmission(submission, configuration.ConfigurationId);
++                            IssueBuildRequestForBuildSubmission(submission, allowMainThreadBuild: false);
++                        }
++                        else if (cacheResult.ResultType == CacheResultType.CacheHit && cacheResult.ProxyTargets != null)
++                        {
++                            // Setup submission.BuildRequest with proxy targets. The proxy request is built on the inproc node (to avoid
++                            // ProjectInstance serialization). The proxy target results are used as results for the real targets.
++                            AddProxyBuildRequestToSubmission(submission, configuration.ConfigurationId, cacheResult.ProxyTargets);
++                            IssueBuildRequestForBuildSubmission(submission, allowMainThreadBuild: false);
++                        }
++                        else if (cacheResult.ResultType == CacheResultType.CacheHit && cacheResult.BuildResult != null)
++                        {
++                            // Mark the build submission as complete with the provided results and return.
++
++                            // There must be a build request for the results, so fake one.
++                            AddBuildRequestToSubmission(submission, configuration.ConfigurationId);
++                            var result = new BuildResult(submission.BuildRequest);
++
++                            foreach (var cacheResult in cacheResult.BuildResult.ResultsByTarget)
++                            {
++                                result.AddResultsForTarget(cacheResult.Key, cacheResult.Value);
++                            }
++
++                            _resultsCache.AddResult(result);
++                            submission.CompleteLogging(false);
++                            ReportResultsToSubmission(result);
++                        }
++                    }
++                    catch (Exception e)
++                    {
++                        CompleteSubmissionWithException(cacheRequest.Submission, cacheRequest.Configuration, e);
++                    }
++                }
++            }
++        }
++
+         /// <summary>
+         /// Handles a new request coming from a node.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/ProjectCache/CacheResult.cs b/src/Build/BackEnd/Components/ProjectCache/CacheResult.cs
+index 7f8a69ecbbd..81f88f705e9 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/CacheResult.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/CacheResult.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ #nullable enable
++using System;
+ using System.Collections.Generic;
+ using System.Linq;
+ using Microsoft.Build.BackEnd;
+@@ -46,6 +47,8 @@ public enum CacheResultType
+     /// </summary>
+     public class CacheResult
+     {
++        public Exception Exception { get; }
++
+         private CacheResult(
+             CacheResultType resultType,
+             BuildResult? buildResult = null,
+@@ -63,6 +66,12 @@ private CacheResult(
+             ProxyTargets = proxyTargets;
+         }
+ 
++        private CacheResult(Exception exception)
++        {
++            ResultType = CacheResultType.None;
++            Exception = exception;
++        }
++
+         public CacheResultType ResultType { get; }
+         public BuildResult? BuildResult { get; }
+         public ProxyTargets? ProxyTargets { get; }
+@@ -90,6 +99,11 @@ public static CacheResult IndicateNonCacheHit(CacheResultType resultType)
+             return new CacheResult(resultType);
+         }
+ 
++        internal static CacheResult IndicateException(Exception e)
++        {
++            return new CacheResult(e);
++        }
++
+         private static BuildResult ConstructBuildResult(IReadOnlyCollection<PluginTargetResult> targetResults)
+         {
+             var buildResult = new BuildResult();
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheDescriptor.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheDescriptor.cs
+index 22d98780b2b..10c97621ef5 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheDescriptor.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheDescriptor.cs
+@@ -30,6 +30,8 @@ public class ProjectCacheDescriptor
+ 
+         public ProjectCachePluginBase? PluginInstance { get; }
+ 
++        internal bool VsWorkaround { get; }
++
+         private ProjectCacheDescriptor(
+             IReadOnlyCollection<ProjectGraphEntryPoint>? entryPoints,
+             ProjectGraph? projectGraph,
+@@ -62,6 +64,19 @@ private ProjectCacheDescriptor(
+             PluginInstance = pluginInstance;
+         }
+ 
++        private ProjectCacheDescriptor(ProjectCacheItem projectCacheItem)
++        {
++            VsWorkaround = true;
++            PluginAssemblyPath = projectCacheItem.PluginPath;
++            PluginSettings = projectCacheItem.PluginSettings;
++        }
++
++        // TODO: remove after we change VS to set the cache descriptor via build parameters.
++        internal static ProjectCacheDescriptor FromVisualStudioWorkaround(ProjectCacheItem projectCacheItem)
++        {
++            return new ProjectCacheDescriptor(projectCacheItem);
++        }
++
+         public static ProjectCacheDescriptor FromAssemblyPath(
+             string pluginAssemblyPath,
+             IReadOnlyCollection<ProjectGraphEntryPoint>? entryPoints,
+@@ -87,18 +102,22 @@ public string GetDetailedDescription()
+                 : $"Assembly path based: {PluginAssemblyPath}";
+ 
+             var entryPointStyle = EntryPoints != null
+-                ? "Graph entrypoint based"
+-                : "Static graph based";
++                ? "Explicit entry-point based"
++                : ProjectGraph != null
++                    ? "Static graph based"
++                    : "Visual Studio Workaround based";
+ 
+             var entryPoints = EntryPoints != null
+                 ? string.Join(
+                     "\n",
+                     EntryPoints.Select(e => $"{e.ProjectFile} {{{FormatGlobalProperties(e.GlobalProperties)}}}"))
+-                : string.Join(
+-                    "\n",
+-                    ProjectGraph!.EntryPointNodes.Select(
+-                        n =>
+-                            $"{n.ProjectInstance.FullPath} {{{FormatGlobalProperties(n.ProjectInstance.GlobalProperties)}}}"));
++                : ProjectGraph != null
++                    ? string.Join(
++                        "\n",
++                        ProjectGraph!.EntryPointNodes.Select(
++                            n =>
++                                $"{n.ProjectInstance.FullPath} {{{FormatGlobalProperties(n.ProjectInstance.GlobalProperties)}}}"))
++                    : "Solution file";
+ 
+             return $"{loadStyle}\nEntry-point style: {entryPointStyle}\nEntry-points:\n{entryPoints}";
+ 
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+index ad7259723ce..c871f990bea 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+@@ -8,15 +8,25 @@
+ using System.Reflection;
+ using System.Threading;
+ using System.Threading.Tasks;
++using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Construction;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.FileSystem;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Graph;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Shared.FileSystem;
+ 
+ namespace Microsoft.Build.Experimental.ProjectCache
+ {
++    internal record CacheRequest(BuildSubmission Submission, BuildRequestConfiguration Configuration);
++
++    internal record VolatileNullableBool(bool Value)
++    {
++        public static implicit operator bool(VolatileNullableBool? d) => d is not null && d.Value;
++    }
++
+     internal class ProjectCacheService
+     {
+         private readonly BuildManager _buildManager;
+@@ -25,6 +35,13 @@ internal class ProjectCacheService
+         private readonly CancellationToken _cancellationToken;
+         private readonly ProjectCachePluginBase _projectCachePlugin;
+ 
++        // Volatile because one thread writes it, another reads it.
++        // The BuildManager thread reads this to cheaply back off when the cache is disabled.
++        // It is written to only once by a ThreadPool thread.
++        // null means no decision has been made yet. bool? cannot be marked volatile so use a class wrapper instead.
++        // TODO: remove after we change VS to set the cache descriptor via build parameters.
++        public volatile VolatileNullableBool? DesignTimeBuildsDetected;
++
+         private ProjectCacheService(
+             ProjectCachePluginBase projectCachePlugin,
+             BuildManager buildManager,
+@@ -49,9 +66,30 @@ public static async Task<ProjectCacheService> FromDescriptorAsync(
+             var plugin = await Task.Run(() => GetPluginInstance(pluginDescriptor), cancellationToken)
+                 .ConfigureAwait(false);
+ 
+-            // TODO: Detect and use the highest verbosity from all the user defined loggers. That's tricky because right now we can't discern between user set loggers and msbuild's internally added loggers.
++            // TODO: Detect and use the highest verbosity from all the user defined loggers. That's tricky because right now we can't query loggers about
++            // their verbosity levels.
+             var loggerFactory = new Func<PluginLoggerBase>(() => new LoggingServiceToPluginLoggerAdapter(LoggerVerbosity.Normal, loggingService));
+ 
++            // TODO: remove after we change VS to set the cache descriptor via build parameters.
++            if (pluginDescriptor.VsWorkaround)
++            {
++                // When running under VS we can't initialize the plugin until we evaluate a project (any project) and extract
++                // further information (set by VS) from it required by the plugin.
++                return new ProjectCacheService(plugin, buildManager, loggerFactory, pluginDescriptor, cancellationToken);
++            }
++
++            await InitializePlugin(pluginDescriptor, cancellationToken, loggerFactory, plugin);
++
++            return new ProjectCacheService(plugin, buildManager, loggerFactory, pluginDescriptor, cancellationToken);
++        }
++
++        private static async Task InitializePlugin(
++            ProjectCacheDescriptor pluginDescriptor,
++            CancellationToken cancellationToken,
++            Func<PluginLoggerBase> loggerFactory,
++            ProjectCachePluginBase plugin
++        )
++        {
+             var logger = loggerFactory();
+ 
+             try
+@@ -75,8 +113,6 @@ await plugin.BeginBuildAsync(
+             {
+                 ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheInitializationFailed");
+             }
+-
+-            return new ProjectCacheService(plugin, buildManager, loggerFactory, pluginDescriptor, cancellationToken);
+         }
+ 
+         private static ProjectCachePluginBase GetPluginInstance(ProjectCacheDescriptor pluginDescriptor)
+@@ -148,9 +184,112 @@ IEnumerable<Type> GetTypes<T>(Assembly assembly)
+         private static readonly CoreClrAssemblyLoader _loader = new CoreClrAssemblyLoader();
+ #endif
+ 
+-        public async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildRequest)
++        public void PostCacheRequest(CacheRequest cacheRequest)
++        {
++            Task.Run(async () =>
++            {
++                try
++                {
++                    var cacheResult = await ProcessCacheRequest(cacheRequest);
++                    _buildManager.PostCacheResult(cacheRequest, cacheResult);
++                }
++                catch (Exception e)
++                {
++                    _buildManager.PostCacheResult(cacheRequest, CacheResult.IndicateException(e));
++                }
++            }, _cancellationToken);
++
++            async Task<CacheResult> ProcessCacheRequest(CacheRequest request)
++            {
++                EvaluateProjectIfNecessary(request);
++                if (DesignTimeBuildsDetected)
++                {
++                    throw new NotImplementedException();
++                    // The BuildManager should disable the cache after the first query that finds
++                    // a design time build.
++                    return CacheResult.IndicateNonCacheHit(CacheResultType.CacheNotApplicable);
++                }
++
++                if (_projectCacheDescriptor.VsWorkaround)
++                {
++                    // TODO: remove after we change VS to set the cache descriptor via build parameters.
++                    await LateInitializePluginForVsWorkaround(request);
++                }
++
++                return await GetCacheResultAsync(cacheRequest.Submission.BuildRequestData);
++            }
++
++            void EvaluateProjectIfNecessary(CacheRequest request)
++            {
++                // TODO: only do this if the project cache requests evaluation. QB needs evaluations, but the Anybuild implementation
++                // TODO: might not need them, so no point evaluating if it's not necessary. As a caveat, evaluations would still be optimal
++                // TODO: when proxy builds are issued by the plugin ( scheduled on the inproc node, no point re-evaluating on out-of-proc nodes).
++                lock (request.Configuration)
++                {
++                    if (!request.Configuration.IsLoaded)
++                    {
++                        request.Configuration.LoadProjectIntoConfiguration(
++                            _buildManager,
++                            request.Submission.BuildRequestData.Flags,
++                            request.Submission.SubmissionId,
++                            Scheduler.InProcNodeId
++                        );
++
++                        // If we're taking the time to evaluate, avoid having other nodes to repeat the same evaluation.
++                        // Based on the assumption that ProjectInstance serialization is faster than evaluating from scratch.
++                        request.Configuration.Project.TranslateEntireState = true;
++                    }
++                }
++
++                // Attribute is volatile and reference writes are atomic.
++                // Assume that if one request is a design time build, all of them are.
++                DesignTimeBuildsDetected ??= new VolatileNullableBool(IsDesignTimeBuild(request.Configuration.Project));
++            }
++
++            static bool IsDesignTimeBuild(ProjectInstance project)
++            {
++                var designTimeBuild = project.GetPropertyValue(DesignTimeProperties.DesignTimeBuild);
++                var buildingProject = project.GlobalPropertiesDictionary[DesignTimeProperties.BuildingProject]?.EvaluatedValue;
++
++                return MSBuildStringIsTrue(designTimeBuild) ||
++                       buildingProject != null && !MSBuildStringIsTrue(buildingProject);
++            }
++
++            async Task LateInitializePluginForVsWorkaround(CacheRequest request)
++            {
++                var (_, configuration) = request;
++                var solutionPath = configuration.Project.GetPropertyValue(SolutionProjectGenerator.SolutionPathPropertyName);
++
++                ErrorUtilities.VerifyThrow(
++                    solutionPath != null && !string.IsNullOrWhiteSpace(solutionPath) && solutionPath != "*Undefined*",
++                    $"Expected VS to set a valid SolutionPath property but got: {solutionPath}");
++
++                ErrorUtilities.VerifyThrow(
++                    FileSystems.Default.FileExists(solutionPath),
++                    $"Solution file does not exist: {solutionPath}");
++
++                await InitializePlugin(
++                    ProjectCacheDescriptor.FromAssemblyPath(
++                        _projectCacheDescriptor.PluginAssemblyPath,
++                        new[]
++                        {
++                            new ProjectGraphEntryPoint(
++                                solutionPath,
++                                configuration.Project.GlobalProperties)
++                        },
++                        projectGraph: null,
++                        _projectCacheDescriptor.PluginSettings),
++                    _cancellationToken,
++                    _loggerFactory,
++                    _projectCachePlugin);
++            }
++
++            static bool MSBuildStringIsTrue(string msbuildString) =>
++                ConversionUtilities.ConvertStringToBool(msbuildString, nullOrWhitespaceIsFalse: true);
++        }
++
++        private async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildRequest)
+         {
+-            // TODO: Parent these logs under the project build event so they appear nested under the project in the binlog viewer.
+             var queryDescription = $"{buildRequest.ProjectFullPath}" +
+                                    $"\n\tTargets:[{string.Join(", ", buildRequest.TargetNames)}]" +
+                                    $"\n\tGlobal Properties: {{{string.Join(",", buildRequest.GlobalProperties.Select(kvp => $"{kvp.Name}={kvp.EvaluatedValue}"))}}}";
+@@ -176,7 +315,7 @@ public async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildRequest
+                 ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheQueryFailed", queryDescription);
+             }
+ 
+-            var message = $"Plugin result: {cacheResult.ResultType}.";
++            var message = $"------  Plugin result: {cacheResult.ResultType}.";
+ 
+             switch (cacheResult.ResultType)
+             {

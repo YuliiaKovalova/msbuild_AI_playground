@@ -1,0 +1,163 @@
+diff --git a/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs b/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
+index f4644d4e358..633a52f037a 100644
+--- a/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
+@@ -18,6 +18,7 @@
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
++using Shouldly;
+ using Xunit;
+ using InvalidProjectFileException = Microsoft.Build.Exceptions.InvalidProjectFileException;
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
+@@ -1048,6 +1049,36 @@ public void TestTaskDictionaryOutputItems()
+                 """);
+             ml.AssertLogContains("a=b");
+         }
++
++        [Fact]
++        public void TestTaskParameterLogging()
++        {
++            string customTaskPath = Assembly.GetExecutingAssembly().Location;
++            MockLogger ml = ObjectModelHelpers.BuildProjectExpectSuccess($"""
++                    <Project>
++                        <UsingTask TaskName=`TaskThatReturnsDictionaryTaskItem` AssemblyFile=`{customTaskPath}`/>
++                        <ItemGroup>
++                            <MyItem Include="item1"/>
++                            <MyItem Include="item2"/>
++                        </ItemGroup>
++                        <Target Name=`Build`>
++                           <TaskThatReturnsDictionaryTaskItem Key="a" Value="b" AdditionalParameters="@(MyItem)" />
++                        </Target>
++                    </Project>
++                """);
++
++            // Each parameter should be logged as TaskParameterEvent.
++            ml.TaskParameterEvents.Count.ShouldBe(3);
++            IList<string> messages = ml.TaskParameterEvents.Select(e => e.Message).ToList();
++            messages.ShouldContain($"{ItemGroupLoggingHelper.TaskParameterPrefix}Key=a");
++            messages.ShouldContain($"{ItemGroupLoggingHelper.TaskParameterPrefix}Value=b");
++            messages.ShouldContain($"{ItemGroupLoggingHelper.TaskParameterPrefix}\n    AdditionalParameters=\n        item1\n        item2");
++
++            // Parameters should not be logged as messages.
++            messages = ml.BuildMessageEvents.Select(e => e.Message).ToList();
++            messages.ShouldNotContain(m => m.StartsWith(ItemGroupLoggingHelper.TaskParameterPrefix));
++        }
++
+         #endregion
+ 
+         #region ITestTaskHost Members
+diff --git a/src/Build.UnitTests/BackEnd/TaskThatReturnsDictionaryTaskItem.cs b/src/Build.UnitTests/BackEnd/TaskThatReturnsDictionaryTaskItem.cs
+index c258beb89a4..b662a2ca441 100644
+--- a/src/Build.UnitTests/BackEnd/TaskThatReturnsDictionaryTaskItem.cs
++++ b/src/Build.UnitTests/BackEnd/TaskThatReturnsDictionaryTaskItem.cs
+@@ -17,6 +17,8 @@ public sealed class TaskThatReturnsDictionaryTaskItem : Utilities.Task
+     public string Key { get; set; }
+     public string Value { get; set; }
+ 
++    public ITaskItem[] AdditionalParameters { get; set; }
++
+     public override bool Execute()
+     {
+         var metaValue = new MinimalDictionary<string, string>
+diff --git a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+index 4418a48a63d..48308779720 100644
+--- a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
++++ b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+@@ -1266,30 +1266,6 @@ private bool InitializeTaskVectorParameter(
+             return success;
+         }
+ 
+-        /// <summary>
+-        /// Variation to handle arrays, to help with logging the parameters.
+-        /// </summary>
+-        /// <remarks>
+-        /// Logging currently enabled only by an env var.
+-        /// </remarks>
+-        private bool InternalSetTaskParameter(TaskPropertyInfo parameter, IList parameterValue)
+-        {
+-            if (LogTaskInputs &&
+-                !_taskLoggingContext.LoggingService.OnlyLogCriticalEvents &&
+-                parameterValue.Count > 0 &&
+-                parameter.Log)
+-            {
+-                ItemGroupLoggingHelper.LogTaskParameter(
+-                    _taskLoggingContext,
+-                    TaskParameterMessageKind.TaskInput,
+-                    parameter.Name,
+-                    parameterValue,
+-                    parameter.LogItemMetadata);
+-            }
+-
+-            return InternalSetTaskParameter(parameter, (object)parameterValue);
+-        }
+-
+         private static readonly string TaskParameterFormatString = ItemGroupLoggingHelper.TaskParameterPrefix + "{0}={1}";
+ 
+         /// <summary>
+@@ -1303,14 +1279,31 @@ private bool InternalSetTaskParameter(
+ 
+             if (LogTaskInputs && !_taskLoggingContext.LoggingService.OnlyLogCriticalEvents)
+             {
+-                // If the type is a list, we already logged the parameters
+-                if (!(parameterValue is IList))
++                IList parameterValueAsList = parameterValue as IList;
++                bool legacyBehavior = !ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_10);
++
++                // Legacy textual logging for parameters that are not lists.
++                if (legacyBehavior && parameterValueAsList == null)
+                 {
+                     _taskLoggingContext.LogCommentFromText(
+-                        MessageImportance.Low,
+-                        TaskParameterFormatString,
+-                        parameter.Name,
+-                        ItemGroupLoggingHelper.GetStringFromParameterValue(parameterValue));
++                       MessageImportance.Low,
++                       TaskParameterFormatString,
++                       parameter.Name,
++                       ItemGroupLoggingHelper.GetStringFromParameterValue(parameterValue));
++                }
++
++                if (parameter.Log)
++                {
++                    // Structured logging for all parameters that have logging enabled and are not empty lists.
++                    if (parameterValueAsList?.Count > 0 || (parameterValueAsList == null && !legacyBehavior))
++                    {
++                        ItemGroupLoggingHelper.LogTaskParameter(
++                            _taskLoggingContext,
++                            TaskParameterMessageKind.TaskInput,
++                            parameter.Name,
++                            parameterValueAsList ?? new object[] { parameterValue },
++                            parameter.LogItemMetadata);
++                    }
+                 }
+             }
+ 
+diff --git a/src/UnitTests.Shared/MockLogger.cs b/src/UnitTests.Shared/MockLogger.cs
+index dab6b5e32d0..782cef74d41 100644
+--- a/src/UnitTests.Shared/MockLogger.cs
++++ b/src/UnitTests.Shared/MockLogger.cs
+@@ -123,6 +123,11 @@ public sealed class MockLogger : ILogger
+         /// </summary>
+         public List<TaskFinishedEventArgs> TaskFinishedEvents { get; } = new List<TaskFinishedEventArgs>();
+ 
++        /// <summary>
++        /// List of TaskParameter events
++        /// </summary>
++        public List<TaskParameterEventArgs> TaskParameterEvents { get; } = new List<TaskParameterEventArgs>();
++
+         /// <summary>
+         /// List of BuildMessage events
+         /// </summary>
+@@ -362,6 +367,11 @@ public void LoggerEventHandler(object sender, BuildEventArgs eventArgs)
+                             TaskFinishedEvents.Add(taskFinishedEventArgs);
+                             break;
+                         }
++                    case TaskParameterEventArgs taskParameterEventArgs:
++                        {
++                            TaskParameterEvents.Add(taskParameterEventArgs);
++                            break;
++                        }
+                     case BuildMessageEventArgs buildMessageEventArgs:
+                         {
+                             BuildMessageEvents.Add(buildMessageEventArgs);

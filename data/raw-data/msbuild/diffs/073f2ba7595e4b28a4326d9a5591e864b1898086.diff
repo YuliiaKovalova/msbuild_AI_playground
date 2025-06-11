@@ -1,0 +1,109 @@
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 523cb72e62d..bbd1f3da49b 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -8,7 +8,6 @@
+ using System.Globalization;
+ using System.IO;
+ using System.IO.Pipes;
+-using System.Linq;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Client;
+@@ -165,33 +164,45 @@ public MSBuildClientExitResult Execute(CancellationToken cancellationToken)
+ #endif
+ 
+             CommunicationsUtilities.Trace("Executing build with command line '{0}'", descriptiveCommandLine);
+-            bool serverIsAlreadyRunning = ServerIsRunning();
+-            if (KnownTelemetry.BuildTelemetry != null)
+-            {
+-                KnownTelemetry.BuildTelemetry.InitialServerState = serverIsAlreadyRunning ? "hot" : "cold";
+-            }
+-            if (!serverIsAlreadyRunning)
++
++            try
+             {
+-                CommunicationsUtilities.Trace("Server was not running. Starting server now.");
+-                if (!TryLaunchServer())
++                bool serverIsAlreadyRunning = ServerIsRunning();
++                if (KnownTelemetry.BuildTelemetry != null)
++                {
++                    KnownTelemetry.BuildTelemetry.InitialServerState = serverIsAlreadyRunning ? "hot" : "cold";
++                }
++                if (!serverIsAlreadyRunning)
++                {
++                    CommunicationsUtilities.Trace("Server was not running. Starting server now.");
++                    if (!TryLaunchServer())
++                    {
++                        _exitResult.MSBuildClientExitType = MSBuildClientExitType.LaunchError;
++                        return _exitResult;
++                    }
++                }
++
++                // Check that server is not busy.
++                bool serverWasBusy = ServerWasBusy();
++                if (serverWasBusy)
+                 {
+-                    _exitResult.MSBuildClientExitType = MSBuildClientExitType.LaunchError;
++                    CommunicationsUtilities.Trace("Server is busy, falling back to former behavior.");
++                    _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
+                     return _exitResult;
+                 }
+-            }
+ 
+-            // Check that server is not busy.
+-            bool serverWasBusy = ServerWasBusy();
+-            if (serverWasBusy)
+-            {
+-                CommunicationsUtilities.Trace("Server is busy, falling back to former behavior.");
+-                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
+-                return _exitResult;
++                // Connect to server.
++                if (!TryConnectToServer(serverIsAlreadyRunning ? 1_000 : 20_000))
++                {
++                    return _exitResult;
++                }
+             }
+-
+-            // Connect to server.
+-            if (!TryConnectToServer(serverIsAlreadyRunning ? 1_000 : 20_000))
++            catch (IOException ex) when (ex is not PathTooLongException)
+             {
++                // For unknown root cause, Mutex.TryOpenExisting can sometimes throw 'Connection timed out' exception preventing to obtain the build server state through it (Running or not, Busy or not).
++                // See: https://github.com/dotnet/msbuild/issues/7993
++                CommunicationsUtilities.Trace("Failed to obtain the current build server state: {0}", ex);
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.UnknownServerState;
+                 return _exitResult;
+             }
+ 
+diff --git a/src/Build/BackEnd/Client/MSBuildClientExitType.cs b/src/Build/BackEnd/Client/MSBuildClientExitType.cs
+index e9916bd5414..a2d683cfe40 100644
+--- a/src/Build/BackEnd/Client/MSBuildClientExitType.cs
++++ b/src/Build/BackEnd/Client/MSBuildClientExitType.cs
+@@ -24,6 +24,13 @@ public enum MSBuildClientExitType
+         /// The build stopped unexpectedly, for example,
+         /// because a named pipe between the server and the client was unexpectedly closed.
+         /// </summary>
+-        Unexpected
++        Unexpected,
++        /// <summary>
++        /// The client is not able to identify the server state.
++        /// </summary>
++        /// <remarks>
++        /// This may happen when mutex that is regulating the server state throws.
++        /// </remarks>
++        UnknownServerState
+     }
+ }
+diff --git a/src/MSBuild/MSBuildClientApp.cs b/src/MSBuild/MSBuildClientApp.cs
+index 9177f76aa19..0fd4ea40181 100644
+--- a/src/MSBuild/MSBuildClientApp.cs
++++ b/src/MSBuild/MSBuildClientApp.cs
+@@ -76,6 +76,7 @@ public static MSBuildApp.ExitType Execute(
+ 
+             if (exitResult.MSBuildClientExitType == MSBuildClientExitType.ServerBusy ||
+                 exitResult.MSBuildClientExitType == MSBuildClientExitType.UnableToConnect ||
++                exitResult.MSBuildClientExitType == MSBuildClientExitType.UnknownServerState ||
+                 exitResult.MSBuildClientExitType == MSBuildClientExitType.LaunchError)
+             {
+                 if (KnownTelemetry.BuildTelemetry != null)

@@ -1,0 +1,197 @@
+diff --git a/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs b/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
+index f4644d4e358..24bfb217e0f 100644
+--- a/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
+@@ -18,6 +18,7 @@
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
++using Shouldly;
+ using Xunit;
+ using InvalidProjectFileException = Microsoft.Build.Exceptions.InvalidProjectFileException;
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
+@@ -1048,6 +1049,47 @@ public void TestTaskDictionaryOutputItems()
+                 """);
+             ml.AssertLogContains("a=b");
+         }
++
++        [Fact]
++        public void TaskExceptionHandlingTest()
++        {
++            // Unfortunately we cannot run those via TheoryAttribute and InlineDataAttribute because
++            //  the MSBuildTestEnvironmentFixture injects the cleanup logic for each testcase and when those
++            //  are run in parallel, within the same process, the two process will conflict with each other (on the error file).
++            TaskExceptionHandlingTestInternal(typeof(OutOfMemoryException), true);
++            TaskExceptionHandlingTestInternal(typeof(ArgumentException), false);
++        }
++
++        private void TaskExceptionHandlingTestInternal(Type exceptionType, bool isCritical)
++        {
++            string testExceptionMessage = "Test Message";
++            string customTaskPath = Assembly.GetExecutingAssembly().Location;
++            MockLogger ml = new MockLogger() { AllowTaskCrashes = true };
++            ObjectModelHelpers.BuildProjectExpectFailure($"""
++                     <Project ToolsVersion=`msbuilddefaulttoolsversion` xmlns=`msbuildnamespace`>
++                         <UsingTask TaskName=`TaskThatThrows` AssemblyFile=`{customTaskPath}`/>
++                         <Target Name=`Build`>
++                            <TaskThatThrows ExceptionType="{exceptionType.ToString()}" ExceptionMessage="{testExceptionMessage}">
++                             </TaskThatThrows>
++                         </Target>
++                     </Project>
++                  """,
++                ml);
++            // 'This is an unhandled exception from a task'
++            ml.AssertLogContains("MSB4018");
++            // 'An internal failure occurred while running MSBuild'
++            ml.AssertLogDoesntContain("MSB1025");
++            // 'This is an unhandled error in MSBuild'
++            ml.AssertLogDoesntContain(ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword("UnhandledMSBuildError", string.Empty));
++            ml.AssertLogContains(testExceptionMessage);
++
++            File.Exists(ExceptionHandling.DumpFilePath).ShouldBe(isCritical);
++            if (isCritical)
++            {
++                FileUtilities.DeleteNoThrow(ExceptionHandling.DumpFilePath);
++            }
++        }
++
+         #endregion
+ 
+         #region ITestTaskHost Members
+diff --git a/src/Build.UnitTests/BackEnd/TaskThatThrows.cs b/src/Build.UnitTests/BackEnd/TaskThatThrows.cs
+new file mode 100644
+index 00000000000..9b05afeb9c6
+--- /dev/null
++++ b/src/Build.UnitTests/BackEnd/TaskThatThrows.cs
+@@ -0,0 +1,37 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Reflection;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.Engine.UnitTests;
++
++/// <summary>
++/// Task that throws exception based on input parameters.
++/// </summary>
++public sealed class TaskThatThrows : Utilities.Task
++{
++    public string ExceptionType { get; set; }
++
++    public string ExceptionMessage { get; set; }
++
++    public override bool Execute()
++    {
++        if (string.IsNullOrWhiteSpace(ExceptionMessage))
++        {
++            ExceptionMessage = "Default exception message";
++        }
++
++        Type exceptionType = string.IsNullOrWhiteSpace(ExceptionType) ? typeof(Exception) : Type.GetType(ExceptionType);
++
++        ConstructorInfo ctor = exceptionType.GetConstructor(new[] { typeof(string) });
++        Exception exceptionInstance = (Exception)ctor.Invoke(new object[] { ExceptionMessage });
++
++
++        throw exceptionInstance;
++    }
++}
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index 0d98b32f5a8..f1adb97b2bf 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -853,7 +853,7 @@ private async Task BuildAndReport()
+ 
+                     loggingContext.LogCommentFromText(MessageImportance.Low, ex.ToString());
+                 }
+-                else
++                else if (ex is not CriticalTaskException)
+                 {
+                     (((LoggingContext)_projectLoggingContext) ?? _nodeLoggingContext).LogError(BuildEventFileInfo.Empty, "UnhandledMSBuildError", ex.ToString());
+                 }
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+index ee09e5be50f..b4d621fce8d 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+@@ -814,8 +814,18 @@ private async Task<WorkUnitResult> ExecuteInstantiatedTask(ITaskExecutionHost ta
+                         }
+                     }
+                 }
+-                catch (Exception ex) when (!ExceptionHandling.IsCriticalException(ex) && Environment.GetEnvironmentVariable("MSBUILDDONOTCATCHTASKEXCEPTIONS") != "1")
++                catch (Exception ex)
+                 {
++                    if (ExceptionHandling.IsCriticalException(ex) || Environment.GetEnvironmentVariable("MSBUILDDONOTCATCHTASKEXCEPTIONS") == "1")
++                    {
++                        taskLoggingContext.LogFatalTaskError(
++                            ex,
++                            new BuildEventFileInfo(_targetChildInstance.Location),
++                            _taskNode.Name);
++
++                        throw new CriticalTaskException(ex);
++                    }
++
+                     taskException = ex;
+                 }
+ 
+diff --git a/src/Framework/CriticalTaskException.cs b/src/Framework/CriticalTaskException.cs
+new file mode 100644
+index 00000000000..f9104088316
+--- /dev/null
++++ b/src/Framework/CriticalTaskException.cs
+@@ -0,0 +1,25 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.Framework.BuildException;
++
++namespace Microsoft.Build.Framework
++{
++    internal sealed class CriticalTaskException : BuildExceptionBase
++    {
++        public CriticalTaskException(
++            Exception innerException)
++            : base(string.Empty, innerException)
++        { }
++
++        // Do not remove - used by BuildExceptionSerializationHelper
++        internal CriticalTaskException(string message, Exception inner)
++            : base(message, inner)
++        { }
++    }
++}
+diff --git a/src/Shared/ExceptionHandling.cs b/src/Shared/ExceptionHandling.cs
+index eca284ecb64..f8601953836 100644
+--- a/src/Shared/ExceptionHandling.cs
++++ b/src/Shared/ExceptionHandling.cs
+@@ -79,6 +79,11 @@ private static string GetDebugDumpPath()
+         /// </summary>
+         internal static string DebugDumpPath => s_debugDumpPath;
+ 
++        /// <summary>
++        /// The file used for diagnostic log files.
++        /// </summary>
++        internal static string DumpFilePath => s_dumpFileName;
++
+ #if !BUILDINGAPPXTASKS
+         /// <summary>
+         /// The filename that exceptions will be dumped to
+@@ -99,6 +104,9 @@ internal static bool IsCriticalException(Exception e)
+              || e is ThreadAbortException
+              || e is ThreadInterruptedException
+              || e is AccessViolationException
++#if !TASKHOST
++             || e is CriticalTaskException
++#endif
+ #if !BUILDINGAPPXTASKS
+              || e is InternalErrorException
+ #endif

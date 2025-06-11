@@ -1,0 +1,822 @@
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index 013b48fb927..ba6c54c110e 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -1590,10 +1590,17 @@ private void RouteBuildEvent(BuildEventArgs eventArg)
+         /// <exception cref="Exception">Any exception which is a ExceptionHandling.IsCriticalException will not be wrapped</exception>
+         private void InitializeLogger(ILogger logger, IEventSource sourceForLogger)
+         {
++            IDisposable assemblyLoadTracker = null;
+             try
+             {
+-                // TODO: can we distinguish builtin and custom loggers here?
+-                using var _ = AssemblyLoadsTracker.StartTracking(this, AssemblyLoadingContext.LoggerInitialization);
++                // Is the logger a custom logger?
++                if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_6) &&
++                    logger.GetType().Assembly != Assembly.GetExecutingAssembly() &&
++                    !(logger.GetType().FullName?.StartsWith("Microsoft.Build.Logging", StringComparison.OrdinalIgnoreCase) ?? false))
++                {
++                    assemblyLoadTracker = AssemblyLoadsTracker.StartTracking(this, AssemblyLoadingContext.LoggerInitialization, logger.GetType());
++                }
++
+                 INodeLogger nodeLogger = logger as INodeLogger;
+                 if (nodeLogger != null)
+                 {
+@@ -1608,6 +1615,10 @@ private void InitializeLogger(ILogger logger, IEventSource sourceForLogger)
+             {
+                 InternalLoggerException.Throw(e, null, "FatalErrorWhileInitializingLogger", true, logger.GetType().Name);
+             }
++            finally
++            {
++                assemblyLoadTracker?.Dispose();
++            }
+ 
+             // Update the minimum guaranteed message importance based on the newly added logger.
+             UpdateMinimumMessageImportance(logger);
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs b/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
+index 8897e3fb426..ae3471ce681 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
+@@ -2,55 +2,105 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
+-using System.Collections.Concurrent;
++#if FEATURE_APPDOMAIN
++using System.Collections.Generic;
++using System.Linq;
++#endif
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Framework;
+ 
+ namespace Microsoft.Build.BackEnd.Components.RequestBuilder
+ {
+-    internal class AssemblyLoadsTracker : MarshalByRefObject, IDisposable
++    internal sealed class AssemblyLoadsTracker : MarshalByRefObject, IDisposable
+     {
+-        private static readonly ConcurrentDictionary<AppDomain, AssemblyLoadsTracker> s_instances = new();
++#if FEATURE_APPDOMAIN
++        private static readonly List<AssemblyLoadsTracker> s_instances = new();
++#endif
+         private readonly LoggingContext? _loggingContext;
+         private readonly LoggingService? _loggingService;
+         private readonly AssemblyLoadingContext _context;
++        private readonly string? _initiator;
+         private readonly AppDomain _appDomain;
+ 
+         private AssemblyLoadsTracker(
+             LoggingContext? loggingContext,
+             LoggingService? loggingService,
+             AssemblyLoadingContext context,
++            Type? initiator,
+             AppDomain appDomain)
+         {
+             _loggingContext = loggingContext;
+             _loggingService = loggingService;
+             _context = context;
++            _initiator = initiator?.FullName;
+             _appDomain = appDomain;
+         }
+ 
++        public static IDisposable StartTracking(
++            LoggingContext loggingContext,
++            AssemblyLoadingContext context)
++            => StartTracking(loggingContext, null, context, null, null);
++
+         public static IDisposable StartTracking(
+             LoggingContext loggingContext,
+             AssemblyLoadingContext context,
+-            AppDomain? appDomain = null)
+-        {
+-            return StartTracking(loggingContext, null, context, appDomain);
+-        }
++            AppDomain appDomain)
++            => StartTracking(loggingContext, null, context, null, appDomain);
++
++        public static IDisposable StartTracking(
++            LoggingContext loggingContext,
++            AssemblyLoadingContext context,
++            Type initiator)
++            => StartTracking(loggingContext, null, context, initiator, null);
++
++        public static IDisposable StartTracking(
++            LoggingContext loggingContext,
++            AssemblyLoadingContext context,
++            Type initiator,
++            AppDomain appDomain)
++            => StartTracking(loggingContext, null, context, initiator, appDomain);
++
++        public static IDisposable StartTracking(
++            LoggingService loggingService,
++            AssemblyLoadingContext context)
++            => StartTracking(null, loggingService, context, null, null);
+ 
+         public static IDisposable StartTracking(
+             LoggingService loggingService,
+             AssemblyLoadingContext context,
+-            AppDomain? appDomain = null)
+-        {
+-            return StartTracking(null, loggingService, context, appDomain);
+-        }
++            Type initiator)
++            => StartTracking(null, loggingService, context, initiator, null);
++
++        public static IDisposable StartTracking(
++            LoggingService loggingService,
++            AssemblyLoadingContext context,
++            AppDomain appDomain)
++            => StartTracking(null, loggingService, context, null, appDomain);
+ 
++        public static IDisposable StartTracking(
++            LoggingService loggingService,
++            AssemblyLoadingContext context,
++            Type initiator,
++            AppDomain appDomain)
++            => StartTracking(null, loggingService, context, initiator, appDomain);
++
++#if FEATURE_APPDOMAIN
+         public static void StopTracking(AppDomain appDomain)
+         {
+-            if (s_instances.TryRemove(appDomain, out AssemblyLoadsTracker? tracker))
++            if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_6) && !appDomain.IsDefaultAppDomain())
+             {
+-                tracker.StopTracking();
++                lock (s_instances)
++                {
++                    foreach (AssemblyLoadsTracker tracker in s_instances.Where(t => t._appDomain == appDomain))
++                    {
++                        tracker.StopTracking();
++                    }
++
++                    s_instances.RemoveAll(t => t._appDomain == appDomain);
++                }
+             }
+         }
++#endif
+ 
+         public void Dispose()
+         {
+@@ -61,13 +111,24 @@ private static IDisposable StartTracking(
+             LoggingContext? loggingContext,
+             LoggingService? loggingService,
+             AssemblyLoadingContext context,
+-            AppDomain? appDomain = null)
++            Type? initiator,
++            AppDomain? appDomain)
+         {
+-            var tracker = new AssemblyLoadsTracker(loggingContext, loggingService, context, appDomain ?? AppDomain.CurrentDomain);
+-            if (appDomain != null)
++            if (!ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_6))
++            {
++                return EmptyDisposable.Instance;
++            }
++
++            var tracker = new AssemblyLoadsTracker(loggingContext, loggingService, context, initiator, appDomain ?? AppDomain.CurrentDomain);
++#if FEATURE_APPDOMAIN
++            if (appDomain != null && !appDomain.IsDefaultAppDomain())
+             {
+-                s_instances.AddOrUpdate(appDomain, tracker, (_, loadsTracker) => loadsTracker);
++                lock (s_instances)
++                {
++                    s_instances.Add(tracker);
++                }
+             }
++#endif
+             tracker.StartTracking();
+             return tracker;
+         }
+@@ -87,15 +148,25 @@ private void StopTracking()
+         private void CurrentDomainOnAssemblyLoad(object? sender, AssemblyLoadEventArgs args)
+         {
+             string? assemblyName = args.LoadedAssembly.FullName;
+-            string? assemblyPath = args.LoadedAssembly.Location;
++            string assemblyPath = args.LoadedAssembly.Location;
+             Guid mvid = args.LoadedAssembly.ManifestModule.ModuleVersionId;
++            string? appDomainDescriptor = _appDomain.IsDefaultAppDomain()
++                ? null
++                : $"{_appDomain.Id}|{_appDomain.FriendlyName}";
+ 
+-            AssemblyLoadBuildEventArgs buildArgs = new(_context, assemblyName, assemblyPath, mvid, _appDomain.Id, _appDomain.FriendlyName)
++
++            AssemblyLoadBuildEventArgs buildArgs = new(_context, _initiator, assemblyName, assemblyPath, mvid, appDomainDescriptor)
+             {
+                 BuildEventContext = _loggingContext?.BuildEventContext
+             };
+             _loggingContext?.LogBuildEvent(buildArgs);
+             _loggingService?.LogBuildEvent(buildArgs);
+         }
++
++        private class EmptyDisposable : IDisposable
++        {
++            public static readonly IDisposable Instance = new EmptyDisposable();
++            public void Dispose() { }
++        }
+     }
+ }
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index caa082d3296..47c1e94941b 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -8,6 +8,7 @@
+ using System.Globalization;
+ using System.IO;
+ using System.Linq;
++using System.Reflection;
+ using System.Text;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Components.Logging;
+@@ -1842,11 +1843,16 @@ static string EvaluateProperty(string value, IElementLocation location,
+                     }
+                 }
+ 
++                IDisposable assemblyLoadTracker = null;
+                 // Combine SDK path with the "project" relative path
+                 try
+                 {
+-                    // TODO: can we distinguish builtin and custom sdkresolvers here?
+-                    using var _ = AssemblyLoadsTracker.StartTracking(_evaluationLoggingContext, AssemblyLoadingContext.SdkResolution);
++                    // Is the sdk resolver a custom type?
++                    if (_sdkResolverService.GetType().Assembly != Assembly.GetExecutingAssembly())
++                    {
++                        assemblyLoadTracker = AssemblyLoadsTracker.StartTracking(_evaluationLoggingContext, AssemblyLoadingContext.SdkResolution, _sdkResolverService.GetType());
++                    }
++
+                     sdkResult = _sdkResolverService.ResolveSdk(_submissionId, sdkReference, _evaluationLoggingContext, importElement.Location, solutionPath, projectPath, _interactive, _isRunningInVisualStudio,
+                         failOnUnresolvedSdk: !_loadSettings.HasFlag(ProjectLoadSettings.IgnoreMissingImports) || _loadSettings.HasFlag(ProjectLoadSettings.FailOnUnresolvedSdk));
+                 }
+@@ -1856,6 +1862,10 @@ static string EvaluateProperty(string value, IElementLocation location,
+                     // https://github.com/dotnet/msbuild/pull/6763
+                     ProjectErrorUtilities.ThrowInvalidProject(importElement.SdkLocation, "SDKResolverCriticalFailure", e.Message);
+                 }
++                finally
++                {
++                    assemblyLoadTracker?.Dispose();
++                }
+ 
+                 if (!sdkResult.Success)
+                 {
+diff --git a/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs b/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
+index 77f891c57b0..db7333432ec 100644
+--- a/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
++++ b/src/Build/Instance/TaskFactories/AssemblyTaskFactory.cs
+@@ -386,7 +386,7 @@ internal ITask CreateTaskInstance(ElementLocation taskLocation, TaskLoggingConte
+                     new TaskLoader.LogError(ErrorLoggingDelegate),
+ #if FEATURE_APPDOMAIN
+                     appDomainSetup,
+-                    appDomain => AssemblyLoadsTracker.StartTracking(taskLoggingContext, AssemblyLoadingContext.TaskRun, appDomain),
++                    appDomain => AssemblyLoadsTracker.StartTracking(taskLoggingContext, AssemblyLoadingContext.TaskRun, _loadedType.Type, appDomain),
+ #endif
+                     isOutOfProc
+ #if FEATURE_APPDOMAIN
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogger.cs b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+index 35780421fb1..4d659332107 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogger.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+@@ -57,7 +57,9 @@ public sealed class BinaryLogger : ILogger
+         //   - TargetSkippedEventArgs: added SkipReason, OriginalBuildEventContext
+         // version 15:
+         //   - new record kind: ResponseFileUsedEventArgs
+-        internal const int FileFormatVersion = 15;
++        // version 16:
++        //   - AssemblyLoadBuildEventArgs
++        internal const int FileFormatVersion = 16;
+ 
+         private Stream stream;
+         private BinaryWriter binaryWriter;
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index 90e5ee44061..ddb7520a7fd 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -808,18 +808,18 @@ private AssemblyLoadBuildEventArgs ReadAssemblyLoadEventArgs()
+             var fields = ReadBuildEventArgsFields(readImportance: false);
+ 
+             AssemblyLoadingContext context = (AssemblyLoadingContext)ReadInt32();
++            string loadingInitiator = ReadDeduplicatedString();
+             string assemblyName = ReadDeduplicatedString();
+             string assemblyPath = ReadDeduplicatedString();
+             Guid mvid = ReadGuid();
+-            int appDomainId = ReadInt32();
+             string appDomainName = ReadDeduplicatedString();
+ 
+             var e = new AssemblyLoadBuildEventArgs(
+                 context,
++                loadingInitiator,
+                 assemblyName,
+                 assemblyPath,
+                 mvid,
+-                appDomainId,
+                 appDomainName);
+             SetCommonFields(e, fields);
+ 
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+index 9e3111d04ca..cf69bcbacbc 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+@@ -475,11 +475,11 @@ private void Write(AssemblyLoadBuildEventArgs e)
+             Write(BinaryLogRecordKind.AssemblyLoad);
+             WriteMessageFields(e, writeMessage: false, writeImportance: false);
+             Write((int)e.LoadingContext);
++            WriteDeduplicatedString(e.LoadingInitiator);
+             WriteDeduplicatedString(e.AssemblyName);
+             WriteDeduplicatedString(e.AssemblyPath);
+             Write(e.MVID);
+-            Write(e.AppDomainId);
+-            WriteDeduplicatedString(e.AppDomainFriendlyName);
++            WriteDeduplicatedString(e.AppDomainDescriptor);
+         }
+ 
+         private void Write(CriticalBuildMessageEventArgs e)
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 77966ee6caa..52faacfee31 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1978,7 +1978,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>SDK resolver "{0}" returned null.</value>
+   </data>
+   <data name="TaskAssemblyLoaded" xml:space="preserve">
+-    <value>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</value>
++    <value>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</value>
+   </data>
+   <data name="NodeReused" xml:space="preserve">
+     <value>Reusing node {0} (PID: {1}).</value>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index a0bc782f9fe..278dbe4c739 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: V sestavení {0} se nenašly žádné moduly plug-in mezipaměti projektu. Modul plug-in se očekával.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">Požadované sestavení NuGet se nenašlo. Očekávaná cesta: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 8c8286209a1..759cbf24118 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: In der Assembly "{0}" wurde ein Projektcache-Plug-In erwartet, aber keines gefunden.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">Eine erforderliche NuGet-Assembly wurde nicht gefunden. Erwarteter Pfad: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index c9e056c58a3..88c3b698231 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: No se encontró ningún complemento de caché de proyectos en el ensamblado "{0}". Se esperaba uno.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">No se encontró un ensamblado de NuGet necesario. Ruta de acceso esperada: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index bb8929a06a9..2264173e816 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: plug-ins de cache de projet introuvables dans l'assembly "{0}". Un plug-in est attendu.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">Un assembly NuGet obligatoire est introuvable. Chemin attendu : {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index f6b0c9e65c6..4c5f37c1953 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: non sono stati trovati plug-in della cache del progetto nell'assembly "{0}". Ne è previsto uno.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">Un assembly NuGet obbligatorio non è stato trovato. Percorso previsto: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 72cfcdd4a45..25261590068 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: プロジェクト キャッシュのプラグインがアセンブリ "{0}" に見つかりませんでした。プラグインが 1 つ必要です。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">必要な NuGet アセンブリが見つかりませんでした。想定されるパス: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 017841bd53b..a315a48652f 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: "{0}" 어셈블리에서 프로젝트 캐시 플러그 인을 찾을 수 없습니다. 1개가 필요합니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">필요한 NuGet 어셈블리를 찾을 수 없습니다. 예상 경로: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index a4d111b5245..00856a177e8 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: nie znaleziono wtyczek pamięci podręcznej projektu w zestawie „{0}”. Oczekiwano jednej.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">Nie znaleziono wymaganego zestawu NuGet. Oczekiwano ścieżki {0}.</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 5f25d70e709..becfa993d0d 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: não foi encontrado nenhum plug-in de cache do projeto no assembly "{0}". Era esperado um plug-in.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">Um assembly NuGet necessário não foi encontrado. Caminho Esperado: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index f6fd65dbbf6..abdf27bb687 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: не найдены подключаемые модули кэша проектов в сборке "{0}". Должен быть указан один модуль.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">Не найдена обязательная сборка NuGet. Ожидаемый путь: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 2e33982ae46..023ad6274fd 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: "{0}" bütünleştirilmiş kodunda proje önbelleği eklentisi bulunamadı. Bir eklenti bekleniyordu.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">Gereken NuGet derlemesi bulunamadı. Beklenen Yol: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 49d887ae03e..400130f727e 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: 在程序集 "{0}" 中未找到项目缓存插件。应有一个插件。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">未找到所需的 NuGet 程序集。所需路径: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index a8de1f697d4..970cd8cd04f 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -191,6 +191,11 @@
+         <target state="translated">MSB4270: 在組件 "{0}" 中找不到任何專案快取外掛程式，但應該要有一個外掛程式。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="NodeReused">
++        <source>Reusing node {0} (PID: {1}).</source>
++        <target state="new">Reusing node {0} (PID: {1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="NuGetAssemblyNotFound">
+         <source>A required NuGet assembly was not found. Expected Path: {0}</source>
+         <target state="translated">找不到必要的 NuGet 元件。預期的路徑: {0}</target>
+@@ -417,8 +422,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskAssemblyLoaded">
+-        <source>Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</source>
+-        <target state="new">Assembly loaded during {0}: {1} (location: {2}, MVID: {3}, AppDomain: {4}|{5})</target>
++        <source>Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</source>
++        <target state="new">Assembly loaded during {0}{1}: {2} (location: {3}, MVID: {4}, AppDomain: {5})</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+diff --git a/src/Framework.UnitTests/AssemblyLoadBuildEventArgs_Tests.cs b/src/Framework.UnitTests/AssemblyLoadBuildEventArgs_Tests.cs
+index 484cfed73ec..8e2bf7db11b 100644
+--- a/src/Framework.UnitTests/AssemblyLoadBuildEventArgs_Tests.cs
++++ b/src/Framework.UnitTests/AssemblyLoadBuildEventArgs_Tests.cs
+@@ -16,11 +16,11 @@ public void SerializationDeserializationTest()
+             string assemblyName = Guid.NewGuid().ToString();
+             string assemblyPath = Guid.NewGuid().ToString();
+             Guid mvid = Guid.NewGuid();
+-            int appDomainId = new Random().Next();
++            string loadingInitiator = Guid.NewGuid().ToString();
+             string appDomainName = Guid.NewGuid().ToString();
+             AssemblyLoadingContext context =
+                 (AssemblyLoadingContext)(new Random().Next(Enum.GetNames(typeof(AssemblyLoadingContext)).Length));
+-            AssemblyLoadBuildEventArgs arg = new(context, assemblyName, assemblyPath, mvid, appDomainId, appDomainName);
++            AssemblyLoadBuildEventArgs arg = new(context, loadingInitiator, assemblyName, assemblyPath, mvid, appDomainName);
+ 
+             using MemoryStream stream = new MemoryStream();
+             using BinaryWriter bw = new BinaryWriter(stream);
+@@ -31,11 +31,11 @@ public void SerializationDeserializationTest()
+             AssemblyLoadBuildEventArgs argDeserialized = new();
+             argDeserialized.CreateFromStream(br, 0);
+ 
++            argDeserialized.LoadingInitiator.ShouldBe(loadingInitiator);
+             argDeserialized.AssemblyName.ShouldBe(assemblyName);
+             argDeserialized.AssemblyPath.ShouldBe(assemblyPath);
+             argDeserialized.MVID.ShouldBe(mvid);
+-            argDeserialized.AppDomainId.ShouldBe(appDomainId);
+-            argDeserialized.AppDomainFriendlyName.ShouldBe(appDomainName);
++            argDeserialized.AppDomainDescriptor.ShouldBe(appDomainName);
+             argDeserialized.LoadingContext.ShouldBe(context);
+         }
+     }
+diff --git a/src/Framework/AssemblyLoadBuildEventArgs.cs b/src/Framework/AssemblyLoadBuildEventArgs.cs
+index 2b69ac56484..bb9d8e58e6f 100644
+--- a/src/Framework/AssemblyLoadBuildEventArgs.cs
++++ b/src/Framework/AssemblyLoadBuildEventArgs.cs
+@@ -1,7 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-#nullable disable
++#nullable enable
+ 
+ using System;
+ using System.IO;
+@@ -9,35 +9,38 @@
+ 
+ namespace Microsoft.Build.Framework
+ {
+-    public class AssemblyLoadBuildEventArgs : BuildMessageEventArgs
++    public sealed class AssemblyLoadBuildEventArgs : BuildMessageEventArgs
+     {
++        private const string DefaultAppDomainDescriptor = "[Default]";
++
+         public AssemblyLoadBuildEventArgs()
+         { }
+ 
+         public AssemblyLoadBuildEventArgs(
+             AssemblyLoadingContext loadingContext,
+-            string assemblyName,
++            string? loadingInitiator,
++            string? assemblyName,
+             string assemblyPath,
+             Guid mvid,
+-            int appDomainId,
+-            string appDomainFriendlyName,
++            string? customAppDomainDescriptor,
+             MessageImportance importance = MessageImportance.Low)
+             : base(null, null, null, importance, DateTime.UtcNow, assemblyName, assemblyPath, mvid)
+         {
+             LoadingContext = loadingContext;
++            LoadingInitiator = loadingInitiator;
+             AssemblyName = assemblyName;
+             AssemblyPath = assemblyPath;
+             MVID = mvid;
+-            AppDomainId = appDomainId;
+-            AppDomainFriendlyName = appDomainFriendlyName;
++            AppDomainDescriptor = customAppDomainDescriptor;
+         }
+ 
+         public AssemblyLoadingContext LoadingContext { get; private set; }
+-        public string AssemblyName { get; private set; }
+-        public string AssemblyPath { get; private set; }
++        public string? LoadingInitiator { get; private set; }
++        public string? AssemblyName { get; private set; }
++        public string? AssemblyPath { get; private set; }
+         public Guid MVID { get; private set; }
+-        public int AppDomainId { get; private set; }
+-        public string AppDomainFriendlyName { get; private set; }
++        // Null string indicates that load occurred on Default AppDomain (for both Core and Framework).
++        public string? AppDomainDescriptor { get; private set; }
+ 
+         internal override void WriteToStream(BinaryWriter writer)
+         {
+@@ -45,10 +48,10 @@ internal override void WriteToStream(BinaryWriter writer)
+             writer.WriteTimestamp(RawTimestamp);
+             writer.WriteOptionalBuildEventContext(BuildEventContext);
+             writer.WriteGuid(MVID);
++            writer.WriteOptionalString(LoadingInitiator);
+             writer.WriteOptionalString(AssemblyName);
+             writer.WriteOptionalString(AssemblyPath);
+-            writer.Write7BitEncodedInt(AppDomainId);
+-            writer.WriteOptionalString(AppDomainFriendlyName);
++            writer.WriteOptionalString(AppDomainDescriptor);
+         }
+ 
+         internal override void CreateFromStream(BinaryReader reader, int version)
+@@ -57,10 +60,10 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+             RawTimestamp = reader.ReadTimestamp();
+             BuildEventContext = reader.ReadOptionalBuildEventContext();
+             MVID = reader.ReadGuid();
++            LoadingInitiator = reader.ReadOptionalString();
+             AssemblyName = reader.ReadOptionalString();
+             AssemblyPath = reader.ReadOptionalString();
+-            AppDomainId = reader.Read7BitEncodedInt();
+-            AppDomainFriendlyName = reader.ReadOptionalString();
++            AppDomainDescriptor = reader.ReadOptionalString();
+         }
+ 
+         public override string Message
+@@ -69,7 +72,8 @@ public override string Message
+             {
+                 if (RawMessage == null)
+                 {
+-                    RawMessage = FormatResourceStringIgnoreCodeAndKeyword("TaskAssemblyLoaded", LoadingContext.ToString(), AssemblyName, AssemblyPath, MVID.ToString(), AppDomainId.ToString(), AppDomainFriendlyName);
++                    string? loadingInitiator = LoadingInitiator == null ? null : $" ({LoadingInitiator})";
++                    RawMessage = FormatResourceStringIgnoreCodeAndKeyword("TaskAssemblyLoaded", LoadingContext.ToString(), loadingInitiator, AssemblyName, AssemblyPath, MVID.ToString(), AppDomainDescriptor ?? DefaultAppDomainDescriptor);
+                 }
+ 
+                 return RawMessage;

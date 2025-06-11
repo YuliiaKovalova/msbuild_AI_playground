@@ -1,0 +1,209 @@
+diff --git a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+index 2877d25f1bb..7c278ef5d8e 100644
+--- a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
++++ b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+@@ -2354,6 +2354,90 @@ public void TransitiveReferencesShouldNotOverwriteMultitargetingEdges()
+             }
+         }
+ 
++        [Fact]
++        public void DuplicateProjectReferences()
++        {
++            var graph = Helpers.CreateProjectGraph(
++                env: _env,
++                dependencyEdges: new Dictionary<int, int[]>()
++                {
++                    { 1, new[] { 2 } },
++                },
++                extraContentPerProjectNumber: new Dictionary<int, string>()
++                {
++                    {
++                        1,
++                        $@"
++<ItemGroup>
++    <ProjectReferenceTmp Include='@(ProjectReference)' />
++    <ProjectReference Include='@(ProjectReferenceTmp)' />
++</ItemGroup>
++
++<ItemGroup>
++    <ProjectReferenceTargets Include='SomeDefaultTarget1' Targets='{MSBuildConstants.ProjectReferenceTargetsOrDefaultTargetsMarker}' />
++</ItemGroup>
++
++<Target Name='SomeDefaultTarget1' />
++"
++                    },
++                    {
++                        2,
++                        @"<Target Name='SomeDefaultTarget2' />"
++                    }
++                });
++
++            IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetLists = graph.GetTargetLists(Array.Empty<string>());
++
++            ProjectGraphNode project1 = GetFirstNodeWithProjectNumber(graph, 1);
++            ProjectGraphNode project2 = GetFirstNodeWithProjectNumber(graph, 2);
++
++            project1.ProjectReferences.ShouldHaveSingleItem().ShouldBe(project2);
++            targetLists[project1].ShouldBe(new[] { "SomeDefaultTarget1" });
++            targetLists[project2].ShouldBe(new[] { "SomeDefaultTarget2" });
++        }
++
++        [Fact]
++        public void MultipleProjectReferencesSameFileDifferentTargets()
++        {
++            var graph = Helpers.CreateProjectGraph(
++                env: _env,
++                dependencyEdges: new Dictionary<int, int[]>()
++                {
++                    {1, new[] {2}},
++                },
++                extraContentPerProjectNumber: new Dictionary<int, string>()
++                {
++                    {
++                        1,
++                        $@"
++<ItemGroup>
++    <ProjectReferenceTmp Include='@(ProjectReference)' />
++    <ProjectReference Include='@(ProjectReferenceTmp)' Targets='SomeOtherTarget' />
++</ItemGroup>
++
++<ItemGroup>
++    <ProjectReferenceTargets Include='SomeDefaultTarget1' Targets='{MSBuildConstants.ProjectReferenceTargetsOrDefaultTargetsMarker}' />
++</ItemGroup>
++
++<Target Name='SomeDefaultTarget1' />
++"
++                    },
++                    {
++                        2,
++                        @"<Target Name='SomeDefaultTarget2' />"
++                    }
++                });
++
++            IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetLists = graph.GetTargetLists(Array.Empty<string>());
++
++            ProjectGraphNode project1 = GetFirstNodeWithProjectNumber(graph, 1);
++            ProjectGraphNode project2 = GetFirstNodeWithProjectNumber(graph, 2);
++
++            project1.ProjectReferences.ShouldHaveSingleItem().ShouldBe(project2);
++            targetLists[project1].ShouldBe(new[] { "SomeDefaultTarget1" });
++            targetLists[project2].ShouldBe(new[] { "SomeDefaultTarget2", "SomeOtherTarget" });
++        }
++
+         public void Dispose()
+         {
+             _env.Dispose();
+diff --git a/src/Build/Graph/GraphBuilder.cs b/src/Build/Graph/GraphBuilder.cs
+index fd84214f2d7..09263b6b97c 100644
+--- a/src/Build/Graph/GraphBuilder.cs
++++ b/src/Build/Graph/GraphBuilder.cs
+@@ -6,6 +6,7 @@
+ using System.Collections.Generic;
+ using System.Collections.Immutable;
+ using System.Linq;
++using System.Security.Cryptography.Xml;
+ using System.Text;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+@@ -607,7 +608,7 @@ private static PropertyDictionary<ProjectPropertyInstance> CreatePropertyDiction
+             return propertyDictionary;
+         }
+ 
+-        internal class GraphEdges
++        internal sealed class GraphEdges
+         {
+             private ConcurrentDictionary<(ProjectGraphNode, ProjectGraphNode), ProjectItemInstance> ReferenceItems =
+                 new ConcurrentDictionary<(ProjectGraphNode, ProjectGraphNode), ProjectItemInstance>();
+@@ -621,9 +622,42 @@ public ProjectItemInstance this[(ProjectGraphNode node, ProjectGraphNode referen
+                     ErrorUtilities.VerifyThrow(ReferenceItems.TryGetValue(key, out ProjectItemInstance referenceItem), "All requested keys should exist");
+                     return referenceItem;
+                 }
++            }
++
++            public void AddOrUpdateEdge((ProjectGraphNode node, ProjectGraphNode reference) key, ProjectItemInstance edge)
++            {
++                ReferenceItems.AddOrUpdate(
++                    key,
++                    addValueFactory: static ((ProjectGraphNode node, ProjectGraphNode reference) key, ProjectItemInstance referenceItem) => referenceItem,
++                    updateValueFactory: static ((ProjectGraphNode node, ProjectGraphNode reference) key, ProjectItemInstance existingItem, ProjectItemInstance newItem) =>
++                    {
++                        string existingTargetsMetadata = existingItem.GetMetadataValue(ItemMetadataNames.ProjectReferenceTargetsMetadataName);
++                        string newTargetsMetadata = newItem.GetMetadataValue(ItemMetadataNames.ProjectReferenceTargetsMetadataName);
++
++                        // Bail out if the targets are the same.
++                        if (existingTargetsMetadata.Equals(newTargetsMetadata, StringComparison.OrdinalIgnoreCase))
++                        {
++                            return existingItem;
++                        }
+ 
+-                // First edge wins, in accordance with vanilla msbuild behaviour when multiple msbuild tasks call into the same logical project
+-                set => ReferenceItems.TryAdd(key, value);
++                        existingTargetsMetadata = GetEffectiveTargets(key.reference, existingTargetsMetadata);
++                        newTargetsMetadata = GetEffectiveTargets(key.reference, newTargetsMetadata);
++
++                        ProjectItemInstance mergedItem = existingItem.DeepClone();
++                        mergedItem.SetMetadata(ItemMetadataNames.ProjectReferenceTargetsMetadataName, $"{existingTargetsMetadata};{newTargetsMetadata}");
++                        return mergedItem;
++
++                        static string GetEffectiveTargets(ProjectGraphNode reference, string targetsMetadata)
++                        {
++                            if (string.IsNullOrWhiteSpace(targetsMetadata))
++                            {
++                                return string.Join(";", reference.ProjectInstance.DefaultTargets);
++                            }
++
++                            return targetsMetadata;
++                        }
++                    },
++                    edge);
+             }
+ 
+             public void RemoveEdge((ProjectGraphNode node, ProjectGraphNode reference) key)
+@@ -632,7 +666,6 @@ public void RemoveEdge((ProjectGraphNode node, ProjectGraphNode reference) key)
+             }
+ 
+             internal bool HasEdge((ProjectGraphNode node, ProjectGraphNode reference) key) => ReferenceItems.ContainsKey(key);
+-            internal bool TryGetEdge((ProjectGraphNode node, ProjectGraphNode reference) key, out ProjectItemInstance edge) => ReferenceItems.TryGetValue(key, out edge);
+ 
+             internal IReadOnlyDictionary<(ConfigurationMetadata, ConfigurationMetadata), ProjectItemInstance> TestOnly_AsConfigurationMetadata()
+             {
+diff --git a/src/Build/Graph/ProjectGraph.cs b/src/Build/Graph/ProjectGraph.cs
+index 0605d41feae..e8a6624faf2 100644
+--- a/src/Build/Graph/ProjectGraph.cs
++++ b/src/Build/Graph/ProjectGraph.cs
+@@ -15,8 +15,6 @@
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Shared;
+-using Microsoft.Build.Shared.Debugging;
+-using Microsoft.Build.Utilities;
+ 
+ #nullable disable
+ 
+diff --git a/src/Build/Graph/ProjectGraphNode.cs b/src/Build/Graph/ProjectGraphNode.cs
+index 40e4a2b451e..802378358f5 100644
+--- a/src/Build/Graph/ProjectGraphNode.cs
++++ b/src/Build/Graph/ProjectGraphNode.cs
+@@ -56,8 +56,7 @@ internal void AddProjectReference(ProjectGraphNode reference, ProjectItemInstanc
+             _projectReferences.Add(reference);
+             reference._referencingProjects.Add(this);
+ 
+-            // First edge wins, in accordance with vanilla msbuild behaviour when multiple msbuild tasks call into the same logical project
+-            edges[(this, reference)] = projectReferenceItem;
++            edges.AddOrUpdateEdge((this, reference), projectReferenceItem);
+         }
+ 
+         internal void RemoveReference(ProjectGraphNode reference, GraphBuilder.GraphEdges edges)
+diff --git a/src/Build/Graph/ProjectInterpretation.cs b/src/Build/Graph/ProjectInterpretation.cs
+index 6284bfdf816..bbd597033fb 100644
+--- a/src/Build/Graph/ProjectInterpretation.cs
++++ b/src/Build/Graph/ProjectInterpretation.cs
+@@ -191,8 +191,6 @@ public void ReparentInnerBuilds(Dictionary<ConfigurationMetadata, ParsedProject>
+ 
+                             if (outerBuildReferencingProject.ProjectReferences.Contains(innerBuild))
+                             {
+-                                graphBuilder.Edges.TryGetEdge((outerBuildReferencingProject, innerBuild), out var existingEdge);
+-
+                                 ErrorUtilities.VerifyThrow(
+                                     graphBuilder.Edges[(outerBuildReferencingProject, innerBuild)]
+                                         .ItemType.Equals(

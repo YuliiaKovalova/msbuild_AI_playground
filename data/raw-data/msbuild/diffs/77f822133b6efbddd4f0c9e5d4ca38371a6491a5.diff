@@ -1,0 +1,699 @@
+diff --git a/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs b/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
+index 04cdf5aa87f..d8ad5a396ef 100644
+--- a/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
++++ b/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
+@@ -9,4 +9,5 @@ public interface IBuildCheckRegistrationContext
+ {
+     void RegisterEvaluatedPropertiesAction(Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction);
+     void RegisterParsedItemsAction(Action<BuildCheckDataContext<ParsedItemsAnalysisData>> parsedItemsAction);
++    void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction);
+ }
+diff --git a/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs b/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
+index 7bf3702aa4f..a09866ebb22 100644
+--- a/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
++++ b/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
+@@ -21,7 +21,7 @@ internal sealed class SharedOutputPathAnalyzer : BuildAnalyzer
+ 
+     public override string FriendlyName => "MSBuild.SharedOutputPathAnalyzer";
+ 
+-    public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } =[SupportedRule];
++    public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } = [SupportedRule];
+ 
+     public override void Initialize(ConfigurationContext configurationContext)
+     {
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index 838a5454ca8..d73b9bb6231 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -17,9 +17,10 @@ internal sealed class BuildCheckCentralContext
+ {
+     private record CallbackRegistry(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>>)> EvaluatedPropertiesActions,
+-        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ParsedItemsAnalysisData>>)> ParsedItemsActions)
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ParsedItemsAnalysisData>>)> ParsedItemsActions,
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<TaskInvocationAnalysisData>>)> TaskInvocationActions)
+     {
+-        public CallbackRegistry() : this([],[]) { }
++        public CallbackRegistry() : this([], [], []) { }
+     }
+ 
+     // In a future we can have callbacks per project as well
+@@ -27,8 +28,9 @@ public CallbackRegistry() : this([],[]) { }
+ 
+     // This we can potentially use to subscribe for receiving evaluated props in the
+     //  build event args. However - this needs to be done early on, when analyzers might not be known yet
+-    internal bool HasEvaluatedPropertiesActions => _globalCallbacks.EvaluatedPropertiesActions.Any();
+-    internal bool HasParsedItemsActions => _globalCallbacks.ParsedItemsActions.Any();
++    internal bool HasEvaluatedPropertiesActions => _globalCallbacks.EvaluatedPropertiesActions.Count > 0;
++    internal bool HasParsedItemsActions => _globalCallbacks.ParsedItemsActions.Count > 0;
++    internal bool HasTaskInvocationActions => _globalCallbacks.TaskInvocationActions.Count > 0;
+ 
+     internal void RegisterEvaluatedPropertiesAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction)
+         // Here we might want to communicate to node that props need to be sent.
+@@ -38,6 +40,9 @@ internal void RegisterEvaluatedPropertiesAction(BuildAnalyzerWrapper analyzer, A
+     internal void RegisterParsedItemsAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<ParsedItemsAnalysisData>> parsedItemsAction)
+         => RegisterAction(analyzer, parsedItemsAction, _globalCallbacks.ParsedItemsActions);
+ 
++    internal void RegisterTaskInvocationAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction)
++        => RegisterAction(analyzer, taskInvocationAction, _globalCallbacks.TaskInvocationActions);
++
+     private void RegisterAction<T>(
+         BuildAnalyzerWrapper wrappedAnalyzer,
+         Action<BuildCheckDataContext<T>> handler,
+@@ -60,6 +65,7 @@ internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
+     {
+         _globalCallbacks.EvaluatedPropertiesActions.RemoveAll(a => a.Item1 == analyzer);
+         _globalCallbacks.ParsedItemsActions.RemoveAll(a => a.Item1 == analyzer);
++        _globalCallbacks.TaskInvocationActions.RemoveAll(a => a.Item1 == analyzer);
+     }
+ 
+     internal void RunEvaluatedPropertiesActions(
+@@ -78,6 +84,14 @@ internal void RunParsedItemsActions(
+         => RunRegisteredActions(_globalCallbacks.ParsedItemsActions, parsedItemsAnalysisData,
+             loggingContext, resultHandler);
+ 
++    internal void RunTaskInvocationActions(
++        TaskInvocationAnalysisData taskInvocationAnalysisData,
++        LoggingContext loggingContext,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.TaskInvocationActions, taskInvocationAnalysisData,
++            loggingContext, resultHandler);
++
+     private void RunRegisteredActions<T>(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<T>>)> registeredCallbacks,
+         T analysisData,
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
+index 678949cea33..7dad5f0c4da 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
+@@ -36,6 +36,10 @@ public void Initialize(IEventSource eventSource)
+         eventSource.AnyEventRaised += EventSource_AnyEventRaised;
+         eventSource.BuildFinished += EventSource_BuildFinished;
+ 
++        if (eventSource is IEventSource3 eventSource3)
++        {
++            eventSource3.IncludeTaskInputs();
++        }
+         if (eventSource is IEventSource4 eventSource4)
+         {
+             eventSource4.IncludeEvaluationPropertiesAndItems();
+@@ -74,6 +78,27 @@ private void HandleBuildCheckTracingEvent(BuildCheckTracingEventArgs eventArgs)
+         }
+     }
+ 
++    private void HandleTaskStartedEvent(TaskStartedEventArgs eventArgs)
++    {
++        _buildCheckManager.ProcessTaskStartedEventArgs(
++            _loggingContextFactory.CreateLoggingContext(eventArgs.BuildEventContext!),
++            eventArgs);
++    }
++
++    private void HandleTaskFinishedEvent(TaskFinishedEventArgs eventArgs)
++    {
++        _buildCheckManager.ProcessTaskFinishedEventArgs(
++            _loggingContextFactory.CreateLoggingContext(eventArgs.BuildEventContext!),
++            eventArgs);
++    }
++
++    private void HandleTaskParameterEvent(TaskParameterEventArgs eventArgs)
++    {
++        _buildCheckManager.ProcessTaskParameterEventArgs(
++            _loggingContextFactory.CreateLoggingContext(eventArgs.BuildEventContext!),
++            eventArgs);
++    }
++
+     private bool IsMetaProjFile(string? projectFile) => !string.IsNullOrEmpty(projectFile) && projectFile!.EndsWith(".metaproj", StringComparison.OrdinalIgnoreCase);
+ 
+     private void EventSource_AnyEventRaised(object sender, BuildEventArgs e)
+@@ -137,6 +162,9 @@ private string BuildCsvString(string title, Dictionary<string, TimeSpan> rowData
+         { typeof(ProjectFinishedEventArgs), (BuildEventArgs e) => _buildCheckManager.EndProjectRequest(BuildCheckDataSource.EventArgs, e.BuildEventContext!) },
+         { typeof(BuildCheckTracingEventArgs), (BuildEventArgs e) => HandleBuildCheckTracingEvent((BuildCheckTracingEventArgs)e) },
+         { typeof(BuildCheckAcquisitionEventArgs), (BuildEventArgs e) => _buildCheckManager.ProcessAnalyzerAcquisition(((BuildCheckAcquisitionEventArgs)e).ToAnalyzerAcquisitionData(), GetBuildEventContext(e)) },
++        { typeof(TaskStartedEventArgs), (BuildEventArgs e) => HandleTaskStartedEvent((TaskStartedEventArgs)e) },
++        { typeof(TaskFinishedEventArgs), (BuildEventArgs e) => HandleTaskFinishedEvent((TaskFinishedEventArgs)e) },
++        { typeof(TaskParameterEventArgs), (BuildEventArgs e) => HandleTaskParameterEvent((TaskParameterEventArgs)e) },
+     };
+ 
+     private BuildEventContext GetBuildEventContext(BuildEventArgs e) => e.BuildEventContext
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+index a4c4793c7e6..76ac5ec7767 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+@@ -18,4 +18,9 @@ public void RegisterParsedItemsAction(Action<BuildCheckDataContext<ParsedItemsAn
+     {
+         buildCheckCentralContext.RegisterParsedItemsAction(analyzerWrapper, parsedItemsAction);
+     }
++
++    public void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction)
++    {
++        buildCheckCentralContext.RegisterTaskInvocationAction(analyzerWrapper, taskInvocationAction);
++    }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index e1704ea15f9..0e425360d0f 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -137,11 +137,23 @@ private static readonly (string[] ruleIds, bool defaultEnablement, BuildAnalyzer
+             []
+         ];
+ 
++        /// <summary>
++        /// For tests only. TODO: Remove when analyzer acquisition is done.
++        /// </summary>
++        internal static (string[] ruleIds, bool defaultEnablement, BuildAnalyzerFactory factory)[][]? s_testFactoriesPerDataSource;
++
+         private void RegisterBuiltInAnalyzers(BuildCheckDataSource buildCheckDataSource)
+         {
+             _analyzersRegistry.AddRange(
+                 s_builtInFactoriesPerDataSource[(int)buildCheckDataSource]
+                     .Select(v => new BuildAnalyzerFactoryContext(v.factory, v.ruleIds, v.defaultEnablement)));
++
++            if (s_testFactoriesPerDataSource is not null)
++            {
++                _analyzersRegistry.AddRange(
++                    s_testFactoriesPerDataSource[(int)buildCheckDataSource]
++                        .Select(v => new BuildAnalyzerFactoryContext(v.factory, v.ruleIds, v.defaultEnablement)));
++            }
+         }
+ 
+         /// <summary>
+@@ -312,6 +324,24 @@ public void ProcessEvaluationFinishedEventArgs(
+             => _buildEventsProcessor
+                 .ProcessEvaluationFinishedEventArgs(buildAnalysisContext, evaluationFinishedEventArgs);
+ 
++        public void ProcessTaskStartedEventArgs(
++            AnalyzerLoggingContext buildAnalysisContext,
++            TaskStartedEventArgs taskStartedEventArgs)
++            => _buildEventsProcessor
++                .ProcessTaskStartedEventArgs(buildAnalysisContext, taskStartedEventArgs);
++
++        public void ProcessTaskFinishedEventArgs(
++            AnalyzerLoggingContext buildAnalysisContext,
++            TaskFinishedEventArgs taskFinishedEventArgs)
++            => _buildEventsProcessor
++                .ProcessTaskFinishedEventArgs(buildAnalysisContext, taskFinishedEventArgs);
++
++        public void ProcessTaskParameterEventArgs(
++            AnalyzerLoggingContext buildAnalysisContext,
++            TaskParameterEventArgs taskParameterEventArgs)
++            => _buildEventsProcessor
++                .ProcessTaskParameterEventArgs(buildAnalysisContext, taskParameterEventArgs);
++
+         public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats()
+         {
+             foreach (BuildAnalyzerFactoryContext analyzerFactoryContext in _analyzersRegistry)
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index 16218c7417d..cf2bae57bad 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -25,9 +25,27 @@ namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal class BuildEventsProcessor(BuildCheckCentralContext buildCheckCentralContext)
+ {
++    /// <summary>
++    /// Represents a task currently being executed.
++    /// </summary>
++    /// <remarks>
++    /// <see cref="TaskParameters"/> is stored in its own field typed as a mutable dictionary because <see cref="AnalysisData"/>
++    /// is immutable.
++    /// </remarks>
++    private struct ExecutingTaskData
++    {
++        public TaskInvocationAnalysisData AnalysisData;
++        public Dictionary<string, TaskInvocationAnalysisData.TaskParameter> TaskParameters;
++    }
++
+     private readonly SimpleProjectRootElementCache _cache = new SimpleProjectRootElementCache();
+     private readonly BuildCheckCentralContext _buildCheckCentralContext = buildCheckCentralContext;
+ 
++    /// <summary>
++    /// Keeps track of in-flight tasks. Keyed by task ID as passed in <see cref="BuildEventContext.TaskId"/>.
++    /// </summary>
++    private readonly Dictionary<int, ExecutingTaskData> _tasksBeingExecuted = [];
++
+     // This requires MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION set to 1
+     internal void ProcessEvaluationFinishedEventArgs(
+         AnalyzerLoggingContext buildAnalysisContext,
+@@ -55,6 +73,95 @@ internal void ProcessEvaluationFinishedEventArgs(
+         }
+     }
+ 
++    internal void ProcessTaskStartedEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskStartedEventArgs taskStartedEventArgs)
++    {
++        if (!_buildCheckCentralContext.HasTaskInvocationActions)
++        {
++            // No analyzer is interested in task invocation actions -> nothing to do.
++            return;
++        }
++
++        if (taskStartedEventArgs.BuildEventContext is not null)
++        {
++            ElementLocation invocationLocation = ElementLocation.Create(
++                taskStartedEventArgs.TaskFile,
++                taskStartedEventArgs.LineNumber,
++                taskStartedEventArgs.ColumnNumber);
++
++            // Add a new entry to _tasksBeingExecuted. TaskParameters are initialized empty and will be recorded
++            // based on TaskParameterEventArgs we receive later.
++            Dictionary<string, TaskInvocationAnalysisData.TaskParameter> taskParameters = new();
++
++            ExecutingTaskData taskData = new()
++            {
++                TaskParameters = taskParameters,
++                AnalysisData = new(
++                    projectFilePath: taskStartedEventArgs.ProjectFile!,
++                    taskInvocationLocation: invocationLocation,
++                    taskName: taskStartedEventArgs.TaskName,
++                    taskAssemblyLocation: taskStartedEventArgs.TaskAssemblyLocation,
++                    parameters: taskParameters),
++            };
++
++            _tasksBeingExecuted.Add(taskStartedEventArgs.BuildEventContext.TaskId, taskData);
++        }
++    }
++
++    internal void ProcessTaskFinishedEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskFinishedEventArgs taskFinishedEventArgs)
++    {
++        if (!_buildCheckCentralContext.HasTaskInvocationActions)
++        {
++            // No analyzer is interested in task invocation actions -> nothing to do.
++            return;
++        }
++
++        if (taskFinishedEventArgs.BuildEventContext is not null &&
++            _tasksBeingExecuted.TryGetValue(taskFinishedEventArgs.BuildEventContext.TaskId, out ExecutingTaskData taskData))
++        {
++            // All task parameters have been recorded by now so remove the task from the dictionary and fire the registered build check actions.
++            _tasksBeingExecuted.Remove(taskFinishedEventArgs.BuildEventContext.TaskId);
++            _buildCheckCentralContext.RunTaskInvocationActions(taskData.AnalysisData, buildAnalysisContext, ReportResult);
++        }
++    }
++
++    internal void ProcessTaskParameterEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskParameterEventArgs taskParameterEventArgs)
++    {
++        if (!_buildCheckCentralContext.HasTaskInvocationActions)
++        {
++            // No analyzer is interested in task invocation actions -> nothing to do.
++            return;
++        }
++
++        bool isOutput;
++        switch (taskParameterEventArgs.Kind)
++        {
++            case TaskParameterMessageKind.TaskInput: isOutput = false; break;
++            case TaskParameterMessageKind.TaskOutput: isOutput = true; break;
++            default: return;
++        }
++
++        if (taskParameterEventArgs.BuildEventContext is not null &&
++            _tasksBeingExecuted.TryGetValue(taskParameterEventArgs.BuildEventContext.TaskId, out ExecutingTaskData taskData))
++        {
++            // Add the parameter name and value to the matching entry in _tasksBeingExecuted. Parameters come typed as IList
++            // but it's more natural to pass them as scalar values so we unwrap one-element lists.
++            string parameterName = taskParameterEventArgs.ItemType;
++            object? parameterValue = taskParameterEventArgs.Items?.Count switch
++            {
++                1 => taskParameterEventArgs.Items[0],
++                _ => taskParameterEventArgs.Items,
++            };
++
++            taskData.TaskParameters[parameterName] = new TaskInvocationAnalysisData.TaskParameter(parameterValue, isOutput);
++        }
++    }
++
+     private static void ReportResult(
+         BuildAnalyzerWrapper analyzerWrapper,
+         LoggingContext loggingContext,
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+index f375b192bcc..9f39f8dcb69 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+@@ -40,6 +40,18 @@ void ProcessEvaluationFinishedEventArgs(
+         AnalyzerLoggingContext buildAnalysisContext,
+         ProjectEvaluationFinishedEventArgs projectEvaluationFinishedEventArgs);
+ 
++    void ProcessTaskStartedEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskStartedEventArgs taskStartedEventArgs);
++
++    void ProcessTaskFinishedEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskFinishedEventArgs taskFinishedEventArgs);
++
++    void ProcessTaskParameterEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskParameterEventArgs taskParameterEventArgs);
++
+     void SetDataSource(BuildCheckDataSource buildCheckDataSource);
+ 
+     void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData, BuildEventContext buildEventContext);
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+index ae5ea663dbd..a0136eafac8 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+@@ -27,6 +27,21 @@ public void SetDataSource(BuildCheckDataSource buildCheckDataSource)
+     {
+     }
+ 
++    public void ProcessTaskStartedEventArgs(AnalyzerLoggingContext buildAnalysisContext,
++        TaskStartedEventArgs taskStartedEventArgs)
++    {
++    }
++
++    public void ProcessTaskFinishedEventArgs(AnalyzerLoggingContext buildAnalysisContext,
++        TaskFinishedEventArgs taskFinishedEventArgs)
++    {
++    }
++
++    public void ProcessTaskParameterEventArgs(AnalyzerLoggingContext buildAnalysisContext,
++        TaskParameterEventArgs taskParameterEventArgs)
++    {
++    }
++
+     public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData, BuildEventContext buildEventContext) 
+     {
+     }
+@@ -60,4 +75,13 @@ public void ResumeProject(BuildCheckDataSource buildCheckDataSource, BuildEventC
+     }
+ 
+     public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats() => new Dictionary<string, TimeSpan>();
++
++    public void StartTaskInvocation(BuildCheckDataSource buildCheckDataSource, TaskStartedEventArgs eventArgs)
++    { }
++
++    public void EndTaskInvocation(BuildCheckDataSource buildCheckDataSource, TaskFinishedEventArgs eventArgs)
++    { }
++
++    public void ProcessTaskParameter(BuildCheckDataSource buildCheckDataSource, TaskParameterEventArgs eventArg)
++    { }
+ }
+diff --git a/src/Build/BuildCheck/OM/BuildCheckDataContext.cs b/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
+index 57524436851..f0623e4a822 100644
+--- a/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
++++ b/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
+@@ -16,7 +16,7 @@ namespace Microsoft.Build.Experimental.BuildCheck;
+ /// <summary>
+ /// Base for a data passed from infrastructure to build analyzers.
+ /// </summary>
+-/// <param name="projectFilePath">Currently build project.</param>
++/// <param name="projectFilePath">Currently built project.</param>
+ public abstract class AnalysisData(string projectFilePath)
+ {
+     /// <summary>
+diff --git a/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs b/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
+index a6b34446258..86598ada553 100644
+--- a/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
++++ b/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
+@@ -4,9 +4,6 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Linq;
+-using System.Text;
+-using System.Threading.Tasks;
+-using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
+ 
+@@ -53,3 +50,53 @@ internal ParsedItemsAnalysisData(
+ 
+     public ItemsHolder ItemsHolder { get; }
+ }
++
++/// <summary>
++/// BuildCheck OM data representing a task executed by a project.
++/// </summary>
++public sealed class TaskInvocationAnalysisData : AnalysisData
++{
++    /// <summary>
++    /// Represents an input or output parameter of a task.
++    /// </summary>
++    /// <param name="Value">The value passed to (when <paramref name="IsOutput"/> is false) or from
++    /// (when <paramref name="IsOutput"/> is true) a task. This object can be of any type supported
++    /// in task parameters: <see cref="Framework.ITaskItem"/>, <see cref="Framework.ITaskItem"/>[],
++    /// bool, string, or anything else convertible to/from string.</param>
++    /// <param name="IsOutput">True for output parameters, false for input parameters.</param>
++    public record class TaskParameter(object? Value, bool IsOutput);
++
++    internal TaskInvocationAnalysisData(
++        string projectFilePath,
++        ElementLocation taskInvocationLocation,
++        string taskName,
++        string taskAssemblyLocation,
++        IReadOnlyDictionary<string, TaskParameter> parameters)
++        : base(projectFilePath)
++    {
++        TaskInvocationLocation = taskInvocationLocation;
++        TaskName = taskName;
++        TaskAssemblyLocation = taskAssemblyLocation;
++        Parameters = parameters;
++    }
++
++    /// <summary>
++    /// The project file and line/column number where the task is invoked.
++    /// </summary>
++    public ElementLocation TaskInvocationLocation { get; }
++
++    /// <summary>
++    /// Name of the task.
++    /// </summary>
++    public string TaskName { get; }
++
++    /// <summary>
++    /// The location of the assembly containing the implementation of the task.
++    /// </summary>
++    public string TaskAssemblyLocation { get; }
++
++    /// <summary>
++    /// The parameters of the task, keyed by parameter name.
++    /// </summary>
++    public IReadOnlyDictionary<string, TaskParameter> Parameters { get; }
++}
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index cc2aa1ae612..1ac4964dcb6 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -150,7 +150,7 @@ public void CustomAnalyzerTest(string[] customAnalyzerNames, string analysisCand
+             AddCustomDataSourceToNugetConfig(analysisCandidatePath, candidatesNugetFullPaths);
+ 
+             string projectAnalysisBuildLog = RunnerUtilities.ExecBootstrapedMSBuild(
+-                $"{Path.Combine(analysisCandidatePath, $"{analysisCandidate}.csproj")} /m:1 -nr:False -restore /p:OutputPath={env.CreateFolder().Path} -analyze -verbosity:d",
++                $"{Path.Combine(analysisCandidatePath, $"{analysisCandidate}.csproj")} /m:1 -nr:False -restore /p:OutputPath={env.CreateFolder().Path} -analyze -verbosity:n",
+                 out bool successBuild);
+             successBuild.ShouldBeTrue();
+ 
+diff --git a/src/BuildCheck.UnitTests/Microsoft.Build.BuildCheck.UnitTests.csproj b/src/BuildCheck.UnitTests/Microsoft.Build.BuildCheck.UnitTests.csproj
+index ada169a4b49..9a500f371df 100644
+--- a/src/BuildCheck.UnitTests/Microsoft.Build.BuildCheck.UnitTests.csproj
++++ b/src/BuildCheck.UnitTests/Microsoft.Build.BuildCheck.UnitTests.csproj
+@@ -11,6 +11,7 @@
+ 
+   <ItemGroup>
+     <ProjectReference Include="..\Build\Microsoft.Build.csproj" />
++    <ProjectReference Include="..\Tasks\Microsoft.Build.Tasks.csproj" />
+     <ProjectReference Include="..\UnitTests.Shared\Microsoft.Build.UnitTests.Shared.csproj" />
+     <ProjectReference Include="..\Xunit.NetCore.Extensions\Xunit.NetCore.Extensions.csproj" />
+   </ItemGroup>
+diff --git a/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs b/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
+new file mode 100644
+index 00000000000..bd93ddcf927
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
+@@ -0,0 +1,147 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using Microsoft.Build.Execution;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++using Microsoft.Build.UnitTests;
++using Shouldly;
++using Xunit;
++using static Microsoft.Build.Experimental.BuildCheck.Infrastructure.BuildCheckManagerProvider;
++
++namespace Microsoft.Build.BuildCheck.UnitTests
++{
++    public class TaskInvocationAnalysisDataTests : IDisposable
++    {
++        internal sealed class TestAnalyzer : BuildAnalyzer
++        {
++            #region BuildAnalyzer initialization
++
++            public static BuildAnalyzerRule SupportedRule = new BuildAnalyzerRule("BC0000", "TestRule", "TestDescription", "TestMessage",
++                new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, IsEnabled = true });
++
++            public override string FriendlyName => "MSBuild.TestAnalyzer";
++
++            public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } = [SupportedRule];
++
++            public override void Initialize(ConfigurationContext configurationContext)
++            { }
++
++            public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++            {
++                registrationContext.RegisterTaskInvocationAction(TaskInvocationAction);
++            }
++
++            #endregion
++
++            /// <summary>
++            /// Stores all TaskInvocationAnalysisData reported during the build.
++            /// </summary>
++            public List<TaskInvocationAnalysisData> AnalysisData = new();
++
++            private void TaskInvocationAction(BuildCheckDataContext<TaskInvocationAnalysisData> context)
++            {
++                AnalysisData.Add(context.Data);
++            }
++        }
++
++        private static TestAnalyzer? s_testAnalyzer;
++
++        public TaskInvocationAnalysisDataTests()
++        {
++            BuildCheckManager.s_testFactoriesPerDataSource =
++            [
++                // BuildCheckDataSource.EventArgs
++                [
++                    ([TestAnalyzer.SupportedRule.Id], true, () => (s_testAnalyzer = new TestAnalyzer())),
++                ],
++                // BuildCheckDataSource.Execution
++                [],
++            ];
++
++            s_testAnalyzer?.AnalysisData.Clear();
++        }
++
++        public void Dispose()
++        {
++            BuildCheckManager.s_testFactoriesPerDataSource = null;
++        }
++
++        private void BuildProject(string taskInvocation)
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                var testProject = env.CreateTestProjectWithFiles($"<Project><Target Name=\"Build\">{taskInvocation}</Target></Project>");
++
++                using (var buildManager = new BuildManager())
++                {
++                    var request = new BuildRequestData(testProject.ProjectFile, new Dictionary<string, string>(), MSBuildConstants.CurrentToolsVersion, [], null, BuildRequestDataFlags.None);
++                    var parameters = new BuildParameters
++                    {
++                        LogTaskInputs = true,
++                        IsBuildCheckEnabled = true,
++                        ShutdownInProcNodeOnBuildFinish = true,
++                    };
++
++                    var result = buildManager.Build(parameters, request);
++
++                    result.OverallResult.ShouldBe(BuildResultCode.Success);
++                }
++
++                foreach (var data in s_testAnalyzer!.AnalysisData)
++                {
++                    data.ProjectFilePath.ShouldBe(testProject.ProjectFile);
++                    data.TaskInvocationLocation.Line.ShouldBeGreaterThan(0);
++                    data.TaskInvocationLocation.Column.ShouldBeGreaterThan(0);
++                }
++            }
++        }
++
++        [Fact]
++        public void ReportsSimpleTaskParameters()
++        {
++            BuildProject("<Message Text='Hello'/>");
++
++            s_testAnalyzer!.AnalysisData.Count.ShouldBe(1);
++            var data = s_testAnalyzer.AnalysisData[0];
++            data.TaskName.ShouldBe("Message");
++            data.Parameters.Count.ShouldBe(1);
++            data.Parameters["Text"].IsOutput.ShouldBe(false);
++            data.Parameters["Text"].Value.ShouldBe("Hello");
++        }
++
++        [Fact]
++        public void ReportsComplexTaskParameters()
++        {
++            BuildProject("""
++                <ItemGroup>
++                  <TestItem Include='item1;item2'/>
++                </ItemGroup>
++                <CombinePath BasePath='base' Paths='@(TestItem)'>
++                    <Output TaskParameter='CombinedPaths' ItemName='OutputDirectories' />
++                </CombinePath>
++            """);
++
++            s_testAnalyzer!.AnalysisData.Count.ShouldBe(1);
++            var data = s_testAnalyzer.AnalysisData[0];
++            data.TaskName.ShouldBe("CombinePath");
++            data.Parameters.Count.ShouldBe(3);
++
++            data.Parameters["Paths"].IsOutput.ShouldBe(false);
++            data.Parameters["Paths"].Value.ShouldBeAssignableTo(typeof(IList));
++            IList listValue = (IList)data.Parameters["Paths"].Value!;
++            listValue.Count.ShouldBe(2);
++            listValue[0]!.ShouldBeAssignableTo(typeof(ITaskItem));
++            listValue[1]!.ShouldBeAssignableTo(typeof(ITaskItem));
++            ((ITaskItem)listValue[0]!).ItemSpec.ShouldBe("item1");
++            ((ITaskItem)listValue[1]!).ItemSpec.ShouldBe("item2");
++
++            // The name of the parameter would ideally be "CombinedPaths" but we don't seem to be currently logging it.
++            data.Parameters["OutputDirectories"].IsOutput.ShouldBe(true);
++        }
++    }
++}
+diff --git a/src/Framework/TaskStartedEventArgs.cs b/src/Framework/TaskStartedEventArgs.cs
+index 288a0193524..db1f450e95b 100644
+--- a/src/Framework/TaskStartedEventArgs.cs
++++ b/src/Framework/TaskStartedEventArgs.cs
+@@ -171,22 +171,22 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+         public string ProjectFile => projectFile;
+ 
+         /// <summary>
+-        /// MSBuild file where this task was defined.
++        /// MSBuild file in which this task was invoked.
+         /// </summary>
+         public string TaskFile => taskFile;
+ 
+         /// <summary>
+-        /// Line number of the task invocation in the project file
++        /// Line number of the task invocation in the project file.
+         /// </summary>
+         public int LineNumber { get; internal set; }
+ 
+         /// <summary>
+-        /// Column number of the task invocation in the project file
++        /// Column number of the task invocation in the project file.
+         /// </summary>
+         public int ColumnNumber { get; internal set; }
+ 
+         /// <summary>
+-        /// The location of the assembly containing the implementation of the task
++        /// The location of the assembly containing the implementation of the task.
+         /// </summary>
+         public string TaskAssemblyLocation { get; private set; }
+ 
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 9fa6956ae03..088d2c00179 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -1336,7 +1336,7 @@ internal static bool BuildProject(
+                 // This is a hack for now to make sure the perf hit only happens
+                 // on diagnostic. This should be changed to pipe it through properly,
+                 // perhaps as part of a fuller tracing feature.
+-                bool logTaskInputs = verbosity == LoggerVerbosity.Diagnostic;
++                bool logTaskInputs = verbosity == LoggerVerbosity.Diagnostic || isBuildCheckEnabled;
+ 
+                 if (!logTaskInputs)
+                 {

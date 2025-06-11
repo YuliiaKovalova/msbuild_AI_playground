@@ -1,0 +1,233 @@
+diff --git a/src/Build/Evaluation/Context/EvaluationContext.cs b/src/Build/Evaluation/Context/EvaluationContext.cs
+index 13ceeed1234..d0a12e16409 100644
+--- a/src/Build/Evaluation/Context/EvaluationContext.cs
++++ b/src/Build/Evaluation/Context/EvaluationContext.cs
+@@ -50,18 +50,13 @@ public enum SharingPolicy
+         /// </summary>
+         internal ConcurrentDictionary<string, IReadOnlyList<string>> FileEntryExpansionCache { get; }
+ 
+-        private EvaluationContext(SharingPolicy policy, IFileSystem fileSystem)
++        private EvaluationContext(SharingPolicy policy, IFileSystem fileSystem, ISdkResolverService sdkResolverService = null,
++            ConcurrentDictionary<string, IReadOnlyList<string>> fileEntryExpansionCache = null)
+         {
+-            // Unsupported case: isolated context with non null file system.
+-            // Isolated means caches aren't reused, but the given file system might cache.
+-            ErrorUtilities.VerifyThrowArgument(
+-                policy == SharingPolicy.Shared || fileSystem == null,
+-                "IsolatedContextDoesNotSupportFileSystem");
+-
+             Policy = policy;
+ 
+-            SdkResolverService = new CachingSdkResolverService();
+-            FileEntryExpansionCache = new ConcurrentDictionary<string, IReadOnlyList<string>>();
++            SdkResolverService = sdkResolverService ?? new CachingSdkResolverService();
++            FileEntryExpansionCache = fileEntryExpansionCache ?? new ConcurrentDictionary<string, IReadOnlyList<string>>();
+             FileSystem = fileSystem ?? new CachingFileSystemWrapper(FileSystems.Default);
+             FileMatcher = new FileMatcher(FileSystem, FileEntryExpansionCache);
+         }
+@@ -89,6 +84,12 @@ public static EvaluationContext Create(SharingPolicy policy)
+         /// </param>
+         public static EvaluationContext Create(SharingPolicy policy, MSBuildFileSystemBase fileSystem)
+         {
++            // Unsupported case: isolated context with non null file system.
++            // Isolated means caches aren't reused, but the given file system might cache.
++            ErrorUtilities.VerifyThrowArgument(
++                policy == SharingPolicy.Shared || fileSystem == null,
++                "IsolatedContextDoesNotSupportFileSystem");
++
+             var context = new EvaluationContext(
+                 policy,
+                 fileSystem);
+@@ -124,5 +125,12 @@ internal EvaluationContext ContextForNewProject()
+                     return null;
+             }
+         }
++
++        internal EvaluationContext ContextWithFileSystem(IFileSystem fileSystem)
++        {
++            var newContext = new EvaluationContext(this.Policy, fileSystem, this.SdkResolverService, this.FileEntryExpansionCache);
++            newContext._used = 1;
++            return newContext;
++        }
+     }
+ }
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 5d006a452e2..d35d10df3ae 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -180,11 +180,6 @@ internal class Evaluator<P, I, M, D>
+         /// </summary>
+         private List<string> _streamImports;
+ 
+-        /// <summary>
+-        /// The <see cref="FileMatcher"/> to use for expanding globs.
+-        /// </summary>
+-        private FileMatcher _fileMatcher;
+-
+         private readonly bool _interactive;
+ 
+         private readonly bool _isRunningInVisualStudio;
+@@ -212,6 +207,7 @@ private Evaluator(
+         {
+             ErrorUtilities.VerifyThrowInternalNull(data, nameof(data));
+             ErrorUtilities.VerifyThrowInternalNull(projectRootElementCache, nameof(projectRootElementCache));
++            ErrorUtilities.VerifyThrowInternalNull(evaluationContext, nameof(evaluationContext));
+             ErrorUtilities.VerifyThrowInternalNull(loggingService, nameof(loggingService));
+             ErrorUtilities.VerifyThrowInternalNull(buildEventContext, nameof(buildEventContext));
+ 
+@@ -226,12 +222,20 @@ private Evaluator(
+                 // Wrap the IEvaluatorData<> object passed in.
+                 data = new PropertyTrackingEvaluatorDataWrapper<P, I, M, D>(data, _evaluationLoggingContext, Traits.Instance.LogPropertyTracking);
+             }
+-            _evaluationContext = evaluationContext ?? EvaluationContext.Create(EvaluationContext.SharingPolicy.Isolated);
++
++            // If the host wishes to provide a directory cache for this evaluation, wrap the EvaluationContext to use the right file system.
++            _evaluationContext = evaluationContext;
++            IDirectoryCache directoryCache = project?.GetDirectoryCacheForEvaluation(_evaluationLoggingContext.BuildEventContext.EvaluationId);
++            if (directoryCache is not null)
++            {
++                IFileSystem fileSystem = new DirectoryCacheFileSystemWrapper(evaluationContext.FileSystem, directoryCache);
++                _evaluationContext = evaluationContext.ContextWithFileSystem(fileSystem);
++            }
+ 
+             // Create containers for the evaluation results
+             data.InitializeForEvaluation(toolsetProvider, _evaluationContext.FileSystem);
+ 
+-            _expander = new Expander<P, I>(data, data, _evaluationContext.FileSystem);
++            _expander = new Expander<P, I>(data, data, _evaluationContext);
+ 
+             // This setting may change after the build has started, therefore if the user has not set the property to true on the build parameters we need to check to see if it is set to true on the environment variable.
+             _expander.WarnForUninitializedProperties = BuildParameters.WarnOnUninitializedProperty || Traits.Instance.EscapeHatches.WarnOnUninitializedProperty;
+@@ -266,13 +270,6 @@ private Evaluator(
+             _streamImports = new List<string>();
+             // When the imports are concatenated with a semicolon, this automatically prepends a semicolon if and only if another element is later added.
+             _streamImports.Add(string.Empty);
+-
+-            // Create a FileMatcher for the given project being evaluated, evaluation context, and evaluation ID.
+-            IDirectoryCache directoryCache = project?.GetDirectoryCacheForEvaluation(_evaluationLoggingContext.BuildEventContext.EvaluationId);
+-            IFileSystem fileSystem = directoryCache is not null
+-                ? new DirectoryCacheFileSystemWrapper(evaluationContext.FileSystem, directoryCache)
+-                : evaluationContext.FileSystem;
+-            _fileMatcher = new FileMatcher(fileSystem, evaluationContext.FileEntryExpansionCache);
+         }
+ 
+         /// <summary>
+@@ -309,7 +306,7 @@ internal static void Evaluate(
+             BuildEventContext buildEventContext,
+             ISdkResolverService sdkResolverService,
+             int submissionId,
+-            EvaluationContext evaluationContext = null,
++            EvaluationContext evaluationContext,
+             bool interactive = false)
+         {
+             MSBuildEventSource.Log.EvaluateStart(root.ProjectFileLocation.File);
+@@ -372,7 +369,7 @@ internal static List<I> CreateItemsFromInclude(string rootDirectory, ProjectItem
+                     else
+                     {
+                         // The expression is not of the form "@(X)". Treat as string
+-                        string[] includeSplitFilesEscaped = EngineFileUtilities.GetFileListEscaped(rootDirectory, includeSplitEscaped, excludeSpecsEscaped: null, forceEvaluate: false, null /* TODO */);
++                        string[] includeSplitFilesEscaped = EngineFileUtilities.GetFileListEscaped(rootDirectory, includeSplitEscaped, excludeSpecsEscaped: null, forceEvaluate: false, expander.EvaluationContext.FileMatcher);
+ 
+                         if (includeSplitFilesEscaped.Length > 0)
+                         {
+@@ -661,7 +658,7 @@ private void Evaluate()
+                 using (_evaluationProfiler.TrackPass(EvaluationPass.Items))
+                 {
+                     // comment next line to turn off lazy Evaluation
+-                    lazyEvaluator = new LazyItemEvaluator<P, I, M, D>(_data, _itemFactory, _evaluationLoggingContext, _evaluationProfiler, _evaluationContext, _fileMatcher);
++                    lazyEvaluator = new LazyItemEvaluator<P, I, M, D>(_data, _itemFactory, _evaluationLoggingContext, _evaluationProfiler, _evaluationContext);
+ 
+                     // Pass3: evaluate project items
+                     MSBuildEventSource.Log.EvaluatePass3Start(projectFile);
+@@ -2024,7 +2021,7 @@ private LoadImportsResult ExpandAndLoadImportsFromUnescapedImportExpression(stri
+                     }
+ 
+                     // Expand the wildcards and provide an alphabetical order list of import statements.
+-                    importFilesEscaped = EngineFileUtilities.GetFileListEscaped(directoryOfImportingFile, importExpressionEscapedItem, forceEvaluate: true, fileMatcher: _fileMatcher);
++                    importFilesEscaped = EngineFileUtilities.GetFileListEscaped(directoryOfImportingFile, importExpressionEscapedItem, forceEvaluate: true, fileMatcher: _evaluationContext.FileMatcher);
+                 }
+                 catch (Exception ex) when (ExceptionHandling.IsIoRelatedException(ex))
+                 {
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 79d3397e928..569b0555c25 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -25,6 +25,7 @@
+ using TaskItemFactory = Microsoft.Build.Execution.ProjectItemInstance.TaskItem.TaskItemFactory;
+ 
+ using Microsoft.NET.StringTools;
++using Microsoft.Build.Evaluation.Context;
+ 
+ namespace Microsoft.Build.Evaluation
+ {
+@@ -301,6 +302,11 @@ private void FlushFirstValueIfNeeded()
+ 
+         private readonly IFileSystem _fileSystem;
+ 
++        /// <summary>
++        /// Non-null if the expander was constructed for evaluation.
++        /// </summary>
++        internal EvaluationContext EvaluationContext { get; }
++
+         /// <summary>
+         /// Creates an expander passing it some properties to use.
+         /// Properties may be null.
+@@ -312,6 +318,18 @@ internal Expander(IPropertyProvider<P> properties, IFileSystem fileSystem)
+             _fileSystem = fileSystem;
+         }
+ 
++        /// <summary>
++        /// Creates an expander passing it some properties to use and the evaluation context.
++        /// Properties may be null.
++        /// </summary>
++        internal Expander(IPropertyProvider<P> properties, EvaluationContext evaluationContext)
++        {
++            _properties = properties;
++            _usedUninitializedProperties = new UsedUninitializedProperties();
++            _fileSystem = evaluationContext.FileSystem;
++            EvaluationContext = evaluationContext;
++        }
++
+         /// <summary>
+         /// Creates an expander passing it some properties and items to use.
+         /// Either or both may be null.
+@@ -322,6 +340,16 @@ internal Expander(IPropertyProvider<P> properties, IItemProvider<I> items, IFile
+             _items = items;
+         }
+ 
++        /// <summary>
++        /// Creates an expander passing it some properties and items to use, and the evaluation context.
++        /// Either or both may be null.
++        /// </summary>
++        internal Expander(IPropertyProvider<P> properties, IItemProvider<I> items, EvaluationContext evaluationContext)
++            : this(properties, evaluationContext)
++        {
++            _items = items;
++        }
++
+         /// <summary>
+         /// Creates an expander passing it some properties, items, and/or metadata to use.
+         /// Any or all may be null.
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.cs b/src/Build/Evaluation/LazyItemEvaluator.cs
+index d85ad8c8982..53a92503e47 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.cs
+@@ -43,8 +43,7 @@ internal partial class LazyItemEvaluator<P, I, M, D>
+ 
+         protected FileMatcher FileMatcher { get; }
+ 
+-        public LazyItemEvaluator(IEvaluatorData<P, I, M, D> data, IItemFactory<I, I> itemFactory, LoggingContext loggingContext, EvaluationProfiler evaluationProfiler, EvaluationContext evaluationContext,
+-            FileMatcher fileMatcher)
++        public LazyItemEvaluator(IEvaluatorData<P, I, M, D> data, IItemFactory<I, I> itemFactory, LoggingContext loggingContext, EvaluationProfiler evaluationProfiler, EvaluationContext evaluationContext)
+         {
+             _outerEvaluatorData = data;
+             _outerExpander = new Expander<P, I>(_outerEvaluatorData, _outerEvaluatorData, evaluationContext.FileSystem);
+@@ -55,7 +54,7 @@ public LazyItemEvaluator(IEvaluatorData<P, I, M, D> data, IItemFactory<I, I> ite
+             _evaluationProfiler = evaluationProfiler;
+ 
+             FileSystem = evaluationContext.FileSystem;
+-            FileMatcher = fileMatcher;
++            FileMatcher = evaluationContext.FileMatcher;
+         }
+ 
+         private ImmutableList<I> GetItems(string itemType)

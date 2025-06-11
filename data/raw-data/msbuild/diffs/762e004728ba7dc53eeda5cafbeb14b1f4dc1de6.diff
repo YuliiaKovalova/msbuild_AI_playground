@@ -1,0 +1,141 @@
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index 2395b09f44d..87602148672 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -152,7 +152,7 @@ protected void ShutdownAllNodes(bool nodeReuse, NodeContextTerminateDelegate ter
+             string msbuildtaskhostExeName = NodeProviderOutOfProcTaskHost.TaskHostNameForClr2TaskHost;
+ 
+             // Search for all instances of msbuildtaskhost process and add them to the process list
+-            nodeProcesses.AddRange(new List<Process>(Process.GetProcessesByName(Path.GetFileNameWithoutExtension(msbuildtaskhostExeName))));
++            nodeProcesses.AddRange(Process.GetProcessesByName(Path.GetFileNameWithoutExtension(msbuildtaskhostExeName)));
+ 
+             // For all processes in the list, send signal to terminate if able to connect
+             foreach (Process nodeProcess in nodeProcesses)
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+index 00cfedb15c0..b2e0055006e 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+@@ -91,6 +91,7 @@ private void HandleProjectEvaluationStartedEvent(ProjectEvaluationStartedEventAr
+                 eventArgs.ProjectFile!);
+ 
+             _buildCheckManager.ProcessProjectEvaluationStarted(
++                BuildCheckDataSource.EventArgs,
+                 checkContext,
+                 eventArgs.ProjectFile!);
+         }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index f7ffa38185a..3476f3dbf8a 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -411,12 +411,10 @@ public void ProcessEvaluationFinishedEventArgs(
+             {
+                 if (importedProjects != null && TryGetProjectFullPath(checkContext.BuildEventContext, out string projectPath))
+                 {
+-                    lock (importedProjects)
++                    foreach (string importedProject in importedProjects)
+                     {
+-                        foreach (string importedProject in importedProjects)
+-                        {
+-                            _buildEventsProcessor.ProcessProjectImportedEventArgs(checkContext, projectPath, importedProject);
+-                        }
++                        _buildEventsProcessor.ProcessProjectImportedEventArgs(checkContext, projectPath,
++                            importedProject);
+                     }
+                 }
+             }
+@@ -504,8 +502,9 @@ public void FinalizeProcessing(LoggingContext loggingContext)
+ 
+         private readonly ConcurrentDictionary<int, string> _projectsByInstanceId = new();
+         private readonly ConcurrentDictionary<int, string> _projectsByEvaluationId = new();
+-
+-        private readonly ConcurrentDictionary<int, HashSet<string>> _deferredProjectEvalIdToImportedProjects = new();
++        // We are receiving project imported data only from the logger events - hence always in a single threaded context
++        //  (https://github.com/dotnet/msbuild/blob/main/documentation/wiki/Logging-Internals.md)
++        private readonly Dictionary<int, HashSet<string>> _deferredProjectEvalIdToImportedProjects = new();
+ 
+         /// <summary>
+         /// This method fetches the project full path from the context id.
+@@ -572,12 +571,22 @@ public void ProjectFirstEncountered(
+             SetupChecksForNewProject(projectFullPath, checkContext);
+         }
+ 
++        public void ProcessProjectEvaluationStarted(ICheckContext checkContext, string projectFullPath)
++            => ProcessProjectEvaluationStarted(BuildCheckDataSource.BuildExecution, checkContext, projectFullPath);
++
+         public void ProcessProjectEvaluationStarted(
++            BuildCheckDataSource buildCheckDataSource,
+             ICheckContext checkContext,
+             string projectFullPath)
+         {
+             _projectsByEvaluationId[checkContext.BuildEventContext.EvaluationId] = projectFullPath;
+-            _deferredProjectEvalIdToImportedProjects.TryAdd(checkContext.BuildEventContext.EvaluationId, [projectFullPath]);
++            // We are receiving project imported data only from the logger events
++            if (buildCheckDataSource == BuildCheckDataSource.EventArgs &&
++                !_deferredProjectEvalIdToImportedProjects.ContainsKey(checkContext.BuildEventContext.EvaluationId))
++            {
++                _deferredProjectEvalIdToImportedProjects.Add(checkContext.BuildEventContext.EvaluationId,
++                    [projectFullPath]);
++            }
+         }
+ 
+         /*
+@@ -612,24 +621,17 @@ public void StartProjectRequest(ICheckContext checkContext, string projectFullPa
+         private readonly Dictionary<int, List<BuildEventArgs>> _deferredEvalDiagnostics = new();
+ 
+         /// <summary>
+-        /// Propagates a newly imported project file to all projects that import the original project file.
+-        /// This method ensures that if Project A imports Project B, and Project B now imports Project C,
+-        /// then Project A will also show Project C as an import.
++        /// Registers the logic import by a project file.
+         /// </summary>
+         /// <param name="evaluationId">The evaluation id is associated with the root project path.</param>
+-        /// <param name="originalProjectFile">The path of the project file that is importing a new project.</param>
+-        /// <param name="newImportedProjectFile">The path of the newly imported project file.</param>
+-        private void PropagateImport(int evaluationId, string originalProjectFile, string newImportedProjectFile)
++        /// <param name="importingProjectFile">The path of the project file that is importing a new project.</param>
++        /// <param name="importedFile">The path of the imported project file.</param>
++        private void PropagateImport(int evaluationId, string importingProjectFile, string importedFile)
+         {
+-            if (_deferredProjectEvalIdToImportedProjects.TryGetValue(evaluationId, out HashSet<string>? importedProjects))
++            if (_deferredProjectEvalIdToImportedProjects.TryGetValue(evaluationId,
++                    out HashSet<string>? importedProjects))
+             {
+-                lock (importedProjects)
+-                {
+-                    if (importedProjects.Contains(originalProjectFile))
+-                    {
+-                        importedProjects.Add(newImportedProjectFile);
+-                    }
+-                }
++                importedProjects.Add(importedFile);
+             }
+         }
+ 
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+index 8971403ed22..82ddf65489e 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+@@ -74,7 +74,7 @@ void ProcessTaskParameterEventArgs(
+     //  - but we still need to know about it, hence the dedicated event.
+     void ProjectFirstEncountered(BuildCheckDataSource buildCheckDataSource, ICheckContext analysisContext, string projectFullPath);
+ 
+-    void ProcessProjectEvaluationStarted(ICheckContext checksContext, string projectFullPath);
++    void ProcessProjectEvaluationStarted(BuildCheckDataSource buildCheckDataSource, ICheckContext checksContext, string projectFullPath);
+ 
+     void EndProjectEvaluation(BuildEventContext buildEventContext);
+ 
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+index bcbe2075e84..f262903c187 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+@@ -61,6 +61,10 @@ public void ProjectFirstEncountered(BuildCheckDataSource buildCheckDataSource, I
+     }
+ 
+     public void ProcessProjectEvaluationStarted(ICheckContext checkContext, string projectFullPath)
++    { 
++    }
++
++    public void ProcessProjectEvaluationStarted(BuildCheckDataSource buildCheckDataSource, ICheckContext checkContext, string projectFullPath)
+     {
+     }
+ 

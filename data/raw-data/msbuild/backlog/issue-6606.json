@@ -1,0 +1,111 @@
+{
+  "number": 6606,
+  "title": "GetCopyToOutputDirectoryItems perf",
+  "body": "### Issue Description\r\nSome build perf for a solution with only vc projects which don\u2019t copy anything to the output dir and noticed that  GetCopyToOutputDirectoryItems   target time is pretty big without doing any actual copying.\r\n\r\n### Steps to Reproduce\r\nGet \\\\olgaark22\\public\\Build\\Generated_250_250_250_5P2P.zip and run `msbuild  /m:10 /v:q /bl:Base_M010_MP010.binlog`\r\n\r\n### Data\r\n\r\n    282473 ms  d:\\olgaark\\Generated_250_250_250_5P2P\\gensln.sln   1 calls\r\n\r\nTarget Performance Summary:\r\n    122175 ms  _GetCopyToOutputDirectoryItemsFromTransitiveProjectReferences 250 calls\r\n    **122392 ms  GetCopyToOutputDirectoryItems**            250 calls\r\n    **127669 ms  GetReferencedVCProjectsInfo**              250 calls\r\n    282461 ms  Build                                    251 calls\r\n    425728 ms  Link                                     250 calls\r\n    2058851 ms  ClCompile                                250 calls\r\n    34881129 ms  ResolveProjectReferences                 250 calls\r\n\r\nTask Performance Summary:\r\n     1088 ms  GenerateDesktopDeployRecipe              250 calls\r\n    **122331 ms  CallTarget**                               500 calls\r\n    416491 ms  Link                                     250 calls\r\n    2048743 ms  CL                                       250 calls\r\n    35412917 ms  MSBuild                                  995 calls\r\n\r\n### Analysis\r\nHypothesis is that GetCopyToOutputDirectoryItems which is supposed to run on particular node is blocked by some other \r\nbuild requests which have started on that node meanwhile.\r\n\r\n### Versions & Configurations\r\nMSBuild version = \"16.10.0-preview-21227-06+1d1fec7c4\"\r\n\r\n### Regression?\r\nMost probably not a regression.\r\n\r\n### Attach a binlog\r\nSee repro.\r\n",
+  "state": "OPEN",
+  "createdAt": "2021-06-22T09:44:17Z",
+  "updatedAt": "2025-06-02T08:26:40Z",
+  "closedAt": null,
+  "author": {
+    "login": "rokonec"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": []
+  },
+  "labels": [
+    "needs-design",
+    "Area: Performance",
+    "needs-more-info",
+    "stale",
+    "closed-by-bot"
+  ],
+  "comments": {
+    "nodes": [
+      {
+        "body": "### Analysis\r\n\r\nI have verified, by debugging repro and code survey, that following Rainer root cause analysis is indeed correct:\r\n> ![image](https://user-images.githubusercontent.com/25249058/125118990-c06bdf80-e0f0-11eb-825b-0c7103cc5e9f.png)\r\n> The actual execution time of GetCopyToOutputDirectoryItems is small (sequence point 9 to 10), but the time from requesting it (7) to completion (10) is much higher, because Unrelated.csproj was blocking Node2 during that time.\r\n\r\n### Experiment\r\nBy adding `GetCopyToOutputDirectoryItems` MSBuild task `GetCopyToOutputDirectoryItems`  into `ResolveProjectReferences` it is assured that `GetCopyToOutputDirectoryItems` is cached and later request are satisfied by Scheduler build result cache. \r\nThis eliminates later waiting for project affinite node to finish its current build.\r\n\r\n`Microsoft Visual Studio\\2022\\Preview\\MSBuild\\Current\\Bin\\Microsoft.Common.CurrentVersion.targets` was modified as follows:\r\n```XML\r\n<Target\r\n      Name=\"ResolveProjectReferences\"\r\n      DependsOnTargets=\"PrepareProjectReferences\"\r\n      Returns=\"@(_ResolvedNativeProjectReferencePaths);@(_ResolvedProjectReferencePaths)\">\r\n    .\r\n   ...\r\n\r\n    <!-- Get items from child projects ASAP to avoid later node blocking by other project builds. -->\r\n    <MSBuild\r\n        Projects=\"@(_MSBuildProjectReferenceExistent)\"\r\n        Targets=\"$(_RecursiveTargetForContentCopying)\"\r\n        BuildInParallel=\"$(BuildInParallel)\"\r\n        Properties=\"%(_MSBuildProjectReferenceExistent.SetConfiguration); %(_MSBuildProjectReferenceExistent.SetPlatform); %(_MSBuildProjectReferenceExistent.SetTargetFramework)\"\r\n        Condition=\"'@(_MSBuildProjectReferenceExistent)' != '' and '$(_GetChildProjectCopyToOutputDirectoryItems)' == 'true' and '%(_MSBuildProjectReferenceExistent.Private)' != 'false' and '$(UseCommonOutputDirectory)' != 'true'\"\r\n        ContinueOnError=\"$(ContinueOnError)\"\r\n        SkipNonexistentTargets=\"true\"\r\n        RemoveProperties=\"%(_MSBuildProjectReferenceExistent.GlobalPropertiesToRemove)$(_GlobalPropertiesToRemoveFromProjectReferences)\">\r\n\r\n      <Output TaskParameter=\"TargetOutputs\" ItemName=\"_AllChildProjectItemsWithTargetPath\"/>\r\n\r\n    </MSBuild>\r\n\r\n    <!--\r\n        Get manifest items from the (non-exe) built project references (to feed them into ResolveNativeReference).\r\n        -->\r\n    <MSBuild\r\n        Projects=\"@(_MSBuildProjectReferenceExistent)\"\r\n        Targets=\"GetNativeManifest\"\r\n\r\n   ...\r\n```\r\n\r\nReported GetCopyToOutputDirectoryItems Target duration has shrunk from 418 s to 25 s the build wall clock was only 3% faster (13 seconds). This is most probably result of GetCopyToOutputDirectoryItems blocked time often NOT being on critical path of MSBuild execution plan.\r\n\r\n### Possible problem solutions\r\n\r\n#### 1) Stub target in `ResolveProjectReference`\r\n\r\nStub target like `AfterResolveProjectReferencePreCache` would allow write extensions which would help solve this issue by preheating Scheduler build results cache. This would allow various `project systems` to customize it for their needs.\r\n\r\n#### `ResolveProjectReferences` task runs 'Build;GetCopyToOutputDirectoryItems' targets by default. \r\nWe have to verify that result of of such MSBuild task run is cached in Scheduler per target and could be used to satisfy inevitable `GetCopyToOutputDirectoryItems` target build request.\r\n\r\n#### 2) Allow running subset of targets concurrently on a build node\r\n\r\nTargets would have to declare if they are written the way that allows safe concurrent execution on busy nodes. Such target would be considered read-only and to not have any side effects (pure-function targets).\r\nHowever, my simple prototype doing this was failing builds. I presume that it was because node was currently building same project for which we want to have `GetCopyToOutputDirectoryItems` target executed and the memory state which is needed for this target result was not yet consistent.\r\n\r\nWe would need to solve above issue by either waiting for `build` target of given project to be finished or by simple blocking while Node runs any exclusive builds of same project.\r\n\r\n#### 3) Storing `CopyToOutputDirectoryItems` in file system `obj` directory\r\n\r\nThis way getting this item list would be simply parsing related file without respecting project-node affinity. This would also eliminates recursive/transitive `GetCopyToOutputDirectoryItems` targets invocation. Additionally it might allows to further optimize incremental builds - VS proj system would copy files itself using content of this file when there would be no need to call MSBuild for example when ref-assemblies of parent projects stays untouched.\r\nHowever, I am not sure if `CopyToOutputDirectoryItems` is stable for every kind of builds. I mean is it always identical regardless to which target project we need to copy files into?\r\n\r\n#### 4) Storing `CopyToOutputDirectoryItems` in a cache\r\n\r\nSame as 3) but storing 'shareble' data from build in some interprocess non persistent cache. Various techniques are possible here. Easiest seems to be, to me, the 'Scheduler node' serving that purpose and hold the 'shareble' data. ",
+        "createdAt": "2021-07-09T19:17:56Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "Any progress on this?",
+        "createdAt": "2024-02-10T23:12:36Z",
+        "author": {
+          "login": "AraHaan"
+        }
+      },
+      {
+        "body": "@AraHaan Could you kindly assist us in better understanding your use case? At the moment, we don't quite see its potential impact, and we'd appreciate your insights to help us grasp its significance better.",
+        "createdAt": "2024-02-15T19:35:50Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "Let's say that if this could be done it can greatly help with improving the speed of my builds on some of my projects.",
+        "createdAt": "2024-02-18T15:29:25Z",
+        "author": {
+          "login": "AraHaan"
+        }
+      },
+      {
+        "body": "> Let's say that if this could be done it can greatly help with improving the speed of my builds on some of my projects.\r\n\r\nMy analysis shows \"only\" 3% performance gain for out test projects. You can try [my experiment](https://github.com/dotnet/msbuild/issues/6606#issuecomment-877404361) for your project to see if it improves overall build duration.",
+        "createdAt": "2024-02-18T18:02:18Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "I have a fast machine, with very fast disk; when doing a \"Build\" on a .NET 4.8 Web Project, we reference 16 other projects, each takes 120 to 400ms:\r\n\r\nThis run is pretty quick... but it does add up.\r\n\r\n18>      185 ms  C:\\Source\\Trunk_2023a\\XXX.Module.Automation\\XXX.Module.Automation.csproj   4 calls\r\n18>                  2 ms  GetTargetFrameworks                        1 calls\r\n18>                  1 ms  GetTargetPath                              1 calls\r\n18>                  0 ms  GetNativeManifest                          1 calls\r\n18>                182 ms  GetCopyToOutputDirectoryItems              1 calls\r\n18>      191 ms  C:\\Source\\Trunk_2023a\\XXX.Module.TimeKeeping\\XXX.Module.TimeKeeping.csproj   4 calls\r\n18>                  2 ms  GetTargetFrameworks                        1 calls\r\n18>                  1 ms  GetTargetPath                              1 calls\r\n18>                  0 ms  GetNativeManifest                          1 calls\r\n18>                188 ms  GetCopyToOutputDirectoryItems              1 calls\r\n18>      193 ms  C:\\Source\\Trunk_2023a\\XXX.Module.Backup\\XXX.Module.Backup.csproj   4 calls\r\n\r\n",
+        "createdAt": "2024-03-29T03:20:12Z",
+        "author": {
+          "login": "ProVega"
+        }
+      },
+      {
+        "body": "@AraHaan / @ProVega  - are you able to try the change that @rokonec mentioned above and take a binlog to compare/contract the time spent in `GetCopyToOutputDirectoryItems` across your projects?",
+        "createdAt": "2024-03-29T03:23:41Z",
+        "author": {
+          "login": "baronfel"
+        }
+      },
+      {
+        "body": "@AraHaan  / @ProVega - are you still trying these changes? ",
+        "createdAt": "2024-10-22T15:35:50Z",
+        "author": {
+          "login": "maridematte"
+        }
+      },
+      {
+        "body": "Sorry about the wait, I will try the change they recommended now.",
+        "createdAt": "2024-12-06T16:00:46Z",
+        "author": {
+          "login": "AraHaan"
+        }
+      },
+      {
+        "body": "Alright, I tried this change with the file in the latest preview version of VS2022's file and then ran my [largest solution file](https://github.com/Elskom/runtime) with ``dotnet build -c Release``. The result of the build was ``194.5s``. That is unless the version from Visual Studio on the changed props file is different than the one inside of the .NET SDK itself when I build in the command line only.",
+        "createdAt": "2024-12-07T15:17:21Z",
+        "author": {
+          "login": "AraHaan"
+        }
+      },
+      {
+        "body": "It does seem that the .NET SDK has it's own copy of the file as well.",
+        "createdAt": "2024-12-08T08:42:17Z",
+        "author": {
+          "login": "AraHaan"
+        }
+      },
+      {
+        "body": "#7864, I think it is the same issue.",
+        "createdAt": "2024-12-09T20:59:14Z",
+        "author": {
+          "login": "yuehuang010"
+        }
+      }
+    ]
+  }
+}

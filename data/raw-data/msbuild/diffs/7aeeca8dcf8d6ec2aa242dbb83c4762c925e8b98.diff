@@ -1,0 +1,592 @@
+diff --git a/documentation/wiki/ChangeWaves.md b/documentation/wiki/ChangeWaves.md
+index ef38fa5942e..9d90c75075e 100644
+--- a/documentation/wiki/ChangeWaves.md
++++ b/documentation/wiki/ChangeWaves.md
+@@ -28,6 +28,7 @@ A wave of features is set to "rotate out" (i.e. become standard functionality) t
+ - [Convert.ToString during a property evaluation uses the InvariantCulture for all types](https://github.com/dotnet/msbuild/pull/9874)
+ - [Fix oversharing of build results in ResultsCache](https://github.com/dotnet/msbuild/pull/9987)
+ - [Add ParameterName and PropertyName to TaskParameterEventArgs](https://github.com/dotnet/msbuild/pull/10130)
++- [Emit eval props if requested by any sink](https://github.com/dotnet/msbuild/pull/10243)
+ 
+ ### 17.10
+ - [AppDomain configuration is serialized without using BinFmt](https://github.com/dotnet/msbuild/pull/9320) - feature can be opted out only if [BinaryFormatter](https://learn.microsoft.com/en-us/dotnet/api/system.runtime.serialization.formatters.binary.binaryformatter) is allowed at runtime by editing `MSBuild.runtimeconfig.json`
+diff --git a/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs b/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
+index 1d81e8ac1aa..1d65cf6b471 100644
+--- a/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
+@@ -82,7 +82,7 @@ public BuildManager_Tests(ITestOutputHelper output)
+                 EnableNodeReuse = false
+             };
+             _buildManager = new BuildManager();
+-            _projectCollection = new ProjectCollection();
++            _projectCollection = new ProjectCollection(globalProperties: null, _parameters.Loggers, ToolsetDefinitionLocations.Default);
+ 
+             _env = TestEnvironment.Create(output);
+             _inProcEnvCheckTransientEnvironmentVariable = _env.SetEnvironmentVariable("MSBUILDINPROCENVCHECK", "1");
+@@ -137,8 +137,8 @@ public void SimpleBuild()
+             _logger.AssertLogContains("[success]");
+             Assert.Single(_logger.ProjectStartedEvents);
+ 
+-            ProjectStartedEventArgs projectStartedEvent = _logger.ProjectStartedEvents[0];
+-            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(projectStartedEvent.Properties);
++            ProjectEvaluationFinishedEventArgs evalFinishedEvent = _logger.EvaluationFinishedEvents[0];
++            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(evalFinishedEvent.Properties);
+ 
+             Assert.True(properties.TryGetValue("InitialProperty1", out string propertyValue));
+             Assert.Equal("InitialProperty1", propertyValue);
+@@ -254,8 +254,8 @@ public void SimpleGraphBuild()
+             _logger.AssertLogContains("[success]");
+             _logger.ProjectStartedEvents.Count.ShouldBe(1);
+ 
+-            ProjectStartedEventArgs projectStartedEvent = _logger.ProjectStartedEvents[0];
+-            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(projectStartedEvent.Properties);
++            ProjectEvaluationFinishedEventArgs evalFinishedEvent = _logger.EvaluationFinishedEvents[0];
++            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(evalFinishedEvent.Properties);
+ 
+             properties.TryGetValue("InitialProperty1", out string propertyValue).ShouldBeTrue();
+             propertyValue.ShouldBe("InitialProperty1", StringCompareShould.IgnoreCase);
+@@ -571,8 +571,8 @@ public void InProcForwardPropertiesFromChild()
+             _logger.AssertLogContains("[success]");
+             Assert.Single(_logger.ProjectStartedEvents);
+ 
+-            ProjectStartedEventArgs projectStartedEvent = _logger.ProjectStartedEvents[0];
+-            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(projectStartedEvent.Properties);
++            ProjectEvaluationFinishedEventArgs evalFinishedEvent = _logger.EvaluationFinishedEvents[0];
++            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(evalFinishedEvent.Properties);
+ 
+             Assert.True(properties.TryGetValue("InitialProperty1", out string propertyValue));
+             Assert.Equal("InitialProperty1", propertyValue);
+@@ -611,8 +611,8 @@ public void InProcMsBuildForwardAllPropertiesFromChild()
+             _logger.AssertLogContains("[success]");
+             Assert.Single(_logger.ProjectStartedEvents);
+ 
+-            ProjectStartedEventArgs projectStartedEvent = _logger.ProjectStartedEvents[0];
+-            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(projectStartedEvent.Properties);
++            ProjectEvaluationFinishedEventArgs evalFinishedEvent = _logger.EvaluationFinishedEvents[0];
++            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(evalFinishedEvent.Properties);
+ 
+             Assert.True(properties.TryGetValue("InitialProperty1", out string propertyValue));
+             Assert.Equal("InitialProperty1", propertyValue);
+@@ -655,8 +655,8 @@ public void MsBuildForwardAllPropertiesFromChildLaunchChildNode()
+             _logger.AssertLogContains("[success]");
+             Assert.Single(_logger.ProjectStartedEvents);
+ 
+-            ProjectStartedEventArgs projectStartedEvent = _logger.ProjectStartedEvents[0];
+-            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(projectStartedEvent.Properties);
++            ProjectEvaluationFinishedEventArgs evalFinishedEvent = _logger.EvaluationFinishedEvents[0];
++            Dictionary<string, string> properties = ExtractProjectStartedPropertyList(evalFinishedEvent.Properties);
+ 
+             Assert.True(properties.TryGetValue("InitialProperty1", out string propertyValue));
+             Assert.Equal("InitialProperty1", propertyValue);
+@@ -704,7 +704,15 @@ public void OutOfProcNodeForwardCertainproperties()
+             var data = new BuildRequestData(project.FullPath, new Dictionary<string, string>(),
+                 MSBuildDefaultToolsVersion, Array.Empty<string>(), null);
+ 
+-            BuildResult result = _buildManager.Build(_parameters, data);
++            // We need to recreate build parameters to ensure proper capturing of newly set environment variables
++            BuildParameters parameters = new BuildParameters
++            {
++                ShutdownInProcNodeOnBuildFinish = true,
++                Loggers = new ILogger[] { _logger },
++                EnableNodeReuse = false
++            };
++
++            BuildResult result = _buildManager.Build(parameters, data);
+             Assert.Equal(BuildResultCode.Success, result.OverallResult);
+             _logger.AssertLogContains("[success]");
+             Assert.Single(_logger.ProjectStartedEvents);
+@@ -760,11 +768,21 @@ public void OutOfProcNodeForwardCertainpropertiesAlsoGetResultsFromCache()
+             _env.SetEnvironmentVariable("MsBuildForwardPropertiesFromChild", "InitialProperty3;IAMNOTREAL");
+             _env.SetEnvironmentVariable("MSBUILDNOINPROCNODE", "1");
+ 
++            _env.SetEnvironmentVariable("MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION", "0");
++
+             var project = CreateProject(contents, null, _projectCollection, false);
+             var data = new BuildRequestData(project.FullPath, new Dictionary<string, string>(),
+                 MSBuildDefaultToolsVersion, Array.Empty<string>(), null);
+ 
+-            BuildResult result = _buildManager.Build(_parameters, data);
++            // We need to recreate build parameters to ensure proper capturing of newly set environment variables
++            BuildParameters parameters = new BuildParameters
++            {
++                ShutdownInProcNodeOnBuildFinish = true,
++                Loggers = new ILogger[] { _logger },
++                EnableNodeReuse = false
++            };
++
++            BuildResult result = _buildManager.Build(parameters, data);
+             Assert.Equal(BuildResultCode.Success, result.OverallResult);
+             _logger.AssertLogContains("[success]");
+             Assert.Equal(3, _logger.ProjectStartedEvents.Count);
+@@ -785,7 +803,8 @@ public void OutOfProcNodeForwardCertainpropertiesAlsoGetResultsFromCache()
+             Assert.Equal("InitialProperty3", propertyValue);
+ 
+             projectStartedEvent = _logger.ProjectStartedEvents[2];
+-            Assert.Null(projectStartedEvent.Properties);
++            properties = ExtractProjectStartedPropertyList(projectStartedEvent.Properties);
++            (properties == null || properties.Count == 0).ShouldBeTrue();
+         }
+ 
+         /// <summary>
+@@ -822,7 +841,7 @@ public void ForwardNoPropertiesLaunchChildNode()
+ 
+             ProjectStartedEventArgs projectStartedEvent = _logger.ProjectStartedEvents[0];
+             Dictionary<string, string> properties = ExtractProjectStartedPropertyList(projectStartedEvent.Properties);
+-            Assert.Null(properties);
++            (properties == null || properties.Count == 0).ShouldBeTrue();
+         }
+ 
+         /// <summary>
+@@ -919,7 +938,7 @@ public void ForwardNoPropertiesLaunchChildNodeDefault()
+ 
+             ProjectStartedEventArgs projectStartedEvent = _logger.ProjectStartedEvents[0];
+             Dictionary<string, string> properties = ExtractProjectStartedPropertyList(projectStartedEvent.Properties);
+-            Assert.Null(properties);
++            (properties == null || properties.Count == 0).ShouldBeTrue();
+         }
+ 
+         /// <summary>
+@@ -3475,9 +3494,11 @@ private static string BuildAndCheckCache(BuildManager localBuildManager, IEnumer
+         /// </summary>
+         private static Dictionary<string, string> ExtractProjectStartedPropertyList(IEnumerable properties)
+         {
+-            // Gather a sorted list of all the properties.
+-            return properties?.Cast<DictionaryEntry>()
+-                .ToDictionary(prop => (string)prop.Key, prop => (string)prop.Value, StringComparer.OrdinalIgnoreCase);
++            Dictionary<string, string> propertiesLookup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
++            Internal.Utilities.EnumerateProperties(properties, propertiesLookup,
++                static (dict, kvp) => dict.Add(kvp.Key, kvp.Value));
++
++            return propertiesLookup;
+         }
+ 
+         /// <summary>
+diff --git a/src/Build.UnitTests/BackEnd/MockLoggingService.cs b/src/Build.UnitTests/BackEnd/MockLoggingService.cs
+index e829d9f4384..e19d7fbec5b 100644
+--- a/src/Build.UnitTests/BackEnd/MockLoggingService.cs
++++ b/src/Build.UnitTests/BackEnd/MockLoggingService.cs
+@@ -222,14 +222,21 @@ public bool IncludeEvaluationProfile
+             set { }
+         }
+ 
+-        /// <summary>
+-        /// Log properties and items on ProjectEvaluationFinishedEventArgs
+-        /// instead of ProjectStartedEventArgs.
+-        /// </summary>
+-        public bool IncludeEvaluationPropertiesAndItems
++        /// <inheritdoc cref="ILoggingService.SetIncludeEvaluationPropertiesAndItemsInEvents"/>
++        public void SetIncludeEvaluationPropertiesAndItemsInEvents(bool inProjectStartedEvent,
++            bool inEvaluationFinishedEvent)
++        { }
++
++        /// <inheritdoc cref="ILoggingService.IncludeEvaluationPropertiesAndItemsInProjectStartedEvent"/>
++        public bool IncludeEvaluationPropertiesAndItemsInProjectStartedEvent
++        {
++            get => false;
++        }
++
++        /// <inheritdoc cref="ILoggingService.IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent"/>
++        public bool IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent
+         {
+             get => false;
+-            set { }
+         }
+ 
+         /// <summary>
+diff --git a/src/Build.UnitTests/ConsoleLogger_Tests.cs b/src/Build.UnitTests/ConsoleLogger_Tests.cs
+index 10859bb9ce5..c1fdc67f6a5 100644
+--- a/src/Build.UnitTests/ConsoleLogger_Tests.cs
++++ b/src/Build.UnitTests/ConsoleLogger_Tests.cs
+@@ -277,7 +277,7 @@ public void ErrorMessageWithMultiplePropertiesInMessage(bool includeEvaluationPr
+ 
+             if (includeEvaluationPropertiesAndItems)
+             {
+-                pc.Collection.LoggingService.IncludeEvaluationPropertiesAndItems = true;
++                pc.Collection.LoggingService.SetIncludeEvaluationPropertiesAndItemsInEvents(inProjectStartedEvent: false, inEvaluationFinishedEvent: true);
+             }
+ 
+             var project = env.CreateTestProjectWithFiles(@"
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 52c61ccc9ab..35e0696f0de 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -2771,7 +2771,8 @@ private NodeConfiguration GetNodeConfiguration()
+                 , new LoggingNodeConfiguration(
+                     loggingService.IncludeEvaluationMetaprojects,
+                     loggingService.IncludeEvaluationProfile,
+-                    loggingService.IncludeEvaluationPropertiesAndItems,
++                    loggingService.IncludeEvaluationPropertiesAndItemsInProjectStartedEvent,
++                    loggingService.IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent,
+                     loggingService.IncludeTaskInputs));
+             }
+ 
+diff --git a/src/Build/BackEnd/Components/Logging/ILoggingService.cs b/src/Build/BackEnd/Components/Logging/ILoggingService.cs
+index ecbf7b8026b..104dac56f6f 100644
+--- a/src/Build/BackEnd/Components/Logging/ILoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/ILoggingService.cs
+@@ -206,12 +206,24 @@ bool IncludeEvaluationProfile
+ 
+         /// <summary>
+         /// Should properties and items be logged on <see cref="ProjectEvaluationFinishedEventArgs"/>
+-        /// instead of <see cref="ProjectStartedEventArgs"/>?
++        /// or/and <see cref="ProjectStartedEventArgs"/>?
+         /// </summary>
+-        bool IncludeEvaluationPropertiesAndItems
++        void SetIncludeEvaluationPropertiesAndItemsInEvents(bool inProjectStartedEvent, bool inEvaluationFinishedEvent);
++
++        /// <summary>
++        /// Indicates whether properties and items should be logged on <see cref="ProjectStartedEventArgs"/>.
++        /// </summary>
++        bool IncludeEvaluationPropertiesAndItemsInProjectStartedEvent
++        {
++            get;
++        }
++
++        /// <summary>
++        /// Indicates whether properties and items should be logged on <see cref="ProjectEvaluationFinishedEventArgs"/>.
++        /// </summary>
++        bool IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent
+         {
+             get;
+-            set;
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index 9a6df6ce995..67ec6e4529e 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -201,12 +201,6 @@ internal partial class LoggingService : ILoggingService, INodePacketHandler
+         /// </summary>
+         private bool? _includeEvaluationProfile;
+ 
+-        /// <summary>
+-        /// Whether properties and items should be logged on <see cref="ProjectEvaluationFinishedEventArgs"/>
+-        /// instead of <see cref="ProjectStartedEventArgs"/>.
+-        /// </summary>
+-        private bool? _includeEvaluationPropertiesAndItems;
+-
+         /// <summary>
+         /// Whether to include task inputs in task events.
+         /// </summary>
+@@ -546,33 +540,77 @@ public bool IncludeTaskInputs
+             set => _includeTaskInputs = value;
+         }
+ 
+-        /// <summary>
+-        /// Should properties and items be logged on <see cref="ProjectEvaluationFinishedEventArgs"/>
+-        /// instead of <see cref="ProjectStartedEventArgs"/>?
+-        /// </summary>
+-        public bool IncludeEvaluationPropertiesAndItems
++        /// <inheritdoc cref="ILoggingService.SetIncludeEvaluationPropertiesAndItemsInEvents"/>
++        public void SetIncludeEvaluationPropertiesAndItemsInEvents(bool inProjectStartedEvent, bool inEvaluationFinishedEvent)
+         {
+-            get
++            _evalDataBehaviorSet = true;
++            IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent = inEvaluationFinishedEvent;
++            IncludeEvaluationPropertiesAndItemsInProjectStartedEvent = inProjectStartedEvent;
++        }
++
++        private bool _evalDataBehaviorSet;
++        private bool _includeEvaluationPropertiesAndItemsInProjectStartedEvent;
++        private bool _includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent;
++        private void InferEvalDataBehavior()
++        {
++            if (_evalDataBehaviorSet)
+             {
+-                if (_includeEvaluationPropertiesAndItems == null)
++                return;
++            }
++            // Set this right away - to prevent SO exception in case of any future refactoring
++            //  that would refer to the IncludeEvaluation... properties here
++            _evalDataBehaviorSet = true;
++
++            bool? escapeHatch = Traits.Instance.EscapeHatches.LogPropertiesAndItemsAfterEvaluation;
++            if (escapeHatch.HasValue)
++            {
++                IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent = escapeHatch.Value;
++                IncludeEvaluationPropertiesAndItemsInProjectStartedEvent = !escapeHatch.Value;
++            }
++            else
++            {
++                var sinks = _eventSinkDictionary.Values.OfType<EventSourceSink>().ToList();
++
++                if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_12))
+                 {
+-                    var escapeHatch = Traits.Instance.EscapeHatches.LogPropertiesAndItemsAfterEvaluation;
+-                    if (escapeHatch.HasValue)
+-                    {
+-                        _includeEvaluationPropertiesAndItems = escapeHatch.Value;
+-                    }
+-                    else
+-                    {
+-                        var sinks = _eventSinkDictionary.Values.OfType<EventSourceSink>();
+-                        // .All() on an empty list defaults to true, we want to default to false
+-                        _includeEvaluationPropertiesAndItems = sinks.Any() && sinks.All(sink => sink.IncludeEvaluationPropertiesAndItems);
+-                    }
++                    // If any logger requested the data - we need to emit them
++                    IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent =
++                        sinks.Any(sink => sink.IncludeEvaluationPropertiesAndItems);
++                    // If any logger didn't request the data - hence it's likely legacy logger
++                    //  - we need to populate the data in legacy way
++                    IncludeEvaluationPropertiesAndItemsInProjectStartedEvent =
++                        sinks.Any(sink => !sink.IncludeEvaluationPropertiesAndItems);
+                 }
++                else
++                {
++                    bool allSinksIncludeEvalData = sinks.Any() && sinks.All(sink => sink.IncludeEvaluationPropertiesAndItems);
++
++                    IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent = allSinksIncludeEvalData;
++                    IncludeEvaluationPropertiesAndItemsInProjectStartedEvent = !allSinksIncludeEvalData;
++                }
++            }
++        }
+ 
+-                return _includeEvaluationPropertiesAndItems ?? false;
++        /// <inheritdoc cref="ILoggingService.IncludeEvaluationPropertiesAndItemsInProjectStartedEvent"/>
++        public bool IncludeEvaluationPropertiesAndItemsInProjectStartedEvent
++        {
++            get
++            {
++                InferEvalDataBehavior();
++                return _includeEvaluationPropertiesAndItemsInProjectStartedEvent;
+             }
++            private set => _includeEvaluationPropertiesAndItemsInProjectStartedEvent = value;
++        }
+ 
+-            set => _includeEvaluationPropertiesAndItems = value;
++        /// <inheritdoc cref="ILoggingService.IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent"/>
++        public bool IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent
++        {
++            get
++            {
++                InferEvalDataBehavior();
++                return _includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent;
++            }
++            private set => _includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent = value;
+         }
+ 
+         /// <summary>
+@@ -614,6 +652,7 @@ public ICollection<string> GetWarningsNotAsErrors(BuildEventContext context)
+             return GetWarningsForProject(context, _warningsNotAsErrorsByProject, WarningsNotAsErrors);
+         }
+ 
++
+         /// <summary>
+         /// Returns a collection of warnings to be demoted to messages for the specified build context.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/Logging/ProjectLoggingContext.cs b/src/Build/BackEnd/Components/Logging/ProjectLoggingContext.cs
+index 49a3cd48fb7..06614c42125 100644
+--- a/src/Build/BackEnd/Components/Logging/ProjectLoggingContext.cs
++++ b/src/Build/BackEnd/Components/Logging/ProjectLoggingContext.cs
+@@ -132,7 +132,7 @@ private static BuildEventContext CreateInitialContext(
+ 
+             // If we are only logging critical events lets not pass back the items or properties
+             if (!loggingService.OnlyLogCriticalEvents &&
+-                !loggingService.IncludeEvaluationPropertiesAndItems &&
++                loggingService.IncludeEvaluationPropertiesAndItemsInProjectStartedEvent &&
+                 (!loggingService.RunningOnRemoteNode || loggingService.SerializeAllProperties))
+             {
+                 if (projectProperties is null)
+@@ -152,7 +152,7 @@ private static BuildEventContext CreateInitialContext(
+             }
+ 
+             if (projectProperties != null &&
+-                !loggingService.IncludeEvaluationPropertiesAndItems &&
++                loggingService.IncludeEvaluationPropertiesAndItemsInProjectStartedEvent &&
+                 propertiesToSerialize?.Length > 0 &&
+                 !loggingService.SerializeAllProperties)
+             {
+diff --git a/src/Build/BackEnd/Node/LoggingNodeConfiguration.cs b/src/Build/BackEnd/Node/LoggingNodeConfiguration.cs
+index 1bae5efa98b..8c6315338da 100644
+--- a/src/Build/BackEnd/Node/LoggingNodeConfiguration.cs
++++ b/src/Build/BackEnd/Node/LoggingNodeConfiguration.cs
+@@ -9,12 +9,14 @@ internal sealed class LoggingNodeConfiguration : ITranslatable
+     {
+         private bool _includeEvaluationMetaprojects;
+         private bool _includeEvaluationProfiles;
+-        private bool _includeEvaluationPropertiesAndItems;
++        private bool _includeEvaluationPropertiesAndItemsInProjectStartedEvent;
++        private bool _includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent;
+         private bool _includeTaskInputs;
+ 
+         public bool IncludeEvaluationMetaprojects => _includeEvaluationMetaprojects;
+         public bool IncludeEvaluationProfiles => _includeEvaluationProfiles;
+-        public bool IncludeEvaluationPropertiesAndItems => _includeEvaluationPropertiesAndItems;
++        public bool IncludeEvaluationPropertiesAndItemsInProjectStartedEvent => _includeEvaluationPropertiesAndItemsInProjectStartedEvent;
++        public bool IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent => _includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent;
+         public bool IncludeTaskInputs => _includeTaskInputs;
+ 
+         public LoggingNodeConfiguration()
+@@ -24,12 +26,14 @@ public LoggingNodeConfiguration()
+         public LoggingNodeConfiguration(
+             bool includeEvaluationMetaprojects,
+             bool includeEvaluationProfiles,
+-            bool includeEvaluationPropertiesAndItems,
++            bool includeEvaluationPropertiesAndItemsInProjectStartedEvent,
++            bool includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent,
+             bool includeTaskInputs)
+         {
+             _includeEvaluationMetaprojects = includeEvaluationMetaprojects;
+             _includeEvaluationProfiles = includeEvaluationProfiles;
+-            _includeEvaluationPropertiesAndItems = includeEvaluationPropertiesAndItems;
++            _includeEvaluationPropertiesAndItemsInProjectStartedEvent = includeEvaluationPropertiesAndItemsInProjectStartedEvent;
++            _includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent = includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent;
+             _includeTaskInputs = includeTaskInputs;
+         }
+ 
+@@ -37,7 +41,8 @@ void ITranslatable.Translate(ITranslator translator)
+         {
+             translator.Translate(ref _includeEvaluationMetaprojects);
+             translator.Translate(ref _includeEvaluationProfiles);
+-            translator.Translate(ref _includeEvaluationPropertiesAndItems);
++            translator.Translate(ref _includeEvaluationPropertiesAndItemsInProjectStartedEvent);
++            translator.Translate(ref _includeEvaluationPropertiesAndItemsInEvaluationFinishedEvent);
+             translator.Translate(ref _includeTaskInputs);
+         }
+     }
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index 14706fc57cd..af13beb079d 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -779,9 +779,12 @@ private void HandleNodeConfiguration(NodeConfiguration configuration)
+                 _loggingService.IncludeTaskInputs = true;
+             }
+ 
+-            if (configuration.LoggingNodeConfiguration.IncludeEvaluationPropertiesAndItems)
++            if (configuration.LoggingNodeConfiguration.IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent)
+             {
+-                _loggingService.IncludeEvaluationPropertiesAndItems = true;
++                _loggingService.SetIncludeEvaluationPropertiesAndItemsInEvents(
++                    configuration.LoggingNodeConfiguration.IncludeEvaluationPropertiesAndItemsInProjectStartedEvent,
++                    configuration.LoggingNodeConfiguration
++                        .IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent);
+             }
+ 
+             try
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 064ea77a49d..7e400d10138 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -343,7 +343,7 @@ internal static void Evaluate(
+                 IEnumerable properties = null;
+                 IEnumerable items = null;
+ 
+-                if (evaluator._evaluationLoggingContext.LoggingService.IncludeEvaluationPropertiesAndItems)
++                if (evaluator._evaluationLoggingContext.LoggingService.IncludeEvaluationPropertiesAndItemsInEvaluationFinishedEvent)
+                 {
+                     globalProperties = evaluator._data.GlobalPropertiesDictionary;
+                     properties = Traits.LogAllEnvironmentVariables ? evaluator._data.Properties : evaluator.FilterOutEnvironmentDerivedProperties(evaluator._data.Properties);
+diff --git a/src/Framework.UnitTests/ProjectStartedEventArgs_Tests.cs b/src/Framework.UnitTests/ProjectStartedEventArgs_Tests.cs
+index 67bacf49a74..7eb7895b2df 100644
+--- a/src/Framework.UnitTests/ProjectStartedEventArgs_Tests.cs
++++ b/src/Framework.UnitTests/ProjectStartedEventArgs_Tests.cs
+@@ -50,30 +50,6 @@ public void EventArgsCtors()
+             projectStartedEvent = new ProjectStartedEventArgs(1, null, null, null, null, null, null, null, DateTime.Now);
+         }
+ 
+-        /// <summary>
+-        /// Verify different Items and properties are not taken into account in the equals comparison. They should
+-        /// not be considered as part of the equals evaluation
+-        /// </summary>
+-        [Fact]
+-        public void ItemsAndPropertiesDifferentEquals()
+-        {
+-            ArrayList itemsList = new ArrayList();
+-            ArrayList propertiesList = new ArrayList();
+-            ProjectStartedEventArgs differentItemsAndProperties = new ProjectStartedEventArgs(
+-                  s_baseProjectStartedEvent.ProjectId,
+-                  s_baseProjectStartedEvent.Message,
+-                  s_baseProjectStartedEvent.HelpKeyword,
+-                  s_baseProjectStartedEvent.ProjectFile,
+-                  s_baseProjectStartedEvent.TargetNames,
+-                  propertiesList,
+-                  itemsList,
+-                  s_baseProjectStartedEvent.ParentProjectBuildEventContext,
+-                  s_baseProjectStartedEvent.Timestamp);
+-
+-            s_baseProjectStartedEvent.Properties.ShouldNotBe(propertiesList);
+-            s_baseProjectStartedEvent.Items.ShouldNotBe(itemsList);
+-        }
+-
+         /// <summary>
+         /// Create a derived class so that we can test the default constructor in order to increase code coverage and
+         /// verify this code path does not cause any exceptions.
+diff --git a/src/Framework/ProjectStartedEventArgs.cs b/src/Framework/ProjectStartedEventArgs.cs
+index cc9d14af45a..4636850306a 100644
+--- a/src/Framework/ProjectStartedEventArgs.cs
++++ b/src/Framework/ProjectStartedEventArgs.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections;
+ using System.Collections.Generic;
++using System.Collections.Immutable;
+ using System.IO;
+ using System.Linq;
+ using System.Runtime.Serialization;
+@@ -249,7 +250,9 @@ public IDictionary<string, string>? GlobalProperties
+         {
+             get
+             {
+-                return globalProperties;
++                return globalProperties ?? (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_12)
++                    ? ImmutableDictionary<string, string>.Empty
++                    : null);
+             }
+ 
+             internal set
+@@ -298,7 +301,9 @@ public IEnumerable? Properties
+                 // up the live list of properties from the loaded project, which is stored in the configuration as well.
+                 // By doing this, we no longer need to transmit properties using this message because they've already
+                 // been transmitted as part of the BuildRequestConfiguration.
+-                return properties;
++                return properties ?? (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_12)
++                    ? Enumerable.Empty<DictionaryEntry>()
++                    : null);
+             }
+         }
+ 
+@@ -322,7 +327,9 @@ public IEnumerable? Items
+                 // case, this access is to the live list.  For the central logger in the multi-proc case, the main node
+                 // has likely not loaded this project, and therefore the live items would not be available to them, which is
+                 // the same as the current functionality.
+-                return items;
++                return items ?? (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_12)
++                    ? Enumerable.Empty<DictionaryEntry>()
++                    : null);
+             }
+         }
+ 
+diff --git a/src/Shared/UnitTests/TestAssemblyInfo.cs b/src/Shared/UnitTests/TestAssemblyInfo.cs
+index 08353749def..afd777eef97 100644
+--- a/src/Shared/UnitTests/TestAssemblyInfo.cs
++++ b/src/Shared/UnitTests/TestAssemblyInfo.cs
+@@ -41,6 +41,12 @@ public MSBuildTestAssemblyFixture()
+             var runningTestsField = testInfoType.GetField("s_runningTests", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+             runningTestsField.SetValue(null, true);
+ 
++            // Set the field in BuildEnvironmentState - as it might have been already preintialized by the data preparation of data driven tests
++            testInfoType = frameworkAssembly.GetType("Microsoft.Build.Framework.BuildEnvironmentState");
++            runningTestsField = testInfoType.GetField("s_runningTests", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
++            runningTestsField.SetValue(null, true);
++            
++
+             // Note: build error files will be initialized in test environments for particular tests, also we don't have output to report error files into anyway...
+             _testEnvironment = TestEnvironment.Create(output: null, ignoreBuildErrorFiles: true);
+ 
+diff --git a/src/UnitTests.Shared/MockLogger.cs b/src/UnitTests.Shared/MockLogger.cs
+index 782cef74d41..b530cc538f0 100644
+--- a/src/UnitTests.Shared/MockLogger.cs
++++ b/src/UnitTests.Shared/MockLogger.cs
+@@ -213,6 +213,11 @@ public void Initialize(IEventSource eventSource)
+             {
+                 _reportTelemetry = true;
+             }
++
++            if (eventSource is IEventSource4 eventSource4)
++            {
++                eventSource4.IncludeEvaluationPropertiesAndItems();
++            }
+         }
+ 
+         /// <summary>

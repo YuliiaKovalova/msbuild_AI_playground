@@ -1,0 +1,290 @@
+diff --git a/src/MSBuild/LiveLogger/ANSIBuilder.cs b/src/MSBuild/LiveLogger/ANSIBuilder.cs
+index 369be7d5bea..1534a52b01e 100644
+--- a/src/MSBuild/LiveLogger/ANSIBuilder.cs
++++ b/src/MSBuild/LiveLogger/ANSIBuilder.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Runtime.InteropServices;
+ using System.Text.RegularExpressions;
+ 
+ namespace Microsoft.Build.Logging.LiveLogger
+@@ -427,7 +428,19 @@ public static string Spinner(int n)
+ 
+             public static string ProgressBar(float percentage, int width = 10, char completedChar = '█', char remainingChar = '░')
+             {
+-                return new string(completedChar, (int)Math.Floor(width * percentage)) + new string(remainingChar, width - (int)Math.Floor(width * percentage));
++                int completed = (int)Math.Floor(width * percentage);
++
++                // Floating point rounding errors can put this slightly off, but we need to ensure that it's non-negative.
++                if (completed < 0)
++                {
++                    completed = 0;
++                }
++                else if (completed > width)
++                {
++                    completed = width;
++                }
++
++                return new string(completedChar, completed) + new string(remainingChar, width - completed);
+             }
+ 
+             public static string Bell()
+diff --git a/src/MSBuild/LiveLogger/LiveLogger.cs b/src/MSBuild/LiveLogger/LiveLogger.cs
+index 14a6d8b77fa..fc0a892cc1a 100644
+--- a/src/MSBuild/LiveLogger/LiveLogger.cs
++++ b/src/MSBuild/LiveLogger/LiveLogger.cs
+@@ -15,6 +15,8 @@ internal class LiveLogger : ILogger
+         private bool succeeded;
+         private int startedProjects = 0;
+         private int finishedProjects = 0;
++        private int restoringProjects = 0;
++        private DateTime? restoreTimestamp = null;
+         private Dictionary<string, int> blockedProjects = new();
+ 
+         public LoggerVerbosity Verbosity { get; set; }
+@@ -134,16 +136,19 @@ private void eventSource_ProjectStarted(object sender, ProjectStartedEventArgs e
+             // Get project id
+             int id = e.BuildEventContext!.ProjectInstanceId;
+ 
+-            // If id does not exist...
+-            if (!projects.ContainsKey(id))
++            // Add or update project
++            ProjectNode node = new(e)
+             {
+-                // Add project
+-                ProjectNode node = new(e)
+-                {
+-                    ShouldRerender = true,
+-                };
+-                projects[id] = node;
+-                UpdateFooter();
++                ShouldRerender = true,
++            };
++            projects[id] = node;
++            UpdateFooter();
++
++            if (e.TargetNames?.Contains("Restore") == true)
++            {
++                TerminalBuffer.IsRestoring = true;
++                restoringProjects++;
++                restoreTimestamp ??= e.Timestamp;
+             }
+         }
+ 
+@@ -161,71 +166,95 @@ private void eventSource_ProjectFinished(object sender, ProjectFinishedEventArgs
+             node.ShouldRerender = true;
+             finishedProjects++;
+             UpdateFooter();
++
++            if (restoringProjects > 0)
++            {
++                restoringProjects--;
++                if (restoringProjects == 0)
++                {
++                    TerminalBuffer.IsRestoring = false;
++                    TerminalBuffer.WriteNewLine($"Restore completed in {(e.Timestamp - restoreTimestamp)?.TotalMilliseconds} milliseconds");
++                    startedProjects = 0;
++                    finishedProjects = 0;
++                }
++            }
+         }
+ 
+         // Target
+         private void eventSource_TargetStarted(object sender, TargetStartedEventArgs e)
+         {
+-            // Get project id
+-            int id = e.BuildEventContext!.ProjectInstanceId;
+-            if (!projects.TryGetValue(id, out ProjectNode? node))
++            if (!TerminalBuffer.IsRestoring)
+             {
+-                return;
++                // Get project id
++                int id = e.BuildEventContext!.ProjectInstanceId;
++                if (!projects.TryGetValue(id, out ProjectNode? node))
++                {
++                    return;
++                }
++                // Update
++                node.AddTarget(e);
++                // Log
++                node.ShouldRerender = true;
+             }
+-            // Update
+-            node.AddTarget(e);
+-            // Log
+-            node.ShouldRerender = true;
+         }
+ 
+         private void eventSource_TargetFinished(object sender, TargetFinishedEventArgs e)
+         {
+-            // Get project id
+-            int id = e.BuildEventContext!.ProjectInstanceId;
+-            if (!projects.TryGetValue(id, out ProjectNode? node))
++            if (!TerminalBuffer.IsRestoring)
+             {
+-                return;
++                // Get project id
++                int id = e.BuildEventContext!.ProjectInstanceId;
++                if (!projects.TryGetValue(id, out ProjectNode? node))
++                {
++                    return;
++                }
++                // Update
++                node.FinishedTargets++;
++                // Log
++                node.ShouldRerender = true;
+             }
+-            // Update
+-            node.FinishedTargets++;
+-            // Log
+-            node.ShouldRerender = true;
+         }
+ 
+         // Task
+         private void eventSource_TaskStarted(object sender, TaskStartedEventArgs e)
+         {
+-            // Get project id
+-            int id = e.BuildEventContext!.ProjectInstanceId;
+-            if (!projects.TryGetValue(id, out ProjectNode? node))
++            if (!TerminalBuffer.IsRestoring)
+             {
+-                return;
+-            }
+-            // Update
+-            node.AddTask(e);
+-            // Log
+-            node.ShouldRerender = true;
++                // Get project id
++                int id = e.BuildEventContext!.ProjectInstanceId;
++                if (!projects.TryGetValue(id, out ProjectNode? node))
++                {
++                    return;
++                }
++                // Update
++                node.AddTask(e);
++                // Log
++                node.ShouldRerender = true;
+ 
+-            if (e.TaskName.Equals("MSBuild"))
+-            {
+-                TerminalBufferLine? line = null; // TerminalBuffer.WriteNewLineAfterMidpoint($"{e.ProjectFile} is blocked by the MSBuild task.");
+-                if (line is not null)
++                if (e.TaskName.Equals("MSBuild"))
+                 {
+-                    blockedProjects[e.ProjectFile] = line.Id;
++                    TerminalBufferLine? line = null; // TerminalBuffer.WriteNewLineAfterMidpoint($"{e.ProjectFile} is blocked by the MSBuild task.");
++                    if (line is not null)
++                    {
++                        blockedProjects[e.ProjectFile] = line.Id;
++                    }
+                 }
+             }
+         }
+ 
+         private void eventSource_TaskFinished(object sender, TaskFinishedEventArgs e)
+         {
+-            if (e.TaskName.Equals("MSBuild"))
++            if (!TerminalBuffer.IsRestoring)
+             {
+-                if (blockedProjects.TryGetValue(e.ProjectFile, out int lineId))
++                if (e.TaskName.Equals("MSBuild"))
+                 {
+-                    TerminalBuffer.DeleteLine(lineId);
+-                    if (projects.TryGetValue(e.BuildEventContext!.ProjectInstanceId, out ProjectNode? node))
++                    if (blockedProjects.TryGetValue(e.ProjectFile, out int lineId))
+                     {
+-                        node.ShouldRerender = true;
++                        TerminalBuffer.DeleteLine(lineId);
++                        if (projects.TryGetValue(e.BuildEventContext!.ProjectInstanceId, out ProjectNode? node))
++                        {
++                            node.ShouldRerender = true;
++                        }
+                     }
+                 }
+             }
+@@ -234,20 +263,23 @@ private void eventSource_TaskFinished(object sender, TaskFinishedEventArgs e)
+         // Raised messages, warnings and errors
+         private void eventSource_MessageRaised(object sender, BuildMessageEventArgs e)
+         {
+-            if (e is TaskCommandLineEventArgs)
++            if (!TerminalBuffer.IsRestoring)
+             {
+-                return;
+-            }
+-            // Get project id
+-            int id = e.BuildEventContext!.ProjectInstanceId;
+-            if (!projects.TryGetValue(id, out ProjectNode? node))
+-            {
+-                return;
++                if (e is TaskCommandLineEventArgs)
++                {
++                    return;
++                }
++                // Get project id
++                int id = e.BuildEventContext!.ProjectInstanceId;
++                if (!projects.TryGetValue(id, out ProjectNode? node))
++                {
++                    return;
++                }
++                // Update
++                node.AddMessage(e);
++                // Log
++                node.ShouldRerender = true;
+             }
+-            // Update
+-            node.AddMessage(e);
+-            // Log
+-            node.ShouldRerender = true;
+         }
+ 
+         private void eventSource_WarningRaised(object sender, BuildWarningEventArgs e)
+diff --git a/src/MSBuild/LiveLogger/ProjectNode.cs b/src/MSBuild/LiveLogger/ProjectNode.cs
+index 7abb1a774f8..b557dc618bc 100644
+--- a/src/MSBuild/LiveLogger/ProjectNode.cs
++++ b/src/MSBuild/LiveLogger/ProjectNode.cs
+@@ -168,12 +168,15 @@ public void Log()
+                     continue;
+                 }
+ 
+-                if (node.Line is null)
++                if (!TerminalBuffer.IsRestoring)
+                 {
+-                    node.Line = TerminalBuffer.WriteNewLineAfter(Line!.Id, "Message");
+-                }
++                    if (node.Line is null)
++                    {
++                        node.Line = TerminalBuffer.WriteNewLineAfter(Line!.Id, "Message");
++                    }
+ 
+-                node.Log();
++                    node.Log();
++                }
+             }
+         }
+ 
+diff --git a/src/MSBuild/LiveLogger/TerminalBuffer.cs b/src/MSBuild/LiveLogger/TerminalBuffer.cs
+index d58b42c7689..e5e5878eb86 100644
+--- a/src/MSBuild/LiveLogger/TerminalBuffer.cs
++++ b/src/MSBuild/LiveLogger/TerminalBuffer.cs
+@@ -65,6 +65,7 @@ internal class TerminalBuffer
+         public static int TopLineIndex = 0;
+         public static string Footer = string.Empty;
+         internal static bool IsTerminated = false;
++        internal static bool IsRestoring = false;
+         internal static bool ShouldRerender = true;
+         internal static OverallBuildState overallBuildState = OverallBuildState.None;
+         internal static int FinishedProjects = 0;
+@@ -116,7 +117,10 @@ public static void Render()
+                 overallBuildState == OverallBuildState.Warning ? ANSIBuilder.Formatting.ForegroundColor.Yellow :
+                 ANSIBuilder.Formatting.ForegroundColor.White;
+ 
+-            string text = $"MSBuild - Build in progress - {FinishedProjects} finished projects";
++            string text = IsRestoring ?
++                $"MSBuild - Restore in progress - {FinishedProjects} finished projects" :
++                $"MSBuild - Build in progress - {FinishedProjects} finished projects";
++
+             text =
+                 overallBuildState == OverallBuildState.Error ? $"{errorSymbol} {text} {errorSymbol}" :
+                 overallBuildState == OverallBuildState.Warning ? $"{warningSymbol} {text} {warningSymbol}" :

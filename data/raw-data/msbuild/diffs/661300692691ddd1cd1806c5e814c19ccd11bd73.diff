@@ -1,0 +1,232 @@
+diff --git a/src/Shared/NodePipeBase.cs b/src/Shared/NodePipeBase.cs
+index fd1d08efe9c..2ee91e536c1 100644
+--- a/src/Shared/NodePipeBase.cs
++++ b/src/Shared/NodePipeBase.cs
+@@ -69,6 +69,14 @@ protected NodePipeBase(string pipeName, Handshake handshake)
+             _writeTranslator = BinaryTranslator.GetWriteTranslator(_writeBuffer);
+         }
+ 
++        /// <summary>
++        /// Gets a value indicating whether the pipe is in the connected state. Note that this is not real-time and
++        /// will only be updated when an operation on the pipe fails.
++        /// When a pipe is broken, Disconnect() must be called for the pipe to be reused - otherwise any attempts to
++        /// connect to a new client will throw.
++        /// </summary>
++        internal bool IsConnected => NodeStream.IsConnected;
++
+         protected abstract PipeStream NodeStream { get; }
+ 
+         protected string PipeName { get; }
+diff --git a/src/Tasks/AssemblyDependency/Node/OutOfProcRarClient.cs b/src/Tasks/AssemblyDependency/Node/OutOfProcRarClient.cs
+index 7a1c9911b78..c5f988781ae 100644
+--- a/src/Tasks/AssemblyDependency/Node/OutOfProcRarClient.cs
++++ b/src/Tasks/AssemblyDependency/Node/OutOfProcRarClient.cs
+@@ -3,29 +3,60 @@
+ 
+ using System;
+ using Microsoft.Build.BackEnd;
++using Microsoft.Build.Framework;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Tasks.AssemblyDependency
+ {
+-    internal class OutOfProcRarClient
++    /// <summary>
++    /// Implements a client for sending the ResolveAssemblyReference task to an out-of-proc node.
++    /// This is intended to be reused for all RAR tasks across a single build.
++    /// </summary>
++    internal class OutOfProcRarClient : IDisposable
+     {
+         private readonly NodePipeClient _pipeClient;
+ 
+-        public OutOfProcRarClient()
++        private OutOfProcRarClient()
+         {
+             ServerNodeHandshake handshake = new(HandshakeOptions.None);
+             _pipeClient = new NodePipeClient(NamedPipeUtil.GetRarNodeEndpointPipeName(handshake), handshake);
+ 
+             NodePacketFactory packetFactory = new();
+-            packetFactory.RegisterPacketHandler(NodePacketType.RarNodeExecuteResponse, RarNodeExecuteRequest.FactoryForDeserialization, null);
++            packetFactory.RegisterPacketHandler(NodePacketType.RarNodeExecuteResponse, RarNodeExecuteResponse.FactoryForDeserialization, null);
+             _pipeClient.RegisterPacketFactory(packetFactory);
+         }
+ 
+-        public bool Execute(ResolveAssemblyReference rarTask)
++        public void Dispose() => _pipeClient.Dispose();
++
++        internal static OutOfProcRarClient GetInstance(IBuildEngine10 buildEngine)
++        {
++            // Create a single cached instance for this build.
++            const string OutOfProcRarClientKey = "OutOfProcRarClient";
++
++            // We want to reuse the pipe client across all RAR invocations within a build, but release the connection once
++            // the MSBuild node is idle. Using RegisteredTaskObjectLifetime.Build ensures that the RAR client is disposed between
++            // builds, freeing the server to run other requests.
++            OutOfProcRarClient rarClient = (OutOfProcRarClient)buildEngine.GetRegisteredTaskObject(OutOfProcRarClientKey, RegisteredTaskObjectLifetime.Build);
++
++            if (rarClient == null)
++            {
++                rarClient = new OutOfProcRarClient();
++                buildEngine.RegisterTaskObject(OutOfProcRarClientKey, rarClient, RegisteredTaskObjectLifetime.Build, allowEarlyCollection: false);
++                CommunicationsUtilities.Trace("Initialized new RAR client.");
++            }
++
++            return rarClient;
++        }
++
++        internal bool Execute(ResolveAssemblyReference rarTask)
+         {
+-            // Don't set a timeout since the build manager currently blocks until the server is running.
+-            _pipeClient.ConnectToServer(0);
++            // This should only be true at the start of a build.
++            if (!_pipeClient.IsConnected)
++            {
++                // Don't set a timeout since the build manager already blocks until the server is running.
++                _pipeClient.ConnectToServer(0);
++            }
+ 
+             // TODO: Use RAR task to create the request packet.
+             _pipeClient.WritePacket(new RarNodeExecuteRequest());
+@@ -33,7 +64,7 @@ public bool Execute(ResolveAssemblyReference rarTask)
+             // TODO: Use response packet to set RAR task outputs.
+             _ = (RarNodeExecuteResponse)_pipeClient.ReadPacket();
+ 
+-            throw new NotImplementedException("RAR node communication succeeded, but task execution is unimplemented.");
++            return true;
+         }
+     }
+ }
+diff --git a/src/Tasks/AssemblyDependency/Node/OutOfProcRarNode.cs b/src/Tasks/AssemblyDependency/Node/OutOfProcRarNode.cs
+index 4ae898ca870..1b1bdfa33b7 100644
+--- a/src/Tasks/AssemblyDependency/Node/OutOfProcRarNode.cs
++++ b/src/Tasks/AssemblyDependency/Node/OutOfProcRarNode.cs
+@@ -12,6 +12,8 @@ namespace Microsoft.Build.Tasks.AssemblyDependency
+ {
+     /// <summary>
+     /// Implements a persistent node for the ResolveAssemblyReferences task.
++    /// This manages the lifecycle of the multi-instance pipe server which executes RAR requests
++    /// and does not invoke the task itself.
+     /// </summary>
+     public class OutOfProcRarNode
+     {
+diff --git a/src/Tasks/AssemblyDependency/Node/OutOfProcRarNodeEndpoint.cs b/src/Tasks/AssemblyDependency/Node/OutOfProcRarNodeEndpoint.cs
+index 97699d3bbbb..5fc9fe4ae85 100644
+--- a/src/Tasks/AssemblyDependency/Node/OutOfProcRarNodeEndpoint.cs
++++ b/src/Tasks/AssemblyDependency/Node/OutOfProcRarNodeEndpoint.cs
+@@ -9,6 +9,9 @@
+ 
+ namespace Microsoft.Build.Tasks.AssemblyDependency
+ {
++    /// <summary>
++    /// Implements a single instance of a pipe server which executes the ResolveAssemblyReference task.
++    /// </summary>
+     internal class OutOfProcRarNodeEndpoint : IDisposable
+     {
+         private readonly int _endpointId;
+@@ -47,20 +50,28 @@ private void RunInternal(CancellationToken cancellationToken)
+         {
+             while (!cancellationToken.IsCancellationRequested)
+             {
+-                LinkStatus linkStatus = _pipeServer.WaitForConnection();
+-
+-                if (linkStatus != LinkStatus.Active)
++                while (!_pipeServer.IsConnected)
+                 {
+-                    // We either timed out or failed to connect to a client.
+-                    // Just continue running since the RAR endpoint isn't tied to a specific client.
+-                    continue;
++                    _ = _pipeServer.WaitForConnection();
+                 }
+ 
+-                CommunicationsUtilities.Trace("({0}) Connected to RAR client.", _endpointId);
++                CommunicationsUtilities.Trace("({0}) Received RAR request.", _endpointId);
+ 
+                 try
+                 {
+-                    RarNodeExecuteRequest request = (RarNodeExecuteRequest)_pipeServer.ReadPacket();
++                    INodePacket packet = _pipeServer.ReadPacket();
++
++                    if (packet.Type == NodePacketType.NodeShutdown)
++                    {
++                        // Although the client has already disconnected, it is still necessary to Diconnect() so the
++                        // pipe can transition into PipeState.Disonnected, which is treated as an intentional pipe break.
++                        // Otherwise, all future operations on the pipe will throw an exception.
++                        CommunicationsUtilities.Trace("({0}) RAR client disconnected.", _endpointId);
++                        _pipeServer.Disconnect();
++                        continue;
++                    }
++
++                    RarNodeExecuteRequest request = (RarNodeExecuteRequest)packet;
+ 
+                     // TODO: Use request packet to set inputs on the RAR task.
+                     ResolveAssemblyReference rarTask = new();
+@@ -75,9 +86,9 @@ private void RunInternal(CancellationToken cancellationToken)
+                 {
+                     CommunicationsUtilities.Trace("({0}) Exception while executing RAR request: {1}", _endpointId, e);
+                 }
+-
+-                _pipeServer.Disconnect();
+             }
++
++            _pipeServer.Disconnect();
+         }
+     }
+ }
+diff --git a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+index 5f9caac3297..85235709ddc 100644
+--- a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
++++ b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+@@ -3253,11 +3253,12 @@ public override bool Execute()
+                 && BuildEngine is IBuildEngine10 buildEngine10
+                 && buildEngine10.EngineServices.IsOutOfProcRarNodeEnabled)
+             {
+-                OutOfProcRarClient rarClient = GetOutOfProcClient(buildEngine10);
+-
+                 try
+                 {
+-                    bool result = rarClient.Execute(this);
++#pragma warning disable CA2000 // Dispose objects before losing scope
++                    _ = OutOfProcRarClient.GetInstance(buildEngine10).Execute(this);
++#pragma warning restore CA2000 // Dispose objects before losing scope
++                    CommunicationsUtilities.Trace("RAR out-of-proc test connection completed. Executing task in-proc.");
+                 }
+                 catch (Exception ex)
+                 {
+@@ -3266,11 +3267,6 @@ public override bool Execute()
+                 }
+             }
+ 
+-            return ExecuteInProcess();
+-        }
+-
+-        public bool ExecuteInProcess()
+-        {
+             return Execute(
+                 p => FileUtilities.FileExistsNoThrow(p),
+                 p => FileUtilities.DirectoryExistsNoThrow(p),
+@@ -3293,24 +3289,6 @@ public bool ExecuteInProcess()
+                     => AssemblyInformation.IsWinMDFile(fullPath, getAssemblyRuntimeVersion, fileExists, out imageRuntimeVersion, out isManagedWinmd),
+                 p => ReferenceTable.ReadMachineTypeFromPEHeader(p));
+         }
+-
+-        private OutOfProcRarClient GetOutOfProcClient(IBuildEngine10 buildEngine)
+-        {
+-            // Create a single cached instance of the RAR out-of-proc client for this build node.
+-            const string OutOfProcRarClientKey = "OutOfProcRarClient";
+-
+-            OutOfProcRarClient rarClient = (OutOfProcRarClient)buildEngine.GetRegisteredTaskObject(OutOfProcRarClientKey, RegisteredTaskObjectLifetime.Build);
+-
+-            if (rarClient == null)
+-            {
+-                rarClient = new OutOfProcRarClient();
+-                buildEngine.RegisterTaskObject(OutOfProcRarClientKey, rarClient, RegisteredTaskObjectLifetime.Build, allowEarlyCollection: false);
+-                CommunicationsUtilities.Trace("Initialized new RAR client.");
+-            }
+-
+-            return rarClient;
+-        }
+-
+         #endregion
+     }
+ }

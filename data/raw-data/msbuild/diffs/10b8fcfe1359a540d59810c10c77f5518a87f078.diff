@@ -1,0 +1,272 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index e3f9b9aecfb..ec86b218112 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1965,11 +1965,10 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+ 
+                 // Non-graph builds verify this in RequestBuilder, but for graph builds we need to disambiguate
+                 // between entry nodes and other nodes in the graph since only entry nodes should error. Just do
+-                // the verification expicitly before the build even starts.
++                // the verification explicitly before the build even starts.
+                 foreach (ProjectGraphNode entryPointNode in projectGraph.EntryPointNodes)
+                 {
+-                    ImmutableList<string> targetList = targetsPerNode[entryPointNode];
+-                    ProjectErrorUtilities.VerifyThrowInvalidProject(targetList.Count > 0, entryPointNode.ProjectInstance.ProjectFileLocation, "NoTargetSpecified");
++                    ProjectErrorUtilities.VerifyThrowInvalidProject(entryPointNode.ProjectInstance.Targets.Count > 0, entryPointNode.ProjectInstance.ProjectFileLocation, "NoTargetSpecified");
+                 }
+ 
+                 resultsPerNode = BuildGraph(projectGraph, targetsPerNode, submission.BuildRequestData);
+@@ -2007,7 +2006,7 @@ private Dictionary<ProjectGraphNode, BuildResult> BuildGraph(
+             IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetsPerNode,
+             GraphBuildRequestData graphBuildRequestData)
+         {
+-            var waitHandle = new AutoResetEvent(true);
++            using var waitHandle = new AutoResetEvent(true);
+             var graphBuildStateLock = new object();
+ 
+             var blockedNodes = new HashSet<ProjectGraphNode>(projectGraph.ProjectNodes);
+@@ -2992,7 +2991,7 @@ private ILoggingService CreateLoggingService(
+ 
+                 loggers = (loggers ?? Enumerable.Empty<ILogger>()).Concat(new[]
+                 {
+-                    new BuildCheckConnectorLogger(new AnalyzerLoggingContextFactory(loggingService), buildCheckManagerProvider.Instance, ((IBuildComponentHost)this).BuildParameters.AreBuildCheckStatsEnabled)
++                    new BuildCheckConnectorLogger(new AnalyzerLoggingContextFactory(loggingService), buildCheckManagerProvider.Instance)
+                 });
+             }
+ 
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index b12b8a6a607..1a4693ba685 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -1102,13 +1102,13 @@ private void SetProjectCurrentDirectory()
+         /// </summary>
+         private async Task<BuildResult> BuildProject()
+         {
++            ErrorUtilities.VerifyThrow(_targetBuilder != null, "Target builder is null");
++
+             // We consider this the entrypoint for the project build for purposes of BuildCheck processing 
+ 
+             var buildCheckManager = (_componentHost.GetComponent(BuildComponentType.BuildCheckManagerProvider) as IBuildCheckManagerProvider)!.Instance;
+             buildCheckManager.SetDataSource(BuildCheckDataSource.BuildExecution);
+ 
+-            ErrorUtilities.VerifyThrow(_targetBuilder != null, "Target builder is null");
+-
+             // Make sure it is null before loading the configuration into the request, because if there is a problem
+             // we do not wand to have an invalid projectLoggingContext floating around. Also if this is null the error will be
+             // logged with the node logging context
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
+index e8c34b430db..eaa1373c15c 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
+@@ -68,7 +68,7 @@ private void EventSource_AnyEventRaised(object sender, BuildEventArgs e)
+         {
+             if (buildCheckBuildEventArgs is BuildCheckTracingEventArgs tracingEventArgs)
+             {
+-                if (!tracingEventArgs.IsLogReport)
++                if (!tracingEventArgs.IsAggregatedGlobalReport)
+                 {
+                     _stats.Merge(tracingEventArgs.TracingData, (span1, span2) => span1 + span2);
+                 }
+@@ -117,24 +117,12 @@ private void LogAnalyzerStats(LoggingContext loggingContext)
+ 
+         loggingContext.LogBuildEvent(statEvent);
+ 
+-        if (_areStatsEnabled)
+-        {
+-            loggingContext.LogCommentFromText(MessageImportance.High, $"BuildCheck run times{Environment.NewLine}");
+-            string infraData = BuildCsvString("Infrastructure run times", infraStats);
+-            loggingContext.LogCommentFromText(MessageImportance.High, infraData);
+-
+-            string analyzerData = BuildCsvString("Analyzer run times", analyzerStats);
+-            loggingContext.LogCommentFromText(MessageImportance.High, analyzerData);
+-        }
+-        else
+-        {
+-            loggingContext.LogCommentFromText(MessageImportance.Low, $"BuildCheck run times{Environment.NewLine}");
+-            string infraData = BuildCsvString("Infrastructure run times", infraStats);
+-            loggingContext.LogCommentFromText(MessageImportance.Low, infraData);
+-
+-            string analyzerData = BuildCsvString("Analyzer run times", analyzerStats);
+-            loggingContext.LogCommentFromText(MessageImportance.Low, analyzerData);
+-        }
++        MessageImportance importance = _areStatsEnabled ? MessageImportance.High : MessageImportance.Low;
++        loggingContext.LogCommentFromText(importance, $"BuildCheck run times{Environment.NewLine}");
++        string infraData = BuildCsvString("Infrastructure run times", infraStats);
++        loggingContext.LogCommentFromText(importance, infraData);
++        string analyzerData = BuildCsvString("Analyzer run times", analyzerStats);
++        loggingContext.LogCommentFromText(importance, analyzerData);
+     }
+ 
+     private string BuildCsvString(string title, Dictionary<string, TimeSpan> rowData)
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 5fbe0eb5594..37c6a9b8aab 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -2,7 +2,6 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
+-using System.CodeDom.Compiler;
+ using System.Collections.Generic;
+ using System.Collections.ObjectModel;
+ using System.Diagnostics;
+@@ -46,8 +45,6 @@ internal static IBuildComponent CreateComponent(BuildComponentType type)
+         return new BuildCheckManagerProvider();
+     }
+ 
+-    internal static Stopwatch _stopwatch = new Stopwatch();
+-
+     public void InitializeComponent(IBuildComponentHost host)
+     {
+         ErrorUtilities.VerifyThrow(host != null, "BuildComponentHost was null");
+@@ -93,20 +90,21 @@ private sealed class BuildCheckManager : IBuildCheckManager
+         /// <param name="buildCheckDataSource"></param>
+         public void SetDataSource(BuildCheckDataSource buildCheckDataSource)
+         {
+-            _stopwatch.Start();
++            Stopwatch stopwatch = new Stopwatch();
++            stopwatch.Start();
+             if (!_enabledDataSources[(int)buildCheckDataSource])
+             {
+                 _enabledDataSources[(int)buildCheckDataSource] = true;
+                 RegisterBuiltInAnalyzers(buildCheckDataSource);
+             }
+-            _stopwatch.Stop();
+-            _tracingReporter.analyzerSetDataSourceTime = _stopwatch.Elapsed;
+-            _stopwatch.Reset();
++            stopwatch.Stop();
++            _tracingReporter.analyzerSetDataSourceTime = stopwatch.Elapsed;
+         }
+ 
+         public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData)
+         {
+-            _stopwatch.Start();
++            Stopwatch stopwatch = new Stopwatch();
++            stopwatch.Start();
+             if (IsInProcNode)
+             {
+                 var factory = _acquisitionModule.CreateBuildAnalyzerFactory(acquisitionData);
+@@ -126,9 +124,8 @@ public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData)
+ 
+                 _loggingService.LogBuildEvent(eventArgs);
+             }
+-            _stopwatch.Stop();
+-            _tracingReporter.analyzerAcquisitionTime = _stopwatch.Elapsed;
+-            _stopwatch.Reset();
++            stopwatch.Stop();
++            _tracingReporter.analyzerAcquisitionTime = stopwatch.Elapsed;
+         }
+ 
+         internal BuildCheckManager(ILoggingService loggingService)
+@@ -272,7 +269,8 @@ private void SetupAnalyzersForNewProject(string projectFullPath, BuildEventConte
+             // On an execution node - we might remove and dispose the analyzers once project is done
+ 
+             // If it's already constructed - just control the custom settings do not differ
+-            _stopwatch.Start();
++            Stopwatch stopwatch = new Stopwatch();
++            stopwatch.Start();
+             List<BuildAnalyzerFactoryContext> analyzersToRemove = new();
+             foreach (BuildAnalyzerFactoryContext analyzerFactoryContext in _analyzersRegistry)
+             {
+@@ -301,9 +299,8 @@ private void SetupAnalyzersForNewProject(string projectFullPath, BuildEventConte
+                 analyzerToRemove.BuildAnalyzer.Dispose();
+             }
+ 
+-            _stopwatch.Stop();
+-            _tracingReporter.newProjectAnalyzersTime = _stopwatch.Elapsed;
+-            _stopwatch.Reset();
++            stopwatch.Stop();
++            _tracingReporter.newProjectAnalyzersTime = stopwatch.Elapsed;
+         }
+ 
+ 
+@@ -325,14 +322,7 @@ public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats()
+                 }
+             }
+ 
+-            var infraStats = new Dictionary<string, TimeSpan>() {
+-                { $"{BuildCheckConstants.infraStatPrefix}analyzerAcquisitionTime", _tracingReporter.analyzerAcquisitionTime },
+-                { $"{BuildCheckConstants.infraStatPrefix}analyzerSetDataSourceTime", _tracingReporter.analyzerSetDataSourceTime },
+-                { $"{BuildCheckConstants.infraStatPrefix}newProjectAnalyzersTime", _tracingReporter.newProjectAnalyzersTime }
+-            };
+-
+-            _tracingReporter.TracingStats.Merge(infraStats, (span1, span2) => span1 + span2);
+-
++            _tracingReporter.AddAnalyzerInfraStats();
+             return _tracingReporter.TracingStats;
+         }
+ 
+diff --git a/src/Build/BuildCheck/Infrastructure/TracingReporter.cs b/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
+index 41eb5f8c177..fa6e1f02b71 100644
+--- a/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
++++ b/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
+@@ -6,6 +6,8 @@
+ using System.Linq;
+ using System.Text;
+ using System.Threading.Tasks;
++using Microsoft.Build.BuildCheck.Utilities;
++using Microsoft.Build.Experimental.BuildCheck;
+ 
+ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+@@ -29,4 +31,15 @@ public void AddStats(string name, TimeSpan subtotal)
+             TracingStats[name] = subtotal;
+         }
+     }
++
++    public void AddAnalyzerInfraStats()
++    {
++        var infraStats = new Dictionary<string, TimeSpan>() {
++                { $"{BuildCheckConstants.infraStatPrefix}analyzerAcquisitionTime", analyzerAcquisitionTime },
++                { $"{BuildCheckConstants.infraStatPrefix}analyzerSetDataSourceTime", analyzerSetDataSourceTime },
++                { $"{BuildCheckConstants.infraStatPrefix}newProjectAnalyzersTime", newProjectAnalyzersTime }
++            };
++
++        TracingStats.Merge(infraStats, (span1, span2) => span1 + span2);
++    }
+ }
+diff --git a/src/Framework/BuildCheck/BuildCheckEventArgs.cs b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+index 0967679fcb7..6c283b13a43 100644
+--- a/src/Framework/BuildCheck/BuildCheckEventArgs.cs
++++ b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+@@ -28,12 +28,12 @@ internal sealed class BuildCheckTracingEventArgs(Dictionary<string, TimeSpan> tr
+     internal BuildCheckTracingEventArgs() : this(new Dictionary<string, TimeSpan>())
+     { }
+ 
+-    internal BuildCheckTracingEventArgs(Dictionary<string, TimeSpan> data, bool isLogReport) : this(data)
++    internal BuildCheckTracingEventArgs(Dictionary<string, TimeSpan> data, bool isAggregatedGlobalReport) : this(data)
+     {
+-        IsLogReport = isLogReport;
++        IsAggregatedGlobalReport = isAggregatedGlobalReport;
+     }
+ 
+-    public bool IsLogReport { get; private set; } = false;
++    public bool IsAggregatedGlobalReport { get; private set; } = false;
+     public Dictionary<string, TimeSpan> TracingData { get; private set; } = tracingData;
+ 
+     internal override void WriteToStream(BinaryWriter writer)
+diff --git a/src/UnitTests.Shared/RunnerUtilities.cs b/src/UnitTests.Shared/RunnerUtilities.cs
+index 65034ae89c6..6310534a391 100644
+--- a/src/UnitTests.Shared/RunnerUtilities.cs
++++ b/src/UnitTests.Shared/RunnerUtilities.cs
+@@ -131,13 +131,13 @@ public static string RunProcessAndGetOutput(string process, string parameters, o
+                 {
+                     p.WaitForExit();
+                 }
+-                // else if (!p.WaitForExit(30_000))
+-                // {
+-                //    // Let's not create a unit test for which we need more than 30 sec to execute.
+-                //    // Please consider carefully if you would like to increase the timeout.
+-                //    p.KillTree(1000);
+-                //    throw new TimeoutException($"Test failed due to timeout: process {p.Id} is active for more than 30 sec.");
+-                // }
++                else if (!p.WaitForExit(30_000))
++                {
++                    // Let's not create a unit test for which we need more than 30 sec to execute.
++                    // Please consider carefully if you would like to increase the timeout.
++                    p.KillTree(1000);
++                    throw new TimeoutException($"Test failed due to timeout: process {p.Id} is active for more than 30 sec.");
++                }
+ 
+                 // We need the WaitForExit call without parameters because our processing of output/error streams is not synchronous.
+                 // See https://docs.microsoft.com/en-us/dotnet/api/system.diagnostics.process.waitforexit?view=net-6.0#system-diagnostics-process-waitforexit(system-int32).

@@ -1,0 +1,222 @@
+diff --git a/src/Build.UnitTests/BackEnd/OpenTelemetryActivities_Tests.cs b/src/Build.UnitTests/BackEnd/OpenTelemetryActivities_Tests.cs
+index ed49dfc54e7..49768a3b35d 100644
+--- a/src/Build.UnitTests/BackEnd/OpenTelemetryActivities_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/OpenTelemetryActivities_Tests.cs
+@@ -141,7 +141,7 @@ public class MSBuildActivitySourceTests
+         [Fact]
+         public void StartActivity_ShouldPrefixNameCorrectly_WhenNoRemoteParent()
+         {
+-            var source = new MSBuildActivitySource(TelemetryConstants.DefaultActivitySourceNamespace);
++            var source = new MSBuildActivitySource(TelemetryConstants.DefaultActivitySourceNamespace, 1.0);
+             using var listener = new ActivityListener
+             {
+                 ShouldListenTo = activitySource => activitySource.Name == TelemetryConstants.DefaultActivitySourceNamespace,
+@@ -167,7 +167,7 @@ public void StartActivity_ShouldUseParentId_WhenRemoteParentExists()
+             parentActivity.AddTag("sampleTag", "sampleVal");
+             parentActivity.Start();
+ 
+-            var source = new MSBuildActivitySource(TelemetryConstants.DefaultActivitySourceNamespace);
++            var source = new MSBuildActivitySource(TelemetryConstants.DefaultActivitySourceNamespace, 1.0);
+             using var listener = new ActivityListener
+             {
+                 ShouldListenTo = activitySource => activitySource.Name == TelemetryConstants.DefaultActivitySourceNamespace,
+diff --git a/src/Build.UnitTests/BackEnd/OpenTelemetryManager_Tests.cs b/src/Build.UnitTests/BackEnd/OpenTelemetryManager_Tests.cs
+index 58408ad5b08..dee09e33afe 100644
+--- a/src/Build.UnitTests/BackEnd/OpenTelemetryManager_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/OpenTelemetryManager_Tests.cs
+@@ -78,8 +78,7 @@ public void Initialize_ShouldSetStateToUnsampled_WhenNoOverrideOnNetCore()
+             OpenTelemetryManager.Instance.DefaultActivitySource.ShouldBeNull();
+         }
+ #endif
+-
+-        [WindowsOnlyTheory]
++        [Theory]
+         [InlineData(true)]
+         [InlineData(false)]
+         public void Initialize_ShouldSetSampleRateOverride_AndCreateActivitySource_WhenRandomBelowOverride(bool standalone)
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index dfcb7769d0c..0771dd9ede0 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1082,12 +1082,10 @@ public void EndBuild()
+                             _buildTelemetry.SACEnabled = sacState == NativeMethodsShared.SAC_State.Evaluation || sacState == NativeMethodsShared.SAC_State.Enforcement;
+ 
+                             loggingService.LogTelemetry(buildEventContext: null, _buildTelemetry.EventName, _buildTelemetry.GetProperties());
+-                            OpenTelemetryManager.Instance.DefaultActivitySource?
+-                                .StartActivity("Build")?
+-                                .WithTags(_buildTelemetry)
+-                                .WithStartTime(_buildTelemetry.InnerStartAt)
+-                                .Dispose();
+-                            OpenTelemetryManager.Instance.ForceFlush();
++                            if (OpenTelemetryManager.Instance.IsActive())
++                            {
++                                EndBuildTelemetry();
++                            }
+ 
+                             // Clean telemetry to make it ready for next build submission.
+                             _buildTelemetry = null;
+@@ -1131,6 +1129,17 @@ void SerializeCaches()
+             }
+         }
+ 
++        [MethodImpl(MethodImplOptions.NoInlining)] // avoid assembly loads
++        private void EndBuildTelemetry()
++        {
++            OpenTelemetryManager.Instance.DefaultActivitySource?
++                .StartActivity("Build")?
++                .WithTags(_buildTelemetry!)
++                .WithStartTime(_buildTelemetry!.InnerStartAt)
++                .Dispose();
++            OpenTelemetryManager.Instance.ForceFlush();
++        }
++
+         /// <summary>
+         /// Convenience method.  Submits a lone build request and blocks until results are available.
+         /// </summary>
+diff --git a/src/Framework/Telemetry/MSBuildActivitySource.cs b/src/Framework/Telemetry/MSBuildActivitySource.cs
+index e19902b20d2..33668c0926f 100644
+--- a/src/Framework/Telemetry/MSBuildActivitySource.cs
++++ b/src/Framework/Telemetry/MSBuildActivitySource.cs
+@@ -11,10 +11,12 @@ namespace Microsoft.Build.Framework.Telemetry
+     internal class MSBuildActivitySource
+     {
+         private readonly ActivitySource _source;
++        private readonly double _sampleRate;
+ 
+-        public MSBuildActivitySource(string name)
++        public MSBuildActivitySource(string name, double sampleRate)
+         {
+             _source = new ActivitySource(name);
++            _sampleRate = sampleRate;
+         }
+         /// <summary>
+         /// Prefixes activity with VS OpenTelemetry.
+@@ -26,6 +28,7 @@ public MSBuildActivitySource(string name)
+             var activity = Activity.Current?.HasRemoteParent == true
+                 ? _source.StartActivity($"{TelemetryConstants.EventPrefix}{name}", ActivityKind.Internal, parentId: Activity.Current.ParentId)
+                 : _source.StartActivity($"{TelemetryConstants.EventPrefix}{name}");
++            activity?.WithTag(new("SampleRate", _sampleRate, false));
+             return activity;
+         }
+     }
+diff --git a/src/Framework/Telemetry/OpenTelemetryManager.cs b/src/Framework/Telemetry/OpenTelemetryManager.cs
+index 6a26999f562..c789cf2b9d0 100644
+--- a/src/Framework/Telemetry/OpenTelemetryManager.cs
++++ b/src/Framework/Telemetry/OpenTelemetryManager.cs
+@@ -12,6 +12,7 @@
+ using System.Diagnostics;
+ using System.Threading;
+ using System.Globalization;
++using System.Runtime.CompilerServices;
+ 
+ namespace Microsoft.Build.Framework.Telemetry
+ {
+@@ -74,39 +75,45 @@ public void Initialize(bool isStandalone)
+                     return;
+                 }
+ 
+-                DefaultActivitySource = new MSBuildActivitySource(TelemetryConstants.DefaultActivitySourceNamespace);
+-                _telemetryState = TelemetryState.TracerInitialized;
+-
++                InitializeActivitySources();
++            }
+ #if NETFRAMEWORK
+-                try
+-                {
+-                    InitializeTracerProvider();
++            try
++            {
++                InitializeTracerProvider();
+ 
+-                    // TODO: Enable commented logic when Collector is present in VS
+-                    // if (isStandalone)
+-                    InitializeCollector();
++                // TODO: Enable commented logic when Collector is present in VS
++                // if (isStandalone)
++                InitializeCollector();
+ 
+-                    // }
+-                }
+-                catch (Exception ex)
++                // }
++            }
++            catch (Exception ex)
++            {
++                // catch exceptions from loading the OTel SDK or Collector to maintain usability of Microsoft.Build.Framework package in our and downstream tests in VS.
++                if (ex is System.IO.FileNotFoundException or System.IO.FileLoadException)
+                 {
+-                    // catch exceptions from loading the OTel SDK or Collector to maintain usability of Microsoft.Build.Framework package in our and downstream tests in VS.
+-                    if (ex is System.IO.FileNotFoundException or System.IO.FileLoadException)
+-                    {
+-                        _telemetryState = TelemetryState.Unsampled;
+-                        return;
+-                    }
+-
+-                    throw;
++                    _telemetryState = TelemetryState.Unsampled;
++                    return;
+                 }
+-#endif
++
++                throw;
+             }
++#endif
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)] // avoid assembly loads
++        private void InitializeActivitySources()
++        {
++            _telemetryState = TelemetryState.TracerInitialized;
++            DefaultActivitySource = new MSBuildActivitySource(TelemetryConstants.DefaultActivitySourceNamespace, _sampleRate);
+         }
+ 
+ #if NETFRAMEWORK
+         /// <summary>
+         /// Initializes the OpenTelemetry SDK TracerProvider with VS default exporter settings.
+         /// </summary>
++        [MethodImpl(MethodImplOptions.NoInlining)] // avoid assembly loads
+         private void InitializeTracerProvider()
+         {
+             var exporterSettings = OpenTelemetryExporterSettingsBuilder
+@@ -125,6 +132,7 @@ private void InitializeTracerProvider()
+         /// <summary>
+         /// Initializes the VS OpenTelemetry Collector with VS default settings.
+         /// </summary>
++        [MethodImpl(MethodImplOptions.NoInlining)] // avoid assembly loads
+         private void InitializeCollector()
+         {
+             IOpenTelemetryCollectorSettings collectorSettings = OpenTelemetryCollectorSettingsBuilder
+@@ -137,7 +145,7 @@ private void InitializeCollector()
+             _telemetryState = TelemetryState.CollectorInitialized;
+         }
+ #endif
+-
++        [MethodImpl(MethodImplOptions.NoInlining)] // avoid assembly loads
+         private void ForceFlushInner()
+         {
+ #if NETFRAMEWORK
+@@ -155,8 +163,9 @@ public void ForceFlush()
+                 ForceFlushInner();
+             }
+         }
+-        
++
+         // to avoid assembly loading OpenTelemetry in tests
++        [MethodImpl(MethodImplOptions.NoInlining)] // avoid assembly loads
+         private void ShutdownInner()
+         {
+ #if NETFRAMEWORK
+@@ -210,10 +219,9 @@ private bool IsSampled()
+             return random.NextDouble() < _sampleRate;
+         }
+ 
+-        private bool ShouldBeCleanedUp()
+-        {
+-            return _telemetryState ==TelemetryState.CollectorInitialized || _telemetryState == TelemetryState.ExporterInitialized;
+-        }
++        private bool ShouldBeCleanedUp() => _telemetryState == TelemetryState.CollectorInitialized || _telemetryState == TelemetryState.ExporterInitialized;
++
++        internal bool IsActive() => _telemetryState == TelemetryState.TracerInitialized || _telemetryState == TelemetryState.CollectorInitialized || _telemetryState == TelemetryState.ExporterInitialized;
+ 
+         /// <summary>
+         /// State of the telemetry infrastructure.

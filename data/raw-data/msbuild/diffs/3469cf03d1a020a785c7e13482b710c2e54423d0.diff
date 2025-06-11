@@ -1,0 +1,245 @@
+diff --git a/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs b/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
+index 4aea24b2a95..4c8cd17ac86 100644
+--- a/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.IO;
++using System.Linq;
+ using System.Xml;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Evaluation;
+@@ -11,6 +12,7 @@
+ using Microsoft.Build.Experimental.ProjectCache;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
++using Microsoft.Build.Unittest;
+ using Shouldly;
+ using Xunit;
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
+@@ -19,8 +21,6 @@
+ 
+ namespace Microsoft.Build.UnitTests.BackEnd
+ {
+-    using Microsoft.Build.Unittest;
+-
+     /// <summary>
+     /// Tests of the scheduler.
+     /// </summary>
+@@ -544,7 +544,13 @@ public void TestProxyAffinityIsInProc()
+ 
+             CreateConfiguration(1, "foo.csproj");
+ 
+-            BuildRequest request1 = CreateProxyBuildRequest(1, 1, new ProxyTargets(new Dictionary<string, string> { { "foo", "bar" } }), null);
++            BuildRequest request1 = CreateBuildRequest(
++                nodeRequestId: 1,
++                configId: 1,
++                targets: new[] { "foo" },
++                NodeAffinity.Any,
++                parentRequest: null,
++                new ProxyTargets(new Dictionary<string, string> { { "foo", "bar" } }));
+ 
+             BuildRequestBlocker blocker = new BuildRequestBlocker(-1, Array.Empty<string>(), new[] { request1 });
+             List<ScheduleResponse> response = new List<ScheduleResponse>(_scheduler.ReportRequestBlocked(1, blocker));
+@@ -806,8 +812,6 @@ private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[
+         /// </summary>
+         private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[] targets, NodeAffinity nodeAffinity, BuildRequest parentRequest, ProxyTargets proxyTargets = null)
+         {
+-            (targets == null ^ proxyTargets == null).ShouldBeTrue();
+-
+             HostServices hostServices = null;
+ 
+             if (nodeAffinity != NodeAffinity.Any)
+@@ -816,16 +820,15 @@ private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[
+                 hostServices.SetNodeAffinity(String.Empty, nodeAffinity);
+             }
+ 
+-            if (targets != null)
++            if (proxyTargets != null)
+             {
+                 return new BuildRequest(
+                     submissionId: 1,
+                     nodeRequestId,
+                     configId,
+-                    targets,
+-                    hostServices,
+-                    BuildEventContext.Invalid,
+-                    parentRequest);
++                    proxyTargets,
++                    targets.ToList(),
++                    hostServices);
+             }
+ 
+             parentRequest.ShouldBeNull();
+@@ -833,19 +836,10 @@ private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[
+                 submissionId: 1,
+                 nodeRequestId,
+                 configId,
+-                proxyTargets,
+-                hostServices);
+-        }
+-
+-        private BuildRequest CreateProxyBuildRequest(int nodeRequestId, int configId, ProxyTargets proxyTargets, BuildRequest parentRequest)
+-        {
+-            return CreateBuildRequest(
+-                nodeRequestId,
+-                configId,
+-                null,
+-                NodeAffinity.Any,
+-                parentRequest,
+-                proxyTargets);
++                targets,
++                hostServices,
++                BuildEventContext.Invalid,
++                parentRequest);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs b/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
+index 6debe82528e..be2345b69c1 100644
+--- a/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
++++ b/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
+@@ -766,6 +766,59 @@ public void RunningProxyBuildsOnOutOfProcNodesShouldIssueWarning(bool disableInp
+             logger.AssertMessageCount("MSB4274", 1);
+         }
+ 
++        // A common scenario is to get a request for N targets, but only some of them can be handled by the cache.
++        // In this case, missing targets should be passed through.
++        [Fact]
++        public async Task PartialProxyTargets()
++        {
++            const string ProjectContent = """
++                <Project>
++                  <Target Name="SomeTarget">
++                    <Message Text="SomeTarget running" />
++                  </Target>
++                  <Target Name="ProxyTarget">
++                    <Message Text="ProxyTarget running" />
++                  </Target>
++                  <Target Name="SomeOtherTarget">
++                    <Message Text="SomeOtherTarget running" />
++                  </Target>
++                </Project>
++                """;
++            TransientTestFile project = _env.CreateFile($"project.proj", ProjectContent);
++
++            BuildParameters buildParameters = new()
++            {
++                ProjectCacheDescriptor = ProjectCacheDescriptor.FromInstance(
++                    new ConfigurableMockCache
++                    {
++                        GetCacheResultImplementation = (_, _, _) =>
++                        {
++                            return Task.FromResult(
++                                CacheResult.IndicateCacheHit(
++                                    new ProxyTargets(
++                                        new Dictionary<string, string>
++                                        {
++                                            { "ProxyTarget", "SomeTarget" },
++                                        })));
++                        }
++                    }),
++            };
++
++            MockLogger logger;
++            using (Helpers.BuildManagerSession buildSession = new(_env, buildParameters))
++            {
++                logger = buildSession.Logger;
++                BuildResult buildResult = await buildSession.BuildProjectFileAsync(project.Path, new[] { "SomeTarget", "SomeOtherTarget" });
++
++                buildResult.Exception.ShouldBeNull();
++                buildResult.ShouldHaveSucceeded();
++            }
++
++            logger.BuildMessageEvents.Select(i => i.Message).ShouldNotContain("SomeTarget running");
++            logger.BuildMessageEvents.Select(i => i.Message).ShouldContain("ProxyTarget running");
++            logger.BuildMessageEvents.Select(i => i.Message).ShouldContain("SomeOtherTarget running");
++        }
++
+         private void AssertCacheBuild(
+             ProjectGraph graph,
+             GraphCacheResponse testData,
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 66e67c82d3c..38caf4ef0c3 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1731,11 +1731,31 @@ private static void AddProxyBuildRequestToSubmission(
+             ProxyTargets proxyTargets,
+             int projectContextId)
+         {
++            // Reverse the map so we can look up requested targets
++            // The ProxyTargetToRealTargetMap is "backwards" from how most users would want to use it and doesn't provide as much flexibility as it could if reversed.
++            // Unfortunately this is part of a public API so cannot easily change at this point.
++            Dictionary<string, string> realTargetsToProxyTargets = new(proxyTargets.ProxyTargetToRealTargetMap.Count, StringComparer.OrdinalIgnoreCase);
++            foreach (KeyValuePair<string, string> kvp in proxyTargets.ProxyTargetToRealTargetMap)
++            {
++                // In the case of multiple proxy targets pointing to the same real target, the last one wins. Another awkwardness of ProxyTargetToRealTargetMap being "backwards".
++                realTargetsToProxyTargets[kvp.Value] = kvp.Key;
++            }
++
++            List<string> targets = new(submission.BuildRequestData.TargetNames.Count);
++            foreach (string requestedTarget in submission.BuildRequestData.TargetNames)
++            {
++                string effectiveTarget = realTargetsToProxyTargets.TryGetValue(requestedTarget, out string proxyTarget)
++                    ? proxyTarget
++                    : requestedTarget;
++                targets.Add(effectiveTarget);
++            }
++
+             submission.BuildRequest = new BuildRequest(
+                 submission.SubmissionId,
+                 BackEnd.BuildRequest.InvalidNodeRequestId,
+                 configurationId,
+                 proxyTargets,
++                targets,
+                 submission.BuildRequestData.HostServices,
+                 submission.BuildRequestData.Flags,
+                 submission.BuildRequestData.RequestedProjectState,
+diff --git a/src/Build/BackEnd/Shared/BuildRequest.cs b/src/Build/BackEnd/Shared/BuildRequest.cs
+index 428eea19656..94ca6b40fcd 100644
+--- a/src/Build/BackEnd/Shared/BuildRequest.cs
++++ b/src/Build/BackEnd/Shared/BuildRequest.cs
+@@ -128,6 +128,7 @@ private BuildRequest(
+         /// <param name="nodeRequestId">The id of the node issuing the request</param>
+         /// <param name="configurationId">The configuration id to use.</param>
+         /// <param name="proxyTargets"><see cref="ProxyTargets"/></param>
++        /// <param name="targets">The set of targets to execute</param>
+         /// <param name="hostServices">Host services if any. May be null.</param>
+         /// <param name="buildRequestDataFlags">Additional flags for the request.</param>
+         /// <param name="requestedProjectState">Filter for desired build results.</param>
+@@ -137,6 +138,7 @@ public BuildRequest(
+             int nodeRequestId,
+             int configurationId,
+             ProxyTargets proxyTargets,
++            List<string> targets,
+             HostServices hostServices,
+             BuildRequestDataFlags buildRequestDataFlags = BuildRequestDataFlags.None,
+             RequestedProjectState requestedProjectState = null,
+@@ -144,7 +146,7 @@ public BuildRequest(
+             : this(submissionId, nodeRequestId, configurationId, hostServices, buildRequestDataFlags, requestedProjectState, projectContextId)
+         {
+             _proxyTargets = proxyTargets;
+-            _targets = proxyTargets.ProxyTargetToRealTargetMap.Keys.ToList();
++            _targets = targets;
+ 
+             // Only root requests can have proxy targets.
+             _parentGlobalRequestId = InvalidGlobalRequestId;
+diff --git a/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs b/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
+index 838210573f6..4dfa7e4332d 100644
+--- a/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
++++ b/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
+@@ -745,13 +745,6 @@ public List<string> GetTargetsUsedToBuildRequest(BuildRequest request)
+             ErrorUtilities.VerifyThrow(_projectInitialTargets != null, "Initial targets have not been set.");
+             ErrorUtilities.VerifyThrow(_projectDefaultTargets != null, "Default targets have not been set.");
+ 
+-            if (request.ProxyTargets != null)
+-            {
+-                ErrorUtilities.VerifyThrow(
+-                    CollectionHelpers.SetEquivalent(request.Targets, request.ProxyTargets.ProxyTargetToRealTargetMap.Keys),
+-                    "Targets must be same as proxy targets");
+-            }
+-
+             List<string> initialTargets = _projectInitialTargets;
+             List<string> nonInitialTargets = (request.Targets.Count == 0) ? _projectDefaultTargets : request.Targets;
+ 

@@ -1,0 +1,193 @@
+{
+  "number": 10973,
+  "title": "Why would Copy target not copy a file running as MSA Group Principal?",
+  "body": "I'm trying to figure out the root cause to why, when running a `dotnet build` in TeamCity, under a MSA Group Principal, the Copy task claims it was successful according to the MSBuild binlog output, but the file does not actually get copied.\n\nThis works correctly when I log in as myself and run the same command on the build server. I am a local administrator on the build machine in question.\n\nI use `-bl:d:\\logs\\msbuild.binlog` both as MSA Group Principal and as myself.\n\nOne wildcard in the mix is that we are setting [`AppendRuntimeIdentifierToOutputPath`](https://learn.microsoft.com/en-us/dotnet/core/project-sdk/msbuild-props#appendruntimeidentifiertooutputpath) to `false` and [`AppendTargetFrameworkToOutputPath`]() to `false` as well. - I was surprised to see these are defined in Microsoft.NET.DefaultOutputPaths.targets and not part of Microsoft.Common.CurrentVersion.targets where `$(OutDir)` is defined. As the Copy task is being imported from https://nuget.info/packages/Microsoft.Data.SqlClient.SNI/5.2.0 's buildTransitive\\net462\\Microsoft.Data.SqlClient.SNI.targets, I think the problem may somehow be related to phases in MSBuild's evaluation order, but I have not been able to figure it out.\n\nA long time ago, Nick Geurrera (the architect of the SDK targets) mentioned to me that sometimes things can fail due to process virtualization, but he did not get into specifics of how to debug it, nor did he directly explain how to resolve the issue inductively - I just took his hint and realized that I should workaround the problem and try something different. At the time, he said the primary way this could occur is if running as NT AUTHORITY\\System - so we are instead running as msaTeamCity$, a MSA Group Principal (passwordless login that authenticates through active directory membership).\n\nWhat's weird is, even after I was able to somehow get it to use the right OutDir value, Copy still... didn't copy anything.  \n\n![Image](https://github.com/user-attachments/assets/3e0f2c53-a90a-4f00-bbe9-8178d30173c5)\n",
+  "state": "OPEN",
+  "createdAt": "2024-11-13T01:11:46Z",
+  "updatedAt": "2025-04-10T14:05:23Z",
+  "closedAt": null,
+  "author": {
+    "login": "jzabroski"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": []
+  },
+  "labels": [
+    "Priority:2",
+    "needs-investigation",
+    "triaged"
+  ],
+  "comments": {
+    "nodes": [
+      {
+        "body": "To debug filesystem virtualization, I'd try [Process Monitor](https://learn.microsoft.com/sysinternals/downloads/procmon).  If that doesn't show anything special going on, then try to change the altitude of its driver (as shown by the `fltmc` command) to the other side of `luafv`.",
+        "createdAt": "2024-11-13T04:16:52Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "Thanks, I asked ChatGPT to explain a bit your answer, as this is not an area I have any experience with, and got the gist of how minifilters work.  But, I am a little lost on what you mean by the other side of luafv?  Why would the relative ordering matter?\n\nThe build server is configured as:\n```\nfltmc filters\n\nFilter Name                     Num Instances    Altitude    Frame\n------------------------------  -------------  ------------  -----\nMsSecFlt                                5       385600         0\nWdFilter                                3       328010         0\nstorqosflt                              0       244000         0\nwcifs                                   0       189900         0\nCldFlt                                  0       180451         0\nFileCrypt                               0       141100         0\nluafv                                   1       135000         0\nnpsvctrig                               1        46000         0\nWof                                     1        40700         0\n```\n\nIf I understand you correctly, only MsSecFlt and WdFilter are running on this box before `luafv`, unless `fltmc filters` is something that needs to be run per-user. \n\nI checked to see if C:\\users\\msaTeamCity$\\AppData\\Local\\VirtualStore exists as administrator, and it does not exist. This would make me think nothing is getting redirected? Is that an incorrect conclusion to draw?\n\nThe recommendations from ChatGPT were to focus on:\n> **WdFilter (Windows Defender Filter)** - This minifilter is associated with Windows Defender. It scans files for malware during operations like opening, closing, and writing, which can potentially slow down file operations or even block them if a threat is detected. If the antivirus configurations are too aggressive, or if there are false positives, it might interfere with file copying.\n> **MsSecFlt (Microsoft Security Filter)** - Though less commonly discussed in documentation, given its altitude and naming, this filter might also be related to security operations, potentially scanning or modifying file operations, which could impact performance or block certain actions if it detects what it considers security risks.\n",
+        "createdAt": "2024-11-13T17:31:43Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "I meant, I'm not sure how luafv virtualises files.  If it returns STATUS_REPARSE to ask the caller to redo the open with a different file name, and the minifilter of Process Monitor is above luafv, I think Process Monitor will log this reparse.  However, if luafv instead passes the open request down with a new file name but pretends to upper drivers that the file was opened with the original name, then Process Monitor above luafv won't see which file was actually opened.  So if the procmon log does **not** show STATUS_REPARSE for the file and procmon is above luafv, then you could try to move procmon below luafv, in order to let procmon log which name luafv passes down to the file system.",
+        "createdAt": "2024-11-13T18:15:19Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "Got it.",
+        "createdAt": "2024-11-13T18:16:40Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "Anti-malware drivers like WdFilter / MsSecFlt seem unlikely to be the cause here \u2014 if one of them didn't like the copy operation, I think it'd just return an error and MSBuild would report that.",
+        "createdAt": "2024-11-13T18:20:58Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "OK. This next question is stupid/crazy but, hear me out. Is it possible there is a bug in MSBuild Copy target? It looks like it was optimized 6 years ago to support multi-threaded copy, so the rational person would expect someone to report an issue with this before now if there was a real problem cf https://github.com/dotnet/msbuild/blame/4a6306491b49be676ded2a43c1e4557785772517/src/Tasks/Copy.cs#L513\n\nI tried to isolate the problem further by writing a TeamCity Powershell command step that runs as a ps1 file.  This _also_ runs as the same MSA Group Principal msaTeamCity$ and successfully copies the files.\n\n#### D:\\BuildAgent\\temp\\buildTmp\\powershell10788514782847466008.ps1\n```pwsh\n$dest = \"d:\\logs\\TeamCity\"\n$source = Join-Path $env:USERPROFILE -ChildPath \".nuget\" | Join-Path -ChildPath \"packages\" | Join-Path -ChildPath \"microsoft.data.sqlclient.sni\" | Join-Path -ChildPath \"5.2.0\"\nWrite-Host $source\nif (Test-Path $source) {\n  # Copy all files from the source directory to the destination directory  \n  $copyErrors = $null\n  Copy-Item -Path \"$source\\*\" -Destination $dest -Recurse -Force -Verbose -ErrorVariable +copyErrors\n  Write-Host \"Files have been copied from '$source' to '$dest'.\"\n  Write-Host \"Errors: $copyErrors\"\n}\n```\n\nOutputs:\n```\n15:14:41  PowerShell Executable: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n15:14:41\u00a0  Working directory: D:\\BuildAgent\\work\\77094892e16807fb\n15:14:41\u00a0  Command: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n15:14:41\u00a0  PowerShell arguments: -NoProfile, -NonInteractive, -ExecutionPolicy, ByPass, -File, D:\\BuildAgent\\temp\\buildTmp\\powershell10788514782847466008.ps1\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy Directory\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build Destination: D:\\logs\\TeamCity\\build\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Create Directory\" on target \"Destination: D:\\logs\\TeamCity\\build\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy Directory\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build\\net462 Destination:\n15:14:41\u00a0  D:\\logs\\TeamCity\\build\\net462\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Create Directory\" on target \"Destination: D:\\logs\\TeamCity\\build\\net462\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build\\net462\\Microsoft.Data.SqlClient.SNI.arm6\n15:14:41\u00a0  4.dll Destination: D:\\logs\\TeamCity\\build\\net462\\Microsoft.Data.SqlClient.SNI.arm64.dll\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build\\net462\\Microsoft.Data.SqlClient.SNI.arm6\n15:14:41\u00a0  4.pdb Destination: D:\\logs\\TeamCity\\build\\net462\\Microsoft.Data.SqlClient.SNI.arm64.pdb\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build\\net462\\Microsoft.Data.SqlClient.SNI.targ\n15:14:41\u00a0  ets Destination: D:\\logs\\TeamCity\\build\\net462\\Microsoft.Data.SqlClient.SNI.targets\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build\\net462\\Microsoft.Data.SqlClient.SNI.x64.\n15:14:41\u00a0  dll Destination: D:\\logs\\TeamCity\\build\\net462\\Microsoft.Data.SqlClient.SNI.x64.dll\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build\\net462\\Microsoft.Data.SqlClient.SNI.x64.\n15:14:41\u00a0  pdb Destination: D:\\logs\\TeamCity\\build\\net462\\Microsoft.Data.SqlClient.SNI.x64.pdb\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build\\net462\\Microsoft.Data.SqlClient.SNI.x86.\n15:14:41\u00a0  dll Destination: D:\\logs\\TeamCity\\build\\net462\\Microsoft.Data.SqlClient.SNI.x86.dll\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\build\\net462\\Microsoft.Data.SqlClient.SNI.x86.\n15:14:41\u00a0  pdb Destination: D:\\logs\\TeamCity\\build\\net462\\Microsoft.Data.SqlClient.SNI.x86.pdb\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy Directory\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive Destination:\n15:14:41\u00a0  D:\\logs\\TeamCity\\buildTransitive\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Create Directory\" on target \"Destination: D:\\logs\\TeamCity\\buildTransitive\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy Directory\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive\\net462 Destination:\n15:14:41\u00a0  D:\\logs\\TeamCity\\buildTransitive\\net462\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Create Directory\" on target \"Destination: D:\\logs\\TeamCity\\buildTransitive\\net462\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive\\net462\\Microsoft.Data.SqlClien\n15:14:41\u00a0  t.SNI.arm64.dll Destination: D:\\logs\\TeamCity\\buildTransitive\\net462\\Microsoft.Data.SqlClient.SNI.arm64.dll\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive\\net462\\Microsoft.Data.SqlClien\n15:14:41\u00a0  t.SNI.arm64.pdb Destination: D:\\logs\\TeamCity\\buildTransitive\\net462\\Microsoft.Data.SqlClient.SNI.arm64.pdb\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive\\net462\\Microsoft.Data.SqlClien\n15:14:41\u00a0  t.SNI.targets Destination: D:\\logs\\TeamCity\\buildTransitive\\net462\\Microsoft.Data.SqlClient.SNI.targets\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive\\net462\\Microsoft.Data.SqlClien\n15:14:41\u00a0  t.SNI.x64.dll Destination: D:\\logs\\TeamCity\\buildTransitive\\net462\\Microsoft.Data.SqlClient.SNI.x64.dll\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive\\net462\\Microsoft.Data.SqlClien\n15:14:41\u00a0  t.SNI.x64.pdb Destination: D:\\logs\\TeamCity\\buildTransitive\\net462\\Microsoft.Data.SqlClient.SNI.x64.pdb\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive\\net462\\Microsoft.Data.SqlClien\n15:14:41\u00a0  t.SNI.x86.dll Destination: D:\\logs\\TeamCity\\buildTransitive\\net462\\Microsoft.Data.SqlClient.SNI.x86.dll\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\buildTransitive\\net462\\Microsoft.Data.SqlClien\n15:14:41\u00a0  t.SNI.x86.pdb Destination: D:\\logs\\TeamCity\\buildTransitive\\net462\\Microsoft.Data.SqlClient.SNI.x86.pdb\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\.nupkg.metadata Destination:\n15:14:41\u00a0  D:\\logs\\TeamCity\\.nupkg.metadata\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\.signature.p7s Destination:\n15:14:41\u00a0  D:\\logs\\TeamCity\\.signature.p7s\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\dotnet.png Destination:\n15:14:41\u00a0  D:\\logs\\TeamCity\\dotnet.png\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\LICENSE.txt Destination:\n15:14:41\u00a0  D:\\logs\\TeamCity\\LICENSE.txt\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\microsoft.data.sqlclient.sni.5.2.0.nupkg\n15:14:41\u00a0  Destination: D:\\logs\\TeamCity\\microsoft.data.sqlclient.sni.5.2.0.nupkg\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\microsoft.data.sqlclient.sni.5.2.0.nupkg.sha51\n15:14:41\u00a0  2 Destination: D:\\logs\\TeamCity\\microsoft.data.sqlclient.sni.5.2.0.nupkg.sha512\".\n15:14:41\u00a0  VERBOSE: Performing the operation \"Copy File\" on target \"Item:\n15:14:41\u00a0  C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0\\microsoft.data.sqlclient.sni.nuspec\n15:14:41\u00a0  Destination: D:\\logs\\TeamCity\\microsoft.data.sqlclient.sni.nuspec\".\n15:14:41\u00a0  Files have been copied from 'C:\\Users\\msaTeamCity$\\.nuget\\packages\\microsoft.data.sqlclient.sni\\5.2.0' to 'd:\\logs\\TeamCity'.\n15:14:41\u00a0  Errors:\n15:14:41\u00a0  Process exited with code 0\n```\n\nVisual Proof it successfully copied the whole folder:\n\n![Image](https://github.com/user-attachments/assets/503c7787-82b9-4bab-9333-09c8e4e39a62)\n\n![Image](https://github.com/user-attachments/assets/4efe3c4b-4d9f-4b2f-8ed4-3a393da560e3)\n",
+        "createdAt": "2024-11-14T22:04:03Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "We plan to further rule out MSA Group Principals next week by changing the authentication mechanism back to NT AUTHORTY\\System or a password-based account, just to briefly test. I don't know if MSBuild has any official recommendations on user access control privileges?",
+        "createdAt": "2024-11-14T22:19:26Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "Team triage: Have you been able to verify that this behaviour is the same in other authentication mechanisms? In a failing case, what exactly have you seen in Process Monitor trace? Was there an IO failure somewhere?",
+        "createdAt": "2024-11-19T15:31:29Z",
+        "author": {
+          "login": "maridematte"
+        }
+      },
+      {
+        "body": "Your screen shot shows the \"Copying file from\" message <https://github.com/dotnet/msbuild/blob/8f6b8ad0ace90c777c66711c907227fcfb6f2efe/src/Tasks/Resources/Strings.resx#L245-L248>\n\nwhich I think is logged from <https://github.com/dotnet/msbuild/blob/4a6306491b49be676ded2a43c1e4557785772517/src/Tasks/Copy.cs#L340-L348>\n\nwhere it is immediately followed by a File.Copy call.  That looks pretty foolproof.\n\n> 15:14:41  PowerShell Executable: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n\nThat's Windows PowerShell on .NET Framework.  Do you get the same result with PowerShell Core?  (So that it uses .NET Runtime like `dotnet build`.)\n\nWhich version of Windows are you using, and are the files on NTFS or ReFS?  If ReFS, then this might be a bug in [Copy-on-Write](https://devblogs.microsoft.com/engineering-at-microsoft/copy-on-write-in-win32-api-early-access/).",
+        "createdAt": "2024-11-19T16:50:54Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "I'm going to follow up tomorrow. Internal deadline today. Excited to find the root cause. ",
+        "createdAt": "2024-11-19T17:13:25Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "The problem appears to be a bug in MSBuild. I do not know why but ProcessMonitor shows no file attempt occurring.  It also shows it under cmd.exe which is confusing as it is really dotnet msbuild that is running, but that is likely due to TeamCity launching dotnet through a cmd wrapper batch file.\n\nSeparately, I moved my PowerShell script to inside a build.targets file and it also worked when run directly inside msbuild, so it does not seem to be permissions related from the MSA Group Principal, although I dont understand why it works when I run it over PS Remoting to the build server. One thought I had is that PS Remoting is messing with the parallelism options in the Copy task, although I dont understand how that could be.\n\nBinLog:\n![Image](https://github.com/user-attachments/assets/68a40c8f-9473-4b71-a16a-02cc599d6e27)\n\nProcess Monitor:\n![Image](https://github.com/user-attachments/assets/0ca32458-a8d2-4848-88cf-3509dcb92f20)\n",
+        "createdAt": "2024-11-20T22:38:39Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "I forgot to add, we are using NTFS, not ReFS. Definitely seems like an MSBuild bug unless I am misreading the logs somehow?  Happy to repeat the test with further instruction on fine tuning using MSBuild and ProcessMonitor, but MSBuild verbosity is already set to diagnostic, and I captured the output in binlog.\n\n",
+        "createdAt": "2024-11-21T14:59:37Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "> It also shows it under cmd.exe which is confusing as it is really dotnet msbuild that is running, but that is likely due to TeamCity launching dotnet through a cmd wrapper batch file.\n\nThat's certainly strange.  What kind of call stack does Process Monitor show for this access?",
+        "createdAt": "2024-11-21T15:17:32Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "I don't know what you are asking. The screenshot clearly shows the native dlls are not even being copied.  It looks as if somehow MSBuild is just dropping the copy operation altogether. What stack trace would exist for something that does not occur?\n\n[Edit: If you look at the screenshot closely, where the yellow arrow is, I am highlighting where you would _expect to see log messages in Process Monitor but do not see any for the affected dlls_, Sorry if that was not clear]\n\nOne thing to note, in searching the dotnet/SqlClient issues on GitHub, at least one other user reported what I would call \"MSBuild phantom writes\" where the target did not actually copy anything. I need to find the exact issue as there are at least a dozen involving SNI.dll issues. It does make me think that some underlying problem has been going on for years.",
+        "createdAt": "2024-11-21T19:34:25Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "See: https://github.com/dotnet/SqlClient/issues/2049#issuecomment-1583279986 CC @Luxed ",
+        "createdAt": "2024-11-21T19:40:56Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "I mean, it's difficult for me to believe Process Monitor would show `dotnet build` file accesses as coming from `cmd.exe`.  If you double-click one of those `cmd.exe` rows in Process Monitor, it should show the details of the event in a dialog box.  From there, one of the tabs should show the call stack from which the I/O came.  In the user-mode part of the stack trace, perhaps it'll show a function name that indicates what kind of command `cmd.exe` was running; if it's a DIR command, then that could explain why it's opening those files but neither reading nor writing them.\n\n> See: <https://github.com/dotnet/SqlClient/issues/2049#issuecomment-1583279986>\n\nI don't think it's the same problem.  There, it says the item types had no items.  In your case, the `Copy` task logged file names, so MSBuild must have given it items.",
+        "createdAt": "2024-11-21T20:53:30Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "You are right. I took the wrong screnshot.\n\n**tldr;** It appears dotnet.exe is deleting the file after it copies it. The culprit appears to be IncrementalClean task that does not add these files to the _CleanRemainingFileWritesAfterIncrementalClean item collection.  I do not know much about how this works, but it looks like since these are not included in TaskRunner.csproj.FileListAbsolute, they get deleted.\n\nHow do I make this stop?  Is it simply that the official guidance on how to package .NET Framework apps being followed by the Microsoft.Data.SqlClient team is incorrect for Microsoft.Data.SqlClient.SNI?  I did point out to them that grpc.core package I use does not have this problem and is used in the same project, and it used a different design pattern, but they told me they're using the one guided by MSBuild.\n\n**long details below**\n\nI re-ran the process, pulled the timestamp from MSBuild:\n\n![Image](https://github.com/user-attachments/assets/10b73bdc-4cc4-47da-92a4-7b34208bc645)\n\n\nProcessMonitor, filtered only on dotnet.exe, starting at 5:51:01.908233, just before MSBuild purports to have invoked CopySNIFiles target.\n\n![Image](https://github.com/user-attachments/assets/7a0735ae-3f7f-4292-8e4e-bed448ca993d)\n\n\nHere is a screenshot showing the openresult was Created.\n\n![Image](https://github.com/user-attachments/assets/232df1dd-e834-4323-93da-f2c9a00fdcae)\n\n\nIt appears it was then deleted:\n\n![Image](https://github.com/user-attachments/assets/d8d302a9-ff16-4e9a-9ebd-2a326653a672)\n\nIn trying to pin down where this could occur, it appears there is an IncrementalClean task that runs _after_ everything else.  I honestly don't know what this task is and never knew it existed.  I am _also_ running msbuild with explicit --no-incremental, so I don't understand why this IncrementalClean thing is deleting my files.  I would expect --no-incremental would tell it \"assume this is a clean checkout.\"\n\n",
+        "createdAt": "2024-11-21T23:50:44Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "> I don't think it's the same problem.\n\nI actually think it is the same problem, if you squint.  I think there is some flaw in how IncrementalClean works on clean checkouts that causes issues for the guidance given to the Microsoft.Data.SqlClient team on how to package this.  I think if they follow the guidance for \".NET Core\", this problem likely goes away.  The documentation is vague on why this approach exists uniquely for .NET Framework, so I dont know why there is separate guidance for NETFX.\n\nThe reason I was able to build this logged in as local administrator is I no longer had a clean checkout.  TeamCity was checking out the code for me.  Thats the key difference I missed and assumed was due to MSA Group Principal.",
+        "createdAt": "2024-11-21T23:54:15Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "IIRC, the incremental cleaning works via the FileWrites item type.  Targets should add output files to that.  If the previous build added a file to FileWrites, but the current build does not, then the file is assumed to be no longer needed and is deleted.",
+        "createdAt": "2024-11-22T04:37:02Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "What's the right solution?\n\nShould Microsoft.Data.SqlClient update their targets file in the CopySNIFiles task to add `<WriteFiles Include=\"@SNIDllFiles\" />`?\n\nOn level of expediency, I think it is:\n\n1. Use Kirill Osenkov's suggestion from a similar issue from 2016: Add `<Target Name=\"IncrementalClean\" />` to my TaskRunner.csproj https://github.com/dotnet/msbuild/issues/1054#issuecomment-313218030\n2. Update guidance to explain comment here: https://learn.microsoft.com/en-us/nuget/create-packages/native-files-in-net-packages#projects-targeting-net-framework - what is the (partial) support for NuGet conventions?  It seems like it probably doesn't function correctly with IncrementalClean\n    > This is due to the build system having (partial) support for these NuGet conventions, but the runtime working sufficiently differently that it's easier to avoid it, to maximize project compatibility.\n3. Reconsider guidance entirely or support whatever functionality is missing in NETFX that is there in .NET Core.\n4. Work with dotnet/SqlClient team to fix packaging",
+        "createdAt": "2024-11-22T13:13:51Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "One last question. In Microsoft.Data.SqlClient.SNI.targets, they have:\n\n```xml\n  <ItemGroup Condition=\"'$(ContentSNIFiles)' != '' And\n                        '$(ContentSNIFiles)' != 'false' And\n                        '@(SNIFiles)' != ''\">\n    <Content Include=\"@(SNIFiles)\">\n      <Link>%(RecursiveDir)%(FileName)%(Extension)</Link>\n      <CopyToOutputDirectory>Always</CopyToOutputDirectory>\n    </Content>\n  </ItemGroup>\n```\n\nSo, setting Content in an imported target via nuget restore is not sufficient to add things automatically to FileWrites?",
+        "createdAt": "2024-11-22T13:51:11Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "Adding to the `Content` item type should suffice; but that is conditional on `$(ContentSNIFiles)` and I don't know whether anything sets ContentSNIFiles in your build.",
+        "createdAt": "2024-11-22T14:19:51Z",
+        "author": {
+          "login": "KalleOlaviNiemitalo"
+        }
+      },
+      {
+        "body": "That did add them to FileListAbsolute.txt but it did not stop IncrementalClean from running the proverbial hoover vac over SNI native dlls.\n\nI probably won't look at this again until Monday. Getting closer!",
+        "createdAt": "2024-11-22T15:03:48Z",
+        "author": {
+          "login": "jzabroski"
+        }
+      },
+      {
+        "body": "FYI @YuliiaKovalova as you are looking into IncrementalClean deficiency (https://github.com/dotnet/msbuild/issues/10931)",
+        "createdAt": "2024-11-25T12:26:29Z",
+        "author": {
+          "login": "JanKrivanek"
+        }
+      }
+    ]
+  }
+}

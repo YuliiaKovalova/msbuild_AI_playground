@@ -1,0 +1,79 @@
+{
+  "number": 3271,
+  "title": "msbuild not embedding resource files",
+  "body": "Hi,\r\n\r\nI've a really strange problem that I thought was related to the vsts build vs solution task but I have been able to repro it on my end here too.\r\n\r\nBasically I have a class library project targeting .net core 2, in the project there are a couple of TypeScript files I want to compile, and have the output of these files added as embedded resources to the generated dll. \r\n\r\nWithin VS 2017 on desktop all was ok, due to building/rebuilding but problem appeared on vsts when code was pulled down to a clean folder structure that contained no build outputs like js files or dlls. With a but of playing I was able to reproduce the behavior with a sample project. \r\n\r\nBasically if you (from command line) do a solution clean and then a solution build, the js files will be generated but not added as embedded resources to the assembly.\r\n\r\nThe important bits of the csproj are as follows:\r\n```\r\n<PropertyGroup>\r\n<TargetFramework>netcoreapp2.0</TargetFramework>\r\n<OutputType>Library</OutputType>\r\n</PropertyGroup>\r\n\r\n<ItemGroup>\r\n  <EmbeddedResource Include=\"Scripts\\dist\\*.js\" />\r\n</ItemGroup>\r\n\r\n<ItemGroup>\r\n  <TypeScriptCompile Include=\"Scripts\\src\\spSampleForTest001.ts\" />\r\n  <TypeScriptCompile Include=\"Scripts\\src\\spSampleForTest002.ts\" />\r\n</ItemGroup>\r\n\r\n```\r\n\r\nIn the sample solution there is a solution item domsbuild.cmd that issues the clean and build commands and if you look at the generated dll you will see no resources.\r\n\r\nUsing VS 2017 15.6.7\r\nMSBuild.exe 15.6.85.37198\r\n\r\n[EmbedResReproSol.zip](https://github.com/Microsoft/msbuild/files/1974791/EmbedResReproSol.zip)\r\n\r\nAny ideas greatly appreciated\r\n",
+  "state": "OPEN",
+  "createdAt": "2018-05-04T14:35:11Z",
+  "updatedAt": "2024-02-21T16:34:07Z",
+  "closedAt": null,
+  "author": {
+    "login": "dmcweeney"
+  },
+  "labels": [
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "Apologies I renamed the solution file to shorten it and didn't update the cmd file to reflect the change. After a but more hacking I notice that if I do the following in the cmd file it embeds the resources.\r\n\r\nmsbuild sol /t:build\r\nand immediately after\r\nmsbuild sol /t:rebuild\r\n\r\n\r\nAny ideas",
+        "createdAt": "2018-05-04T14:56:23Z",
+        "updatedAt": "2018-05-04T14:56:23Z",
+        "author": {
+          "login": "dmcweeney"
+        }
+      },
+      {
+        "body": "The `Scripts\\dist\\*.js` files are generated during the build by a TypeScript compiler process, right?\r\n\r\nIf so, the problem is that you're including them as static items (outside of a Target), which means the wildcard is expanded _before running any targets_. So the order of operations becomes\r\n\r\n1. Expand the wildcard, find nothing, and store no new entries in `@(EmbeddedResource)`\r\n2. Run the TypeScript compiler, creating the `.js` files\r\n3. Run the C# compiler, passing `@(EmbeddedResource)` (which doesn't contain the newly-created files).\r\n\r\nOn the _second_ and subsequent runs, step 1 runs after the previous run's step 2, so it _does_ find files to include.\r\n\r\nYou can fix this by explicitly adding the generated files to `@(EmbeddedResource)` _after they're generated_. For example:\r\n\r\n```xml\r\n<Target Name=\"EmbedGeneratedJavascript\" AfterTargets=\"GetTypeScriptOutputForPublishing\">\r\n  <ItemGroup>\r\n    <EmbeddedResource Include=\"Scripts\\dist\\*.js\" />\r\n  </ItemGroup>\r\n</Target>\r\n```\r\n\r\nor better yet\r\n\r\n```xml\r\n<EmbeddedResource Include=\"@(GeneratedJavascript)\" />\r\n```\r\n\r\nWhich is an item populated by the `CompileTypeScript` target.\r\n\r\nI don't know the TypeScript targets super well, so I'm making an educated guess on the hook point `GetTypeScriptOutputForPublishing`.",
+        "createdAt": "2018-05-04T15:02:30Z",
+        "updatedAt": "2018-05-04T15:02:30Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "@rainersigwald thanks for the quick response. I've \"quickly\" tried both options and neither fixes it. \r\nSo I will need to do more hacking on Tuesday.",
+        "createdAt": "2018-05-04T15:52:12Z",
+        "updatedAt": "2018-05-04T15:52:12Z",
+        "author": {
+          "login": "dmcweeney"
+        }
+      },
+      {
+        "body": "Ah, naturally it was more complicated! The problem is that `@(EmbeddedResource)` is adjusted in the `PrepareResources` target, which runs (by default) before TypeScript compilation (which happens before `Compile`). Without adjustments, the items get ignored.\r\n\r\nForcing TypeScript compilation to happen early enough is very difficult, unfortunately. But you can specify all the required metadata:\r\n\r\n```diff\r\ndiff --git a/EmbedResReproSol/src/ClassLibrary/ClassLibrary.csproj b/EmbedResReproSol/src/ClassLibrary/ClassLibrary.csproj\r\nindex dd63967..c025d40 100644\r\n--- a/EmbedResReproSol/src/ClassLibrary/ClassLibrary.csproj\r\n+++ b/EmbedResReproSol/src/ClassLibrary/ClassLibrary.csproj\r\n@@ -9,13 +9,14 @@\r\n \t  <OutputType>Library</OutputType>\r\n   </PropertyGroup>\r\n \r\n-\t<ItemGroup>\r\n-\t\t<EmbeddedResource Include=\"Scripts\\dist\\*.js\" />\r\n-\t</ItemGroup>\r\n-\r\n \t<ItemGroup>\r\n \t\t<TypeScriptCompile Include=\"Scripts\\src\\spSampleForTest001.ts\" />\r\n \t\t<TypeScriptCompile Include=\"Scripts\\src\\spSampleForTest002.ts\" />\r\n \t</ItemGroup>\r\n \r\n+\t<Target Name=\"EmbedGeneratedJavascript\"  AfterTargets=\"GetTypeScriptOutputForPublishing\">\r\n+\t\t<ItemGroup>\r\n+\t\t\t<EmbeddedResource Include=\"@(GeneratedJavascript)\" WithCulture=\"false\" Type=\"Non-Resx\" />\r\n+\t\t</ItemGroup>\r\n+\t</Target>\r\n </Project>\r\n```",
+        "createdAt": "2018-05-04T16:54:39Z",
+        "updatedAt": "2018-05-04T16:54:39Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "@rainersigwald thanks for mill for this. It does certainly fix the sequencing problem.\r\n\r\nI think I am going to have to give up on this route and resort to gulp as next phase of this will be concatenating some of the GeneratedJavascript files and it will be these concatenated files that will get embedded as resources. See this link for the detail: [TypeScript enhancement request](https://github.com/Microsoft/TypeScript/issues/23654#issuecomment-385710540)\r\n\r\nThanks again, Donal\r\n",
+        "createdAt": "2018-05-08T13:06:11Z",
+        "updatedAt": "2018-05-08T13:06:11Z",
+        "author": {
+          "login": "dmcweeney"
+        }
+      },
+      {
+        "body": "I have the same problem. I want to embed my React static files to the assembly and read it from using EmbeddedFileProvider.\r\n\r\nInteresting thing is that when I put the related code to the root it's including the files as expected and also the app is working without any problem. But I want to have this code on a `Target` and be able to embed the file after the `npm run build`.\r\n\r\nThis is the current configuration:\r\n\r\n`<Target Name=\"EmbedClientResources\" BeforeTargets=\"PrepareForBuild\">\r\n       <ItemGroup>\r\n      <EmbeddedResource Include=\"$(SpaRoot)build\\**\" Exclude=\"$(SpaRoot)build\\**\\*.js.map\" WithCulture=\"false\" Type=\"Non-Resx\" />\r\n    </ItemGroup>\r\n  </Target>`\r\n\r\nAfter running the project in can find my `index.html` file. But the javascript files in nested js directory can not be found.\r\n\r\nI changed the code to \r\n\r\n`<Target Name=\"EmbedClientResources\" BeforeTargets=\"PrepareForBuild\">\r\n    <ItemGroup>\r\n      <EmbeddedResource Include=\"$(SpaRoot)build\\**\" Exclude=\"$(SpaRoot)build\\**\\*.js.map\" WithCulture=\"false\" Type=\"Non-Resx\" >\r\n        <Link>ClientApp\\%(RecursiveDir)\\%(Filename)%(Extension)</Link>\r\n      </EmbeddedResource>\r\n    </ItemGroup>\r\n  </Target>`\r\n\r\nthis time I'm getting a compile time error:\r\n\r\n`Resource identifier 'EPaperApi.ClientApp' has already been used in this assembly`\r\n\r\nWhen I put the second code outside of the Target tag it loads all the expected files and show them on solution explorer. Also the app is working correctly. But the files are the old built files and are not the updated ones.\r\n\r\nCan anybody please help me with this?\r\n\r\nthis is the screenshot when the files are loaded outside of Target tag.\r\n![image](https://user-images.githubusercontent.com/19901130/61472731-b5f92e00-a98d-11e9-8a1b-129852967c33.png)\r\n",
+        "createdAt": "2019-07-18T15:58:43Z",
+        "updatedAt": "2019-07-18T15:58:43Z",
+        "author": {
+          "login": "mohsenno1"
+        }
+      },
+      {
+        "body": "@mohsenno1 Im facing the same problem, did you solve it ? \r\n\r\nIn my case the resources are added but without the folder structure",
+        "createdAt": "2020-09-16T16:15:12Z",
+        "updatedAt": "2020-09-16T16:15:12Z",
+        "author": {
+          "login": "AsmisAlan"
+        }
+      }
+    ]
+  }
+}

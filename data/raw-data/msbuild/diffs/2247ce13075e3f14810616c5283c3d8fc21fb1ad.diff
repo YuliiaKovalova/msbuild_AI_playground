@@ -1,0 +1,632 @@
+diff --git a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+index 7262bb0d329..5d650d4c7d0 100644
+--- a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
++++ b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+@@ -7,6 +7,7 @@
+ using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.FileAccesses;
+ using Microsoft.Build.Shared;
++using Microsoft.Build.Telemetry;
+ 
+ #nullable disable
+ 
+@@ -77,8 +78,9 @@ public void RegisterDefaultFactories()
+             // NodeEndpoint,
+             _componentEntriesByType[BuildComponentType.LoggingService] = new BuildComponentEntry(BuildComponentType.LoggingService, null);
+             _componentEntriesByType[BuildComponentType.RequestBuilder] = new BuildComponentEntry(BuildComponentType.RequestBuilder, RequestBuilder.CreateComponent, CreationPattern.CreateAlways);
+-            // This conditionally registers real or no-op implementation based on BuildParameters
++            // Following two conditionally registers real or no-op implementation based on BuildParameters
+             _componentEntriesByType[BuildComponentType.BuildCheckManagerProvider] = new BuildComponentEntry(BuildComponentType.BuildCheckManagerProvider, BuildCheckManagerProvider.CreateComponent, CreationPattern.Singleton);
++            _componentEntriesByType[BuildComponentType.TelemetryCollector] = new BuildComponentEntry(BuildComponentType.TelemetryCollector, TelemetryCollectorProvider.CreateComponent, CreationPattern.Singleton);
+             _componentEntriesByType[BuildComponentType.TargetBuilder] = new BuildComponentEntry(BuildComponentType.TargetBuilder, TargetBuilder.CreateComponent, CreationPattern.CreateAlways);
+             _componentEntriesByType[BuildComponentType.TaskBuilder] = new BuildComponentEntry(BuildComponentType.TaskBuilder, TaskBuilder.CreateComponent, CreationPattern.CreateAlways);
+             _componentEntriesByType[BuildComponentType.RegisteredTaskObjectCache] = new BuildComponentEntry(BuildComponentType.RegisteredTaskObjectCache, RegisteredTaskObjectCache.CreateComponent, CreationPattern.Singleton);
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+index 9c633d14b8c..abbe6441335 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+@@ -15,6 +15,7 @@
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Shared.Debugging;
++using Microsoft.Build.Telemetry;
+ using BuildAbortedException = Microsoft.Build.Exceptions.BuildAbortedException;
+ 
+ #nullable disable
+@@ -286,6 +287,9 @@ public void CleanupForBuild()
+                     IBuildCheckManagerProvider buildCheckProvider = (_componentHost.GetComponent(BuildComponentType.BuildCheckManagerProvider) as IBuildCheckManagerProvider);
+                     var buildCheckManager = buildCheckProvider!.Instance;
+                     buildCheckManager.FinalizeProcessing(_nodeLoggingContext);
++                    // Flush and send the final telemetry data if they are being collected
++                    ITelemetryCollector telemetryCollector = (_componentHost.GetComponent(BuildComponentType.TelemetryCollector) as TelemetryCollectorProvider)!.Instance;
++                    telemetryCollector.FinalizeProcessing(_nodeLoggingContext);
+                     // Clears the instance so that next call (on node reuse) to 'GetComponent' leads to reinitialization.
+                     buildCheckProvider.ShutdownComponent();
+                 },
+diff --git a/src/Build/BackEnd/Components/IBuildComponentHost.cs b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+index a3fc16da831..568976587ee 100644
+--- a/src/Build/BackEnd/Components/IBuildComponentHost.cs
++++ b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+@@ -147,6 +147,11 @@ internal enum BuildComponentType
+         /// The Build Check Manager.
+         /// </summary>
+         BuildCheckManagerProvider,
++
++        /// <summary>
++        /// The component which collects telemetry data.
++        /// </summary>
++        TelemetryCollector,
+     }
+ 
+     /// <summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index 6186f2fda23..8be7bc50114 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -21,6 +21,7 @@
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
++using Microsoft.Build.Telemetry;
+ using NodeLoggingContext = Microsoft.Build.BackEnd.Logging.NodeLoggingContext;
+ using ProjectLoggingContext = Microsoft.Build.BackEnd.Logging.ProjectLoggingContext;
+ 
+@@ -771,7 +772,6 @@ private async Task RequestThreadProc(bool setThreadParameters)
+         {
+             Exception thrownException = null;
+             BuildResult result = null;
+-            ProjectBuildStats stats = null;
+ 
+             try
+             {
+@@ -781,7 +781,7 @@ private async Task RequestThreadProc(bool setThreadParameters)
+                 }
+                 MSBuildEventSource.Log.RequestThreadProcStart();
+                 VerifyEntryInActiveState();
+-                (result, stats) = await BuildProject();
++                result = await BuildProject();
+                 MSBuildEventSource.Log.RequestThreadProcStop();
+             }
+             catch (InvalidProjectFileException ex)
+@@ -867,20 +867,20 @@ private async Task RequestThreadProc(bool setThreadParameters)
+                     result = new BuildResult(_requestEntry.Request, thrownException);
+                 }
+ 
+-                ReportResultAndCleanUp(result, stats);
++                ReportResultAndCleanUp(result);
+             }
+         }
+ 
+         /// <summary>
+         /// Reports this result to the engine and cleans up.
+         /// </summary>
+-        private void ReportResultAndCleanUp(BuildResult result, ProjectBuildStats stats)
++        private void ReportResultAndCleanUp(BuildResult result)
+         {
+             if (_projectLoggingContext != null)
+             {
+                 try
+                 {
+-                    _projectLoggingContext.LogProjectFinished(result.OverallResult == BuildResultCode.Success, stats);
++                    _projectLoggingContext.LogProjectFinished(result.OverallResult == BuildResultCode.Success);
+                 }
+                 catch (Exception ex) when (!ExceptionHandling.IsCriticalException(ex))
+                 {
+@@ -1102,7 +1102,7 @@ private void SetProjectCurrentDirectory()
+         /// <summary>
+         /// Kicks off the build of the project file.  Doesn't return until the build is complete (or aborted.)
+         /// </summary>
+-        private async Task<(BuildResult, ProjectBuildStats)> BuildProject()
++        private async Task<BuildResult> BuildProject()
+         {
+             ErrorUtilities.VerifyThrow(_targetBuilder != null, "Target builder is null");
+ 
+@@ -1205,13 +1205,11 @@ private void SetProjectCurrentDirectory()
+                         _requestEntry.RequestConfiguration.ResultsNodeId);
+                 }
+ 
+-                ProjectBuildStats projectBuildStats = GetPreBuildStatistics();
+-
+                 // Build the targets
+                 BuildResult result = await _targetBuilder.BuildTargets(_projectLoggingContext, _requestEntry, this,
+                     allTargets, _requestEntry.RequestConfiguration.BaseLookup, _cancellationTokenSource.Token);
+ 
+-                UpdateStatisticsPostBuild(projectBuildStats);
++                UpdateStatisticsPostBuild();
+ 
+                 result = _requestEntry.Request.ProxyTargets == null
+                     ? result
+@@ -1223,7 +1221,7 @@ private void SetProjectCurrentDirectory()
+                         string.Join(", ", allTargets));
+                 }
+ 
+-                return (result, projectBuildStats);
++                return result;
+             }
+             finally
+             {
+@@ -1263,39 +1261,13 @@ BuildResult CopyTargetResultsFromProxyTargetsToRealTargets(BuildResult resultFro
+             }
+         }
+ 
+-        private ProjectBuildStats GetPreBuildStatistics()
++        private void UpdateStatisticsPostBuild()
+         {
+-            if (!_componentHost.BuildParameters.IsTelemetryEnabled)
+-            {
+-                return null;
+-            }
+-
+-            ProjectBuildStats stats = new ProjectBuildStats(false);
+-
+-            IResultsCache resultsCache = (IResultsCache)_componentHost.GetComponent(BuildComponentType.ResultsCache);
+-            BuildResult existingBuildResult = resultsCache.GetResultsForConfiguration(_requestEntry.Request.ConfigurationId);
+-
+-            stats.TotalTargetsCount = (short)_requestEntry.RequestConfiguration.Project.TargetsCount;
+-
+-            stats.CustomTargetsCount = (short)
+-                _requestEntry.RequestConfiguration.Project.Targets.Count(t =>
+-                    IsCustomTargetPath(t.Value.FullPath));
++            ITelemetryCollector collector =
++                ((TelemetryCollectorProvider)_componentHost.GetComponent(BuildComponentType.TelemetryCollector))
++                .Instance;
+ 
+-            if (existingBuildResult?.ResultsByTarget != null && stats.CustomTargetsCount > 0)
+-            {
+-                stats.ExecutedCustomTargetsCount = (short)_requestEntry.RequestConfiguration.Project.Targets
+-                    .Where(t => IsCustomTargetPath(t.Value.FullPath))
+-                    .Count(t => existingBuildResult.ResultsByTarget.ContainsKey(t.Key));
+-            }
+-
+-            stats.TotalTargetsExecutionsCount = (short)(existingBuildResult?.ResultsByTarget.Count ?? 0);
+-
+-            return stats;
+-        }
+-
+-        private void UpdateStatisticsPostBuild(ProjectBuildStats stats)
+-        {
+-            if (stats == null)
++            if (!collector.IsTelemetryCollected)
+             {
+                 return;
+             }
+@@ -1305,23 +1277,21 @@ private void UpdateStatisticsPostBuild(ProjectBuildStats stats)
+             // Hence we need to fetch the original result from the cache - to get the data for all executed targets.
+             BuildResult unfilteredResult = resultsCache.GetResultsForConfiguration(_requestEntry.Request.ConfigurationId);
+ 
+-            // Count only new executions
+-            stats.TotalTargetsExecutionsCount = (short)(unfilteredResult.ResultsByTarget.Count - stats.TotalTargetsExecutionsCount);
+-
+-            if (stats.CustomTargetsCount > 0)
++            foreach (var projectTargetInstance in _requestEntry.RequestConfiguration.Project.Targets)
+             {
+-                int executedCustomTargetsCount = _requestEntry.RequestConfiguration.Project.Targets
+-                    .Where(t => IsCustomTargetPath(t.Value.FullPath))
+-                    .Count(t => unfilteredResult.ResultsByTarget.ContainsKey(t.Key));
+-
+-                // Count only new executions
+-                stats.ExecutedCustomTargetsCount = (short)(executedCustomTargetsCount - stats.ExecutedCustomTargetsCount);
++                collector.AddTarget(
++                    projectTargetInstance.Key,
++                    // would we want to distinguish targets that were executed only during this execution - we'd need
++                    //  to remember target names from ResultsByTarget from before execution
++                    unfilteredResult.ResultsByTarget.ContainsKey(projectTargetInstance.Key),
++                    IsCustomTargetPath(projectTargetInstance.Value.FullPath),
++                    FileClassifier.Shared.IsInNugetCache(projectTargetInstance.Value.FullPath));
+             }
+ 
+             TaskRegistry taskReg = _requestEntry.RequestConfiguration.Project.TaskRegistry;
+-            CollectTasksStats(taskReg, stats);
++            CollectTasksStats(taskReg);
+ 
+-            void CollectTasksStats(TaskRegistry taskRegistry, ProjectBuildStats projectBuildStats)
++            void CollectTasksStats(TaskRegistry taskRegistry)
+             {
+                 if (taskRegistry == null)
+                 {
+@@ -1330,15 +1300,16 @@ void CollectTasksStats(TaskRegistry taskRegistry, ProjectBuildStats projectBuild
+ 
+                 foreach (TaskRegistry.RegisteredTaskRecord registeredTaskRecord in taskRegistry.TaskRegistrations.Values.SelectMany(record => record))
+                 {
+-                    projectBuildStats.AddTask(registeredTaskRecord.TaskIdentity.Name,
++                    collector.AddTask(registeredTaskRecord.TaskIdentity.Name,
+                         registeredTaskRecord.Statistics.ExecutedTime,
+                         registeredTaskRecord.Statistics.ExecutedCount,
+-                        registeredTaskRecord.GetIsCustom());
++                        registeredTaskRecord.GetIsCustom(),
++                        registeredTaskRecord.IsFromNugetCache);
+ 
+                     registeredTaskRecord.Statistics.Reset();
+                 }
+ 
+-                taskRegistry.Toolset?.InspectInternalTaskRegistry(tr => CollectTasksStats(tr, projectBuildStats));
++                taskRegistry.Toolset?.InspectInternalTaskRegistry(CollectTasksStats);
+             }
+         }
+ 
+diff --git a/src/Build/Instance/TaskRegistry.cs b/src/Build/Instance/TaskRegistry.cs
+index 2da3245876a..443d3320b73 100644
+--- a/src/Build/Instance/TaskRegistry.cs
++++ b/src/Build/Instance/TaskRegistry.cs
+@@ -1266,6 +1266,10 @@ public bool GetIsCustom()
+                     && !FileClassifier.Shared.IsBuiltInLogic(_definingFileFullPath);
+             }
+ 
++            public bool IsFromNugetCache
++                => FileClassifier.Shared.IsInNugetCache(_taskFactoryAssemblyLoadInfo.AssemblyFile) ||
++                   FileClassifier.Shared.IsInNugetCache(_definingFileFullPath);
++
+             private static bool IsMicrosoftAssembly(string assemblyName)
+                 => assemblyName.StartsWith("Microsoft.", StringComparison.Ordinal);
+ 
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 2f6a8ee8a5a..4d4bb19627d 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -175,6 +175,7 @@
+     <Compile Include="FileAccess\RequestedAccess.cs" />
+     <Compile Include="Instance\IPropertyElementWithLocation.cs" />
+     <Compile Include="Logging\BuildEventArgsExtensions.cs" />
++    <Compile Include="Telemetry\ITelemetryCollector.cs" />
+     <Compile Include="Utilities\ReaderWriterLockSlimExtensions.cs" />
+     <Compile Include="BackEnd\Node\ConsoleOutput.cs" />
+     <Compile Include="BackEnd\Node\PartialBuildTelemetry.cs" />
+diff --git a/src/Build/Telemetry/ITelemetryCollector.cs b/src/Build/Telemetry/ITelemetryCollector.cs
+new file mode 100644
+index 00000000000..138055151fc
+--- /dev/null
++++ b/src/Build/Telemetry/ITelemetryCollector.cs
+@@ -0,0 +1,133 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Shared;
++using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Framework;
++
++namespace Microsoft.Build.Telemetry;
++
++internal interface ITelemetryCollector
++{
++    bool IsTelemetryCollected { get; }
++
++    void AddTask(string name, TimeSpan cumulativeExectionTime, short executionsCount, bool isCustom,
++        bool isFromNugetCache);
++
++    // wasExecuted - means anytime, not necessarily from the last time target was added to telemetry
++    void AddTarget(string name, bool wasExecuted, bool isCustom, bool isFromNugetCache);
++
++    void FinalizeProcessing(LoggingContext loggingContext);
++}
++
++internal class TelemetryCollectorProvider : IBuildComponent
++{
++    private ITelemetryCollector? _instance;
++
++    public ITelemetryCollector Instance => _instance ?? new NullTelemetryCollector();
++
++    internal static IBuildComponent CreateComponent(BuildComponentType type)
++    {
++        ErrorUtilities.VerifyThrow(type == BuildComponentType.TelemetryCollector, "Cannot create components of type {0}", type);
++        return new TelemetryCollectorProvider();
++    }
++
++    public void InitializeComponent(IBuildComponentHost host)
++    {
++        ErrorUtilities.VerifyThrow(host != null, "BuildComponentHost was null");
++
++        if (_instance == null)
++        {
++            if (host!.BuildParameters.IsTelemetryEnabled)
++            {
++                _instance = new TelemetryCollector();
++            }
++            else
++            {
++                _instance = new NullTelemetryCollector();
++            }
++        }
++    }
++
++    public void ShutdownComponent()
++    {
++        /* Too late here for any communication to the main node or for logging anything. Just cleanup. */
++        _instance = null;
++    }
++
++    public class TelemetryCollector : ITelemetryCollector, IWorkerNodeTelemetryData
++    {
++        private readonly Dictionary<string, TaskExecutionStats> _tasksExecutionData = new();
++        private readonly Dictionary<string, bool> _targetsExecutionData = new();
++
++        // in future, this might ber per event type
++        public bool IsTelemetryCollected => true;
++
++        Dictionary<string, TaskExecutionStats> IWorkerNodeTelemetryData.TasksExecutionData => _tasksExecutionData;
++
++        Dictionary<string, bool> IWorkerNodeTelemetryData.TargetsExecutionData => _targetsExecutionData;
++
++        public void AddTask(string name, TimeSpan cumulativeExectionTime, short executionsCount, bool isCustom, bool isFromNugetCache)
++        {
++            name = GetName(name, isCustom, isFromNugetCache);
++
++            TaskExecutionStats taskExecutionStats;
++            if (!_tasksExecutionData.TryGetValue(name, out taskExecutionStats))
++            {
++                taskExecutionStats = new(cumulativeExectionTime, executionsCount);
++                _tasksExecutionData[name] = taskExecutionStats;
++            }
++            else
++            {
++                taskExecutionStats.CumulativeExecutionTime += cumulativeExectionTime;
++                taskExecutionStats.ExecutionsCount += executionsCount;
++            }
++        }
++
++        public void AddTarget(string name, bool wasExecuted, bool isCustom, bool isFromNugetCache)
++        {
++            name = GetName(name, isCustom, isFromNugetCache);
++            _targetsExecutionData[name] =
++                // we just need to store if it was ever executed
++                wasExecuted || (_targetsExecutionData.TryGetValue(name, out bool wasAlreadyExecuted) && wasAlreadyExecuted);
++        }
++
++        private static string GetName(string name, bool isCustom, bool isFromNugetCache)
++        {
++            if (isCustom)
++            {
++                name = "C:" + name;
++            }
++
++            if (isFromNugetCache)
++            {
++                name = "N:" + name;
++            }
++
++            return name;
++        }
++
++        public void FinalizeProcessing(LoggingContext loggingContext)
++        {
++            WorkerNodeTelemetryEventArgs telemetryArgs = new(this)
++                { BuildEventContext = loggingContext.BuildEventContext };
++            loggingContext.LogBuildEvent(telemetryArgs);
++        }
++    }
++
++    public class NullTelemetryCollector : ITelemetryCollector
++    {
++        public bool IsTelemetryCollected => false;
++
++        public void AddTask(string name, TimeSpan cumulativeExectionTime, short executionsCount, bool isCustom, bool isFromNugetCache) { }
++        public void AddTarget(string name, bool wasExecuted, bool isCustom, bool isFromNugetCache) { }
++
++        public void FinalizeProcessing(LoggingContext loggingContext) { }
++    }
++}
+diff --git a/src/Framework/BuildCheck/BuildCheckEventArgs.cs b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+index 442b519894e..d1d3c682a3f 100644
+--- a/src/Framework/BuildCheck/BuildCheckEventArgs.cs
++++ b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+@@ -46,12 +46,7 @@ internal override void WriteToStream(BinaryWriter writer)
+     {
+         base.WriteToStream(writer);
+ 
+-        writer.Write7BitEncodedInt(TracingData.InfrastructureTracingData.Count);
+-        foreach (KeyValuePair<string, TimeSpan> kvp in TracingData.InfrastructureTracingData)
+-        {
+-            writer.Write(kvp.Key);
+-            writer.Write(kvp.Value.Ticks);
+-        }
++        writer.WriteDurationsDictionary(TracingData.InfrastructureTracingData);
+ 
+         writer.Write7BitEncodedInt(TracingData.TelemetryData.Count);
+         foreach (BuildCheckRuleTelemetryData data in TracingData.TelemetryData.Values)
+@@ -82,17 +77,9 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+     {
+         base.CreateFromStream(reader, version);
+ 
+-        int count = reader.Read7BitEncodedInt();
+-        var infrastructureTracingData = new Dictionary<string, TimeSpan>(count);
+-        for (int i = 0; i < count; i++)
+-        {
+-            string key = reader.ReadString();
+-            TimeSpan value = TimeSpan.FromTicks(reader.ReadInt64());
+-
+-            infrastructureTracingData.Add(key, value);
+-        }
++        var infrastructureTracingData = reader.ReadDurationDictionary();
+ 
+-        count = reader.Read7BitEncodedInt();
++        int count = reader.Read7BitEncodedInt();
+         List<BuildCheckRuleTelemetryData> tracingData = new List<BuildCheckRuleTelemetryData>(count);
+         for (int i = 0; i < count; i++)
+         {
+diff --git a/src/Framework/FileClassifier.cs b/src/Framework/FileClassifier.cs
+index dfd360b726a..bdfffdb5a4f 100644
+--- a/src/Framework/FileClassifier.cs
++++ b/src/Framework/FileClassifier.cs
+@@ -92,6 +92,8 @@ private set
+         /// </summary>
+         private volatile IReadOnlyList<string> _knownBuiltInLogicDirectoriesSnapshot = [];
+ 
++        private string? _nugetCacheLocation;
++
+         /// <summary>
+         ///     Creates default FileClassifier which following immutable folders:
+         ///     Classifications provided are:
+@@ -250,7 +252,8 @@ public void RegisterKnownImmutableLocations(Func<string, string?> getPropertyVal
+             // example: C:\Program Files\dotnet\
+             RegisterImmutableDirectory(getPropertyValue("NetCoreRoot")?.Trim(), false);
+             // example: C:\Users\<username>\.nuget\packages\
+-            RegisterImmutableDirectory(getPropertyValue("NuGetPackageFolders")?.Trim(), true);
++            _nugetCacheLocation = getPropertyValue("NuGetPackageFolders")?.Trim();
++            RegisterImmutableDirectory(_nugetCacheLocation, true);
+ 
+             IsImmutablePathsInitialized = true;
+         }
+@@ -342,6 +345,19 @@ public bool IsBuiltInLogic(string filePath)
+         public bool IsNonModifiable(string filePath)
+             => IsInLocationList(filePath, _knownImmutableDirectoriesSnapshot);
+ 
++        /// <summary>
++        ///    Gets whether a file is assumed to be inside a nuget cache location.
++        /// </summary>
++        public bool IsInNugetCache(string filePath)
++        {
++            string? nugetCache = _nugetCacheLocation;
++            if (string.IsNullOrEmpty(filePath) || string.IsNullOrEmpty(nugetCache))
++            {
++                return false;
++            }
++            return filePath.StartsWith(nugetCache, PathComparison);
++        }
++
+         private static bool IsInLocationList(string filePath, IReadOnlyList<string> locations)
+         {
+             if (string.IsNullOrEmpty(filePath))
+diff --git a/src/Framework/Telemetry/WorkerNodeTelemetryEventArgs.cs b/src/Framework/Telemetry/WorkerNodeTelemetryEventArgs.cs
+new file mode 100644
+index 00000000000..b6f79b6dce2
+--- /dev/null
++++ b/src/Framework/Telemetry/WorkerNodeTelemetryEventArgs.cs
+@@ -0,0 +1,88 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Framework;
++
++
++internal struct TaskExecutionStats(TimeSpan cumulativeExecutionTime, short executionsCount)
++{
++    public TimeSpan CumulativeExecutionTime { get; set; } = cumulativeExecutionTime;
++    public short ExecutionsCount { get; set; } = executionsCount;
++}
++
++internal interface IWorkerNodeTelemetryData
++{
++    Dictionary<string, TaskExecutionStats> TasksExecutionData { get; }
++    Dictionary<string, bool> TargetsExecutionData { get; }
++}
++
++internal class WorkerNodeTelemetryData : IWorkerNodeTelemetryData
++{
++    public WorkerNodeTelemetryData(Dictionary<string, TaskExecutionStats> tasksExecutionData, Dictionary<string, bool> targetsExecutionData)
++    {
++        TasksExecutionData = tasksExecutionData;
++        TargetsExecutionData = targetsExecutionData;
++    }
++
++    public WorkerNodeTelemetryData()
++        : this([], [])
++    { }
++
++    public Dictionary<string, TaskExecutionStats> TasksExecutionData { get; private init; }
++    public Dictionary<string, bool> TargetsExecutionData { get; private init; }
++}
++
++internal sealed class WorkerNodeTelemetryEventArgs(IWorkerNodeTelemetryData workerNodeTelemetryData) : BuildEventArgs
++{
++    public WorkerNodeTelemetryEventArgs()
++        : this(new WorkerNodeTelemetryData())
++    { }
++
++    public IWorkerNodeTelemetryData WorkerNodeTelemetryData { get; private set; } = workerNodeTelemetryData;
++
++    internal override void WriteToStream(BinaryWriter writer)
++    {
++        writer.Write7BitEncodedInt(WorkerNodeTelemetryData.TasksExecutionData.Count);
++        foreach (KeyValuePair<string, TaskExecutionStats> entry in WorkerNodeTelemetryData.TasksExecutionData)
++        {
++            writer.Write(entry.Key);
++            writer.Write(entry.Value.CumulativeExecutionTime.Ticks);
++            writer.Write(entry.Value.ExecutionsCount);
++        }
++
++        writer.Write7BitEncodedInt(WorkerNodeTelemetryData.TargetsExecutionData.Count);
++        foreach (KeyValuePair<string, bool> entry in WorkerNodeTelemetryData.TargetsExecutionData)
++        {
++            writer.Write(entry.Key);
++        }
++    }
++
++    internal override void CreateFromStream(BinaryReader reader, int version)
++    {
++        int count = reader.Read7BitEncodedInt();
++        Dictionary<string, TaskExecutionStats> tasksExecutionData = new();
++        for (int i = 0; i < count; i++)
++        {
++            tasksExecutionData.Add(reader.ReadString(),
++                new TaskExecutionStats(TimeSpan.FromTicks(reader.ReadInt64()), reader.ReadInt16()));
++        }
++
++        count = reader.Read7BitEncodedInt();
++        Dictionary<string, bool> targetsExecutionData = new();
++        for (int i = 0; i < count; i++)
++        {
++            targetsExecutionData.Add(reader.ReadString(), true);
++        }
++
++        WorkerNodeTelemetryData = new WorkerNodeTelemetryData(tasksExecutionData, targetsExecutionData);
++    }
++}
+diff --git a/src/Shared/BinaryReaderExtensions.cs b/src/Shared/BinaryReaderExtensions.cs
+index 7990d261f93..9078401ba2f 100644
+--- a/src/Shared/BinaryReaderExtensions.cs
++++ b/src/Shared/BinaryReaderExtensions.cs
+@@ -125,5 +125,20 @@ public static void ReadExtendedBuildEventData(this BinaryReader reader, IExtende
+                 data.ExtendedMetadata = null;
+             }
+         }
++
++        public static Dictionary<string, TimeSpan> ReadDurationDictionary(this BinaryReader reader)
++        {
++            int count = reader.Read7BitEncodedInt();
++            var durations = new Dictionary<string, TimeSpan>(count);
++            for (int i = 0; i < count; i++)
++            {
++                string key = reader.ReadString();
++                TimeSpan value = TimeSpan.FromTicks(reader.ReadInt64());
++
++                durations.Add(key, value);
++            }
++
++            return durations;
++        }
+     }
+ }
+diff --git a/src/Shared/BinaryWriterExtensions.cs b/src/Shared/BinaryWriterExtensions.cs
+index 5f7a0046a6e..9cb458f4ec7 100644
+--- a/src/Shared/BinaryWriterExtensions.cs
++++ b/src/Shared/BinaryWriterExtensions.cs
+@@ -129,5 +129,15 @@ public static void WriteExtendedBuildEventData(this BinaryWriter writer, IExtend
+                 }
+             }
+         }
++
++        public static void WriteDurationsDictionary(this BinaryWriter writer, Dictionary<string, TimeSpan> durations)
++        {
++            writer.Write7BitEncodedInt(durations.Count);
++            foreach (KeyValuePair<string, TimeSpan> kvp in durations)
++            {
++                writer.Write(kvp.Key);
++                writer.Write(kvp.Value.Ticks);
++            }
++        }
+     }
+ }

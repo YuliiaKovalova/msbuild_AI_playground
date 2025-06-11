@@ -1,0 +1,288 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 551abc15c0b..10dbc54a7ae 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -417,6 +417,8 @@ public void BeginBuild(BuildParameters parameters)
+                 // Initialize additional build parameters.
+                 _buildParameters.BuildId = GetNextBuildId();
+ 
++                // Loading caches from files turns on project isolation constraints.
++                // Undefined behavior for what would happen if file based caches are used without isolation.
+                 if (_buildParameters.UsesCachedResults())
+                 {
+                     _buildParameters.IsolateProjects = true;
+@@ -2491,8 +2493,8 @@ private bool ReuseOldCaches(string[] inputCacheFiles)
+                 // should contain only the results from new builds, and should not contain old results inherited from the cache files.
+                 // The override cache will contain the old build results, and the current cache will contain new results.
+                 // Upon reads, both caches are interrogated (override before current), but writes should only happen in the current cache.
+-                _componentFactories.ReplaceFactory(BuildComponentType.ConfigCache, new ConfigCacheWithOverride(cacheAggregation.ConfigCache));
+-                _componentFactories.ReplaceFactory(BuildComponentType.ResultsCache, new ResultsCacheWithOverride(cacheAggregation.ResultsCache));
++                _componentFactories.ReplaceFactory(BuildComponentType.ConfigCache, new ConfigCacheWithOverride(cacheAggregation.ConfigCache, _buildParameters.IsolateProjects));
++                _componentFactories.ReplaceFactory(BuildComponentType.ResultsCache, new ResultsCacheWithOverride(cacheAggregation.ResultsCache, _buildParameters.IsolateProjects));
+ 
+                 return true;
+             }
+diff --git a/src/Build/BackEnd/Components/Caching/ConfigCache.cs b/src/Build/BackEnd/Components/Caching/ConfigCache.cs
+index b6989894a6b..5031f924f82 100644
+--- a/src/Build/BackEnd/Components/Caching/ConfigCache.cs
++++ b/src/Build/BackEnd/Components/Caching/ConfigCache.cs
+@@ -66,6 +66,24 @@ public BuildRequestConfiguration this[int configId]
+ 
+         #region IConfigCache Members
+ 
++        /// <inheritdoc />
++        public bool TryGetConfiguration(int configId, out BuildRequestConfiguration existingConfig)
++        {
++            lock (_lockObject)
++            {
++                if (HasConfiguration(configId))
++                {
++                    existingConfig = this[configId];
++                    return true;
++                }
++                else
++                {
++                    existingConfig = null;
++                    return false;
++                }
++            }
++        }
++
+         /// <summary>
+         /// Adds the specified configuration to the cache.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/Caching/ConfigCacheWithOverride.cs b/src/Build/BackEnd/Components/Caching/ConfigCacheWithOverride.cs
+index 30f31f25456..f94a757a1c6 100644
+--- a/src/Build/BackEnd/Components/Caching/ConfigCacheWithOverride.cs
++++ b/src/Build/BackEnd/Components/Caching/ConfigCacheWithOverride.cs
+@@ -14,11 +14,13 @@ namespace Microsoft.Build.Execution
+     internal class ConfigCacheWithOverride : IConfigCache
+     {
+         private readonly IConfigCache _override;
++        private readonly bool _isolateProjects;
+         public ConfigCache CurrentCache { get; }
+ 
+-        public ConfigCacheWithOverride(IConfigCache @override)
++        public ConfigCacheWithOverride(IConfigCache @override, bool isolateProjects)
+         {
+             _override = @override;
++            _isolateProjects = isolateProjects;
+             CurrentCache = new ConfigCache();
+         }
+ 
+@@ -53,12 +55,11 @@ public BuildRequestConfiguration this[int configId]
+         {
+             get
+             {
+-                if (_override.HasConfiguration(configId))
++                if (_override.TryGetConfiguration(configId, out var overrideConfig))
+                 {
+-#if DEBUG
+-                    ErrorUtilities.VerifyThrow(!CurrentCache.HasConfiguration(configId), "caches should not overlap");
+-#endif
+-                    return _override[configId];
++                    AssertCurrentCacheDoesNotContainConfig(overrideConfig);
++
++                    return overrideConfig;
+                 }
+                 else
+                 {
+@@ -67,6 +68,18 @@ public BuildRequestConfiguration this[int configId]
+             }
+         }
+ 
++        public bool TryGetConfiguration(int configId, out BuildRequestConfiguration existingConfig)
++        {
++            if (_override.TryGetConfiguration(configId, out existingConfig))
++            {
++                AssertCurrentCacheDoesNotContainConfig(existingConfig);
++
++                return true;
++            }
++
++            return CurrentCache.TryGetConfiguration(configId, out existingConfig);
++        }
++
+         public void AddConfiguration(BuildRequestConfiguration config)
+         {
+             CurrentCache.AddConfiguration(config);
+@@ -83,9 +96,8 @@ public BuildRequestConfiguration GetMatchingConfiguration(BuildRequestConfigurat
+ 
+             if (overrideConfig != null)
+             {
+-#if DEBUG
+-                ErrorUtilities.VerifyThrow(CurrentCache.GetMatchingConfiguration(config) == null, "caches should not overlap");
+-#endif
++                AssertCurrentCacheDoesNotContainConfig(overrideConfig);
++
+                 return overrideConfig;
+             }
+             else
+@@ -100,9 +112,8 @@ public BuildRequestConfiguration GetMatchingConfiguration(ConfigurationMetadata
+ 
+             if (overrideConfig != null)
+             {
+-#if DEBUG
+-                ErrorUtilities.VerifyThrow(CurrentCache.GetMatchingConfiguration(configMetadata) == null, "caches should not overlap");
+-#endif
++                AssertCurrentCacheDoesNotContainConfig(overrideConfig);
++
+                 return overrideConfig;
+             }
+             else
+@@ -118,9 +129,8 @@ public BuildRequestConfiguration GetMatchingConfiguration(ConfigurationMetadata
+ 
+             if (overrideConfig != null)
+             {
+-#if DEBUG
+-                ErrorUtilities.VerifyThrow(CurrentCache.GetMatchingConfiguration(configMetadata) == null, "caches should not overlap");
+-#endif
++                AssertCurrentCacheDoesNotContainConfig(overrideConfig);
++
+                 return overrideConfig;
+             }
+ 
+@@ -129,17 +139,14 @@ public BuildRequestConfiguration GetMatchingConfiguration(ConfigurationMetadata
+ 
+         public bool HasConfiguration(int configId)
+         {
+-            var overrideHasConfiguration = _override.HasConfiguration(configId);
+-
+-            if (overrideHasConfiguration)
++            if (_override.TryGetConfiguration(configId, out var overrideConfig))
+             {
+-#if DEBUG
+-                ErrorUtilities.VerifyThrow(!CurrentCache.HasConfiguration(configId), "caches should not overlap");
+-#endif
++                AssertCurrentCacheDoesNotContainConfig(overrideConfig);
++
+                 return true;
+             }
+ 
+-            return _override.HasConfiguration(configId) || CurrentCache.HasConfiguration(configId);
++            return CurrentCache.HasConfiguration(configId);
+         }
+ 
+         public void ClearConfigurations()
+@@ -161,5 +168,13 @@ public bool WriteConfigurationsToDisk()
+         {
+             return CurrentCache.WriteConfigurationsToDisk();
+         }
++
++        private void AssertCurrentCacheDoesNotContainConfig(BuildRequestConfiguration config)
++        {
++            if (_isolateProjects)
++            {
++                ErrorUtilities.VerifyThrow(!CurrentCache.HasConfiguration(config.ConfigurationId), "caches should not overlap");
++            }
++        }
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/Caching/IConfigCache.cs b/src/Build/BackEnd/Components/Caching/IConfigCache.cs
+index 4a2464d181d..6f876bbc300 100644
+--- a/src/Build/BackEnd/Components/Caching/IConfigCache.cs
++++ b/src/Build/BackEnd/Components/Caching/IConfigCache.cs
+@@ -27,6 +27,14 @@ BuildRequestConfiguration this[int configId]
+             get;
+         }
+ 
++        /// <summary>
++        /// Check existence of entry and return value if present.
++        /// </summary>
++        /// <param name="configId">The configuration id.</param>
++        /// <param name="existingConfig">Corresponding configuration if configId is present. Null otherwise</param>
++        /// <returns>True if the cache contains the configuration. False otherwise. </returns>
++        bool TryGetConfiguration(int configId, out BuildRequestConfiguration existingConfig);
++
+         /// <summary>
+         /// Adds the configuration to the cache.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/Caching/ResultsCacheWithOverride.cs b/src/Build/BackEnd/Components/Caching/ResultsCacheWithOverride.cs
+index a83ea4a0efe..bc08a0b483e 100644
+--- a/src/Build/BackEnd/Components/Caching/ResultsCacheWithOverride.cs
++++ b/src/Build/BackEnd/Components/Caching/ResultsCacheWithOverride.cs
+@@ -1,6 +1,7 @@
+ ﻿// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
++using System;
+ using System.Collections;
+ using System.Collections.Generic;
+ using Microsoft.Build.BackEnd;
+@@ -14,12 +15,14 @@ namespace Microsoft.Build.Execution
+     internal class ResultsCacheWithOverride : IResultsCache
+     {
+         private readonly IResultsCache _override;
++        private readonly bool _isolateProjects;
+         public ResultsCache CurrentCache { get; }
+ 
+ 
+-        public ResultsCacheWithOverride(IResultsCache @override)
++        public ResultsCacheWithOverride(IResultsCache @override, bool isolateProjects)
+         {
+             _override = @override;
++            _isolateProjects = isolateProjects;
+             CurrentCache = new ResultsCache();
+         }
+ 
+@@ -51,11 +54,11 @@ public void ClearResults()
+         public BuildResult GetResultForRequest(BuildRequest request)
+         {
+             var overrideResult = _override.GetResultForRequest(request);
++
+             if (overrideResult != null)
+             {
+-#if DEBUG
+-                ErrorUtilities.VerifyThrow(CurrentCache.GetResultForRequest(request) == null, "caches should not overlap");
+-#endif
++                AssertCachesDoNotOverlap(() => CurrentCache.GetResultForRequest(request) == null);
++
+                 return overrideResult;
+             }
+ 
+@@ -67,9 +70,8 @@ public BuildResult GetResultsForConfiguration(int configurationId)
+             var overrideResult = _override.GetResultsForConfiguration(configurationId);
+             if (overrideResult != null)
+             {
+-#if DEBUG
+-                ErrorUtilities.VerifyThrow(CurrentCache.GetResultsForConfiguration(configurationId) == null, "caches should not overlap");
+-#endif
++                AssertCachesDoNotOverlap(() => CurrentCache.GetResultsForConfiguration(configurationId) == null);
++
+                 return overrideResult;
+             }
+ 
+@@ -90,16 +92,13 @@ public ResultsCacheResponse SatisfyRequest(
+ 
+             if (overrideRequest.Type == ResultsCacheResponseType.Satisfied)
+             {
+-#if DEBUG
+-                ErrorUtilities.VerifyThrow(
+-                    CurrentCache.SatisfyRequest(
++                AssertCachesDoNotOverlap(() => CurrentCache.SatisfyRequest(
+                         request,
+                         configInitialTargets,
+                         configDefaultTargets,
+                         skippedResultsDoNotCauseCacheMiss)
+-                        .Type == ResultsCacheResponseType.NotSatisfied,
+-                    "caches should not overlap");
+-#endif
++                    .Type == ResultsCacheResponseType.NotSatisfied);
++
+                 return overrideRequest;
+             }
+ 
+@@ -131,5 +130,13 @@ IEnumerator IEnumerable.GetEnumerator()
+         {
+             return GetEnumerator();
+         }
++
++        private void AssertCachesDoNotOverlap(Func<bool> condition)
++        {
++            if (_isolateProjects)
++            {
++                ErrorUtilities.VerifyThrow(condition(), "caches should not overlap");
++            }
++        }
+     }
+ }

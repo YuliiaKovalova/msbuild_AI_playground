@@ -1,0 +1,165 @@
+diff --git a/src/Build.UnitTests/BackEnd/RedirectConsoleWriter_Tests.cs b/src/Build.UnitTests/BackEnd/RedirectConsoleWriter_Tests.cs
+new file mode 100644
+index 00000000000..9e58d151b66
+--- /dev/null
++++ b/src/Build.UnitTests/BackEnd/RedirectConsoleWriter_Tests.cs
+@@ -0,0 +1,29 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++//
++
++using System;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.Execution;
++using Xunit;
++
++namespace Microsoft.Build.Engine.UnitTests.BackEnd
++{
++    public class RedirectConsoleWriter_Tests
++    {
++        [Fact]
++        public async Task EmitConsoleMessages()
++        {
++            StringBuilder sb = new StringBuilder();
++            var writer = OutOfProcServerNode.RedirectConsoleWriter.Create(text => sb.Append(text));
++
++            writer.WriteLine("Line 1");
++            await Task.Delay(300);
++            writer.Write("Line 2");
++            writer.Dispose();
++
++            Assert.Equal($"Line 1{Environment.NewLine}Line 2", sb.ToString());
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index 087247ade3e..13b10953b98 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -5,7 +5,6 @@
+ using System.Collections.Generic;
+ using System.Collections.Concurrent;
+ using System.IO;
+-using System.Linq;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Shared;
+@@ -320,53 +319,56 @@ private void HandleServerNodeBuildCommand(ServerNodeBuildCommand command)
+             // configure console output redirection
+             var oldOut = Console.Out;
+             var oldErr = Console.Error;
++            (int exitCode, string exitType) buildResult;
+ 
+-            using var outWriter = new RedirectConsoleWriter(text =>
++            // Dispose must be called before the server sends response packet
++            using (var outWriter = RedirectConsoleWriter.Create(text => SendPacket(new ServerNodeConsoleWrite(text, 1))))
++            using (var errWriter = RedirectConsoleWriter.Create(text => SendPacket(new ServerNodeConsoleWrite(text, 2))))
+             {
+-                SendPacket(new ServerNodeConsoleWrite(text, 1));
+-            });
+-            using var errWriter = new RedirectConsoleWriter(text =>
+-            {
+-                SendPacket(new ServerNodeConsoleWrite(text, 2));
+-            });
+-
+-            Console.SetOut(outWriter);
+-            Console.SetError(errWriter);
+-
+-            var (exitCode, exitType) = _buildFunction(command.CommandLine);
++                Console.SetOut(outWriter);
++                Console.SetError(errWriter);
+ 
+-            Console.SetOut(oldOut);
+-            Console.SetError(oldErr);
++                buildResult = _buildFunction(command.CommandLine);
+ 
++                Console.SetOut(oldOut);
++                Console.SetError(oldErr);
++            }
++          
+             // On Windows, a process holds a handle to the current directory,
+             // so reset it away from a user-requested folder that may get deleted.
+             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);
+ 
+-            var response = new ServerNodeBuildResult(exitCode, exitType);
++            var response = new ServerNodeBuildResult(buildResult.exitCode, buildResult.exitType);
+             SendPacket(response);
+ 
+             _shutdownReason = NodeEngineShutdownReason.BuildCompleteReuse;
+             _shutdownEvent.Set();
+         }
+ 
+-        // TODO: unit tests
+         internal sealed class RedirectConsoleWriter : StringWriter
+         {
+-            private readonly string _newLineString;
+-
+             private readonly Action<string> _writeCallback;
++            private readonly Timer _timer;
++            private readonly TextWriter _syncWriter;
+ 
+-            public RedirectConsoleWriter(Action<string> writeCallback)
++            private RedirectConsoleWriter(Action<string> writeCallback)
+             {
+-                _newLineString = new String(CoreNewLine);
+                 _writeCallback = writeCallback;
++                _syncWriter = Synchronized(this);
++                _timer = new Timer(TimerCallback, null, 0, 200);
+             }
+ 
+-            private void MaybeFlushCaptured(bool force)
++            public static TextWriter Create(Action<string> writeCallback)
+             {
+-                if (force || GetStringBuilder().Length > 200)
++                RedirectConsoleWriter writer = new(writeCallback);
++                return writer._syncWriter;
++            }
++
++            private void TimerCallback(object? state)
++            {
++                if (GetStringBuilder().Length > 0)
+                 {
+-                    Flush();
++                    _syncWriter.Flush();
+                 }
+             }
+ 
+@@ -374,6 +376,7 @@ protected override void Dispose(bool disposing)
+             {
+                 if (disposing)
+                 {
++                    _timer.Dispose();
+                     Flush();
+                 }
+ 
+@@ -389,29 +392,6 @@ public override void Flush()
+ 
+                 base.Flush();
+             }
+-
+-            public override void Write(char value)
+-            {
+-                base.Write(value);
+-                MaybeFlushCaptured(false);
+-            }
+-
+-            public override void Write(char[] buffer, int index, int count)
+-            {
+-                base.Write(buffer, index, count);
+-                MaybeFlushCaptured(buffer.SequenceEqual(CoreNewLine));
+-            }
+-
+-            public override void Write(string? value)
+-            {
+-                if (value is null)
+-                {
+-                    return;
+-                }
+-
+-                base.Write(value);
+-                MaybeFlushCaptured(value.Contains(_newLineString));
+-            }
+         }
+ 
+         /// <summary>

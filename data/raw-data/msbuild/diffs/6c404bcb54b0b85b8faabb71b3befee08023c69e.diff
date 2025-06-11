@@ -1,0 +1,146 @@
+diff --git a/src/Package/MSBuild.VSSetup/files.swr b/src/Package/MSBuild.VSSetup/files.swr
+index 31a40ba1869..171b5df44de 100644
+--- a/src/Package/MSBuild.VSSetup/files.swr
++++ b/src/Package/MSBuild.VSSetup/files.swr
+@@ -40,6 +40,7 @@ folder InstallDir:\MSBuild\Current\Bin
+   file source=$(TaskHostBinPath)MSBuildTaskHost.exe.config
+   file source=$(X86BinPath)System.Buffers.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+   file source=$(X86BinPath)System.Memory.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
++  file source=$(X86BinPath)System.Reflection.Metadata.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+   file source=$(X86BinPath)System.Reflection.MetadataLoadContext.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+   file source=$(X86BinPath)System.Text.Json.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+   file source=$(X86BinPath)Microsoft.Bcl.AsyncInterfaces.dll vs.file.ngenApplications="[installDir]\MSBuild\Current\Bin\MSBuild.exe" vs.file.ngenArchitecture=all vs.file.ngenPriority=1
+@@ -186,6 +187,7 @@ folder InstallDir:\MSBuild\Current\Bin\amd64
+   file source=$(X86BinPath)Microsoft.Build.Utilities.Core.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)System.Buffers.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)System.Memory.dll vs.file.ngenArchitecture=all
++  file source=$(X86BinPath)System.Reflection.Metadata.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)System.Reflection.MetadataLoadContext.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)System.Text.Json.dll vs.file.ngenArchitecture=all
+   file source=$(X86BinPath)Microsoft.Bcl.AsyncInterfaces.dll vs.file.ngenArchitecture=all
+diff --git a/src/Shared/LoadedType.cs b/src/Shared/LoadedType.cs
+index 79d047f3dd7..a929313f47d 100644
+--- a/src/Shared/LoadedType.cs
++++ b/src/Shared/LoadedType.cs
+@@ -41,7 +41,32 @@ internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo, Assembly loade
+             LoadedAssemblyName = loadedAssembly.GetName();
+             Path = loadedAssembly.Location;
+             LoadedAssembly = loadedAssembly;
++
+ #if !NET35
++            // Properties set in this block aren't used by TaskHosts. Properties below are only used on the NodeProvider side to get information about the
++            // properties and reflect over them without needing them to be fully loaded, so it also isn't need for TaskHosts.
++            // MetadataLoadContext-loaded Type objects don't support testing for inherited attributes, so we manually walk the BaseType chain.
++            Type t = type;
++            while (t is not null)
++            {
++                if (CustomAttributeData.GetCustomAttributes(t).Any(attr => attr.AttributeType.Name.Equals(nameof(LoadInSeparateAppDomainAttribute))))
++                {
++                    HasLoadInSeparateAppDomainAttribute = true;
++                }
++
++                if (CustomAttributeData.GetCustomAttributes(t).Any(attr => attr.AttributeType.Name.Equals(nameof(RunInSTAAttribute))))
++                {
++                    HasSTAThreadAttribute = true;
++                }
++
++                if (t.IsMarshalByRef)
++                {
++                    IsMarshalByRef = true;
++                }
++
++                t = t.BaseType;
++            }
++
+             PropertyInfo[] props = type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
+             Properties = new ReflectableTaskPropertyInfo[props.Length];
+             if (loadedViaMetadataLoadContext)
+@@ -51,21 +76,36 @@ internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo, Assembly loade
+ 
+             for (int i = 0; i < props.Length; i++)
+             {
+-                bool outputAttribute = CustomAttributeData.GetCustomAttributes(props[i]).Any(attr => attr.AttributeType.Name.Equals(nameof(OutputAttribute)));
+-                bool requiredAttribute = CustomAttributeData.GetCustomAttributes(props[i]).Any(attr => attr.AttributeType.Name.Equals(nameof(RequiredAttribute)));
+-                bool IsAssignableToITask = false;
++                bool outputAttribute = false;
++                bool requiredAttribute = false;
++                foreach (CustomAttributeData attr in CustomAttributeData.GetCustomAttributes(props[i]))
++                {
++                    if (attr.AttributeType.Name.Equals(nameof(OutputAttribute)))
++                    {
++                        outputAttribute = true;
++                    }
++                    else if (attr.AttributeType.Name.Equals(nameof(RequiredAttribute)))
++                    {
++                        requiredAttribute = true;
++                    }
++                }
++
++                bool isAssignableToITask = false;
+ 
++                // Check whether it's assignable to ITaskItem or ITaskItem[]. Simplify to just checking for ITaskItem.
+                 Type pt = props[i].PropertyType;
+                 if (pt.IsArray)
+                 {
+                     pt = pt.GetElementType();
+                 }
+ 
++                // Microsoft.Build.Framework.ITaskItem is different when loaded normally versus via MetadataLoadContext. This is the only reliable way to see
++                // whether this property derives from ITaskItem.
+                 while (pt is not null)
+                 {
+                     if (pt.FullName.Equals("Microsoft.Build.Framework.ITaskItem"))
+                     {
+-                        IsAssignableToITask = true;
++                        isAssignableToITask = true;
+                         break;
+                     }
+                     else
+@@ -74,33 +114,12 @@ internal LoadedType(Type type, AssemblyLoadInfo assemblyLoadInfo, Assembly loade
+                     }
+                 }
+ 
+-                Properties[i] = new ReflectableTaskPropertyInfo(props[i], outputAttribute, requiredAttribute, IsAssignableToITask);
++                Properties[i] = new ReflectableTaskPropertyInfo(props[i], outputAttribute, requiredAttribute, isAssignableToITask);
+                 if (loadedViaMetadataLoadContext)
+                 {
+                     PropertyAssemblyQualifiedNames[i] = Properties[i].PropertyType.AssemblyQualifiedName;
+                 }
+             }
+-
+-            Type t = type;
+-            while (t is not null)
+-            {
+-                if (CustomAttributeData.GetCustomAttributes(t).Any(attr => attr.AttributeType.Name.Equals(nameof(LoadInSeparateAppDomainAttribute))))
+-                {
+-                    HasLoadInSeparateAppDomainAttribute = true;
+-                }
+-
+-                if (CustomAttributeData.GetCustomAttributes(t).Any(attr => attr.AttributeType.Name.Equals(nameof(RunInSTAAttribute))))
+-                {
+-                    HasSTAThreadAttribute = true;
+-                }
+-
+-                if (t.IsMarshalByRef)
+-                {
+-                    IsMarshalByRef = true;
+-                }
+-
+-                t = t.BaseType;
+-            }
+ #endif
+         }
+ 
+diff --git a/src/Shared/TypeLoader.cs b/src/Shared/TypeLoader.cs
+index f9928871aaa..3d604a01f9a 100644
+--- a/src/Shared/TypeLoader.cs
++++ b/src/Shared/TypeLoader.cs
+@@ -224,7 +224,7 @@ internal LoadedType ReflectionOnlyLoad
+             AssemblyLoadInfo assembly
+         )
+         {
+-            return GetLoadedType(s_cacheOfReflectionOnlyLoadedTypesByFilter, typeName, assembly, false);
++            return GetLoadedType(s_cacheOfReflectionOnlyLoadedTypesByFilter, typeName, assembly, useTaskHost: false);
+         }
+ 
+         /// <summary>

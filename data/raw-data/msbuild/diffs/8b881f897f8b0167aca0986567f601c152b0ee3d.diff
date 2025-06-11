@@ -1,0 +1,399 @@
+diff --git a/src/Build.UnitTests/BackEnd/TaskHostTaskComplete_Tests.cs b/src/Build.UnitTests/BackEnd/TaskHostTaskComplete_Tests.cs
+index 23cf234576d..b6b6025441b 100644
+--- a/src/Build.UnitTests/BackEnd/TaskHostTaskComplete_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TaskHostTaskComplete_Tests.cs
+@@ -32,8 +32,10 @@ public void TestConstructors()
+                 new FileAccessData(
+                     ReportedFileOperation.CreateFile,
+                     RequestedAccess.Read,
+-                    0,
+-                    0,
++                    processId: 123,
++                    id: 1,
++                    correlationId: 0,
++                    error: 0,
+                     DesiredAccess.GENERIC_READ,
+                     FlagsAndAttributes.FILE_ATTRIBUTE_NORMAL,
+                     "foo",
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index b2aae4fb743..3d2088d264c 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1332,6 +1332,7 @@ internal void ExecuteSubmission(BuildSubmission submission, bool allowMainThread
+                             _projectCacheService.InitializePluginsForVsScenario(
+                                 ProjectCacheDescriptors.Values,
+                                 resolvedConfiguration,
++                                submission.BuildRequestData.TargetNames,
+                                 _executionCancellationTokenSource.Token);
+                         }
+ 
+@@ -1953,7 +1954,7 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+ 
+             if (submission.BuildRequestData.GraphBuildOptions.Build)
+             {
+-                _projectCacheService.InitializePluginsForGraph(projectGraph, _executionCancellationTokenSource.Token);
++                _projectCacheService.InitializePluginsForGraph(projectGraph, submission.BuildRequestData.TargetNames, _executionCancellationTokenSource.Token);
+ 
+                 var targetListTask = projectGraph.GetTargetLists(submission.BuildRequestData.TargetNames);
+ 
+diff --git a/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs b/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs
+index a10c7b4eb8b..8bfb43b1ecb 100644
+--- a/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs
++++ b/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs
+@@ -173,6 +173,8 @@ public override void HandleFileAccess(FileAccessData fileAccessData) => _fileAcc
+                     (Experimental.FileAccess.ReportedFileOperation)fileAccessData.Operation,
+                     (Experimental.FileAccess.RequestedAccess)fileAccessData.RequestedAccess,
+                     fileAccessData.ProcessId,
++                    fileAccessData.Id,
++                    fileAccessData.CorrelationId,
+                     fileAccessData.Error,
+                     (Experimental.FileAccess.DesiredAccess)fileAccessData.DesiredAccess,
+                     (Experimental.FileAccess.FlagsAndAttributes)fileAccessData.FlagsAndAttributes,
+diff --git a/src/Build/BackEnd/Components/ProjectCache/CacheContext.cs b/src/Build/BackEnd/Components/ProjectCache/CacheContext.cs
+index 256102d0d86..d7b5ea98cca 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/CacheContext.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/CacheContext.cs
+@@ -1,6 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
+ using System.Collections.Generic;
+ using Microsoft.Build.FileSystem;
+ using Microsoft.Build.Graph;
+@@ -22,12 +23,23 @@ public class CacheContext
+         public IReadOnlyCollection<ProjectGraphEntryPoint>? GraphEntryPoints { get; }
+         public string? MSBuildExePath { get; }
+         public MSBuildFileSystemBase FileSystem { get; }
++        public IReadOnlyCollection<string> RequestedTargets { get; }
+ 
+         public CacheContext(
+             IReadOnlyDictionary<string, string> pluginSettings,
+             MSBuildFileSystemBase fileSystem,
+             ProjectGraph? graph = null,
+             IReadOnlyCollection<ProjectGraphEntryPoint>? graphEntryPoints = null)
++            : this(pluginSettings, fileSystem, requestedTargets: Array.Empty<string>(), graph, graphEntryPoints)
++        {
++        }
++
++        public CacheContext(
++            IReadOnlyDictionary<string, string> pluginSettings,
++            MSBuildFileSystemBase fileSystem,
++            IReadOnlyCollection<string> requestedTargets,
++            ProjectGraph? graph = null,
++            IReadOnlyCollection<ProjectGraphEntryPoint>? graphEntryPoints = null)
+         {
+             ErrorUtilities.VerifyThrow(
+                 (graph != null) ^ (graphEntryPoints != null),
+@@ -38,6 +50,7 @@ public CacheContext(
+             GraphEntryPoints = graphEntryPoints;
+             MSBuildExePath = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
+             FileSystem = fileSystem;
++            RequestedTargets = requestedTargets;
+         }
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+index 4d695e99076..e53d28292d1 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+@@ -95,7 +95,10 @@ public ProjectCacheService(
+         /// <summary>
+         /// Optimization which frontloads plugin initialization since we have an entire graph.
+         /// </summary>
+-        public void InitializePluginsForGraph(ProjectGraph projectGraph, CancellationToken cancellationToken)
++        public void InitializePluginsForGraph(
++            ProjectGraph projectGraph,
++            ICollection<string> requestedTargets,
++            CancellationToken cancellationToken)
+         {
+             EnsureNotDisposed();
+ 
+@@ -111,7 +114,7 @@ public void InitializePluginsForGraph(ProjectGraph projectGraph, CancellationTok
+                             foreach (ProjectCacheDescriptor projectCacheDescriptor in GetProjectCacheDescriptors(node.ProjectInstance))
+                             {
+                                 // Intentionally fire-and-forget to asynchronously initialize the plugin. Any exceptions will bubble up later when querying.
+-                                _ = GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph, buildRequestConfiguration: null, cancellationToken)
++                                _ = GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph, buildRequestConfiguration: null, requestedTargets, cancellationToken)
+                                     .ContinueWith(t => { }, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted);
+                             }
+                         });
+@@ -122,6 +125,7 @@ public void InitializePluginsForGraph(ProjectGraph projectGraph, CancellationTok
+         public void InitializePluginsForVsScenario(
+             IEnumerable<ProjectCacheDescriptor> projectCacheDescriptors,
+             BuildRequestConfiguration buildRequestConfiguration,
++            ICollection<string> requestedTargets,
+             CancellationToken cancellationToken)
+         {
+             EnsureNotDisposed();
+@@ -144,7 +148,7 @@ public void InitializePluginsForVsScenario(
+                         projectCacheDescriptor =>
+                         {
+                             // Intentionally fire-and-forget to asynchronously initialize the plugin. Any exceptions will bubble up later when querying.
+-                            _ = GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph: null, buildRequestConfiguration, cancellationToken)
++                            _ = GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph: null, buildRequestConfiguration, requestedTargets, cancellationToken)
+                                 .ContinueWith(t => { }, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted);
+                         });
+                 },
+@@ -155,12 +159,13 @@ private Task<ProjectCachePlugin> GetProjectCachePluginAsync(
+             ProjectCacheDescriptor projectCacheDescriptor,
+             ProjectGraph? projectGraph,
+             BuildRequestConfiguration? buildRequestConfiguration,
++            ICollection<string> requestedTargets,
+             CancellationToken cancellationToken)
+             => _projectCachePlugins.GetOrAdd(
+                 projectCacheDescriptor,
+                 // The use of Lazy is because ConcurrentDictionary doesn't guarantee the value factory executes only once if there are multiple simultaneous callers,
+                 // so this ensures that CreateAndInitializePluginAsync is only called exactly once.
+-                descriptor => new Lazy<Task<ProjectCachePlugin>>(() => CreateAndInitializePluginAsync(descriptor, projectGraph, buildRequestConfiguration, cancellationToken)))
++                descriptor => new Lazy<Task<ProjectCachePlugin>>(() => CreateAndInitializePluginAsync(descriptor, projectGraph, buildRequestConfiguration, requestedTargets, cancellationToken)))
+                .Value;
+ 
+         private IEnumerable<ProjectCacheDescriptor> GetProjectCacheDescriptors(ProjectInstance projectInstance)
+@@ -189,6 +194,7 @@ private async Task<ProjectCachePlugin> CreateAndInitializePluginAsync(
+             ProjectCacheDescriptor projectCacheDescriptor,
+             ProjectGraph? projectGraph,
+             BuildRequestConfiguration? buildRequestConfiguration,
++            ICollection<string> requestedTargets,
+             CancellationToken cancellationToken)
+         {
+             BuildEventContext buildEventContext = BuildEventContext.Invalid;
+@@ -241,6 +247,9 @@ private async Task<ProjectCachePlugin> CreateAndInitializePluginAsync(
+                 ? GetGraphEntryPoints(buildRequestConfiguration)
+                 : null;
+ 
++            // In practice, the underlying type of the ICollection is a List<string> so attempt to cast first
++            IReadOnlyList<string> requestedTargetsList = requestedTargets as List<string> ?? requestedTargets.ToList();
++
+             _loggingService.LogComment(buildEventContext, MessageImportance.High, "LoadingProjectCachePlugin", pluginTypeName);
+             MSBuildEventSource.Log.ProjectCacheBeginBuildStart(pluginTypeName);
+ 
+@@ -250,6 +259,7 @@ await pluginInstance.BeginBuildAsync(
+                     new CacheContext(
+                         projectCacheDescriptor.PluginSettings,
+                         DefaultMSBuildFileSystem.Instance,
++                        requestedTargetsList,
+                         projectGraph,
+                         graphEntryPoints),
+                     pluginLogger,
+@@ -517,7 +527,8 @@ private async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildReques
+                     continue;
+                 }
+ 
+-                ProjectCachePlugin plugin = await GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph: null, buildRequestConfiguration, cancellationToken);
++                ICollection<string> requestedTargetsList = buildRequestConfiguration.RequestedTargets as ICollection<string> ?? buildRequestConfiguration.RequestedTargets.ToList();
++                ProjectCachePlugin plugin = await GetProjectCachePluginAsync(projectCacheDescriptor, projectGraph: null, buildRequestConfiguration, requestedTargetsList, cancellationToken);
+                 try
+                 {
+                     // Rethrow any initialization exception.
+diff --git a/src/Build/CompatibilitySuppressions.xml b/src/Build/CompatibilitySuppressions.xml
+new file mode 100644
+index 00000000000..eebf61e063c
+--- /dev/null
++++ b/src/Build/CompatibilitySuppressions.xml
+@@ -0,0 +1,33 @@
++﻿<?xml version="1.0" encoding="utf-8"?>
++<!-- https://learn.microsoft.com/en-us/dotnet/fundamentals/package-validation/diagnostic-ids -->
++<Suppressions xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
++  <!-- Changes to the Experimental namespace are considered non-breaking, and this ctor should be used only internally, not by plugin code. -->
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>M:Microsoft.Build.Experimental.FileAccess.FileAccessData.#ctor(Microsoft.Build.Experimental.FileAccess.ReportedFileOperation,Microsoft.Build.Experimental.FileAccess.RequestedAccess,System.UInt32,System.UInt32,Microsoft.Build.Experimental.FileAccess.DesiredAccess,Microsoft.Build.Experimental.FileAccess.FlagsAndAttributes,System.String,System.String,System.Boolean)</Target>
++    <Left>lib/net472/Microsoft.Build.dll</Left>
++    <Right>lib/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>M:Microsoft.Build.Experimental.FileAccess.FileAccessData.#ctor(Microsoft.Build.Experimental.FileAccess.ReportedFileOperation,Microsoft.Build.Experimental.FileAccess.RequestedAccess,System.UInt32,System.UInt32,Microsoft.Build.Experimental.FileAccess.DesiredAccess,Microsoft.Build.Experimental.FileAccess.FlagsAndAttributes,System.String,System.String,System.Boolean)</Target>
++    <Left>lib/net8.0/Microsoft.Build.dll</Left>
++    <Right>lib/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>M:Microsoft.Build.Experimental.FileAccess.FileAccessData.#ctor(Microsoft.Build.Experimental.FileAccess.ReportedFileOperation,Microsoft.Build.Experimental.FileAccess.RequestedAccess,System.UInt32,System.UInt32,Microsoft.Build.Experimental.FileAccess.DesiredAccess,Microsoft.Build.Experimental.FileAccess.FlagsAndAttributes,System.String,System.String,System.Boolean)</Target>
++    <Left>ref/net472/Microsoft.Build.dll</Left>
++    <Right>ref/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>M:Microsoft.Build.Experimental.FileAccess.FileAccessData.#ctor(Microsoft.Build.Experimental.FileAccess.ReportedFileOperation,Microsoft.Build.Experimental.FileAccess.RequestedAccess,System.UInt32,System.UInt32,Microsoft.Build.Experimental.FileAccess.DesiredAccess,Microsoft.Build.Experimental.FileAccess.FlagsAndAttributes,System.String,System.String,System.Boolean)</Target>
++    <Left>ref/net8.0/Microsoft.Build.dll</Left>
++    <Right>ref/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++</Suppressions>
+\ No newline at end of file
+diff --git a/src/Build/FileAccess/FileAccessData.cs b/src/Build/FileAccess/FileAccessData.cs
+index 64cd45a92d4..7d66385def7 100644
+--- a/src/Build/FileAccess/FileAccessData.cs
++++ b/src/Build/FileAccess/FileAccessData.cs
+@@ -2,7 +2,6 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
+-
+ using Microsoft.Build.BackEnd;
+ 
+ namespace Microsoft.Build.Experimental.FileAccess
+@@ -17,6 +16,8 @@ public struct FileAccessData
+         private ReportedFileOperation _operation;
+         private RequestedAccess _requestedAccess;
+         private uint _processId;
++        private uint _id;
++        private uint _correlationId;
+         private uint _error;
+         private DesiredAccess _desiredAccess;
+         private FlagsAndAttributes _flagsAndAttributes;
+@@ -28,6 +29,8 @@ public FileAccessData(
+             ReportedFileOperation operation,
+             RequestedAccess requestedAccess,
+             uint processId,
++            uint id,
++            uint correlationId,
+             uint error,
+             DesiredAccess desiredAccess,
+             FlagsAndAttributes flagsAndAttributes,
+@@ -38,6 +41,8 @@ public FileAccessData(
+             _operation = operation;
+             _requestedAccess = requestedAccess;
+             _processId = processId;
++            _id = id;
++            _correlationId = correlationId;
+             _error = error;
+             _desiredAccess = desiredAccess;
+             _flagsAndAttributes = flagsAndAttributes;
+@@ -56,7 +61,7 @@ public ReportedFileOperation Operation
+         /// <summary>The requested access.</summary>
+         public RequestedAccess RequestedAccess
+         {
+-            get => _requestedAccess;
++            readonly get => _requestedAccess;
+             private set => _requestedAccess = value;
+         }
+ 
+@@ -67,6 +72,22 @@ public uint ProcessId
+             private set => _processId = value;
+         }
+ 
++        /// <summary>Id of file access.</summary>
++        public uint Id
++        {
++            readonly get => _id;
++            private set => _id = value;
++        }
++
++
++        /// <summary>Correlation id of file access.</summary>
++        public uint CorrelationId
++        {
++            readonly get => _correlationId;
++            private set => _correlationId = value;
++        }
++
++
+         /// <summary>The error code of the operation.</summary>
+         public uint Error
+         {
+@@ -114,6 +135,8 @@ void ITranslatable.Translate(ITranslator translator)
+             translator.TranslateEnum(ref _operation, (int)_operation);
+             translator.TranslateEnum(ref _requestedAccess, (int)_requestedAccess);
+             translator.Translate(ref _processId);
++            translator.Translate(ref _id);
++            translator.Translate(ref _correlationId);
+             translator.Translate(ref _error);
+             translator.TranslateEnum(ref _desiredAccess, (int)_desiredAccess);
+             translator.TranslateEnum(ref _flagsAndAttributes, (int)_flagsAndAttributes);
+diff --git a/src/Tasks/ManifestUtil/PathUtil.cs b/src/Tasks/ManifestUtil/PathUtil.cs
+index 1428e5a01f8..de99413b6bc 100644
+--- a/src/Tasks/ManifestUtil/PathUtil.cs
++++ b/src/Tasks/ManifestUtil/PathUtil.cs
+@@ -45,6 +45,24 @@ public static string Format(string path)
+ 
+             string resolvedPath = Resolve(path);
+             Uri u = new Uri(resolvedPath);
++            //
++            // GB18030: Uri class does not correctly encode chars in the PUA range for implicit 
++            // file paths (paths without explicit scheme):
++            // https://github.com/dotnet/runtime/issues/89538
++            // Workaround is to use UriBuilder with the file scheme specified explicitly to 
++            // correctly encode the PUA chars.
++            //
++            if (Uri.UriSchemeFile.Equals(u.Scheme, StringComparison.OrdinalIgnoreCase) &&
++                !IsAsciiString(resolvedPath))
++            {
++                UriBuilder builder = new UriBuilder()
++                {
++                    Scheme = Uri.UriSchemeFile,
++                    Host = string.Empty,
++                    Path = resolvedPath,
++                };
++                u = builder.Uri;
++            }
+             return u.AbsoluteUri;
+         }
+ 
+@@ -209,5 +227,15 @@ public static string Resolve(string path)
+             // if not unc or url then it must be a local disk path...
+             return Path.GetFullPath(path); // make sure it's a full path
+         }
++
++        private static bool IsAsciiString(string str)
++        {
++            foreach (char c in str)
++            {
++                if (c > 127)
++                {  return false; }
++            }
++            return true;
++        }
+     }
+ }
+diff --git a/src/Tasks/Microsoft.Common.CurrentVersion.targets b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+index 1ed602b0251..c3d092cf024 100644
+--- a/src/Tasks/Microsoft.Common.CurrentVersion.targets
++++ b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+@@ -4479,23 +4479,38 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+         either have the .exe/.dll extension or their publish status has been overriden in VS so they will show up in the PublishFiles collection.
+         The PublishProtocol property is available only in .NET>=5 so we will used that to exclude .NET FX 4.X case.
+       -->
+-      <_ClickOnceTransitiveContentItemsTemp Include="@(_TransitiveItemsToCopyToOutputDirectory->'%(TargetPath)')" Condition="'$(PublishProtocol)' == 'ClickOnce'" >
++      <_ClickOnceTransitiveContentItemsTemp Include="@(_TransitiveItemsToCopyToOutputDirectory->WithoutMetadataValue('CopyToPublishDirectory', 'Never')->'%(TargetPath)')" Condition="'$(PublishProtocol)' == 'ClickOnce'" >
+         <SavedIdentity>%(Identity)</SavedIdentity>
+       </_ClickOnceTransitiveContentItemsTemp>
+       <_ClickOnceTransitiveContentItems Include="@(_ClickOnceTransitiveContentItemsTemp->'%(SavedIdentity)')" Condition="'%(Identity)'=='@(PublishFile)' Or '%(Extension)'=='.exe' Or '%(Extension)'=='.dll'" />
+ 
++      <!-- 
++        ClickOnce content items is union of transitive content items and content items from this project.
++        We also exclude content items from this project that have set CopyToPublishDirectory to Never.
++      -->
++      <_ClickOnceContentItems Include="@(ContentWithTargetPath->WithoutMetadataValue('CopyToPublishDirectory', 'Never'))" />
++      <_ClickOnceContentItems Include="@(_ClickOnceTransitiveContentItems)" />
++
+       <!--
+         For .NET>=5, we need to check if we need to publish any copylocal items from None group. For such items to be published, they either
+         have .exe/.dll extension or their publish status has been overriden in VS so they will show up in the PublishFiles collection.
+         The PublishProtocol property is available only in .NET>=5 so we will used that to exclude .NET FX 4.X case.
+       -->
+       <!-- Include items from None group for publishing -->
+-      <_ClickOnceNoneItemsTemp Include="@(_NoneWithTargetPath->'%(TargetPath)')" Condition="'$(PublishProtocol)'=='Clickonce' And ('%(_NoneWithTargetPath.CopyToOutputDirectory)'=='Always' or '%(_NoneWithTargetPath.CopyToOutputDirectory)'=='PreserveNewest')">
++      <_ClickOnceNoneItemsTemp Include="@(_NoneWithTargetPath->WithoutMetadataValue('CopyToPublishDirectory', 'Never')->'%(TargetPath)')" Condition="'$(PublishProtocol)'=='Clickonce' And ('%(_NoneWithTargetPath.CopyToOutputDirectory)'=='Always' or '%(_NoneWithTargetPath.CopyToOutputDirectory)'=='PreserveNewest')">
+         <SavedIdentity>%(Identity)</SavedIdentity>
+       </_ClickOnceNoneItemsTemp>
+       <_ClickOnceNoneItems Include="@(_ClickOnceNoneItemsTemp->'%(SavedIdentity)')" Condition="'%(Identity)'=='@(PublishFile)' Or '%(Extension)'=='.exe' Or '%(Extension)'=='.dll'" />
+ 
+-      <_ClickOnceFiles Include="@(ContentWithTargetPath);@(_DeploymentManifestIconFile);@(AppConfigWithTargetPath);@(NetCoreRuntimeJsonFilesForClickOnce);@(_ClickOnceRuntimeCopyLocalItems);@(_ClickOnceNoneItems);@(_ClickOnceTransitiveContentItems)"/>
++      <_ClickOnceFiles Include="@(_ClickOnceContentItems);@(_DeploymentManifestIconFile);@(AppConfigWithTargetPath);@(NetCoreRuntimeJsonFilesForClickOnce);@(_ClickOnceRuntimeCopyLocalItems);@(_ClickOnceNoneItems)" />
++
++      <!-- clear temporary item groups to free memory -->
++      <_ClickOnceNoneItemsTemp Remove="@(_ClickOnceNoneItemsTemp)"/>
++      <_ClickOnceNoneItems Remove="@(_ClickOnceNoneItems)"/>
++      <_ClickOnceTransitiveContentItemsTemp Remove="@(_ClickOnceTransitiveContentItemsTemp)"/>
++      <_ClickOnceTransitiveContentItems Remove="@(_ClickOnceTransitiveContentItems)"/>
++      <_ClickOnceContentItems Remove="@(_ClickOnceContentItems)"/>
++      <_ClickOnceRuntimeCopyLocalItems Remove="@(_ClickOnceRuntimeCopyLocalItems)"/>
+     </ItemGroup>
+ 
+     <!-- For single file publish, we need to include the SF bundle EXE, application icon file and files excluded from the bundle EXE in the clickonce manifest -->

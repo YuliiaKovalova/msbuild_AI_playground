@@ -1,0 +1,97 @@
+{
+  "number": 460,
+  "title": "Memory leaks when unloading Projects",
+  "body": "There is an ancient thread about this at http://social.msdn.microsoft.com/Forums/vstudio/en-US/36381eaf-4118-4f10-9101-69021619d3ba/memory-leak-in-solutionloadstandaloneproject. As far as I know this hasn't been fixed.\n\nAccording to another internal report from long ago,\n\n> You can confirm this by creating a simple project that just loads and disposes projects; it will eat up all of your memory.\n\nThis seems likely to be related to memory-usage complaints from another internal team that has a similar load-a-bunch-of-projects workflow.\n",
+  "state": "CLOSED",
+  "createdAt": "2016-02-02T21:55:32Z",
+  "updatedAt": "2024-02-21T17:29:10Z",
+  "closedAt": "2022-08-08T12:32:56Z",
+  "author": {
+    "login": "rainersigwald"
+  },
+  "labels": [
+    "help wanted",
+    "Area: Performance",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "@heXelium did some good analysis on this issue in #474, which presents a couple of options.\n",
+        "createdAt": "2016-06-21T23:10:28Z",
+        "updatedAt": "2016-06-21T23:10:28Z",
+        "author": {
+          "login": "Sarabeth-Jaffe-Microsoft"
+        }
+      },
+      {
+        "body": "I'd love to make a PR to fix this issue but seeing as how #474 was closed because there was no clear direction on the fix I'm a bit hesitant to. There's several ways I can think of to fix it:\r\n1) Use `String.Intern()` instead of `ProjectStringCache` -- the projects aren't getting unloaded properly anyway, so the reference counting going on doesn't happen.\r\n2) Don't try and pool the strings at all. They should already be getting pooled in an `XmlNameTable` already, so pooling them again seems like a waste.\r\n3) Override the equality/hashcode members on `XmlDocumentWithLocation` so that the reference cache works properly.\r\n4) Use a different key for `ProjectStringCache._documents (the document location, the hashcode of the object, something...)\r\n5) Use something like a `WeakReference<>` as the key and a custom key comparer for the dictionary so that the XmlDocument isn't prevented from being GC'd.\r\n\r\nThis bug in combination with the `GC.Collect` inside the loop in `BuildRequestEngine.CheckMemoryUsage` can lead to really horrible performance. A key example would be switching a branch in git and clicking \"Reload All Projects\" in Visual Studio -- the memory pressure goes up due to the projects not getting unloaded and then you start getting huge > 90 second pauses in Visual Studio because it is trying to make room for more memory (glad to see that https://github.com/Microsoft/msbuild/pull/1351 made it into the VS15-rtw branch)",
+        "createdAt": "2017-02-21T23:39:28Z",
+        "updatedAt": "2017-02-21T23:39:28Z",
+        "author": {
+          "login": "OniBait"
+        }
+      },
+      {
+        "body": "I've hit this issue when dealing with Roslyn's `MSBuildWorkspace` (repeatedly creating workspaces in the same process) and here's how I'm currently dealing with it:\r\n\r\n```csharp\r\nif (typeof(Microsoft.Build.Construction.ElementLocation).Assembly.GetType(\"Microsoft.Build.Construction.ProjectStringCache\") is { } stringCacheType)\r\n{\r\n\tif (stringCacheType.GetField(\"_documents\", BindingFlags.Instance | BindingFlags.NonPublic) is { } documentsField)\r\n\t{\r\n\t\tif (typeof(Microsoft.Build.Construction.ElementLocation).Assembly.GetType(\"Microsoft.Build.Construction.XmlDocumentWithLocation\") is { } xmlDocumentWithLocationType)\r\n\t\t{\r\n\t\t\tif (xmlDocumentWithLocationType.GetField(\"s_globalStringCache\", BindingFlags.Static | BindingFlags.NonPublic)?.GetValue(null) is { } globalStringCache)\r\n\t\t\t{\r\n\t\t\t\tif (documentsField.GetValue(globalStringCache) is { } documents)\r\n\t\t\t\t{\r\n\t\t\t\t\tif (documents.GetType().GetMethod(\"Clear\") is { } clearMethod)\r\n\t\t\t\t\t{\r\n\t\t\t\t\t\tclearMethod.Invoke(documents, null);\r\n\t\t\t\t\t}\r\n\t\t\t\t}\r\n\t\t\t}\r\n\t\t}\r\n\t}\r\n}\r\n```\r\n\r\nThis is extremely ugly, to say the least, but it at least keeps the memory consumption to acceptable levels.",
+        "createdAt": "2022-05-04T03:04:23Z",
+        "updatedAt": "2022-05-04T03:04:23Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "I am assigning this to myself, as this seems to be related to memory leak I have fixed for MSBuild server. \r\nThere is slight chance it has been fixed by this. I will try to repro it after we merge MSBuild server.",
+        "createdAt": "2022-06-27T11:23:13Z",
+        "updatedAt": "2022-06-27T11:23:13Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "The problem is indeed in `s_globalStringCache`. It caches strings of XML documents but the key is the XMLDocument object, so each time same XML file is parsed new dictionary pair `<XmlDocument, HashSet<StringCacheEntry>` is created and filled with all used `StringCacheEntry`(s). It effectively root all XmlDocuments, as keys, which includes lots of memory and is causing significant memory leak.\r\n\r\nThis is tightly coupled with `ProjectRootElementCache` which maintains `s_globalStringCache` when projects load or reload.\r\n\r\nUnfortunately neither `ProjectCollection` nor `ProjectRootElementCache` is automatically cleared as it is expected that persistent process like VS will maintain lifetime of Projects and its caches itself.\r\n\r\nAll above is very complex and entangled and I believe this should be replaced by our StringTools interning and carefully measured and analyzed.\r\n\r\nRecently I have created new `ProjectCollections` constructor https://github.com/dotnet/msbuild/blob/827c1bf9c4f400f3aea448bbe7048ab12af0089a/src/Build/Definition/ProjectCollection.cs#L303\r\nwith argument `reuseProjectRootElementCache`. \r\nWhen `true` if will use reuse static instance of `ProjectRootElementCache` and thus can eliminates this memory leak providing it creates `Project` the way which leverages `ProjectRootElementCache`.\r\nHowever, because shared `ProjectRootElementCache` is supposed to have longer lifetime than builds it has to autoreload project XMLs which has small performance price of testing XMLs timestamps.\r\n\r\n@jeromelaban is this constructor something you can use in Roslyn?\r\n\r\n",
+        "createdAt": "2022-07-28T15:35:41Z",
+        "updatedAt": "2022-07-28T15:35:41Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "@rokonec should the GlobalProjectCollection use this constructor? I'm unsure of the guidance for using that collection. ",
+        "createdAt": "2022-07-28T16:04:07Z",
+        "updatedAt": "2022-07-28T16:04:14Z",
+        "author": {
+          "login": "baronfel"
+        }
+      },
+      {
+        "body": "@baronfel I though about it, but then realized there is no need for it. My hypothesis is that people mostly use either either `GlobalProjectCollection` or new `ProjectColletion()` approach. If they use `GlobalProjectCollection` it servers as singleton and uses  dedicated `ProjectRootElementCache` effectively making `ProjectRootElementCache` also singleton.",
+        "createdAt": "2022-07-28T16:13:01Z",
+        "updatedAt": "2022-07-28T16:13:01Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "> @jeromelaban is this constructor something you can use in Roslyn?\r\n\r\nI don't think I'll be able to use this specific constructor yet as, it would require to bump msbuild to a very recent version that would make some older SDKs fail because of backward compatibility constraints.\r\n\r\nThe poke through hacks I put in place to clear the caches make my scenario viable for now.\r\n\r\nThanks for looking into it!\r\n",
+        "createdAt": "2022-08-03T19:39:58Z",
+        "updatedAt": "2022-08-03T19:39:58Z",
+        "author": {
+          "login": "jeromelaban"
+        }
+      },
+      {
+        "body": "We closed this issue and created new ticket with changes described by @rokonec. Feel free to reopen it.",
+        "createdAt": "2022-08-08T12:35:57Z",
+        "updatedAt": "2022-08-08T12:35:57Z",
+        "author": {
+          "login": "MichalPavlik"
+        }
+      }
+    ]
+  }
+}

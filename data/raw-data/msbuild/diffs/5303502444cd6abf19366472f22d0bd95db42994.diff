@@ -1,0 +1,207 @@
+diff --git a/src/Build.UnitTests/BackEnd/MockLoggingService.cs b/src/Build.UnitTests/BackEnd/MockLoggingService.cs
+index ac9b733f8d2..2d4ed73b93d 100644
+--- a/src/Build.UnitTests/BackEnd/MockLoggingService.cs
++++ b/src/Build.UnitTests/BackEnd/MockLoggingService.cs
+@@ -223,6 +223,11 @@ public bool IncludeTaskInputs
+             set { }
+         }
+ 
++        public MessageImportance MinimumRequiredMessageImportance
++        {
++            get => MessageImportance.Low;
++        }
++
+         public void AddWarningsAsMessages(BuildEventContext buildEventContext, ISet<string> codes)
+         {
+             throw new NotImplementedException();
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 42c230c97cb..61adb110cf1 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -3113,7 +3113,7 @@ private void CancelAndMarkAsFailure()
+         /// <summary>
+         /// The logger registered to the logging service when no other one is.
+         /// </summary>
+-        private class NullLogger : ILogger
++        internal class NullLogger : ILogger
+         {
+             #region ILogger Members
+ 
+diff --git a/src/Build/BackEnd/Components/Logging/ILoggingService.cs b/src/Build/BackEnd/Components/Logging/ILoggingService.cs
+index 86d4e070d33..096fb99283f 100644
+--- a/src/Build/BackEnd/Components/Logging/ILoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/ILoggingService.cs
+@@ -207,6 +207,15 @@ bool IncludeTaskInputs
+             set;
+         }
+ 
++        /// <summary>
++        /// Returns the minimum logging importance that must be logged because there is a possibility that
++        /// at least one registered logger consumes it.
++        /// </summary>
++        MessageImportance MinimumRequiredMessageImportance
++        {
++            get;
++        }
++
+         #endregion
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index eb11739f920..982cf729a50 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -222,6 +222,12 @@ internal partial class LoggingService : ILoggingService, INodePacketHandler, IBu
+         /// </summary>
+         private IDictionary<int, ISet<string>> _warningsAsMessagesByProject;
+ 
++        /// <summary>
++        /// The minimum message importance that must be logged because there is a possibility that a logger consumes it.
++        /// Null means that the optimization is disabled or no relevant logger has been registered.
++        /// </summary>
++        private MessageImportance? _minimumRequiredMessageImportance;
++
+         #region LoggingThread Data
+ 
+         /// <summary>
+@@ -702,6 +708,19 @@ public ICollection<string> RegisteredSinkNames
+             }
+         }
+ 
++        /// <summary>
++        /// Returns the minimum logging importance that must be logged because there is a possibility that
++        /// at least one registered logger consumes it.
++        /// </summary>
++        public MessageImportance MinimumRequiredMessageImportance
++        {
++            get
++            {
++                // If we haven't set the field return the default of "all messages must be logged".
++                return _minimumRequiredMessageImportance ?? MessageImportance.Low;
++            }
++        }
++
+         #endregion
+ 
+         #region Members
+@@ -1120,7 +1139,7 @@ public void LogBuildEvent(BuildEventArgs buildEvent)
+         #endregion
+ 
+         /// <summary>
+-        /// This method will becalled from multiple threads in asynchronous mode.
++        /// This method will be called from multiple threads in asynchronous mode.
+         ///
+         /// Determine where to send the buildevent either to the filters or to a specific sink.
+         /// When in Asynchronous mode the event should to into the logging queue (as long as we are initialized).
+@@ -1553,10 +1572,71 @@ private void InitializeLogger(ILogger logger, IEventSource sourceForLogger)
+                 InternalLoggerException.Throw(e, null, "FatalErrorWhileInitializingLogger", true, logger.GetType().Name);
+             }
+ 
++            // Update the minimum guaranteed message importance based on the newly added logger.
++            UpdateMinimumMessageImportance(logger);
++
+             // Keep track of the loggers so they can be unregistered later on
+             _loggers.Add(logger);
+         }
+ 
++        /// <summary>
++        /// Updates <see cref="_minimumRequiredMessageImportance"/> based on the given <paramref name="logger"/>.
++        /// </summary>
++        /// <param name="logger">The newly registered logger.</param>
++        /// <remarks>
++        /// This method contains knowledge about several logger classes used by MSBuild. The goal is to optimize common scenarios,
++        /// such as building on the command line with normal or minimum verbosity. If the user registers an external custom logger,
++        /// we will fall back to "minimum importance" == Low because we don't know how the logger processes messages, therefore we
++        /// must feed it everything.
++        /// </remarks>
++        private void UpdateMinimumMessageImportance(ILogger logger)
++        {
++            var innerLogger = (logger is Evaluation.ProjectCollection.ReusableLogger reusableLogger) ? reusableLogger.OriginalLogger : logger;
++
++            MessageImportance minimumImportance;
++            if (innerLogger is Build.Logging.ConsoleLogger consoleLogger)
++            {
++                minimumImportance = consoleLogger.GetMinimumMessageImportance();
++            }
++            else if (innerLogger is Build.Logging.ConfigurableForwardingLogger forwardingLogger)
++            {
++                minimumImportance = forwardingLogger.GetMinimumMessageImportance();
++            }
++            else if (innerLogger is CentralForwardingLogger)
++            {
++                // Central forwarding loggers are used in worker nodes if logging verbosity could not be optimized, i.e. in cases
++                // where we must log everything. They can be ignored in inproc nodes.
++                if (_nodeId > 1)
++                {
++                    minimumImportance = MessageImportance.Low;
++                }
++                else
++                {
++                    return;
++                }
++            }
++            else if (innerLogger is Execution.BuildManager.NullLogger)
++            {
++                // The null logger has no effect on minimum verbosity.
++                return;
++            }
++            else
++            {
++                // If the logger is not on our whitelist, there are no importance guarantees. Fall back to "any importance".
++                minimumImportance = MessageImportance.Low;
++            }
++
++            if (_minimumRequiredMessageImportance == null)
++            {
++                _minimumRequiredMessageImportance = minimumImportance;
++            }
++            else
++            {
++                int newMinImportance = Math.Max((int)_minimumRequiredMessageImportance, (int)minimumImportance);
++                _minimumRequiredMessageImportance = (MessageImportance)newMinImportance;
++            }
++        }
++
+         /// <summary>
+         /// When an exception is raised in the logging thread, we do not want the application to terminate right away.
+         /// Whidbey and orcas msbuild have the logger exceptions occurring on the engine thread so that the host can
+@@ -1609,8 +1689,7 @@ private void TryRaiseProjectFinishedEvent(BuildEventArgs args)
+         /// </summary>
+         private string GetAndVerifyProjectFileFromContext(BuildEventContext context)
+         {
+-            string projectFile;
+-            _projectFileMap.TryGetValue(context.ProjectContextId, out projectFile);
++            _projectFileMap.TryGetValue(context.ProjectContextId, out string projectFile);
+ 
+             // PERF: Not using VerifyThrow to avoid boxing an int in the non-error case.
+             if (projectFile == null)
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index 64e76436c3c..8f588e113d5 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -876,7 +876,8 @@ internal void ReleaseAllCores()
+         /// <summary>
+         /// Returns the minimum message importance not guaranteed to be ignored by registered loggers.
+         /// </summary>
+-        MessageImportance IBuildEngineInternal.MinimumRequiredMessageImportance => MessageImportance.Low;
++        MessageImportance IBuildEngineInternal.MinimumRequiredMessageImportance =>
++            _taskLoggingContext?.LoggingService.MinimumRequiredMessageImportance ?? MessageImportance.Low;
+ 
+         #endregion
+ 
+diff --git a/src/Build/Definition/ProjectCollection.cs b/src/Build/Definition/ProjectCollection.cs
+index 07519d583ba..8629bd94317 100644
+--- a/src/Build/Definition/ProjectCollection.cs
++++ b/src/Build/Definition/ProjectCollection.cs
+@@ -1801,6 +1801,11 @@ internal class ReusableLogger : INodeLogger, IEventSource4
+             /// </summary>
+             private readonly ILogger _originalLogger;
+ 
++            /// <summary>
++            /// Returns the logger we are wrapping.
++            /// </summary>
++            internal ILogger OriginalLogger => _originalLogger;
++
+             /// <summary>
+             /// The design-time event source
+             /// </summary>

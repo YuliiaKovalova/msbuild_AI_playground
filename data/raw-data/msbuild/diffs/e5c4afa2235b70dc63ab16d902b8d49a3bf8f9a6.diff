@@ -1,0 +1,292 @@
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 9f4a4cdb9e2..a7045fe956d 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -169,70 +169,86 @@ public MSBuildClientExitResult Execute(CancellationToken cancellationToken)
+                 string.Join(" ", _commandLine);
+ #endif
+ 
+-            CommunicationsUtilities.Trace("Executing build with command line '{0}'", descriptiveCommandLine);
++            CommunicationsUtilities.Trace("Trying execute build at server with command line '{0}'", descriptiveCommandLine);
+ 
+             try
+             {
+-                bool serverIsAlreadyRunning = ServerIsRunning();
+-                if (KnownTelemetry.PartialBuildTelemetry != null)
++                ConfigureAndQueryConsoleProperties();
++
++                if (_consoleConfiguration?.OutputIsScreen == false && Environment.GetEnvironmentVariable(Traits.UseMSBuildServerInNonInteractiveEnvVarName) != "1")
+                 {
+-                    KnownTelemetry.PartialBuildTelemetry.InitialServerState = serverIsAlreadyRunning ? "hot" : "cold";
++                    CommunicationsUtilities.Trace("Non interactive mode detected, falling back to non-server behavior.");
++                    _exitResult.MSBuildClientExitType = MSBuildClientExitType.NonInteractive;
++                    return _exitResult;
+                 }
+-                if (!serverIsAlreadyRunning)
++
++                try
+                 {
+-                    CommunicationsUtilities.Trace("Server was not running. Starting server now.");
+-                    if (!TryLaunchServer())
++                    bool serverIsAlreadyRunning = ServerIsRunning();
++                    if (KnownTelemetry.PartialBuildTelemetry != null)
++                    {
++                        KnownTelemetry.PartialBuildTelemetry.InitialServerState = serverIsAlreadyRunning ? "hot" : "cold";
++                    }
++
++                    if (!serverIsAlreadyRunning)
++                    {
++                        CommunicationsUtilities.Trace("Server was not running. Starting server now.");
++                        if (!TryLaunchServer())
++                        {
++                            _exitResult.MSBuildClientExitType = (_exitResult.MSBuildClientExitType == MSBuildClientExitType.Success)
++                                ? MSBuildClientExitType.LaunchError
++                                : _exitResult.MSBuildClientExitType;
++                            return _exitResult;
++                        }
++                    }
++
++                    // Check that server is not busy.
++                    bool serverWasBusy = ServerWasBusy();
++                    if (serverWasBusy)
+                     {
+-                        _exitResult.MSBuildClientExitType = (_exitResult.MSBuildClientExitType == MSBuildClientExitType.Success) ? MSBuildClientExitType.LaunchError : _exitResult.MSBuildClientExitType;
++                        CommunicationsUtilities.Trace("Server is busy, falling back to non-server behavior.");
++                        _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
+                         return _exitResult;
+                     }
+-                }
+ 
+-                // Check that server is not busy.
+-                bool serverWasBusy = ServerWasBusy();
+-                if (serverWasBusy)
+-                {
+-                    CommunicationsUtilities.Trace("Server is busy, falling back to former behavior.");
+-                    _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
+-                    return _exitResult;
++                    // Connect to server.
++                    if (!TryConnectToServer(serverIsAlreadyRunning ? 1_000 : 20_000))
++                    {
++                        return _exitResult;
++                    }
+                 }
+-
+-                // Connect to server.
+-                if (!TryConnectToServer(serverIsAlreadyRunning ? 1_000 : 20_000))
++                catch (IOException ex) when (ex is not PathTooLongException)
+                 {
++                    // For unknown root cause, Mutex.TryOpenExisting can sometimes throw 'Connection timed out' exception preventing to obtain the build server state through it (Running or not, Busy or not).
++                    // See: https://github.com/dotnet/msbuild/issues/7993
++                    CommunicationsUtilities.Trace("Failed to obtain the current build server state: {0}", ex);
++                    CommunicationsUtilities.Trace("HResult: {0}.", ex.HResult);
++                    _exitResult.MSBuildClientExitType = MSBuildClientExitType.UnknownServerState;
+                     return _exitResult;
+                 }
+-            }
+-            catch (IOException ex) when (ex is not PathTooLongException)
+-            {
+-                // For unknown root cause, Mutex.TryOpenExisting can sometimes throw 'Connection timed out' exception preventing to obtain the build server state through it (Running or not, Busy or not).
+-                // See: https://github.com/dotnet/msbuild/issues/7993
+-                CommunicationsUtilities.Trace("Failed to obtain the current build server state: {0}", ex);
+-                CommunicationsUtilities.Trace("HResult: {0}.", ex.HResult);
+-                _exitResult.MSBuildClientExitType = MSBuildClientExitType.UnknownServerState;
+-                return _exitResult;
+-            }
+ 
+-            ConfigureAndQueryConsoleProperties();
+-
+-            // Send build command.
+-            // Let's send it outside the packet pump so that we easier and quicker deal with possible issues with connection to server.
+-            MSBuildEventSource.Log.MSBuildServerBuildStart(descriptiveCommandLine);
+-            if (TrySendBuildCommand())
+-            {
+-                _numConsoleWritePackets = 0;
+-                _sizeOfConsoleWritePackets = 0;
++                // Send build command.
++                // Let's send it outside the packet pump so that we easier and quicker deal with possible issues with connection to server.
++                MSBuildEventSource.Log.MSBuildServerBuildStart(descriptiveCommandLine);
++                if (TrySendBuildCommand())
++                {
++                    _numConsoleWritePackets = 0;
++                    _sizeOfConsoleWritePackets = 0;
+ 
+-                ReadPacketsLoop(cancellationToken);
++                    ReadPacketsLoop(cancellationToken);
+ 
+-                MSBuildEventSource.Log.MSBuildServerBuildStop(descriptiveCommandLine, _numConsoleWritePackets, _sizeOfConsoleWritePackets, _exitResult.MSBuildClientExitType.ToString(), _exitResult.MSBuildAppExitTypeString);
+-                CommunicationsUtilities.Trace("Build finished.");
++                    MSBuildEventSource.Log.MSBuildServerBuildStop(descriptiveCommandLine, _numConsoleWritePackets, _sizeOfConsoleWritePackets,
++                        _exitResult.MSBuildClientExitType.ToString(), _exitResult.MSBuildAppExitTypeString);
++                    CommunicationsUtilities.Trace("Build finished.");
++                }
+             }
+-
+-            if (NativeMethodsShared.IsWindows && _originalConsoleMode is not null)
++            finally
+             {
+-                IntPtr stdOut = NativeMethodsShared.GetStdHandle(NativeMethodsShared.STD_OUTPUT_HANDLE);
+-                NativeMethodsShared.SetConsoleMode(stdOut, _originalConsoleMode.Value);
++                if (NativeMethodsShared.IsWindows && _originalConsoleMode is not null)
++                {
++                    IntPtr stdOut = NativeMethodsShared.GetStdHandle(NativeMethodsShared.STD_OUTPUT_HANDLE);
++                    NativeMethodsShared.SetConsoleMode(stdOut, _originalConsoleMode.Value);
++                }
+             }
+ 
+             return _exitResult;
+diff --git a/src/Build/BackEnd/Client/MSBuildClientExitType.cs b/src/Build/BackEnd/Client/MSBuildClientExitType.cs
+index 84e999c433c..67256fc26d5 100644
+--- a/src/Build/BackEnd/Client/MSBuildClientExitType.cs
++++ b/src/Build/BackEnd/Client/MSBuildClientExitType.cs
+@@ -33,6 +33,11 @@ public enum MSBuildClientExitType
+         /// This may happen when mutex that is regulating the server state throws.
+         /// See: https://github.com/dotnet/msbuild/issues/7993.
+         /// </remarks>
+-        UnknownServerState
++        UnknownServerState,
++        /// <summary>
++        /// MSBuild usually has not advantages while used in non-interactive (output redirected) mode.
++        /// This would invoke a fallback behavior.
++        /// </summary>
++        NonInteractive
+     }
+ }
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index 7a4db37105c..044942a50d7 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -128,6 +128,10 @@ public Traits()
+         /// Name of environment variables used to enable MSBuild server.
+         /// </summary>
+         public const string UseMSBuildServerEnvVarName = "MSBUILDUSESERVER";
++        /// <summary>
++        /// Name of environment variables used to use MSBuild server even if non interactive mode has been detected.
++        /// </summary>
++        public const string UseMSBuildServerInNonInteractiveEnvVarName = "MSBUILDUSESERVERINNONINTERACTIVE";
+ 
+         public readonly bool DebugEngine = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBuildDebugEngine"));
+         public readonly bool DebugScheduler;
+diff --git a/src/MSBuild.UnitTests/MSBuildServer_Tests.cs b/src/MSBuild.UnitTests/MSBuildServer_Tests.cs
+index a7ea9759b10..672627d7a58 100644
+--- a/src/MSBuild.UnitTests/MSBuildServer_Tests.cs
++++ b/src/MSBuild.UnitTests/MSBuildServer_Tests.cs
+@@ -26,37 +26,6 @@
+ 
+ namespace Microsoft.Build.Engine.UnitTests
+ {
+-    public class SleepingTask : Microsoft.Build.Utilities.Task
+-    {
+-        public int SleepTime { get; set; }
+-
+-        /// <summary>
+-        /// Sleep for SleepTime milliseconds.
+-        /// </summary>
+-        /// <returns>Success on success.</returns>
+-        public override bool Execute()
+-        {
+-            Thread.Sleep(SleepTime);
+-            return !Log.HasLoggedErrors;
+-        }
+-    }
+-
+-    public class ProcessIdTask : Microsoft.Build.Utilities.Task
+-    {
+-        [Output]
+-        public int Pid { get; set; }
+-
+-        /// <summary>
+-        /// Log the id for this process.
+-        /// </summary>
+-        /// <returns></returns>
+-        public override bool Execute()
+-        {
+-            Pid = Process.GetCurrentProcess().Id;
+-            return true;
+-        }
+-    }
+-
+     public class MSBuildServer_Tests : IDisposable
+     {
+         private readonly ITestOutputHelper _output;
+@@ -83,6 +52,7 @@ public MSBuildServer_Tests(ITestOutputHelper output)
+         {
+             _output = output;
+             _env = TestEnvironment.Create(_output);
++            _env.SetEnvironmentVariable("MSBUILDUSESERVERINNONINTERACTIVE", "1");
+         }
+ 
+         public void Dispose() => _env.Dispose();
+@@ -335,4 +305,35 @@ private int ParseNumber(string searchString, string toFind)
+             return int.Parse(match.Groups[1].Value);
+         }
+     }
++
++    public class SleepingTask : Microsoft.Build.Utilities.Task
++    {
++        public int SleepTime { get; set; }
++
++        /// <summary>
++        /// Sleep for SleepTime milliseconds.
++        /// </summary>
++        /// <returns>Success on success.</returns>
++        public override bool Execute()
++        {
++            Thread.Sleep(SleepTime);
++            return !Log.HasLoggedErrors;
++        }
++    }
++
++    public class ProcessIdTask : Microsoft.Build.Utilities.Task
++    {
++        [Output]
++        public int Pid { get; set; }
++
++        /// <summary>
++        /// Log the id for this process.
++        /// </summary>
++        /// <returns></returns>
++        public override bool Execute()
++        {
++            Pid = Process.GetCurrentProcess().Id;
++            return true;
++        }
++    }
+ }
+diff --git a/src/MSBuild/MSBuildClientApp.cs b/src/MSBuild/MSBuildClientApp.cs
+index de7895a6259..20b339d0544 100644
+--- a/src/MSBuild/MSBuildClientApp.cs
++++ b/src/MSBuild/MSBuildClientApp.cs
+@@ -73,17 +73,14 @@ public static MSBuildApp.ExitType Execute(
+             MSBuildClient msbuildClient = new MSBuildClient(commandLine, msbuildLocation);
+             MSBuildClientExitResult exitResult = msbuildClient.Execute(cancellationToken);
+ 
+-            if (exitResult.MSBuildClientExitType == MSBuildClientExitType.ServerBusy ||
+-                exitResult.MSBuildClientExitType == MSBuildClientExitType.UnableToConnect ||
+-                exitResult.MSBuildClientExitType == MSBuildClientExitType.UnknownServerState ||
+-                exitResult.MSBuildClientExitType == MSBuildClientExitType.LaunchError)
++            if (shouldFallback(exitResult))
+             {
+                 if (KnownTelemetry.PartialBuildTelemetry != null)
+                 {
+                     KnownTelemetry.PartialBuildTelemetry.ServerFallbackReason = exitResult.MSBuildClientExitType.ToString();
+                 }
+ 
+-                // Server is busy, fallback to old behavior.
++                // Fallback to old behavior.
+                 return MSBuildApp.Execute(commandLine);
+             }
+ 
+@@ -96,6 +93,13 @@ public static MSBuildApp.ExitType Execute(
+             }
+ 
+             return MSBuildApp.ExitType.MSBuildClientFailure;
++
++            bool shouldFallback(MSBuildClientExitResult clientResult) =>
++                clientResult.MSBuildClientExitType == MSBuildClientExitType.ServerBusy ||
++                clientResult.MSBuildClientExitType == MSBuildClientExitType.UnableToConnect ||
++                clientResult.MSBuildClientExitType == MSBuildClientExitType.UnknownServerState ||
++                clientResult.MSBuildClientExitType == MSBuildClientExitType.LaunchError ||
++                clientResult.MSBuildClientExitType == MSBuildClientExitType.NonInteractive;
+         }
+ 
+         // Copied from NodeProviderOutOfProcBase.cs

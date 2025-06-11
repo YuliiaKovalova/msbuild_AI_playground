@@ -1,0 +1,380 @@
+diff --git a/src/Build/BuildCheck/Acquisition/BuildCheckAcquisitionModule.cs b/src/Build/BuildCheck/Acquisition/BuildCheckAcquisitionModule.cs
+index 97c4c65cae1..7083d50aa8d 100644
+--- a/src/Build/BuildCheck/Acquisition/BuildCheckAcquisitionModule.cs
++++ b/src/Build/BuildCheck/Acquisition/BuildCheckAcquisitionModule.cs
+@@ -56,9 +56,9 @@ public List<CheckFactory> CreateCheckFactories(
+         }
+         catch (ReflectionTypeLoadException ex) when (ex.LoaderExceptions.Length != 0)
+         {
+-            foreach (Exception? loaderException in ex.LoaderExceptions)
++            foreach (Exception? unrolledEx in ex.LoaderExceptions.Where(e => e != null).Prepend(ex))
+             {
+-                ReportLoadingError(loaderException);
++                ReportLoadingError(unrolledEx!);
+             }
+         }
+         catch (Exception ex)
+@@ -68,10 +68,10 @@ public List<CheckFactory> CreateCheckFactories(
+ 
+         return checksFactories;
+ 
+-        void ReportLoadingError(Exception? ex)
++        void ReportLoadingError(Exception ex)
+         {
+-            checkContext.DispatchAsComment(MessageImportance.Normal, "CustomCheckFailedRuleLoading", ex?.Message);
+-            KnownTelemetry.BuildCheckTelemetry.AddCustomCheckLoadingFailure();
++            checkContext.DispatchAsComment(MessageImportance.Normal, "CustomCheckFailedRuleLoading", ex.Message);
++            checkContext.DispatchFailedAcquisitionTelemetry(System.IO.Path.GetFileName(checkAcquisitionData.AssemblyPath), ex);
+         }
+     }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+index 6cf33f96a37..84cdd25ad6d 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+@@ -166,6 +166,7 @@ private void LogCheckStats(ICheckContext checkContext)
+         checkContext.DispatchAsCommentFromText(MessageImportance.Low, infraData);
+         string checkData = BuildCsvString("Checks run times", checkStats);
+         checkContext.DispatchAsCommentFromText(MessageImportance.Low, checkData);
++        checkContext.DispatchTelemetry(_tracingData);
+     }
+ 
+     private string BuildCsvString(string title, Dictionary<string, TimeSpan> rowData)
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckContext/CheckDispatchingContext.cs b/src/Build/BuildCheck/Infrastructure/CheckContext/CheckDispatchingContext.cs
+index 584bedca51e..06b7d5ccec1 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckContext/CheckDispatchingContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckContext/CheckDispatchingContext.cs
+@@ -69,4 +69,12 @@ public void DispatchAsWarningFromText(string? subcategoryResourceName, string? e
+ 
+         _eventDispatcher.Dispatch(buildEvent);
+     }
++
++    public void DispatchFailedAcquisitionTelemetry(string assemblyName, Exception exception)
++    // This is it - no action for replay mode.
++    { }
++
++    public void DispatchTelemetry(BuildCheckTracingData data)
++    // This is it - no action for replay mode.
++    { }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckContext/CheckLoggingContext.cs b/src/Build/BuildCheck/Infrastructure/CheckContext/CheckLoggingContext.cs
+index 8c15478a702..13f308d2283 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckContext/CheckLoggingContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckContext/CheckLoggingContext.cs
+@@ -8,6 +8,7 @@
+ using System.Threading.Tasks;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Framework.Telemetry;
+ using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+@@ -43,4 +44,18 @@ public void DispatchAsErrorFromText(string? subcategoryResourceName, string? err
+     public void DispatchAsWarningFromText(string? subcategoryResourceName, string? errorCode, string? helpKeyword, BuildEventFileInfo file, string message)
+         => loggingService
+             .LogWarningFromText(eventContext, subcategoryResourceName, errorCode, helpKeyword, file, message);
++
++    public void DispatchFailedAcquisitionTelemetry(string assemblyName, Exception exception)
++    {
++        var telemetryTransportData = KnownTelemetry.BuildCheckTelemetry.ProcessCustomCheckLoadingFailure(assemblyName, exception);
++        loggingService.LogTelemetry(eventContext, telemetryTransportData.Item1, telemetryTransportData.Item2);
++    }
++
++    public void DispatchTelemetry(BuildCheckTracingData data)
++    {
++        foreach ((string, IDictionary<string, string>) telemetryTransportData in KnownTelemetry.BuildCheckTelemetry.ProcessBuildCheckTracingData(data))
++        {
++            loggingService.LogTelemetry(eventContext, telemetryTransportData.Item1, telemetryTransportData.Item2);
++        }
++    }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckContext/ICheckContext.cs b/src/Build/BuildCheck/Infrastructure/CheckContext/ICheckContext.cs
+index 0f592d129d6..8cfa8b5b820 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckContext/ICheckContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckContext/ICheckContext.cs
+@@ -45,4 +45,14 @@ internal interface ICheckContext
+     /// Dispatch the instance of <see cref="BuildEventContext"/> as a warning message.
+     /// </summary>
+     void DispatchAsWarningFromText(string? subcategoryResourceName, string? errorCode, string? helpKeyword, BuildEventFileInfo file, string message);
++
++    /// <summary>
++    /// Dispatch the telemetry data for a failed acquisition.
++    /// </summary>
++    void DispatchFailedAcquisitionTelemetry(string assemblyName, Exception exception);
++
++    /// <summary>
++    /// If supported - dispatches the telemetry data.
++    /// </summary>
++    void DispatchTelemetry(BuildCheckTracingData data);
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs b/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
+index c71cc40d3ae..9e18a3b44c0 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
+@@ -63,7 +63,10 @@ internal void StartNewProject(
+         foreach (BuildCheckRuleTelemetryData ruleTelemetryData in _ruleTelemetryData)
+         {
+             CheckConfigurationEffective effectiveConfig = effectiveConfigs[Math.Max(idx, effectiveConfigs.Count - 1)];
+-            ruleTelemetryData.ExplicitSeverities.Add(editorConfigs[idx].Severity.ToDiagnosticSeverity());
++            if (editorConfigs[idx].Severity != null)
++            {
++                ruleTelemetryData.ExplicitSeverities.Add(editorConfigs[idx].Severity!.Value.ToDiagnosticSeverity());
++            }
+ 
+             if (effectiveConfig.IsEnabled)
+             {
+diff --git a/src/Framework/BuildCheck/BuildCheckEventArgs.cs b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+index bd8a1c6644e..b017a05d3fc 100644
+--- a/src/Framework/BuildCheck/BuildCheckEventArgs.cs
++++ b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+@@ -61,9 +61,9 @@ internal override void WriteToStream(BinaryWriter writer)
+             writer.Write(data.IsBuiltIn);
+             writer.Write7BitEncodedInt((int)data.DefaultSeverity);
+             writer.Write7BitEncodedInt(data.ExplicitSeverities.Count);
+-            foreach (DiagnosticSeverity? severity in data.ExplicitSeverities)
++            foreach (DiagnosticSeverity severity in data.ExplicitSeverities)
+             {
+-                writer.WriteOptionalInt32(severity == null ? null : (int)severity);
++                writer.Write7BitEncodedInt((int)severity);
+             }
+             writer.Write7BitEncodedInt(data.ProjectNamesWhereEnabled.Count);
+             foreach (string projectName in data.ProjectNamesWhereEnabled)
+@@ -101,15 +101,15 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+             bool isBuiltIn = reader.ReadBoolean();
+             DiagnosticSeverity defaultSeverity = (DiagnosticSeverity)reader.Read7BitEncodedInt();
+             int explicitSeveritiesCount = reader.Read7BitEncodedInt();
+-            HashSet<DiagnosticSeverity?> explicitSeverities =
++            HashSet<DiagnosticSeverity> explicitSeverities =
+ #if NETSTANDARD2_0
+-                new HashSet<DiagnosticSeverity?>();
++                new HashSet<DiagnosticSeverity>();
+ #else
+-                new HashSet<DiagnosticSeverity?>(explicitSeveritiesCount);
++                new HashSet<DiagnosticSeverity>(explicitSeveritiesCount);
+ #endif
+             for (int j = 0; j < explicitSeveritiesCount; j++)
+             {
+-                explicitSeverities.Add(reader.ReadOptionalInt32() == null ? null : (DiagnosticSeverity)reader.ReadInt32());
++                explicitSeverities.Add((DiagnosticSeverity)reader.Read7BitEncodedInt());
+             }
+             int projectNamesWhereEnabledCount = reader.Read7BitEncodedInt();
+             HashSet<string> projectNamesWhereEnabled =
+diff --git a/src/Framework/BuildCheck/BuildCheckRuleTelemetryData.cs b/src/Framework/BuildCheck/BuildCheckRuleTelemetryData.cs
+index 886febef9cc..451b8ca55de 100644
+--- a/src/Framework/BuildCheck/BuildCheckRuleTelemetryData.cs
++++ b/src/Framework/BuildCheck/BuildCheckRuleTelemetryData.cs
+@@ -25,7 +25,7 @@ public BuildCheckRuleTelemetryData(
+         string checkFriendlyName,
+         bool isBuiltIn,
+         DiagnosticSeverity defaultSeverity,
+-        HashSet<DiagnosticSeverity?> explicitSeverities,
++        HashSet<DiagnosticSeverity> explicitSeverities,
+         HashSet<string> projectNamesWhereEnabled,
+         int violationMessagesCount,
+         int violationWarningsCount,
+@@ -56,7 +56,7 @@ public static BuildCheckRuleTelemetryData Merge(
+             data1.CheckFriendlyName,
+             data1.IsBuiltIn,
+             data1.DefaultSeverity,
+-            new HashSet<DiagnosticSeverity?>(data1.ExplicitSeverities.Union(data2.ExplicitSeverities)),
++            new HashSet<DiagnosticSeverity>(data1.ExplicitSeverities.Union(data2.ExplicitSeverities)),
+             new HashSet<string>(data1.ProjectNamesWhereEnabled.Union(data2.ProjectNamesWhereEnabled)),
+             data1.ViolationMessagesCount + data2.ViolationMessagesCount,
+             data1.ViolationWarningsCount + data2.ViolationWarningsCount,
+@@ -73,11 +73,12 @@ public static BuildCheckRuleTelemetryData Merge(
+     /// <summary>
+     /// A set of explicitly set severities (through editorconfig(s)) for the rule. There can be multiple - as different projects can have different settings.
+     /// </summary>
+-    public HashSet<DiagnosticSeverity?> ExplicitSeverities { get; init; } = [];
++    public HashSet<DiagnosticSeverity> ExplicitSeverities { get; init; } = [];
+     public HashSet<string> ProjectNamesWhereEnabled { get; init; } = [];
+     public int ViolationMessagesCount { get; private set; }
+     public int ViolationWarningsCount { get; private set; }
+     public int ViolationErrorsCount { get; private set; }
++    public int ViolationsCount => ViolationMessagesCount + ViolationWarningsCount + ViolationErrorsCount;
+     public bool IsThrottled { get; private set; }
+     public TimeSpan TotalRuntime { get; set; }
+ 
+diff --git a/src/Framework/Telemetry/BuildCheckTelemetry.cs b/src/Framework/Telemetry/BuildCheckTelemetry.cs
+index 1c950a0e65c..41d83a4819f 100644
+--- a/src/Framework/Telemetry/BuildCheckTelemetry.cs
++++ b/src/Framework/Telemetry/BuildCheckTelemetry.cs
+@@ -3,60 +3,93 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Globalization;
+ using System.Linq;
+-using System.Text;
+-using System.Threading.Tasks;
++using Microsoft.Build.Experimental.BuildCheck;
+ 
+ namespace Microsoft.Build.Framework.Telemetry;
+ 
+ internal class BuildCheckTelemetry
+ {
+-    internal void AddCustomCheckLoadingFailure()
+-    { }
+-}
++    private const string FailedAcquistionEventName = "buildcheck/acquisitionfailure";
++    private const string RunEventName = "buildcheck/run";
++    private const string RuleStatsEventName = "buildcheck/rule";
++    private Guid _submissionId = Guid.NewGuid();
++
++    /// <summary>
++    /// Translates failed acquisition event to telemetry transport data.
++    /// </summary>
++    internal (string, IDictionary<string, string>) ProcessCustomCheckLoadingFailure(string assemblyName,
++        Exception exception)
++    {
++        var properties = new Dictionary<string, string>();
++        properties["SubmissionId"] = _submissionId.ToString();
++        properties["AssemblyName"] = assemblyName;
++        string? exceptionType = exception.GetType().FullName;
++        if (exceptionType != null)
++        {
++            properties["ExceptionType"] = exceptionType;
++        }
++        if (exception.Message != null)
++        {
++            properties["ExceptionMessage"] = exception.Message;
++        }
++
++        return (FailedAcquistionEventName, properties);
++    }
++
++    /// <summary>
++    /// Translates BuildCheck tracing data to telemetry transport data.
++    /// </summary>
++    internal IEnumerable<(string, IDictionary<string, string>)> ProcessBuildCheckTracingData(BuildCheckTracingData data)
++    {
++        int rulesCount = data.TelemetryData.Count;
++        int customRulesCount = data.TelemetryData.Count(t => !t.Value.IsBuiltIn);
++        int violationsCount = data.TelemetryData.Sum(t => t.Value.ViolationsCount);
++        long runtimeTicks = data.ExtractCheckStats().Sum(v => v.Value.Ticks);
++        runtimeTicks += data.InfrastructureTracingData.Sum(v => v.Value.Ticks);
++        TimeSpan totalRuntime = new TimeSpan(runtimeTicks);
++
++        var properties = new Dictionary<string, string>();
++        properties["SubmissionId"] = _submissionId.ToString();
++        properties["RulesCount"] = rulesCount.ToString(CultureInfo.InvariantCulture);
++        properties["CustomRulesCount"] = customRulesCount.ToString(CultureInfo.InvariantCulture);
++        properties["ViolationsCount"] = violationsCount.ToString(CultureInfo.InvariantCulture);
++        properties["TotalRuntimeInMilliseconds"] = totalRuntime.TotalMilliseconds.ToString(CultureInfo.InvariantCulture);
++
++        yield return (RunEventName, properties);
+ 
+-////internal class BuildCheckTelemetry : TelemetryBase
+-////{
+-////    public override string EventName => "buildcheck";
+-
+-////    internal void AddCustomCheckLoadingFailure()
+-////    {
+-
+-////    }
+-
+-////    /// <summary>
+-////    /// True if terminal logger was used.
+-////    /// </summary>
+-////    public bool IsBuildCheckOn { get; set; }
+-////    public int RulesCount { get; set; }
+-////    public int CustomRulesCount { get; set; }
+-////    public int ViolationsCount { get; set; }
+-////    public TimeSpan TotalRuntime { get; set; }
+-
+-
+-
+-////    public override IDictionary<string, string> GetProperties() => throw new NotImplementedException();
+-
+-////    internal class BuildCheckRuleTelemetryData
+-////    {
+-////        public string RuleId { get; set; }
+-////        public bool IsBuiltIn { get; set; }
+-////        public byte DefaultSeverityId { get; set; }
+-////        public string DefaultSeverityName { get; set; }
+-////        public int ProjectsCount { get; set; }
+-////        public byte? ExplicitSeverityId { get; set; }
+-////        public string? ExplicitSeverityName { get; set; }
+-////        public int ViolationCount { get; set; }
+-////        public bool IsThrottled { get; set; }
+-////        public TimeSpan TotalRuntime { get; set; }
+-////    }
+-
+-////    internal class CustomCheckErrorTelemetryData
+-////    {
+-////        public string RuleId { get; set; }
+-////        public string ExceptionType { get; set; }
+-////        public string ExceptionMessage { get; set; }
+-////    }
+-////}
++        foreach (BuildCheckRuleTelemetryData buildCheckRuleTelemetryData in data.TelemetryData.Values)
++        {
++            properties = new Dictionary<string, string>();
++            properties["SubmissionId"] = _submissionId.ToString();
++            properties["RuleId"] = buildCheckRuleTelemetryData.RuleId;
++            properties["IsBuiltIn"] = buildCheckRuleTelemetryData.IsBuiltIn.ToString(CultureInfo.InvariantCulture);
++            properties["DefaultSeverityId"] = ((int)buildCheckRuleTelemetryData.DefaultSeverity).ToString(CultureInfo.InvariantCulture);
++            properties["DefaultSeverity"] = buildCheckRuleTelemetryData.DefaultSeverity.ToString();
++            properties["EnabledProjectsCount"] = buildCheckRuleTelemetryData.ProjectNamesWhereEnabled.Count.ToString(CultureInfo.InvariantCulture);
++
++            if (buildCheckRuleTelemetryData.ExplicitSeverities.Any())
++            {
++                properties["ExplicitSeverities"] = buildCheckRuleTelemetryData.ExplicitSeverities
++                    .Select(s => s.ToString()).ToCsvString(false);
++                properties["ExplicitSeveritiesIds"] = buildCheckRuleTelemetryData.ExplicitSeverities
++                    .Select(s => ((int)s).ToString(CultureInfo.InvariantCulture)).ToCsvString(false);
++            }
++
++            properties["ViolationMessagesCount"] = buildCheckRuleTelemetryData.ViolationMessagesCount.ToString(CultureInfo.InvariantCulture);
++            properties["ViolationWarningsCount"] = buildCheckRuleTelemetryData.ViolationWarningsCount.ToString(CultureInfo.InvariantCulture);
++            properties["ViolationErrorsCount"] = buildCheckRuleTelemetryData.ViolationErrorsCount.ToString(CultureInfo.InvariantCulture);
++            properties["IsThrottled"] = buildCheckRuleTelemetryData.IsThrottled.ToString(CultureInfo.InvariantCulture);
++            properties["TotalRuntimeInMilliseconds"] = buildCheckRuleTelemetryData.TotalRuntime.TotalMilliseconds.ToString(CultureInfo.InvariantCulture);
++
++            yield return (RuleStatsEventName, properties);
++        }
++
++
++        // set for the new submission in case of build server
++        _submissionId = Guid.NewGuid();
++    }
++}
+ 
+ 
+diff --git a/src/Framework/Telemetry/LoggingConfigurationTelemetry.cs b/src/Framework/Telemetry/LoggingConfigurationTelemetry.cs
+index 493a945a526..0b54fe58139 100644
+--- a/src/Framework/Telemetry/LoggingConfigurationTelemetry.cs
++++ b/src/Framework/Telemetry/LoggingConfigurationTelemetry.cs
+@@ -16,6 +16,11 @@ internal class LoggingConfigurationTelemetry : TelemetryBase
+     /// </summary>
+     public bool TerminalLogger { get; set; }
+ 
++    /// <summary>
++    /// True if buildcheck was used.
++    /// </summary>
++    public bool BuildCheckEnabled { get; set; }
++
+     /// <summary>
+     /// What was user intent:
+     ///   on | true -> user intent to enable logging
+@@ -104,6 +109,7 @@ public override IDictionary<string, string> GetProperties()
+ 
+         // populate property values
+         properties["TerminalLogger"] = TerminalLogger.ToString(CultureInfo.InvariantCulture);
++        properties["BuildCheckEnabled"] = BuildCheckEnabled.ToString(CultureInfo.InvariantCulture);
+ 
+         if (TerminalLoggerUserIntent != null)
+         {
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 8411c5408ba..7335ecbf171 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -2797,7 +2797,7 @@ private static bool IsBuildCheckEnabled(CommandLineSwitches commandLineSwitches)
+         {
+             // Opt-in behavior to be determined by: https://github.com/dotnet/msbuild/issues/9723
+             bool isBuildCheckEnabled = commandLineSwitches.IsParameterizedSwitchSet(CommandLineSwitches.ParameterizedSwitch.Check);
+-            return isBuildCheckEnabled;
++            return KnownTelemetry.LoggingConfigurationTelemetry.BuildCheckEnabled = isBuildCheckEnabled;
+         }
+ 
+         private static bool ProcessTerminalLoggerConfiguration(CommandLineSwitches commandLineSwitches, out string aggregatedParameters)

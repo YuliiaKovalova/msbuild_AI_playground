@@ -1,0 +1,141 @@
+{
+  "number": 2123,
+  "title": "MSBuild is reusing project instances",
+  "body": "This was \"fixed\" here: https://github.com/Microsoft/msbuild/pull/1955, but I'm still repro'ing this.\r\n\r\n1. `git clone https://github.com/dotnet/project-system/`\r\n2. `cd project-system`\r\n3. `git checkout a9e5252cb89e45bc9c5202789bc7effc61b7531c`\r\n4. `build.cmd`\r\n5. open src\\ProjectSystem.sln\r\n\r\n-- Wait for 1 minute for restore/design-time builds to catch up (when all the errors go away) --\r\n\r\n6. While the solution is open, make a whitespace only change to build\\Targets\\VSL.Imports.targets and Save\r\n\r\nExpected: No errors\r\nActual: \r\n\r\n```\r\nSeverity\tCode\tDescription\tProject\tFile\tLine\tSuppression State\r\nError\t\tSkipCompilerExecution and ProvideCommandLineArgs should be set before calling the CompileDesignTime target\tMicrosoft.NetStandard.CSharp.ProjectTemplates\tC:\\Program Files (x86)\\Microsoft Visual Studio\\Preview\\Enterprise\\MSBuild\\Microsoft\\VisualStudio\\Managed\\Microsoft.Managed.DesignTime.targets\t262\t\r\nError\t\tSkipCompilerExecution and ProvideCommandLineArgs should be set before calling the CompileDesignTime target\tMicrosoft.VisualStudio.AppDesigner\tC:\\Program Files (x86)\\Microsoft Visual Studio\\Preview\\Enterprise\\MSBuild\\Microsoft\\VisualStudio\\Managed\\Microsoft.Managed.DesignTime.targets\t262\t\r\nError\t\tSkipCompilerExecution and ProvideCommandLineArgs should be set before calling the CompileDesignTime target\tMicrosoft.VisualStudio.ProjectSystem.CSharp.VS\tC:\\Program Files (x86)\\Microsoft Visual Studio\\Preview\\Enterprise\\MSBuild\\Microsoft\\VisualStudio\\Managed\\Microsoft.Managed.DesignTime.targets\t262\t\r\nError\t\tSkipCompilerExecution and ProvideCommandLineArgs should be set before calling the CompileDesignTime target\tMicrosoft.VisualStudio.ProjectSystem.Managed.VS.UnitTests\tC:\\Program Files (x86)\\Microsoft Visual Studio\\Preview\\Enterprise\\MSBuild\\Microsoft\\VisualStudio\\Managed\\Microsoft.Managed.DesignTime.targets\t262\t\r\nError\t\tSkipCompilerExecution and ProvideCommandLineArgs should be set before calling the CompileDesignTime target\tMicrosoft.NetCore.FSharp.ProjectTemplates\tC:\\Program Files (x86)\\Microsoft Visual Studio\\Preview\\Enterprise\\MSBuild\\Microsoft\\VisualStudio\\Managed\\Microsoft.Managed.DesignTime.targets\t262\t\r\nError\t\tSkipCompilerExecution and ProvideCommandLineArgs should be set before calling the CompileDesignTime target\tMicrosoft.VisualStudio.ProjectSystem.VisualBasic.VS\tC:\\Program Files (x86)\\Microsoft Visual Studio\\Preview\\Enterprise\\MSBuild\\Microsoft\\VisualStudio\\Managed\\Microsoft.Managed.DesignTime.targets\t262\t\r\nError\t\tSkipCompilerExecution and ProvideCommandLineArgs should be set before calling the CompileDesignTime target\tMicrosoft.VisualStudio.ProjectSystem.VisualBasic\tC:\\Program Files (x86)\\Microsoft Visual Studio\\Preview\\Enterprise\\MSBuild\\Microsoft\\VisualStudio\\Managed\\Microsoft.Managed.DesignTime.targets\t262\t\r\n```\r\n\r\nThe errors come and go.",
+  "state": "CLOSED",
+  "createdAt": "2017-05-22T23:01:13Z",
+  "updatedAt": "2024-02-21T17:19:00Z",
+  "closedAt": "2017-06-29T00:30:21Z",
+  "author": {
+    "login": "davkean"
+  },
+  "labels": [
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": [
+      {
+        "login": "cdmihai"
+      }
+    ]
+  },
+  "milestone": {
+    "title": "MSBuild 15.5"
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "Editing `VSL.Imports.targets` twice in the repo from the description also triggers the bug.",
+        "createdAt": "2017-05-22T23:07:26Z",
+        "updatedAt": "2017-05-22T23:07:26Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "It looks like you have to wait a while between edits of VSL.Imports.targets to wait for design-time builds to catch up - it seems like only the second edit causes the issue.",
+        "createdAt": "2017-05-22T23:12:37Z",
+        "updatedAt": "2017-05-22T23:12:37Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "OK, I think I know what happens here.\r\n\r\n- Let's say there are two projects, `A`->`B` (A depends on `B`)\r\n- Both `A` and `B` are sent as `ProjectInstance` objects to the `BuildManager` in async mode (via `BuildSubmission.ExecuteAsync`). This eventually leads to A building once, and B building twice, once as a p2p under A (`p2p B`) and again as a top level project (`top B`)\r\n- Let's say that `top B` has an in-memory mutation of its state. This means that the evaluation state (properties, items) of `top B` differs from the evaluation state of `p2p B`.\r\n- Let's say that `A` and `top B` both need to build target `Foo`\r\n- Let's say that `p2p B` builds a different target than `top B`, so `p2p B` builds `Bar` and `top B` builds `Foo`. This mimics VS design time builds where the targets between p2p and top are also non-overlapping\r\n- `A` and `top B` both get a `BuildRequestConfiguration` upon submission, on the main node\r\n- `A` starts building on the child node and gets blocked on `p2p B`\r\n- the child node (who knows no configuration so far) asks the master for a configuration id for `p2p B` and master responds with the configuration id of `top B`. **This is incorrect**, because the two `B`s have different states. Conceptually they cannot be represented by the same configuration inside the engine. This happens because MSBuild only considers global properties, toolsversion, and the project path as unique identifiers for projects, as opposed to considering the entire state.\r\n- the child node then evaluates `p2p B` from file inside the same configuration id as `top B`. _This leads to the master node and the child node having a configuration with the same id but different ProjectInstance states._\r\n- `p2p B` correctly executes target `Bar` and `A` correctly executes target `Foo`\r\n- the main node requests the child node to build `top B`\r\n- the child node uses the state of `p2p B` to execute target `Foo` on `top B`. This leads to an incorrect build execution.\r\n\r\nHere's how this looks from the Scheduler's point of view: \r\n[SchedulerState_18884.txt](https://github.com/Microsoft/msbuild/files/1079110/SchedulerState_18884.txt)\r\n\r\nProbable fix is to _always_ add a dummy unique global property to ProjectInstance based builds coming from the outside. Unfortunately some tests are failing with this fix. If this turns out to break engine invariants, then another fix would for CPS to build each project instance in its own separate Begin / End Build session.\r\n",
+        "createdAt": "2017-06-15T22:03:47Z",
+        "updatedAt": "2017-06-15T22:03:47Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "@cdmihai That's sounds like a fairly big change to CPS and not something we should tackle lightly. @lifengl @AArnott Thoughts on this?",
+        "createdAt": "2017-06-15T22:17:19Z",
+        "updatedAt": "2017-06-15T22:17:19Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "There's about 10 very cryptic tests failing, I'll have to go over each one and see what they mean and imply. For now I don't see other solutions though :(",
+        "createdAt": "2017-06-15T23:42:11Z",
+        "updatedAt": "2017-06-15T23:42:40Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "This comes from 3+ years of distant memory, but here goes...\r\n\r\nCPS's build scheduler supports 'bundles' of build requests being built together in a single build session of MSBuild. That is, between BuildManager.BeginBuild() and EndBuild(), there can be multiple top-level build requests. This allows the MSBuild scheduler to skip targets that were already built within that same build session and overall increases build throughput, which is a good thing.\r\nSome of these build requests simply specify a project file, while others provide the `ProjectInstance` that must be built.\r\nCPS recognizes that some build requests are \"compatible\" with each other and can thus share the same build session, while others are incompatible. Two build requests that simply specify the project file by its path are compatible. Two build requests that specify a `ProjectInstance` are *in*compatible because of this P2P issue that @cdmihai calls out. As CPS prepares a bundle of requests to include in a single build session, it starts at the top of the CPS build request queue and selects as many compatible requests as it can, then submits that all together.\r\n\r\nFrom @cdmihai's analysis, it sounds like CPS is perhaps considering build requests to be compatible that should not be considered compatible. That would hopefully be a very small fix to that test logic rather than a big change to CPS. \r\n\r\n[CPS's design-time build manager](https://mseng.visualstudio.com/DefaultCollection/VSIDEProj/_git/VSIDEProj.CPS?path=%2Fsrc%2FMicrosoft.VisualStudio.ProjectSystem.VS.Implementation%2FBuild%2FBuildManagerAccessorDesignTime.cs)\r\n[CPS' build request compatibility check](https://mseng.visualstudio.com/DefaultCollection/VSIDEProj/_git/VSIDEProj.CPS?path=%2Fsrc%2FMicrosoft.VisualStudio.ProjectSystem.Implementation%2FBuild%2FBuildManagerHostBatchingService.cs&line=98&lineStyle=plain&lineEnd=98&lineStartColumn=21&lineEndColumn=48)",
+        "createdAt": "2017-06-16T00:39:57Z",
+        "updatedAt": "2017-06-16T00:39:57Z",
+        "author": {
+          "login": "AArnott"
+        }
+      },
+      {
+        "body": "Awesome, we should have pulled you in months ago. :) \r\n\r\nLet me do a little digging...",
+        "createdAt": "2017-06-16T00:42:02Z",
+        "updatedAt": "2017-06-16T00:42:02Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Actually, too heads down in some other performance work to looking into this. @lifengl looks like your team might be able to make a change here to fix this?",
+        "createdAt": "2017-06-16T02:15:47Z",
+        "updatedAt": "2017-06-16T02:15:47Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "\r\nYes, please open a bug and send to us.\r\n\r\nOn Jun 15, 2017, at 7:16 PM, David Kean <notifications@github.com<mailto:notifications@github.com>> wrote:\r\n\r\n\r\nActually, too heads down in some other performance work to looking into this. @lifengl<https://github.com/lifengl> looks like your team might be able to make a change here to fix this?\r\n\r\n\u2014\r\nYou are receiving this because you were mentioned.\r\nReply to this email directly, view it on GitHub<https://github.com/Microsoft/msbuild/issues/2123#issuecomment-308914275>, or mute the thread<https://github.com/notifications/unsubscribe-auth/ALGWwlFtbdXmMYpZNOwTWEQtPC4Y7KPfks5sEeVdgaJpZM4Ni_Gy>.\r\n",
+        "createdAt": "2017-06-16T14:50:42Z",
+        "updatedAt": "2017-06-16T14:50:42Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "Based on the build error comes out and goes away, the bug is currently moved to 15.5.  If your team think it is more impactful, please let us know.",
+        "createdAt": "2017-06-16T23:40:52Z",
+        "updatedAt": "2017-06-16T23:40:52Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "@lifengl Did we get an internal bug for this?",
+        "createdAt": "2017-06-27T05:05:51Z",
+        "updatedAt": "2017-06-27T05:05:51Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "I filed: https://devdiv.visualstudio.com/DevDiv/Managed%20Project%20System/_workItems?id=457737&fullScreen=false&_a=edit.",
+        "createdAt": "2017-06-29T00:30:21Z",
+        "updatedAt": "2017-06-29T00:30:21Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "@davkean Was this issue closed because it has been fixed or because it is now tracked by devdiv internally? If the latter, could you maybe keep it open until it's really fixed so that the community can track it's status? Thanks!",
+        "createdAt": "2017-08-09T07:07:41Z",
+        "updatedAt": "2017-08-09T07:07:41Z",
+        "author": {
+          "login": "fschmied"
+        }
+      },
+      {
+        "body": "This issue has been fixed in internal builds. It will appear in the 15.5 milestone called out this in this roadmap: https://github.com/dotnet/project-system/blob/master/docs/repo/roadmap.md#roadmap.\r\n\r\n",
+        "createdAt": "2017-08-09T07:11:01Z",
+        "updatedAt": "2017-08-09T07:11:01Z",
+        "author": {
+          "login": "davkean"
+        }
+      }
+    ]
+  }
+}

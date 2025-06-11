@@ -1,0 +1,2119 @@
+diff --git a/documentation/specs/proposed/BuildCheck-Architecture.md b/documentation/specs/proposed/BuildCheck-Architecture.md
+index 70f64146ca8..f819a3d8d22 100644
+--- a/documentation/specs/proposed/BuildCheck-Architecture.md
++++ b/documentation/specs/proposed/BuildCheck-Architecture.md
+@@ -84,10 +84,36 @@ Planned model:
+ 
+ **TBD** - implementation details to be amended by @f-alizada 
+ 
++## High-level logic
++
++MSBuild engine always finds and parses relevant `.editorconfig` files to see which analyzers should be enabled, if any. In typical builds this operation will not be expensive compared to everything else happening as part of building a project. It's a new cost to all builds though, and in the unlikely case that it starts showing as a perf bottleneck, we can cache the data relevant to MSBuild in a separate intermediate file, in a process-wide in-memory cache invalidated by timestamp checks, and so on.
++
++The rest of the configuration comes directly or indirectly from project files in the form of properties, which creates an interesting ordering issue. For the engine to know the final values of properties such as `TargetFramework`, it needs to evaluate the project. However, if it turns out that an analyzer should be enabled that is interested in _tracing_ the evaluation, it is already too late. It's important to note that this issue exists only for a subset of analyzers. Analyzers interested in the _result_ of evaluation, for example, are fine. The best way of handling this would be to simply evaluate again. Technically, we only need to finish Pass 1 of evaluation to know the value of properties and have the relevant property functions called, so the extra work can be limited to pass 0 and 1. Measurements show that 75% of evaluation is spent in passes 0 and 1. In the very worst case when an extra pass 0/1 runs for each project and lacks any kind of further optimization, single-process incremental build of OrchardCore has been measured to take about 5% longer. There are opportunities for optimizing this, for example by adding a marker to SDK targets files notifying MSBuild of the point after which `TargetFramework` is expected to be fixed so the engine can bail early.
++
++Once `TargetFramework` is known, we can combine the default analyzer config with what came from `.editorconfig`, restart evaluation if an evaluation-tracing analyzer just got enabled, and continue with the rest of the build. Unlike `TargetFramework` which has an additive effect on the enabled analyzers, a master switch like `RunMSBuildChecks` may instruct the engine to not run anything. It would be unfortunate if the user had to pay any extra cost when `RunMSBuildChecks` evaluates to false. So preferrably we don't do anything perf sensitive until we hit the point in evaluation when `TargetFramework`, `RunMSBuildChecks`, `SdkAnalysisLevel`, ... are all known and the set of analyzers to use is finalized.
++
++Since we are unlikely to enable any analyzers by default in .NET 9, the focus in this release should be on optimizing the `.editorconfig` handling.
++
+ # Acquisition
+ 
+-**TBD** - implementation details to be amended by @YuliiaKovalova
++BuildCheck employs two distinct types of analyzers: inbox and custom. As a result, the acquisition and distribution processes vary.
++Inbox rules are integrated into the MSBuild repository, while custom analyzers can be packaged as NuGet packages and detected by MSBuild provided they adhere to a specific structure. 
++
++To streamline the creation of custom rules, a special [template](https://learn.microsoft.com/dotnet/core/tools/custom-templates) has been introduced.
++To enable MSBuild to recognize a custom analyzer, it must invoke the intrinsic function [`void RegisterBuildCheck(string path)`](https://github.com/dotnet/msbuild/blob/1c3b240ce7417223672c62862a6ff7e884e6997a/src/Build/Evaluation/IntrinsicFunctions.cs#L700), which requires the path to the assembly as input. Therefore, it's essential for the user to ensure that the assembly exists in the specified location.
++Additionally, the custom rule must use [`BuildAnalyzerRule`](https://github.com/dotnet/msbuild/blob/9cdb3615adb4115f92b390de2f258fac5f320909/src/Build/BuildCheck/API/BuildAnalyzerRule.cs#L11C14-L11C31) as a parent class; otherwise, MSBuild will not register it.
++
++Examples of custom rules can be found in the [end-to-end tests](https://github.com/dotnet/msbuild/blob/1c3b240ce7417223672c62862a6ff7e884e6997a/src/BuildCheck.UnitTests/EndToEndTests.cs#L139), showcasing various scenarios:
++
++1. [`Single Custom Rule Packaged as a NuGet Package`](https://github.com/dotnet/msbuild/tree/main/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidate): Demonstrates the implementation of a custom rule encapsulated within a NuGet package. It contains the process of creating, packaging, and integrating a single custom rule into a project.
++2. [`Project with Multiple Analyzers Referenced`](https://github.com/dotnet/msbuild/tree/main/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidateWithMultipleAnalyzersInjected): Illustrates a project setup where multiple custom analyzers are referenced. This scenario is common in larger projects where multiple rule sets need to be enforced simultaneously.
++
++Important Notes: 
++- In these examples, pay attention to the presence of the `CustomAnalyzerName.props` file. This file contains intrinsic function invocations necessary for successful rule registration. Understanding and correctly implementing these invocations are crucial for integrating custom rules into your projects effectively.
++- The examples do not include references to third-party assemblies that might be required in other custom analyzers. To load the custom instance in MSBuild, third-party assemblies have to be included in the NuGet package. The current implementation achieves this goal by using a special target: [AddNuGetDlls](https://github.com/dotnet/msbuild/blob/1c3b240ce7417223672c62862a6ff7e884e6997a/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.csproj#L22).
+ 
++### Future Enhancements
++As our library of custom rules expands, we plan to enrich this section with real-world production rule examples. These examples will showcase a diverse range of rules addressing common development challenges. Once these production rules are published and available on nuget.org, we will update this documentation accordingly.
+ 
+ # Build OM for Analyzers Authoring
+ 
+diff --git a/documentation/specs/proposed/BuildCheck.md b/documentation/specs/proposed/BuildCheck.md
+index a6266df45d4..4fa78061b78 100644
+--- a/documentation/specs/proposed/BuildCheck.md
++++ b/documentation/specs/proposed/BuildCheck.md
+@@ -22,9 +22,11 @@ Users are able to tune the behavior of the checks via `.editorconfig` which brin
+ 
+ Powerusers are able to develop, test and publish their custom analyzers easily and contribute them back to community. The local development scenario doesn’t require roundtrip through packaging.
+ 
+-A solid set of in-the-box analyzers is provided by MSBuild and the .NET SDK, extended each release, with high quality reports (pointing exact locations of issue, offering clear and actionable explanations, not repetitive for builds with multi-execution or/and multi-importing of a same script in single build context). The existing in-the-box analyzers are gradually enabled by default and their severity increased - in waves (likely tied to sdk releases) - aiming to constantly increase quality of our customers build scripts. MSBuild.exe (and hence Visual Studio) builds will take more conservative approach with requiring an explicit opt-in into the analyzers - in order to not introduce upgrade blockers. 
++A solid set of in-the-box analyzers is provided by MSBuild and the .NET SDK, extended each release, with high quality reports (pointing exact locations of issue, offering clear and actionable explanations, not repetitive for builds with multi-execution or/and multi-importing of a same script in single build context). The existing in-the-box analyzers are gradually enabled by default and their severity increased - in waves (likely tied to sdk releases) - aiming to constantly increase the quality of our customers build scripts. To avoid breaking customers builds, there will still be an explicit user gesture required to opt into running the analysis. This will be done either by configuring the analyzers with `.editorconfig` or auto-enabling the analysis based on the TFM of the project. There will be no difference between building with `dotnet build` and with `MSBuild.exe`, they will follow the same enablement rules with the set of enabled built-in analyzers derived from `.editorconfig` and TFM/props. Building in Visual Studio will eventually reach parity with command-line build as well.
+ 
+-The analysis has small impact on build duration with ability to disable analysis altogether which will remove all the performance costs associated with the analysis. The perf impact on representative projects is continuously monitored and documented by the MsBuild team.
++Projects that don't use the .NET SDK and those that are not SDK-style at all are TBD. There is a possibility of using a property like `MSBuildAnalysisLevel` to enable some base analyzers we believe will add value everywhere.
++
++The analysis has small impact on build duration with ability to disable analysis altogether which will remove all the performance costs associated with the analysis. The perf impact on representative projects is continuously monitored and documented by the MSBuild team.
+ 
+ 
+ # Scope of initial iteration
+@@ -99,7 +101,7 @@ The proposed initial configuration for those is TBD (as well based on initial te
+ 
+ ### Live Build
+ 
+-BuildCheck will run as part of the build and execute [inbox analyzers](#inbox-analyzers) and [custom analyzers](#acquisition-of-custom-analyzers) based on the [configuration](#configuration). Users will have an option to completely opt-out from BuildCheck to run via commandline switch.
++BuildCheck will run as part of the build and execute [inbox analyzers](#inbox-analyzers) and [custom analyzers](#acquisition-of-custom-analyzers) based on the [configuration](#configuration). Users will have an option to completely opt-out from BuildCheck to run via an MSBuild property (could be set in a project file or passed on the commandline).
+ 
+ Findings - reports - of analyzers will be output as build messages/warnings/errors, and the message/warnings/error code should help distinguish BuildCheck produced reports from regular build errors/warnings.
+ 
+@@ -128,9 +130,20 @@ We might as well consider specifying custom analyzers on a command line (as a no
+ 
+ There will be 3 mechanisms of configuring the analyzers and rules:
+ * The default configuration declared by the analyzers themselves ([more details on implementation](#rules-declaration))
+-* [Sdk Analysis Level property](https://github.com/dotnet/designs/blob/main/proposed/sdk-analysis-level.md) – mostly for the inbox analyzers
++* The TFM of the project and the [Sdk Analysis Level property](https://github.com/dotnet/designs/blob/main/proposed/sdk-analysis-level.md) – mostly for the inbox analyzers
+ * `.editorconfig` file
+ 
++We will also consider respecting `SdkAnalysisLevel` to override the per-TFM defaults. Additionally, we may introduce a new "master switch" property, tentatively called `RunMSBuildChecks`, to make it possible to disable everything whole-sale. This would be used in scenarios like F5 in VS.
++```
++Skipping analyzers to speed up the build. You can execute 'Build' or 'Rebuild' command to run analyzers.
++```
++
++Here's the proposed release schedule:
++- **.NET 9** - the feature is introduced and enabled in `dotnet build` and `MSBuild.exe` command-line builds. It is not enabled in VS just yet. No analyzers are enabled by default. It is not technically required to read the TFM or any other props during evaluation, though it would be nice to respect `RunMSBuildChecks` already in this release. `.editorconfig` can be the sole source of configuration.
++- **.NET 10** - based on feedback and testing, we choose a set of analyzers to enable by default for projects targeting `net10.0`, and enable the feature as a whole in Visual Studio. Depending on how we feel about the perf characteristics of evaluation, especially the "double evaluation" mandated by discovering evaluation-tracking analyzers just-in-time, we may want to omit such analyzers from the default set.
++- **.NET 11** and beyond - some more analyzers are enabled for projects targeting `net11.0`, the `net10.0` does not change. Everything is mature and performant enough that we are able to auto-enable any analyzer. The gradual tightening of rules enabled by default gets us closer to the long envisioned "strict mode", which will ultimately allow us to evolve MSBuild to be simpler and more performant.
++
++
+ For the `.editorconfig` file configuration, following will apply:
+ * Only `.editorconfig` files collocated with the project file or up the folder hierarchy will be considered.
+ * `.editorconfig` files placed along with explicitly or implicitly imported msbuild files won’t be considered.
+diff --git a/eng/BootStrapMsBuild.targets b/eng/BootStrapMsBuild.targets
+index 07531f6633b..9209876eecf 100644
+--- a/eng/BootStrapMsBuild.targets
++++ b/eng/BootStrapMsBuild.targets
+@@ -191,6 +191,15 @@
+           DestinationFiles="@(FreshlyBuiltProjects -> '$(BootstrapDestination)$(TargetMSBuildToolsVersion)\Bin\arm64\%(RecursiveDir)%(Filename)%(Extension)')"
+           SkipUnchangedFiles="true" />
+ 
++    <!-- Disable workload resolver until we can figure out whether it can work in the bootstrap
++         https://github.com/dotnet/msbuild/issues/6566 -->
++    <MakeDir Directories="$(BootstrapDestination)$(TargetMSBuildToolsVersion)\Bin\SdkResolvers\Microsoft.DotNet.MSBuildSdkResolver" />
++    <Touch Files="$(BootstrapDestination)$(TargetMSBuildToolsVersion)\Bin\SdkResolvers\Microsoft.DotNet.MSBuildSdkResolver\DisableWorkloadResolver.sentinel"
++           AlwaysCreate="true" />
++
++    <MakeDir Directories="$(BootstrapDestination)$(TargetMSBuildToolsVersion)\Bin\amd64\SdkResolvers\Microsoft.DotNet.MSBuildSdkResolver" />
++    <Touch Files="$(BootstrapDestination)$(TargetMSBuildToolsVersion)\Bin\amd64\SdkResolvers\Microsoft.DotNet.MSBuildSdkResolver\DisableWorkloadResolver.sentinel"
++           AlwaysCreate="true" />
+   </Target>
+ 
+   <Target Name="BootstrapNetCore" DependsOnTargets="CleanBootstrapFolder">
+diff --git a/eng/Version.Details.xml b/eng/Version.Details.xml
+index b896ed6ace8..fe852e01165 100644
+--- a/eng/Version.Details.xml
++++ b/eng/Version.Details.xml
+@@ -2,9 +2,9 @@
+ <Dependencies>
+   <ProductDependencies>
+     <!-- Intermediate is necessary for source build. -->
+-    <Dependency Name="Microsoft.SourceBuild.Intermediate.source-build-reference-packages" Version="8.0.0-alpha.1.24163.3">
++    <Dependency Name="Microsoft.SourceBuild.Intermediate.source-build-reference-packages" Version="8.0.0-alpha.1.24257.2">
+       <Uri>https://github.com/dotnet/source-build-reference-packages</Uri>
+-      <Sha>79827eed138fd2575a8b24820b4f385ee4ffb6e6</Sha>
++      <Sha>6ed73280a6d70f7e7ac39c86f2abe8c10983f0bb</Sha>
+       <SourceBuild RepoName="source-build-reference-packages" ManagedOnly="true" />
+     </Dependency>
+     <!-- Necessary for source-build. This allows the live version of the package to be used by source-build. -->
+@@ -91,9 +91,9 @@
+       <Uri>https://github.com/nuget/nuget.client</Uri>
+       <Sha>fb50d1a45ed10b39b5f335bc3a4bdcaea9b951cf</Sha>
+     </Dependency>
+-    <Dependency Name="Microsoft.Net.Compilers.Toolset" Version="4.10.0-3.24225.4">
++    <Dependency Name="Microsoft.Net.Compilers.Toolset" Version="4.10.0-3.24259.10">
+       <Uri>https://github.com/dotnet/roslyn</Uri>
+-      <Sha>0156fea1a01c1fd88ef625b45fda9d4239c99fb3</Sha>
++      <Sha>6a0e23ee35042a881060eb97dea37dd7cc51db88</Sha>
+       <SourceBuild RepoName="roslyn" ManagedOnly="true" />
+     </Dependency>
+     <Dependency Name="Microsoft.DotNet.XUnitExtensions" Version="8.0.0-beta.24225.1">
+diff --git a/eng/Versions.props b/eng/Versions.props
+index b06c9cc3bc0..58a1f592918 100644
+--- a/eng/Versions.props
++++ b/eng/Versions.props
+@@ -51,7 +51,7 @@
+     <MicrosoftDotNetXUnitExtensionsVersion>8.0.0-beta.24225.1</MicrosoftDotNetXUnitExtensionsVersion>
+     <MicrosoftExtensionsDependencyModelVersion>7.0.0</MicrosoftExtensionsDependencyModelVersion>
+     <MicrosoftIORedistVersion>6.0.0</MicrosoftIORedistVersion>
+-    <MicrosoftNetCompilersToolsetVersion>4.10.0-3.24225.4</MicrosoftNetCompilersToolsetVersion>
++    <MicrosoftNetCompilersToolsetVersion>4.10.0-3.24259.10</MicrosoftNetCompilersToolsetVersion>
+     <NuGetBuildTasksVersion>6.10.0-preview.2.97</NuGetBuildTasksVersion>
+     <SystemRuntimeCompilerServicesUnsafeVersion>6.0.0</SystemRuntimeCompilerServicesUnsafeVersion>
+   </PropertyGroup>
+diff --git a/src/Build.UnitTests/BackEnd/MockHost.cs b/src/Build.UnitTests/BackEnd/MockHost.cs
+index 920e49b51e1..1ff79810e54 100644
+--- a/src/Build.UnitTests/BackEnd/MockHost.cs
++++ b/src/Build.UnitTests/BackEnd/MockHost.cs
+@@ -5,7 +5,7 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BackEnd.SdkResolution;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Engine.UnitTests.BackEnd;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+diff --git a/src/Build.UnitTests/Evaluation/Expander_Tests.cs b/src/Build.UnitTests/Evaluation/Expander_Tests.cs
+index 90f06cf86c7..f47f94fd217 100644
+--- a/src/Build.UnitTests/Evaluation/Expander_Tests.cs
++++ b/src/Build.UnitTests/Evaluation/Expander_Tests.cs
+@@ -5071,7 +5071,7 @@ private static bool ICUModeAvailable()
+         }
+ 
+         [Fact]
+-        public void PropertyFunctionRegisterAnalyzer()
++        public void PropertyFunctionRegisterBuildCheck()
+         {
+             using (var env = TestEnvironment.Create())
+             {
+@@ -5084,7 +5084,7 @@ public void PropertyFunctionRegisterAnalyzer()
+                 var dummyAssemblyFile = env.CreateFile(env.CreateFolder(), "test.dll");
+ 
+                 var result = new Expander<ProjectPropertyInstance, ProjectItemInstance>(new PropertyDictionary<ProjectPropertyInstance>(), FileSystems.Default)
+-                    .ExpandIntoStringLeaveEscaped($"$([MSBuild]::RegisterAnalyzer({dummyAssemblyFile.Path}))", ExpanderOptions.ExpandProperties, MockElementLocation.Instance, loggingContext);
++                    .ExpandIntoStringLeaveEscaped($"$([MSBuild]::RegisterBuildCheck({dummyAssemblyFile.Path}))", ExpanderOptions.ExpandProperties, MockElementLocation.Instance, loggingContext);
+ 
+                 result.ShouldBe(Boolean.TrueString);
+                 _ = logger.AllBuildEvents.Select(be => be.ShouldBeOfType<BuildCheckAcquisitionEventArgs>());
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 9c59416ea49..c30c97d672e 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -21,8 +21,8 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BackEnd.SdkResolution;
+-using Microsoft.Build.BuildCheck.Infrastructure;
+-using Microsoft.Build.BuildCheck.Logging;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Logging;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Eventing;
+ using Microsoft.Build.Exceptions;
+diff --git a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+index abcb6c22fb0..dd833490899 100644
+--- a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
++++ b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+@@ -4,7 +4,7 @@
+ using System.Collections.Generic;
+ using Microsoft.Build.BackEnd.Components.Caching;
+ using Microsoft.Build.BackEnd.SdkResolution;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.FileAccesses;
+ using Microsoft.Build.Shared;
+ 
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+index 7e72bd3a159..4fc3f6db70a 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+@@ -10,7 +10,7 @@
+ using System.Threading;
+ using System.Threading.Tasks.Dataflow;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+diff --git a/src/Build/BackEnd/Components/Logging/EventSourceSink.cs b/src/Build/BackEnd/Components/Logging/EventSourceSink.cs
+index 308e26cae4d..8b8885b195e 100644
+--- a/src/Build/BackEnd/Components/Logging/EventSourceSink.cs
++++ b/src/Build/BackEnd/Components/Logging/EventSourceSink.cs
+@@ -2,7 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index c4fb2a1b766..1b19f496efa 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -9,7 +9,7 @@
+ using System.Reflection;
+ using System.Threading;
+ using Microsoft.Build.BackEnd.Components.RequestBuilder;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+@@ -1761,7 +1761,7 @@ private void UpdateMinimumMessageImportance(ILogger logger)
+ 
+                 // The BuildCheck connector logger consumes only high priority messages.
+                 BuildCheckForwardingLogger => MessageImportance.High,
+-                BuildCheck.Infrastructure.BuildCheckConnectorLogger => MessageImportance.High,
++                BuildCheckConnectorLogger => MessageImportance.High,
+ 
+                 // Central forwarding loggers are used in worker nodes if logging verbosity could not be optimized, i.e. in cases
+                 // where we must log everything. They can be ignored in inproc nodes.
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index 1a4693ba685..577fc877071 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -10,7 +10,7 @@
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Eventing;
+diff --git a/src/Build/BuildCheck/API/BuildAnalyzer.cs b/src/Build/BuildCheck/API/BuildAnalyzer.cs
+index f249dc98cc5..0c6ed5a0752 100644
+--- a/src/Build/BuildCheck/API/BuildAnalyzer.cs
++++ b/src/Build/BuildCheck/API/BuildAnalyzer.cs
+@@ -4,7 +4,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Collections.Immutable;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+diff --git a/src/Build/BuildCheck/API/ConfigurationContext.cs b/src/Build/BuildCheck/API/ConfigurationContext.cs
+index 49dcdcfafec..81576a42fb5 100644
+--- a/src/Build/BuildCheck/API/ConfigurationContext.cs
++++ b/src/Build/BuildCheck/API/ConfigurationContext.cs
+@@ -4,7 +4,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Linq;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+diff --git a/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs b/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
+index 04cdf5aa87f..d8ad5a396ef 100644
+--- a/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
++++ b/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
+@@ -9,4 +9,5 @@ public interface IBuildCheckRegistrationContext
+ {
+     void RegisterEvaluatedPropertiesAction(Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction);
+     void RegisterParsedItemsAction(Action<BuildCheckDataContext<ParsedItemsAnalysisData>> parsedItemsAction);
++    void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction);
+ }
+diff --git a/src/Build/BuildCheck/Acquisition/AnalyzerAcquisitionData.cs b/src/Build/BuildCheck/Acquisition/AnalyzerAcquisitionData.cs
+index 125dc27458e..908aa931bef 100644
+--- a/src/Build/BuildCheck/Acquisition/AnalyzerAcquisitionData.cs
++++ b/src/Build/BuildCheck/Acquisition/AnalyzerAcquisitionData.cs
+@@ -8,7 +8,7 @@
+ using System.Threading.Tasks;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Acquisition;
++namespace Microsoft.Build.Experimental.BuildCheck.Acquisition;
+ 
+ // https://github.com/dotnet/msbuild/issues/9633
+ // Acquisition
+diff --git a/src/Build/BuildCheck/Acquisition/BuildCheckAcquisitionModule.cs b/src/Build/BuildCheck/Acquisition/BuildCheckAcquisitionModule.cs
+index 1d2ff00841e..673c98919a4 100644
+--- a/src/Build/BuildCheck/Acquisition/BuildCheckAcquisitionModule.cs
++++ b/src/Build/BuildCheck/Acquisition/BuildCheckAcquisitionModule.cs
+@@ -6,12 +6,12 @@
+ using System.Linq;
+ using System.Reflection;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+-namespace Microsoft.Build.BuildCheck.Acquisition;
++namespace Microsoft.Build.Experimental.BuildCheck.Acquisition;
+ 
+ internal class BuildCheckAcquisitionModule : IBuildCheckAcquisitionModule
+ {
+diff --git a/src/Build/BuildCheck/Acquisition/IBuildCheckAcquisitionModule.cs b/src/Build/BuildCheck/Acquisition/IBuildCheckAcquisitionModule.cs
+index e86dc7d0c4a..efb860ef844 100644
+--- a/src/Build/BuildCheck/Acquisition/IBuildCheckAcquisitionModule.cs
++++ b/src/Build/BuildCheck/Acquisition/IBuildCheckAcquisitionModule.cs
+@@ -2,10 +2,10 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Collections.Generic;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Framework;
+ 
+-namespace Microsoft.Build.BuildCheck.Acquisition;
++namespace Microsoft.Build.Experimental.BuildCheck.Acquisition;
+ 
+ internal interface IBuildCheckAcquisitionModule
+ {
+diff --git a/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs b/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
+index 174fb305b83..a09866ebb22 100644
+--- a/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
++++ b/src/Build/BuildCheck/Analyzers/SharedOutputPathAnalyzer.cs
+@@ -6,11 +6,11 @@
+ using System.Collections.Immutable;
+ using System.Diagnostics;
+ using System.IO;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Analyzers;
++namespace Microsoft.Build.Experimental.BuildCheck.Analyzers;
+ 
+ internal sealed class SharedOutputPathAnalyzer : BuildAnalyzer
+ {
+@@ -21,7 +21,7 @@ internal sealed class SharedOutputPathAnalyzer : BuildAnalyzer
+ 
+     public override string FriendlyName => "MSBuild.SharedOutputPathAnalyzer";
+ 
+-    public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } =[SupportedRule];
++    public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } = [SupportedRule];
+ 
+     public override void Initialize(ConfigurationContext configurationContext)
+     {
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationInternal.cs b/src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationInternal.cs
+index c2c36c813f9..9d7738922e7 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationInternal.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildAnalyzerConfigurationInternal.cs
+@@ -3,7 +3,7 @@
+ 
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ /// <summary>
+ /// Counterpart type for BuildAnalyzerConfiguration - with all properties non-nullable
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildAnalyzerWrapper.cs b/src/Build/BuildCheck/Infrastructure/BuildAnalyzerWrapper.cs
+index 06e0aaa2439..598d0be021d 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildAnalyzerWrapper.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildAnalyzerWrapper.cs
+@@ -8,7 +8,7 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ /// <summary>
+ /// A wrapping, enriching class for BuildAnalyzer - so that we have additional data and functionality.
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index 9995aef71b3..d73b9bb6231 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -8,7 +8,7 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ /// <summary>
+ /// A manager of the runs of the analyzers - deciding based on configuration of what to run and what to postfilter.
+@@ -17,9 +17,10 @@ internal sealed class BuildCheckCentralContext
+ {
+     private record CallbackRegistry(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>>)> EvaluatedPropertiesActions,
+-        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ParsedItemsAnalysisData>>)> ParsedItemsActions)
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ParsedItemsAnalysisData>>)> ParsedItemsActions,
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<TaskInvocationAnalysisData>>)> TaskInvocationActions)
+     {
+-        public CallbackRegistry() : this([],[]) { }
++        public CallbackRegistry() : this([], [], []) { }
+     }
+ 
+     // In a future we can have callbacks per project as well
+@@ -27,8 +28,9 @@ public CallbackRegistry() : this([],[]) { }
+ 
+     // This we can potentially use to subscribe for receiving evaluated props in the
+     //  build event args. However - this needs to be done early on, when analyzers might not be known yet
+-    internal bool HasEvaluatedPropertiesActions => _globalCallbacks.EvaluatedPropertiesActions.Any();
+-    internal bool HasParsedItemsActions => _globalCallbacks.ParsedItemsActions.Any();
++    internal bool HasEvaluatedPropertiesActions => _globalCallbacks.EvaluatedPropertiesActions.Count > 0;
++    internal bool HasParsedItemsActions => _globalCallbacks.ParsedItemsActions.Count > 0;
++    internal bool HasTaskInvocationActions => _globalCallbacks.TaskInvocationActions.Count > 0;
+ 
+     internal void RegisterEvaluatedPropertiesAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction)
+         // Here we might want to communicate to node that props need to be sent.
+@@ -38,6 +40,9 @@ internal void RegisterEvaluatedPropertiesAction(BuildAnalyzerWrapper analyzer, A
+     internal void RegisterParsedItemsAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<ParsedItemsAnalysisData>> parsedItemsAction)
+         => RegisterAction(analyzer, parsedItemsAction, _globalCallbacks.ParsedItemsActions);
+ 
++    internal void RegisterTaskInvocationAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction)
++        => RegisterAction(analyzer, taskInvocationAction, _globalCallbacks.TaskInvocationActions);
++
+     private void RegisterAction<T>(
+         BuildAnalyzerWrapper wrappedAnalyzer,
+         Action<BuildCheckDataContext<T>> handler,
+@@ -60,6 +65,7 @@ internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
+     {
+         _globalCallbacks.EvaluatedPropertiesActions.RemoveAll(a => a.Item1 == analyzer);
+         _globalCallbacks.ParsedItemsActions.RemoveAll(a => a.Item1 == analyzer);
++        _globalCallbacks.TaskInvocationActions.RemoveAll(a => a.Item1 == analyzer);
+     }
+ 
+     internal void RunEvaluatedPropertiesActions(
+@@ -78,6 +84,14 @@ internal void RunParsedItemsActions(
+         => RunRegisteredActions(_globalCallbacks.ParsedItemsActions, parsedItemsAnalysisData,
+             loggingContext, resultHandler);
+ 
++    internal void RunTaskInvocationActions(
++        TaskInvocationAnalysisData taskInvocationAnalysisData,
++        LoggingContext loggingContext,
++        Action<BuildAnalyzerWrapper, LoggingContext, BuildAnalyzerConfigurationInternal[], BuildCheckResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.TaskInvocationActions, taskInvocationAnalysisData,
++            loggingContext, resultHandler);
++
+     private void RunRegisteredActions<T>(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<T>>)> registeredCallbacks,
+         T analysisData,
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
+index 29a0a8acf50..ed795891df5 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
+@@ -7,7 +7,7 @@
+ using System.Text;
+ using System.Threading.Tasks;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal sealed class BuildCheckConfigurationException : Exception
+ {
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
+index 14f16e691f0..7dad5f0c4da 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
+@@ -5,13 +5,12 @@
+ using System.Collections.Generic;
+ using System.Linq;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Acquisition;
+-using Microsoft.Build.BuildCheck.Utilities;
++using Microsoft.Build.Experimental.BuildCheck.Acquisition;
++using Microsoft.Build.Experimental.BuildCheck.Utilities;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+-using static Microsoft.Build.BuildCheck.Infrastructure.BuildCheckManagerProvider;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal sealed class BuildCheckConnectorLogger : ILogger
+ {
+@@ -37,6 +36,10 @@ public void Initialize(IEventSource eventSource)
+         eventSource.AnyEventRaised += EventSource_AnyEventRaised;
+         eventSource.BuildFinished += EventSource_BuildFinished;
+ 
++        if (eventSource is IEventSource3 eventSource3)
++        {
++            eventSource3.IncludeTaskInputs();
++        }
+         if (eventSource is IEventSource4 eventSource4)
+         {
+             eventSource4.IncludeEvaluationPropertiesAndItems();
+@@ -67,6 +70,35 @@ private void HandleProjectEvaluationStartedEvent(ProjectEvaluationStartedEventAr
+         }
+     }
+ 
++    private void HandleBuildCheckTracingEvent(BuildCheckTracingEventArgs eventArgs)
++    {
++        if (!eventArgs.IsAggregatedGlobalReport)
++        {
++            _stats.Merge(eventArgs.TracingData, (span1, span2) => span1 + span2);
++        }
++    }
++
++    private void HandleTaskStartedEvent(TaskStartedEventArgs eventArgs)
++    {
++        _buildCheckManager.ProcessTaskStartedEventArgs(
++            _loggingContextFactory.CreateLoggingContext(eventArgs.BuildEventContext!),
++            eventArgs);
++    }
++
++    private void HandleTaskFinishedEvent(TaskFinishedEventArgs eventArgs)
++    {
++        _buildCheckManager.ProcessTaskFinishedEventArgs(
++            _loggingContextFactory.CreateLoggingContext(eventArgs.BuildEventContext!),
++            eventArgs);
++    }
++
++    private void HandleTaskParameterEvent(TaskParameterEventArgs eventArgs)
++    {
++        _buildCheckManager.ProcessTaskParameterEventArgs(
++            _loggingContextFactory.CreateLoggingContext(eventArgs.BuildEventContext!),
++            eventArgs);
++    }
++
+     private bool IsMetaProjFile(string? projectFile) => !string.IsNullOrEmpty(projectFile) && projectFile!.EndsWith(".metaproj", StringComparison.OrdinalIgnoreCase);
+ 
+     private void EventSource_AnyEventRaised(object sender, BuildEventArgs e)
+@@ -81,19 +113,12 @@ private void EventSource_AnyEventRaised(object sender, BuildEventArgs e)
+ 
+     private void EventSource_BuildFinished(object sender, BuildFinishedEventArgs e)
+     {
+-        BuildEventContext buildEventContext = e.BuildEventContext
+-            ?? new BuildEventContext(
+-                BuildEventContext.InvalidNodeId,
+-                BuildEventContext.InvalidTargetId,
+-                BuildEventContext.InvalidProjectContextId,
+-                BuildEventContext.InvalidTaskId);
+-
+-        LoggingContext loggingContext = _loggingContextFactory.CreateLoggingContext(buildEventContext);
++        LoggingContext loggingContext = _loggingContextFactory.CreateLoggingContext(GetBuildEventContext(e));
+ 
+         _stats.Merge(_buildCheckManager.CreateAnalyzerTracingStats(), (span1, span2) => span1 + span2);
+         LogAnalyzerStats(loggingContext);
+     }
+-    
++
+     private void LogAnalyzerStats(LoggingContext loggingContext)
+     {
+         Dictionary<string, TimeSpan> infraStats = new Dictionary<string, TimeSpan>();
+@@ -131,18 +156,21 @@ private string BuildCsvString(string title, Dictionary<string, TimeSpan> rowData
+ 
+     private Dictionary<Type, Action<BuildEventArgs>> GetBuildEventHandlers() => new()
+     {
+-        { typeof(ProjectEvaluationFinishedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationFinishedEvent((ProjectEvaluationFinishedEventArgs) e) },
+-        { typeof(ProjectEvaluationStartedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationStartedEvent((ProjectEvaluationStartedEventArgs) e) },
++        { typeof(ProjectEvaluationFinishedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationFinishedEvent((ProjectEvaluationFinishedEventArgs)e) },
++        { typeof(ProjectEvaluationStartedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationStartedEvent((ProjectEvaluationStartedEventArgs)e) },
+         { typeof(ProjectStartedEventArgs), (BuildEventArgs e) => _buildCheckManager.StartProjectRequest(BuildCheckDataSource.EventArgs, e.BuildEventContext!) },
+         { typeof(ProjectFinishedEventArgs), (BuildEventArgs e) => _buildCheckManager.EndProjectRequest(BuildCheckDataSource.EventArgs, e.BuildEventContext!) },
+-        { typeof(BuildCheckTracingEventArgs), (BuildEventArgs e) => 
+-        {
+-            if(!((BuildCheckTracingEventArgs)e).IsAggregatedGlobalReport)
+-            {
+-                _stats.Merge(((BuildCheckTracingEventArgs)e).TracingData, (span1, span2) => span1 + span2);
+-            }
+-        }
+-        },
+-        { typeof(BuildCheckAcquisitionEventArgs), (BuildEventArgs e) => _buildCheckManager.ProcessAnalyzerAcquisition(((BuildCheckAcquisitionEventArgs)e).ToAnalyzerAcquisitionData(), e.BuildEventContext!) },
++        { typeof(BuildCheckTracingEventArgs), (BuildEventArgs e) => HandleBuildCheckTracingEvent((BuildCheckTracingEventArgs)e) },
++        { typeof(BuildCheckAcquisitionEventArgs), (BuildEventArgs e) => _buildCheckManager.ProcessAnalyzerAcquisition(((BuildCheckAcquisitionEventArgs)e).ToAnalyzerAcquisitionData(), GetBuildEventContext(e)) },
++        { typeof(TaskStartedEventArgs), (BuildEventArgs e) => HandleTaskStartedEvent((TaskStartedEventArgs)e) },
++        { typeof(TaskFinishedEventArgs), (BuildEventArgs e) => HandleTaskFinishedEvent((TaskFinishedEventArgs)e) },
++        { typeof(TaskParameterEventArgs), (BuildEventArgs e) => HandleTaskParameterEvent((TaskParameterEventArgs)e) },
+     };
++
++    private BuildEventContext GetBuildEventContext(BuildEventArgs e) => e.BuildEventContext
++        ?? new BuildEventContext(
++                BuildEventContext.InvalidNodeId,
++                BuildEventContext.InvalidTargetId,
++                BuildEventContext.InvalidProjectContextId,
++                BuildEventContext.InvalidTaskId);
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+index 19a4e3d6967..76ac5ec7767 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+@@ -5,7 +5,7 @@
+ using System.Threading;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal sealed class BuildCheckRegistrationContext(BuildAnalyzerWrapper analyzerWrapper, BuildCheckCentralContext buildCheckCentralContext) : IBuildCheckRegistrationContext
+ {
+@@ -18,4 +18,9 @@ public void RegisterParsedItemsAction(Action<BuildCheckDataContext<ParsedItemsAn
+     {
+         buildCheckCentralContext.RegisterParsedItemsAction(analyzerWrapper, parsedItemsAction);
+     }
++
++    public void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction)
++    {
++        buildCheckCentralContext.RegisterTaskInvocationAction(analyzerWrapper, taskInvocationAction);
++    }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
+index 3a61bcaf612..6e8f969b544 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckForwardingLogger.cs
+@@ -8,7 +8,7 @@
+ using System.Threading.Tasks;
+ using Microsoft.Build.BackEnd.Logging;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ /// <summary>
+ /// Forwarding logger for the build check infrastructure.
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 3fadcac86b1..0e425360d0f 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -8,14 +8,14 @@
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Acquisition;
+-using Microsoft.Build.BuildCheck.Analyzers;
+-using Microsoft.Build.BuildCheck.Logging;
++using Microsoft.Build.Experimental.BuildCheck.Acquisition;
++using Microsoft.Build.Experimental.BuildCheck.Analyzers;
++using Microsoft.Build.Experimental.BuildCheck.Logging;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal delegate BuildAnalyzer BuildAnalyzerFactory();
+ internal delegate BuildAnalyzerWrapper BuildAnalyzerWrapperFactory(ConfigurationContext configurationContext);
+@@ -137,11 +137,23 @@ private static readonly (string[] ruleIds, bool defaultEnablement, BuildAnalyzer
+             []
+         ];
+ 
++        /// <summary>
++        /// For tests only. TODO: Remove when analyzer acquisition is done.
++        /// </summary>
++        internal static (string[] ruleIds, bool defaultEnablement, BuildAnalyzerFactory factory)[][]? s_testFactoriesPerDataSource;
++
+         private void RegisterBuiltInAnalyzers(BuildCheckDataSource buildCheckDataSource)
+         {
+             _analyzersRegistry.AddRange(
+                 s_builtInFactoriesPerDataSource[(int)buildCheckDataSource]
+                     .Select(v => new BuildAnalyzerFactoryContext(v.factory, v.ruleIds, v.defaultEnablement)));
++
++            if (s_testFactoriesPerDataSource is not null)
++            {
++                _analyzersRegistry.AddRange(
++                    s_testFactoriesPerDataSource[(int)buildCheckDataSource]
++                        .Select(v => new BuildAnalyzerFactoryContext(v.factory, v.ruleIds, v.defaultEnablement)));
++            }
+         }
+ 
+         /// <summary>
+@@ -312,6 +324,24 @@ public void ProcessEvaluationFinishedEventArgs(
+             => _buildEventsProcessor
+                 .ProcessEvaluationFinishedEventArgs(buildAnalysisContext, evaluationFinishedEventArgs);
+ 
++        public void ProcessTaskStartedEventArgs(
++            AnalyzerLoggingContext buildAnalysisContext,
++            TaskStartedEventArgs taskStartedEventArgs)
++            => _buildEventsProcessor
++                .ProcessTaskStartedEventArgs(buildAnalysisContext, taskStartedEventArgs);
++
++        public void ProcessTaskFinishedEventArgs(
++            AnalyzerLoggingContext buildAnalysisContext,
++            TaskFinishedEventArgs taskFinishedEventArgs)
++            => _buildEventsProcessor
++                .ProcessTaskFinishedEventArgs(buildAnalysisContext, taskFinishedEventArgs);
++
++        public void ProcessTaskParameterEventArgs(
++            AnalyzerLoggingContext buildAnalysisContext,
++            TaskParameterEventArgs taskParameterEventArgs)
++            => _buildEventsProcessor
++                .ProcessTaskParameterEventArgs(buildAnalysisContext, taskParameterEventArgs);
++
+         public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats()
+         {
+             foreach (BuildAnalyzerFactoryContext analyzerFactoryContext in _analyzersRegistry)
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index 9514f0a7ca0..cf2bae57bad 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -12,8 +12,8 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Components.Caching;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Analyzers;
+-using Microsoft.Build.BuildCheck.Logging;
++using Microsoft.Build.Experimental.BuildCheck.Analyzers;
++using Microsoft.Build.Experimental.BuildCheck.Logging;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Evaluation;
+@@ -21,13 +21,31 @@
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal class BuildEventsProcessor(BuildCheckCentralContext buildCheckCentralContext)
+ {
++    /// <summary>
++    /// Represents a task currently being executed.
++    /// </summary>
++    /// <remarks>
++    /// <see cref="TaskParameters"/> is stored in its own field typed as a mutable dictionary because <see cref="AnalysisData"/>
++    /// is immutable.
++    /// </remarks>
++    private struct ExecutingTaskData
++    {
++        public TaskInvocationAnalysisData AnalysisData;
++        public Dictionary<string, TaskInvocationAnalysisData.TaskParameter> TaskParameters;
++    }
++
+     private readonly SimpleProjectRootElementCache _cache = new SimpleProjectRootElementCache();
+     private readonly BuildCheckCentralContext _buildCheckCentralContext = buildCheckCentralContext;
+ 
++    /// <summary>
++    /// Keeps track of in-flight tasks. Keyed by task ID as passed in <see cref="BuildEventContext.TaskId"/>.
++    /// </summary>
++    private readonly Dictionary<int, ExecutingTaskData> _tasksBeingExecuted = [];
++
+     // This requires MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION set to 1
+     internal void ProcessEvaluationFinishedEventArgs(
+         AnalyzerLoggingContext buildAnalysisContext,
+@@ -55,6 +73,95 @@ internal void ProcessEvaluationFinishedEventArgs(
+         }
+     }
+ 
++    internal void ProcessTaskStartedEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskStartedEventArgs taskStartedEventArgs)
++    {
++        if (!_buildCheckCentralContext.HasTaskInvocationActions)
++        {
++            // No analyzer is interested in task invocation actions -> nothing to do.
++            return;
++        }
++
++        if (taskStartedEventArgs.BuildEventContext is not null)
++        {
++            ElementLocation invocationLocation = ElementLocation.Create(
++                taskStartedEventArgs.TaskFile,
++                taskStartedEventArgs.LineNumber,
++                taskStartedEventArgs.ColumnNumber);
++
++            // Add a new entry to _tasksBeingExecuted. TaskParameters are initialized empty and will be recorded
++            // based on TaskParameterEventArgs we receive later.
++            Dictionary<string, TaskInvocationAnalysisData.TaskParameter> taskParameters = new();
++
++            ExecutingTaskData taskData = new()
++            {
++                TaskParameters = taskParameters,
++                AnalysisData = new(
++                    projectFilePath: taskStartedEventArgs.ProjectFile!,
++                    taskInvocationLocation: invocationLocation,
++                    taskName: taskStartedEventArgs.TaskName,
++                    taskAssemblyLocation: taskStartedEventArgs.TaskAssemblyLocation,
++                    parameters: taskParameters),
++            };
++
++            _tasksBeingExecuted.Add(taskStartedEventArgs.BuildEventContext.TaskId, taskData);
++        }
++    }
++
++    internal void ProcessTaskFinishedEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskFinishedEventArgs taskFinishedEventArgs)
++    {
++        if (!_buildCheckCentralContext.HasTaskInvocationActions)
++        {
++            // No analyzer is interested in task invocation actions -> nothing to do.
++            return;
++        }
++
++        if (taskFinishedEventArgs.BuildEventContext is not null &&
++            _tasksBeingExecuted.TryGetValue(taskFinishedEventArgs.BuildEventContext.TaskId, out ExecutingTaskData taskData))
++        {
++            // All task parameters have been recorded by now so remove the task from the dictionary and fire the registered build check actions.
++            _tasksBeingExecuted.Remove(taskFinishedEventArgs.BuildEventContext.TaskId);
++            _buildCheckCentralContext.RunTaskInvocationActions(taskData.AnalysisData, buildAnalysisContext, ReportResult);
++        }
++    }
++
++    internal void ProcessTaskParameterEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskParameterEventArgs taskParameterEventArgs)
++    {
++        if (!_buildCheckCentralContext.HasTaskInvocationActions)
++        {
++            // No analyzer is interested in task invocation actions -> nothing to do.
++            return;
++        }
++
++        bool isOutput;
++        switch (taskParameterEventArgs.Kind)
++        {
++            case TaskParameterMessageKind.TaskInput: isOutput = false; break;
++            case TaskParameterMessageKind.TaskOutput: isOutput = true; break;
++            default: return;
++        }
++
++        if (taskParameterEventArgs.BuildEventContext is not null &&
++            _tasksBeingExecuted.TryGetValue(taskParameterEventArgs.BuildEventContext.TaskId, out ExecutingTaskData taskData))
++        {
++            // Add the parameter name and value to the matching entry in _tasksBeingExecuted. Parameters come typed as IList
++            // but it's more natural to pass them as scalar values so we unwrap one-element lists.
++            string parameterName = taskParameterEventArgs.ItemType;
++            object? parameterValue = taskParameterEventArgs.Items?.Count switch
++            {
++                1 => taskParameterEventArgs.Items[0],
++                _ => taskParameterEventArgs.Items,
++            };
++
++            taskData.TaskParameters[parameterName] = new TaskInvocationAnalysisData.TaskParameter(parameterValue, isOutput);
++        }
++    }
++
+     private static void ReportResult(
+         BuildAnalyzerWrapper analyzerWrapper,
+         LoggingContext loggingContext,
+diff --git a/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs b/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
+index 67c2155500e..fe563a087f6 100644
+--- a/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/ConfigurationProvider.cs
+@@ -12,7 +12,7 @@
+ using Microsoft.Build.Experimental.BuildCheck;
+ using System.Configuration;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ 
+ // Let's flip form statics to instance, with exposed interface (so that we can easily swap implementations)
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+index ca8803b99af..9f39f8dcb69 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+@@ -4,8 +4,8 @@
+ using System;
+ using System.Collections.Generic;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Acquisition;
+-using Microsoft.Build.BuildCheck.Logging;
++using Microsoft.Build.Experimental.BuildCheck.Acquisition;
++using Microsoft.Build.Experimental.BuildCheck.Logging;
+ using Microsoft.Build.Framework;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+@@ -40,6 +40,18 @@ void ProcessEvaluationFinishedEventArgs(
+         AnalyzerLoggingContext buildAnalysisContext,
+         ProjectEvaluationFinishedEventArgs projectEvaluationFinishedEventArgs);
+ 
++    void ProcessTaskStartedEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskStartedEventArgs taskStartedEventArgs);
++
++    void ProcessTaskFinishedEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskFinishedEventArgs taskFinishedEventArgs);
++
++    void ProcessTaskParameterEventArgs(
++        AnalyzerLoggingContext buildAnalysisContext,
++        TaskParameterEventArgs taskParameterEventArgs);
++
+     void SetDataSource(BuildCheckDataSource buildCheckDataSource);
+ 
+     void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData, BuildEventContext buildEventContext);
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManagerProvider.cs
+index 6b8bdea6080..43b08b39111 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManagerProvider.cs
+@@ -9,7 +9,7 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal interface IBuildCheckManagerProvider : IBuildComponent
+ {
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+index 4ba7579c0ba..a0136eafac8 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+@@ -4,12 +4,12 @@
+ using System;
+ using System.Collections.Generic;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Acquisition;
+-using Microsoft.Build.BuildCheck.Logging;
++using Microsoft.Build.Experimental.BuildCheck.Acquisition;
++using Microsoft.Build.Experimental.BuildCheck.Logging;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal class NullBuildCheckManager : IBuildCheckManager
+ {
+@@ -27,6 +27,21 @@ public void SetDataSource(BuildCheckDataSource buildCheckDataSource)
+     {
+     }
+ 
++    public void ProcessTaskStartedEventArgs(AnalyzerLoggingContext buildAnalysisContext,
++        TaskStartedEventArgs taskStartedEventArgs)
++    {
++    }
++
++    public void ProcessTaskFinishedEventArgs(AnalyzerLoggingContext buildAnalysisContext,
++        TaskFinishedEventArgs taskFinishedEventArgs)
++    {
++    }
++
++    public void ProcessTaskParameterEventArgs(AnalyzerLoggingContext buildAnalysisContext,
++        TaskParameterEventArgs taskParameterEventArgs)
++    {
++    }
++
+     public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData, BuildEventContext buildEventContext) 
+     {
+     }
+@@ -60,4 +75,13 @@ public void ResumeProject(BuildCheckDataSource buildCheckDataSource, BuildEventC
+     }
+ 
+     public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats() => new Dictionary<string, TimeSpan>();
++
++    public void StartTaskInvocation(BuildCheckDataSource buildCheckDataSource, TaskStartedEventArgs eventArgs)
++    { }
++
++    public void EndTaskInvocation(BuildCheckDataSource buildCheckDataSource, TaskFinishedEventArgs eventArgs)
++    { }
++
++    public void ProcessTaskParameter(BuildCheckDataSource buildCheckDataSource, TaskParameterEventArgs eventArg)
++    { }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManagerProvider.cs
+index c6dcbd84f8d..6005d4a7ea8 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManagerProvider.cs
+@@ -9,7 +9,7 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal class NullBuildCheckManagerProvider : IBuildCheckManagerProvider
+ {
+diff --git a/src/Build/BuildCheck/Infrastructure/TracingReporter.cs b/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
+index eb41e3d1214..9809ad27e49 100644
+--- a/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
++++ b/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
+@@ -6,10 +6,10 @@
+ using System.Linq;
+ using System.Text;
+ using System.Threading.Tasks;
+-using Microsoft.Build.BuildCheck.Utilities;
++using Microsoft.Build.Experimental.BuildCheck.Utilities;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+-namespace Microsoft.Build.BuildCheck.Infrastructure;
++namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+ internal class TracingReporter
+ {
+diff --git a/src/Build/BuildCheck/Logging/AnalyzerLoggingContext.cs b/src/Build/BuildCheck/Logging/AnalyzerLoggingContext.cs
+index 1b3eb9cb4bb..b7e39eaa8b0 100644
+--- a/src/Build/BuildCheck/Logging/AnalyzerLoggingContext.cs
++++ b/src/Build/BuildCheck/Logging/AnalyzerLoggingContext.cs
+@@ -5,7 +5,7 @@
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ 
+-namespace Microsoft.Build.BuildCheck.Logging;
++namespace Microsoft.Build.Experimental.BuildCheck.Logging;
+ 
+ internal class AnalyzerLoggingContext : LoggingContext
+ {
+diff --git a/src/Build/BuildCheck/Logging/AnalyzerLoggingContextFactory.cs b/src/Build/BuildCheck/Logging/AnalyzerLoggingContextFactory.cs
+index 3b1e035aed9..06b7dd6e033 100644
+--- a/src/Build/BuildCheck/Logging/AnalyzerLoggingContextFactory.cs
++++ b/src/Build/BuildCheck/Logging/AnalyzerLoggingContextFactory.cs
+@@ -5,7 +5,7 @@
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ 
+-namespace Microsoft.Build.BuildCheck.Logging;
++namespace Microsoft.Build.Experimental.BuildCheck.Logging;
+ 
+ internal class AnalyzerLoggingContextFactory(ILoggingService loggingService) : IBuildAnalysisLoggingContextFactory
+ {
+diff --git a/src/Build/BuildCheck/Logging/IBuildAnalysisLoggingContextFactory.cs b/src/Build/BuildCheck/Logging/IBuildAnalysisLoggingContextFactory.cs
+index e5188703ff7..bbb562c5ec9 100644
+--- a/src/Build/BuildCheck/Logging/IBuildAnalysisLoggingContextFactory.cs
++++ b/src/Build/BuildCheck/Logging/IBuildAnalysisLoggingContextFactory.cs
+@@ -1,7 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-using Microsoft.Build.BuildCheck.Logging;
++using Microsoft.Build.Experimental.BuildCheck.Logging;
+ using Microsoft.Build.Framework;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+diff --git a/src/Build/BuildCheck/OM/BuildCheckDataContext.cs b/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
+index d0738fe6b71..f0623e4a822 100644
+--- a/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
++++ b/src/Build/BuildCheck/OM/BuildCheckDataContext.cs
+@@ -7,7 +7,7 @@
+ using System.Text;
+ using System.Threading.Tasks;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Experimental;
+ using Microsoft.Build.Framework;
+ 
+@@ -16,7 +16,7 @@ namespace Microsoft.Build.Experimental.BuildCheck;
+ /// <summary>
+ /// Base for a data passed from infrastructure to build analyzers.
+ /// </summary>
+-/// <param name="projectFilePath">Currently build project.</param>
++/// <param name="projectFilePath">Currently built project.</param>
+ public abstract class AnalysisData(string projectFilePath)
+ {
+     /// <summary>
+diff --git a/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs b/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
+index a6b34446258..86598ada553 100644
+--- a/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
++++ b/src/Build/BuildCheck/OM/ParsedItemsAnalysisData.cs
+@@ -4,9 +4,6 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Linq;
+-using System.Text;
+-using System.Threading.Tasks;
+-using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
+ 
+@@ -53,3 +50,53 @@ internal ParsedItemsAnalysisData(
+ 
+     public ItemsHolder ItemsHolder { get; }
+ }
++
++/// <summary>
++/// BuildCheck OM data representing a task executed by a project.
++/// </summary>
++public sealed class TaskInvocationAnalysisData : AnalysisData
++{
++    /// <summary>
++    /// Represents an input or output parameter of a task.
++    /// </summary>
++    /// <param name="Value">The value passed to (when <paramref name="IsOutput"/> is false) or from
++    /// (when <paramref name="IsOutput"/> is true) a task. This object can be of any type supported
++    /// in task parameters: <see cref="Framework.ITaskItem"/>, <see cref="Framework.ITaskItem"/>[],
++    /// bool, string, or anything else convertible to/from string.</param>
++    /// <param name="IsOutput">True for output parameters, false for input parameters.</param>
++    public record class TaskParameter(object? Value, bool IsOutput);
++
++    internal TaskInvocationAnalysisData(
++        string projectFilePath,
++        ElementLocation taskInvocationLocation,
++        string taskName,
++        string taskAssemblyLocation,
++        IReadOnlyDictionary<string, TaskParameter> parameters)
++        : base(projectFilePath)
++    {
++        TaskInvocationLocation = taskInvocationLocation;
++        TaskName = taskName;
++        TaskAssemblyLocation = taskAssemblyLocation;
++        Parameters = parameters;
++    }
++
++    /// <summary>
++    /// The project file and line/column number where the task is invoked.
++    /// </summary>
++    public ElementLocation TaskInvocationLocation { get; }
++
++    /// <summary>
++    /// Name of the task.
++    /// </summary>
++    public string TaskName { get; }
++
++    /// <summary>
++    /// The location of the assembly containing the implementation of the task.
++    /// </summary>
++    public string TaskAssemblyLocation { get; }
++
++    /// <summary>
++    /// The parameters of the task, keyed by parameter name.
++    /// </summary>
++    public IReadOnlyDictionary<string, TaskParameter> Parameters { get; }
++}
+diff --git a/src/Build/BuildCheck/Utilities/Constants.cs b/src/Build/BuildCheck/Utilities/Constants.cs
+index 9ba6b58a1e6..8ba5eaf65f6 100644
+--- a/src/Build/BuildCheck/Utilities/Constants.cs
++++ b/src/Build/BuildCheck/Utilities/Constants.cs
+@@ -7,7 +7,7 @@
+ using System.Text;
+ using System.Threading.Tasks;
+ 
+-namespace Microsoft.Build.BuildCheck.Utilities
++namespace Microsoft.Build.Experimental.BuildCheck.Utilities
+ {
+     /// <summary>
+     /// Constants to be shared within BuildCheck infrastructure
+diff --git a/src/Build/Collections/PropertyDictionary.cs b/src/Build/Collections/PropertyDictionary.cs
+index 96884a1914d..26be27d807b 100644
+--- a/src/Build/Collections/PropertyDictionary.cs
++++ b/src/Build/Collections/PropertyDictionary.cs
+@@ -135,16 +135,7 @@ ICollection<T> IDictionary<string, T>.Values
+         /// Returns the number of properties in the collection
+         /// </summary>
+         [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+-        int ICollection<KeyValuePair<string, T>>.Count
+-        {
+-            get
+-            {
+-                lock (_properties)
+-                {
+-                    return ((ICollection<T>)_properties).Count;
+-                }
+-            }
+-        }
++        int ICollection<KeyValuePair<string, T>>.Count => Count;
+ 
+         /// <summary>
+         /// Whether the collection is read-only.
+@@ -155,7 +146,7 @@ int ICollection<KeyValuePair<string, T>>.Count
+         /// <summary>
+         /// Returns the number of property in the collection.
+         /// </summary>
+-        internal int Count
++        public int Count
+         {
+             get
+             {
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 84d485b7c59..e67785390a4 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -3917,12 +3917,12 @@ private bool TryExecuteWellKnownFunction(out object returnVal, object objectInst
+                     }
+                     else if (_receiverType == typeof(IntrinsicFunctions))
+                     {
+-                        if (string.Equals(_methodMethodName, nameof(IntrinsicFunctions.RegisterAnalyzer), StringComparison.OrdinalIgnoreCase))
++                        if (string.Equals(_methodMethodName, nameof(IntrinsicFunctions.RegisterBuildCheck), StringComparison.OrdinalIgnoreCase))
+                         {
+-                            ErrorUtilities.VerifyThrow(_loggingContext != null, $"The logging context is missed. {nameof(IntrinsicFunctions.RegisterAnalyzer)} can not be invoked.");
++                            ErrorUtilities.VerifyThrow(_loggingContext != null, $"The logging context is missed. {nameof(IntrinsicFunctions.RegisterBuildCheck)} can not be invoked.");
+                             if (TryGetArg(args, out string arg0))
+                             {
+-                                returnVal = IntrinsicFunctions.RegisterAnalyzer(arg0, _loggingContext);
++                                returnVal = IntrinsicFunctions.RegisterBuildCheck(arg0, _loggingContext);
+                                 return true;
+                             }
+                         }
+diff --git a/src/Build/Evaluation/IntrinsicFunctions.cs b/src/Build/Evaluation/IntrinsicFunctions.cs
+index 944478d4be6..17e67ce123a 100644
+--- a/src/Build/Evaluation/IntrinsicFunctions.cs
++++ b/src/Build/Evaluation/IntrinsicFunctions.cs
+@@ -697,7 +697,7 @@ public static string GetMSBuildExtensionsPath()
+ 
+         public static bool IsRunningFromVisualStudio() => BuildEnvironmentHelper.Instance.Mode == BuildEnvironmentMode.VisualStudio;
+ 
+-        public static bool RegisterAnalyzer(string pathToAssembly, LoggingContext loggingContext)
++        public static bool RegisterBuildCheck(string pathToAssembly, LoggingContext loggingContext)
+         {
+             pathToAssembly = FileUtilities.GetFullPathNoThrow(pathToAssembly);
+             if (File.Exists(pathToAssembly))
+diff --git a/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationInternalTests.cs b/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationInternalTests.cs
+index 248b66ea6b0..a3f8b019439 100644
+--- a/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationInternalTests.cs
++++ b/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationInternalTests.cs
+@@ -7,7 +7,7 @@
+ using System.Text;
+ using System.Threading.Tasks;
+ using Xunit;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Shouldly;
+ 
+diff --git a/src/BuildCheck.UnitTests/BuildCheckManagerProviderTests.cs b/src/BuildCheck.UnitTests/BuildCheckManagerProviderTests.cs
+index 1518241d42f..bf1ccb8105a 100644
+--- a/src/BuildCheck.UnitTests/BuildCheckManagerProviderTests.cs
++++ b/src/BuildCheck.UnitTests/BuildCheckManagerProviderTests.cs
+@@ -5,8 +5,8 @@
+ using System.Linq;
+ using System.Reflection;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BuildCheck.Acquisition;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Acquisition;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+@@ -14,7 +14,7 @@
+ using Shouldly;
+ using Xunit;
+ using Xunit.Abstractions;
+-using static Microsoft.Build.BuildCheck.Infrastructure.BuildCheckManagerProvider;
++using static Microsoft.Build.Experimental.BuildCheck.Infrastructure.BuildCheckManagerProvider;
+ 
+ namespace Microsoft.Build.BuildCheck.UnitTests;
+ 
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 9351612060f..1ac4964dcb6 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -4,12 +4,10 @@
+ using System;
+ using System.Collections.Generic;
+ using System.IO;
+-using System.Linq;
+-using System.Reflection;
+-using System.Text;
+-using System.Threading.Tasks;
++using System.Xml;
+ using Microsoft.Build.UnitTests;
+ using Microsoft.Build.UnitTests.Shared;
++using Newtonsoft.Json.Linq;
+ using Shouldly;
+ using Xunit;
+ using Xunit.Abstractions;
+@@ -19,6 +17,7 @@ namespace Microsoft.Build.BuildCheck.UnitTests;
+ public class EndToEndTests : IDisposable
+ {
+     private readonly TestEnvironment _env;
++
+     public EndToEndTests(ITestOutputHelper output)
+     {
+         _env = TestEnvironment.Create(output);
+@@ -27,6 +26,8 @@ public EndToEndTests(ITestOutputHelper output)
+         _env.WithEnvironmentInvariant();
+     }
+ 
++    private static string TestAssetsRootPath { get; } = Path.Combine(Path.GetDirectoryName(typeof(EndToEndTests).Assembly.Location) ?? AppContext.BaseDirectory, "TestAssets");
++
+     public void Dispose() => _env.Dispose();
+ 
+     [Theory]
+@@ -91,7 +92,6 @@ public void SampleAnalyzerIntegrationTest(bool buildInOutOfProcessNode, bool ana
+         // var cache = new SimpleProjectRootElementCache();
+         // ProjectRootElement xml = ProjectRootElement.OpenProjectOrSolution(projectFile.Path, /*unused*/null, /*unused*/null, cache, false /*Not explicitly loaded - unused*/);
+ 
+-
+         TransientTestFile config = _env.CreateFile(workFolder, "editorconfig.json",
+             /*lang=json,strict*/
+             """
+@@ -134,4 +134,90 @@ public void SampleAnalyzerIntegrationTest(bool buildInOutOfProcessNode, bool ana
+             output.ShouldNotContain("BC0101");
+         }
+     }
++
++    [Theory]
++    [InlineData(new[] { "CustomAnalyzer" }, "AnalysisCandidate", new[] { "CustomRule1", "CustomRule2" })]
++    [InlineData(new[] { "CustomAnalyzer", "CustomAnalyzer2" }, "AnalysisCandidateWithMultipleAnalyzersInjected", new[] { "CustomRule1", "CustomRule2", "CustomRule3" })]
++    public void CustomAnalyzerTest(string[] customAnalyzerNames, string analysisCandidate, string[] expectedRegisteredRules)
++    {
++        using (var env = TestEnvironment.Create())
++        {
++            var candidatesNugetFullPaths = BuildAnalyzerRules(env, customAnalyzerNames);
++
++            candidatesNugetFullPaths.ShouldNotBeEmpty("Nuget package with custom analyzer was not generated or detected.");
++
++            var analysisCandidatePath = Path.Combine(TestAssetsRootPath, analysisCandidate);
++            AddCustomDataSourceToNugetConfig(analysisCandidatePath, candidatesNugetFullPaths);
++
++            string projectAnalysisBuildLog = RunnerUtilities.ExecBootstrapedMSBuild(
++                $"{Path.Combine(analysisCandidatePath, $"{analysisCandidate}.csproj")} /m:1 -nr:False -restore /p:OutputPath={env.CreateFolder().Path} -analyze -verbosity:n",
++                out bool successBuild);
++            successBuild.ShouldBeTrue();
++
++            foreach (string expectedRegisteredRule in expectedRegisteredRules)
++            {
++                projectAnalysisBuildLog.ShouldContain($"Custom analyzer rule: {expectedRegisteredRule} has been registered successfully.");
++            }
++        }
++    }
++
++    private IList<string> BuildAnalyzerRules(TestEnvironment env, string[] customAnalyzerNames)
++    {
++        var candidatesNugetFullPaths = new List<string>();
++
++        foreach (var customAnalyzerName in customAnalyzerNames)
++        {
++            var candidateAnalysisProjectPath = Path.Combine(TestAssetsRootPath, customAnalyzerName, $"{customAnalyzerName}.csproj");
++            var nugetPackResults = RunnerUtilities.ExecBootstrapedMSBuild(
++                 $"{candidateAnalysisProjectPath} /m:1 -nr:False -restore /p:OutputPath={env.CreateFolder().Path} -getTargetResult:Build", out bool success, attachProcessId: false);
++
++            success.ShouldBeTrue();
++
++            string? candidatesNugetPackageFullPath = (string?)(JObject.Parse(nugetPackResults)?["TargetResults"]?["Build"]?["Items"]?[0]?["RelativeDir"] ?? string.Empty);
++
++            candidatesNugetPackageFullPath.ShouldNotBeNull();
++            candidatesNugetFullPaths.Add(candidatesNugetPackageFullPath);
++        }
++
++        return candidatesNugetFullPaths;
++    }
++
++    private void AddCustomDataSourceToNugetConfig(string analysisCandidatePath, IList<string> candidatesNugetPackageFullPaths)
++    {
++        var nugetTemplatePath = Path.Combine(analysisCandidatePath, "nugetTemplate.config");
++
++        var doc = new XmlDocument();
++        doc.LoadXml(File.ReadAllText(nugetTemplatePath));
++        if (doc.DocumentElement != null)
++        {
++            XmlNode? packageSourcesNode = doc.SelectSingleNode("//packageSources");
++            for (int i = 0; i < candidatesNugetPackageFullPaths.Count; i++)
++            {
++                AddPackageSource(doc, packageSourcesNode, $"Key{i}", Path.GetDirectoryName(candidatesNugetPackageFullPaths[i]) ?? string.Empty);
++            }
++
++            doc.Save(Path.Combine(analysisCandidatePath, "nuget.config"));
++        }
++    }
++
++    private void AddPackageSource(XmlDocument doc, XmlNode? packageSourcesNode, string key, string value)
++    {
++        if (packageSourcesNode != null)
++        {
++            XmlElement addNode = doc.CreateElement("add");
++
++            PopulateXmlAttribute(doc, addNode, "key", key);
++            PopulateXmlAttribute(doc, addNode, "value", value);
++
++            packageSourcesNode.AppendChild(addNode);
++        }
++    }
++
++    private void PopulateXmlAttribute(XmlDocument doc, XmlNode node, string attributeName, string attributeValue)
++    {
++        node.ShouldNotBeNull($"The attribute {attributeName} can not be populated with {attributeValue}. Xml node is null.");
++        var attribute = doc.CreateAttribute(attributeName);
++        attribute.Value = attributeValue;
++        node.Attributes!.Append(attribute);
++    }
+ }
+diff --git a/src/BuildCheck.UnitTests/Microsoft.Build.BuildCheck.UnitTests.csproj b/src/BuildCheck.UnitTests/Microsoft.Build.BuildCheck.UnitTests.csproj
+index 3aa9eaff7d1..9a500f371df 100644
+--- a/src/BuildCheck.UnitTests/Microsoft.Build.BuildCheck.UnitTests.csproj
++++ b/src/BuildCheck.UnitTests/Microsoft.Build.BuildCheck.UnitTests.csproj
+@@ -11,6 +11,7 @@
+ 
+   <ItemGroup>
+     <ProjectReference Include="..\Build\Microsoft.Build.csproj" />
++    <ProjectReference Include="..\Tasks\Microsoft.Build.Tasks.csproj" />
+     <ProjectReference Include="..\UnitTests.Shared\Microsoft.Build.UnitTests.Shared.csproj" />
+     <ProjectReference Include="..\Xunit.NetCore.Extensions\Xunit.NetCore.Extensions.csproj" />
+   </ItemGroup>
+@@ -33,5 +34,9 @@
+     <None Include="..\Shared\UnitTests\xunit.runner.json">
+       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+     </None>
++    <None Include="TestAssets\**\*">
++      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
++    </None>
+   </ItemGroup>
++
+ </Project>
+diff --git a/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs b/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
+new file mode 100644
+index 00000000000..bd93ddcf927
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
+@@ -0,0 +1,147 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using Microsoft.Build.Execution;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++using Microsoft.Build.UnitTests;
++using Shouldly;
++using Xunit;
++using static Microsoft.Build.Experimental.BuildCheck.Infrastructure.BuildCheckManagerProvider;
++
++namespace Microsoft.Build.BuildCheck.UnitTests
++{
++    public class TaskInvocationAnalysisDataTests : IDisposable
++    {
++        internal sealed class TestAnalyzer : BuildAnalyzer
++        {
++            #region BuildAnalyzer initialization
++
++            public static BuildAnalyzerRule SupportedRule = new BuildAnalyzerRule("BC0000", "TestRule", "TestDescription", "TestMessage",
++                new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, IsEnabled = true });
++
++            public override string FriendlyName => "MSBuild.TestAnalyzer";
++
++            public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } = [SupportedRule];
++
++            public override void Initialize(ConfigurationContext configurationContext)
++            { }
++
++            public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++            {
++                registrationContext.RegisterTaskInvocationAction(TaskInvocationAction);
++            }
++
++            #endregion
++
++            /// <summary>
++            /// Stores all TaskInvocationAnalysisData reported during the build.
++            /// </summary>
++            public List<TaskInvocationAnalysisData> AnalysisData = new();
++
++            private void TaskInvocationAction(BuildCheckDataContext<TaskInvocationAnalysisData> context)
++            {
++                AnalysisData.Add(context.Data);
++            }
++        }
++
++        private static TestAnalyzer? s_testAnalyzer;
++
++        public TaskInvocationAnalysisDataTests()
++        {
++            BuildCheckManager.s_testFactoriesPerDataSource =
++            [
++                // BuildCheckDataSource.EventArgs
++                [
++                    ([TestAnalyzer.SupportedRule.Id], true, () => (s_testAnalyzer = new TestAnalyzer())),
++                ],
++                // BuildCheckDataSource.Execution
++                [],
++            ];
++
++            s_testAnalyzer?.AnalysisData.Clear();
++        }
++
++        public void Dispose()
++        {
++            BuildCheckManager.s_testFactoriesPerDataSource = null;
++        }
++
++        private void BuildProject(string taskInvocation)
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                var testProject = env.CreateTestProjectWithFiles($"<Project><Target Name=\"Build\">{taskInvocation}</Target></Project>");
++
++                using (var buildManager = new BuildManager())
++                {
++                    var request = new BuildRequestData(testProject.ProjectFile, new Dictionary<string, string>(), MSBuildConstants.CurrentToolsVersion, [], null, BuildRequestDataFlags.None);
++                    var parameters = new BuildParameters
++                    {
++                        LogTaskInputs = true,
++                        IsBuildCheckEnabled = true,
++                        ShutdownInProcNodeOnBuildFinish = true,
++                    };
++
++                    var result = buildManager.Build(parameters, request);
++
++                    result.OverallResult.ShouldBe(BuildResultCode.Success);
++                }
++
++                foreach (var data in s_testAnalyzer!.AnalysisData)
++                {
++                    data.ProjectFilePath.ShouldBe(testProject.ProjectFile);
++                    data.TaskInvocationLocation.Line.ShouldBeGreaterThan(0);
++                    data.TaskInvocationLocation.Column.ShouldBeGreaterThan(0);
++                }
++            }
++        }
++
++        [Fact]
++        public void ReportsSimpleTaskParameters()
++        {
++            BuildProject("<Message Text='Hello'/>");
++
++            s_testAnalyzer!.AnalysisData.Count.ShouldBe(1);
++            var data = s_testAnalyzer.AnalysisData[0];
++            data.TaskName.ShouldBe("Message");
++            data.Parameters.Count.ShouldBe(1);
++            data.Parameters["Text"].IsOutput.ShouldBe(false);
++            data.Parameters["Text"].Value.ShouldBe("Hello");
++        }
++
++        [Fact]
++        public void ReportsComplexTaskParameters()
++        {
++            BuildProject("""
++                <ItemGroup>
++                  <TestItem Include='item1;item2'/>
++                </ItemGroup>
++                <CombinePath BasePath='base' Paths='@(TestItem)'>
++                    <Output TaskParameter='CombinedPaths' ItemName='OutputDirectories' />
++                </CombinePath>
++            """);
++
++            s_testAnalyzer!.AnalysisData.Count.ShouldBe(1);
++            var data = s_testAnalyzer.AnalysisData[0];
++            data.TaskName.ShouldBe("CombinePath");
++            data.Parameters.Count.ShouldBe(3);
++
++            data.Parameters["Paths"].IsOutput.ShouldBe(false);
++            data.Parameters["Paths"].Value.ShouldBeAssignableTo(typeof(IList));
++            IList listValue = (IList)data.Parameters["Paths"].Value!;
++            listValue.Count.ShouldBe(2);
++            listValue[0]!.ShouldBeAssignableTo(typeof(ITaskItem));
++            listValue[1]!.ShouldBeAssignableTo(typeof(ITaskItem));
++            ((ITaskItem)listValue[0]!).ItemSpec.ShouldBe("item1");
++            ((ITaskItem)listValue[1]!).ItemSpec.ShouldBe("item2");
++
++            // The name of the parameter would ideally be "CombinedPaths" but we don't seem to be currently logging it.
++            data.Parameters["OutputDirectories"].IsOutput.ShouldBe(true);
++        }
++    }
++}
+diff --git a/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidate/AnalysisCandidate.csproj b/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidate/AnalysisCandidate.csproj
+new file mode 100644
+index 00000000000..52f65afffee
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidate/AnalysisCandidate.csproj
+@@ -0,0 +1,18 @@
++<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <TargetFramework>net8.0</TargetFramework>
++    <Nullable>enable</Nullable>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <PackageReference Include="CustomAnalyzer" Version="1.0.0"/>
++  </ItemGroup>
++
++  <ItemGroup>
++    <None Include="nuget.config">
++      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
++    </None>
++  </ItemGroup>
++
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidate/nugetTemplate.config b/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidate/nugetTemplate.config
+new file mode 100644
+index 00000000000..1097d29bafd
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidate/nugetTemplate.config
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<configuration>
++   <packageSources>
++
++  </packageSources>
++</configuration>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidateWithMultipleAnalyzersInjected/AnalysisCandidateWithMultipleAnalyzersInjected.csproj b/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidateWithMultipleAnalyzersInjected/AnalysisCandidateWithMultipleAnalyzersInjected.csproj
+new file mode 100644
+index 00000000000..9e71d7ff38f
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidateWithMultipleAnalyzersInjected/AnalysisCandidateWithMultipleAnalyzersInjected.csproj
+@@ -0,0 +1,19 @@
++<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <TargetFramework>net8.0</TargetFramework>
++    <Nullable>enable</Nullable>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <PackageReference Include="CustomAnalyzer" Version="1.0.0"/>
++    <PackageReference Include="CustomAnalyzer2" Version="1.0.0"/>
++  </ItemGroup>
++
++  <ItemGroup>
++    <None Include="nuget.config">
++      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
++    </None>
++  </ItemGroup>
++
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidateWithMultipleAnalyzersInjected/nugetTemplate.config b/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidateWithMultipleAnalyzersInjected/nugetTemplate.config
+new file mode 100644
+index 00000000000..1097d29bafd
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/AnalysisCandidateWithMultipleAnalyzersInjected/nugetTemplate.config
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<configuration>
++   <packageSources>
++
++  </packageSources>
++</configuration>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/Analyzer1.cs b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/Analyzer1.cs
+new file mode 100644
+index 00000000000..5cd1d3317c0
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/Analyzer1.cs
+@@ -0,0 +1,38 @@
++﻿using System.Collections.Generic;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace CustomAnalyzer
++{
++    public sealed class Analyzer1 : BuildAnalyzer
++    {
++        public static BuildAnalyzerRule SupportedRule = new BuildAnalyzerRule(
++            "X01234",
++            "Title",
++            "Description",
++            "Message format: {0}",
++            new BuildAnalyzerConfiguration());
++
++        public override string FriendlyName => "CustomRule1";
++
++        public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } = new List<BuildAnalyzerRule>() { SupportedRule };
++
++        public override void Initialize(ConfigurationContext configurationContext)
++        {
++            // configurationContext to be used only if analyzer needs external configuration data.
++        }
++
++        public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++        {
++            registrationContext.RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction);
++        }
++
++        private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesAnalysisData> context)
++        {
++            context.ReportResult(BuildCheckResult.Create(
++                SupportedRule,
++                ElementLocation.EmptyLocation,
++                "Argument for the message format"));
++        }
++    }
++}
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/Analyzer2.cs b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/Analyzer2.cs
+new file mode 100644
+index 00000000000..714a82ae95a
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/Analyzer2.cs
+@@ -0,0 +1,38 @@
++﻿using System.Collections.Generic;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace CustomAnalyzer
++{
++    public sealed class Analyzer2 : BuildAnalyzer
++    {
++        public static BuildAnalyzerRule SupportedRule = new BuildAnalyzerRule(
++            "X01235",
++            "Title",
++            "Description",
++            "Message format: {0}",
++            new BuildAnalyzerConfiguration());
++
++        public override string FriendlyName => "CustomRule2";
++
++        public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } = new List<BuildAnalyzerRule>() { SupportedRule };
++
++        public override void Initialize(ConfigurationContext configurationContext)
++        {
++            // configurationContext to be used only if analyzer needs external configuration data.
++        }
++
++        public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++        {
++            registrationContext.RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction);
++        }
++
++        private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesAnalysisData> context)
++        {
++            context.ReportResult(BuildCheckResult.Create(
++                SupportedRule,
++                ElementLocation.EmptyLocation,
++                "Argument for the message format"));
++        }
++    }
++}
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/CustomAnalyzer.csproj b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/CustomAnalyzer.csproj
+new file mode 100644
+index 00000000000..f780e9eb213
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/CustomAnalyzer.csproj
+@@ -0,0 +1,29 @@
++<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <TargetFramework>netstandard2.0</TargetFramework>
++    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
++    <IncludeBuildOutput>false</IncludeBuildOutput>
++    <!-- The output structure was modified for msbuild development needs.-->
++    <NoWarn>NU5101;NU5128;MSB3277</NoWarn>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <None Include="CustomAnalyzer.props" Pack="true" PackagePath="build\CustomAnalyzer.props" />
++  </ItemGroup>
++
++  <ItemGroup>
++    <!-- In the real world scenario, the DLLs are added as PackageReference, modified for test purposes only. -->
++    <Reference Include="Microsoft.Build">
++      <HintPath>$(MSBuildProjectDirectory)\..\..\Microsoft.Build.dll</HintPath>
++    </Reference>
++  </ItemGroup>
++
++  <Target Name="AddNuGetDlls" BeforeTargets="_GetPackageFiles">
++    <ItemGroup>
++      <!-- Add the DLL produced by the current project to the NuGet package -->
++      <None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="build" Visible="false" />
++    </ItemGroup>
++  </Target>
++
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/CustomAnalyzer.props b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/CustomAnalyzer.props
+new file mode 100644
+index 00000000000..31a9526dd62
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer/CustomAnalyzer.props
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project>
++  <PropertyGroup>
++	  <MSBuildAnalyzer>$([MSBuild]::RegisterBuildCheck($(MSBuildThisFileDirectory)CustomAnalyzer.dll))</MSBuildAnalyzer>
++  </PropertyGroup>
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/Analyzer3.cs b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/Analyzer3.cs
+new file mode 100644
+index 00000000000..c0272937c87
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/Analyzer3.cs
+@@ -0,0 +1,38 @@
++﻿using System.Collections.Generic;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace CustomAnalyzer2
++{
++    public sealed class Analyzer3 : BuildAnalyzer
++    {
++        public static BuildAnalyzerRule SupportedRule = new BuildAnalyzerRule(
++            "X01235",
++            "Title",
++            "Description",
++            "Message format: {0}",
++            new BuildAnalyzerConfiguration());
++
++        public override string FriendlyName => "CustomRule3";
++
++        public override IReadOnlyList<BuildAnalyzerRule> SupportedRules { get; } = new List<BuildAnalyzerRule>() { SupportedRule };
++
++        public override void Initialize(ConfigurationContext configurationContext)
++        {
++            // configurationContext to be used only if analyzer needs external configuration data.
++        }
++
++        public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++        {
++            registrationContext.RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction);
++        }
++
++        private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesAnalysisData> context)
++        {
++            context.ReportResult(BuildCheckResult.Create(
++                SupportedRule,
++                ElementLocation.EmptyLocation,
++                "Argument for the message format"));
++        }
++    }
++}
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/CustomAnalyzer2.csproj b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/CustomAnalyzer2.csproj
+new file mode 100644
+index 00000000000..17007b03785
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/CustomAnalyzer2.csproj
+@@ -0,0 +1,28 @@
++<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <TargetFramework>netstandard2.0</TargetFramework>
++    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
++    <!-- The output structure was modified for msbuild development needs.-->
++    <NoWarn>NU5101;NU5128;MSB3277</NoWarn>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <None Include="CustomAnalyzer2.props" Pack="true" PackagePath="build\CustomAnalyzer2.props" />
++  </ItemGroup>
++
++  <ItemGroup>
++    <!-- In the real world scenario, the DLLs are added as PackageReference, modified for test purposes only. -->
++    <Reference Include="Microsoft.Build">
++      <HintPath>$(MSBuildProjectDirectory)\..\..\Microsoft.Build.dll</HintPath>
++    </Reference>
++  </ItemGroup>
++
++  <Target Name="AddNuGetDlls" BeforeTargets="_GetPackageFiles">
++    <ItemGroup>
++      <!-- Add the DLL produced by the current project to the NuGet package -->
++      <None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="build" Visible="false" />
++    </ItemGroup>
++  </Target>
++
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/CustomAnalyzer2.props b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/CustomAnalyzer2.props
+new file mode 100644
+index 00000000000..869000fa12f
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CustomAnalyzer2/CustomAnalyzer2.props
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project>
++  <PropertyGroup>
++	  <MSBuildAnalyzer>$([MSBuild]::RegisterBuildCheck($(MSBuildThisFileDirectory)CustomAnalyzer2.dll))</MSBuildAnalyzer>
++  </PropertyGroup>
++</Project>
+diff --git a/src/Framework/TaskStartedEventArgs.cs b/src/Framework/TaskStartedEventArgs.cs
+index 288a0193524..db1f450e95b 100644
+--- a/src/Framework/TaskStartedEventArgs.cs
++++ b/src/Framework/TaskStartedEventArgs.cs
+@@ -171,22 +171,22 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+         public string ProjectFile => projectFile;
+ 
+         /// <summary>
+-        /// MSBuild file where this task was defined.
++        /// MSBuild file in which this task was invoked.
+         /// </summary>
+         public string TaskFile => taskFile;
+ 
+         /// <summary>
+-        /// Line number of the task invocation in the project file
++        /// Line number of the task invocation in the project file.
+         /// </summary>
+         public int LineNumber { get; internal set; }
+ 
+         /// <summary>
+-        /// Column number of the task invocation in the project file
++        /// Column number of the task invocation in the project file.
+         /// </summary>
+         public int ColumnNumber { get; internal set; }
+ 
+         /// <summary>
+-        /// The location of the assembly containing the implementation of the task
++        /// The location of the assembly containing the implementation of the task.
+         /// </summary>
+         public string TaskAssemblyLocation { get; private set; }
+ 
+diff --git a/src/MSBuild/TerminalLogger/Project.cs b/src/MSBuild/TerminalLogger/Project.cs
+index 959bab12960..eabfd989c3e 100644
+--- a/src/MSBuild/TerminalLogger/Project.cs
++++ b/src/MSBuild/TerminalLogger/Project.cs
+@@ -51,6 +51,11 @@ public Project(string? targetFramework, StopwatchAbstraction? stopwatch)
+     /// </summary>
+     public bool IsTestProject { get; set; }
+ 
++    /// <summary>
++    /// True when the project has run target with name "_CachePluginRunStart" defined in <see cref="TerminalLogger._cachePluginStartTarget"/>.
++    /// </summary>
++    public bool IsCachePluginProject { get; set; }
++
+     /// <summary>
+     /// A lazily initialized list of build messages/warnings/errors raised during the build.
+     /// </summary>
+diff --git a/src/MSBuild/TerminalLogger/TerminalLogger.cs b/src/MSBuild/TerminalLogger/TerminalLogger.cs
+index bb31cf7d6bd..64fe4a5a594 100644
+--- a/src/MSBuild/TerminalLogger/TerminalLogger.cs
++++ b/src/MSBuild/TerminalLogger/TerminalLogger.cs
+@@ -70,6 +70,11 @@ public ProjectContext(BuildEventContext context)
+ 
+     internal Func<StopwatchAbstraction>? CreateStopwatch = null;
+ 
++    /// <summary>
++    /// Name of target that identifies the project cache plugin run has just started.
++    /// </summary>
++    private const string CachePluginStartTarget = "_CachePluginRunStart";
++
+     /// <summary>
+     /// Protects access to state shared between the logger callbacks and the rendering thread.
+     /// </summary>
+@@ -206,6 +211,11 @@ public ProjectContext(BuildEventContext context)
+     /// </summary>
+     private DateTime? _testEndTime;
+ 
++    /// <summary>
++    /// Demonstrates whether there exists at least one project which is a cache plugin project.
++    /// </summary>
++    private bool _hasUsedCache = false;
++
+     /// <summary>
+     /// Whether to show TaskCommandLineEventArgs high-priority messages. 
+     /// </summary>
+@@ -683,12 +693,17 @@ private void TargetStarted(object sender, TargetStartedEventArgs e)
+ 
+             string projectFile = Path.GetFileNameWithoutExtension(e.ProjectFile);
+ 
++            string targetName = e.TargetName;
++            if (targetName == CachePluginStartTarget)
++            {
++                project.IsCachePluginProject = true;
++                _hasUsedCache = true;
++            }
+ 
+-            var isTestTarget = e.TargetName == _testStartTarget;
+-
+-            var targetName = isTestTarget ? "Testing" : e.TargetName;
+-            if (isTestTarget)
++            if (targetName == _testStartTarget)
+             {
++                targetName = "Testing";
++
+                 // Use the minimal start time, so if we run tests in parallel, we can calculate duration
+                 // as this start time, minus time when tests finished.
+                 _testStartTime = _testStartTime == null
+@@ -714,6 +729,24 @@ private void UpdateNodeStatus(BuildEventContext buildEventContext, NodeStatus? n
+     /// </summary>
+     private void TargetFinished(object sender, TargetFinishedEventArgs e)
+     {
++        // For cache plugin projects which result in a cache hit, ensure the output path is set
++        // to the item spec corresponding to the GetTargetPath target upon completion.
++        var buildEventContext = e.BuildEventContext;
++        if (_restoreContext is null
++            && buildEventContext is not null
++            && _hasUsedCache
++            && e.TargetName == "GetTargetPath"
++            && _projects.TryGetValue(new ProjectContext(buildEventContext), out Project? project))
++        {
++            if (project.IsCachePluginProject)
++            {
++                foreach (ITaskItem output in e.TargetOutputs)
++                {
++                    project.OutputPath = output.ItemSpec.AsMemory();
++                    break;
++                }
++            }
++        }
+     }
+ 
+     /// <summary>
+@@ -918,7 +951,7 @@ private void ErrorRaised(object sender, BuildErrorEventArgs e)
+         }
+     }
+ 
+-    #endregion
++#endregion
+ 
+     #region Refresher thread implementation
+ 
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 9fa6956ae03..088d2c00179 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -1336,7 +1336,7 @@ internal static bool BuildProject(
+                 // This is a hack for now to make sure the perf hit only happens
+                 // on diagnostic. This should be changed to pipe it through properly,
+                 // perhaps as part of a fuller tracing feature.
+-                bool logTaskInputs = verbosity == LoggerVerbosity.Diagnostic;
++                bool logTaskInputs = verbosity == LoggerVerbosity.Diagnostic || isBuildCheckEnabled;
+ 
+                 if (!logTaskInputs)
+                 {
+diff --git a/src/Shared/LogMessagePacketBase.cs b/src/Shared/LogMessagePacketBase.cs
+index 291594fcfdc..3770b80c09d 100644
+--- a/src/Shared/LogMessagePacketBase.cs
++++ b/src/Shared/LogMessagePacketBase.cs
+@@ -11,7 +11,7 @@
+ 
+ #if !TASKHOST
+ using Microsoft.Build.Experimental.BuildCheck;
+-using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ #endif
+ 
+ #if !TASKHOST && !MSBUILDENTRYPOINTEXE
+diff --git a/src/UnitTests.Shared/RunnerUtilities.cs b/src/UnitTests.Shared/RunnerUtilities.cs
+index a61f1a9fb4c..6b8354dc0da 100644
+--- a/src/UnitTests.Shared/RunnerUtilities.cs
++++ b/src/UnitTests.Shared/RunnerUtilities.cs
+@@ -52,7 +52,12 @@ public static string ExecMSBuild(string pathToMsBuildExe, string msbuildParamete
+             return RunProcessAndGetOutput(pathToExecutable, msbuildParameters, out successfulExit, shellExecute, outputHelper);
+         }
+ 
+-        public static string ExecBootstrapedMSBuild(string msbuildParameters, out bool successfulExit, bool shellExecute = false, ITestOutputHelper outputHelper = null)
++        public static string ExecBootstrapedMSBuild(
++            string msbuildParameters,
++            out bool successfulExit,
++            bool shellExecute = false,
++            ITestOutputHelper outputHelper = null,
++            bool attachProcessId = true)
+         {
+             BootstrapLocationAttribute attribute = Assembly.GetExecutingAssembly().GetCustomAttribute<BootstrapLocationAttribute>()
+                                                    ?? throw new InvalidOperationException("This test assembly does not have the BootstrapLocationAttribute");
+@@ -64,7 +69,7 @@ public static string ExecBootstrapedMSBuild(string msbuildParameters, out bool s
+ #else
+             string pathToExecutable = Path.Combine(binaryFolder, "MSBuild.exe");
+ #endif
+-            return RunProcessAndGetOutput(pathToExecutable, msbuildParameters, out successfulExit, shellExecute, outputHelper);
++            return RunProcessAndGetOutput(pathToExecutable, msbuildParameters, out successfulExit, shellExecute, outputHelper, attachProcessId);
+         }
+ 
+         private static void AdjustForShellExecution(ref string pathToExecutable, ref string arguments)
+@@ -84,9 +89,15 @@ private static void AdjustForShellExecution(ref string pathToExecutable, ref str
+         }
+ 
+         /// <summary>
+-        /// Run the process and get stdout and stderr
++        /// Run the process and get stdout and stderr.
+         /// </summary>
+-        public static string RunProcessAndGetOutput(string process, string parameters, out bool successfulExit, bool shellExecute = false, ITestOutputHelper outputHelper = null)
++        public static string RunProcessAndGetOutput(
++            string process,
++            string parameters,
++            out bool successfulExit,
++            bool shellExecute = false,
++            ITestOutputHelper outputHelper = null,
++            bool attachProcessId = true)
+         {
+             if (shellExecute)
+             {
+@@ -148,10 +159,13 @@ public static string RunProcessAndGetOutput(string process, string parameters, o
+                 successfulExit = p.ExitCode == 0;
+             }
+ 
+-            WriteOutput("Process ID is " + pid + "\r\n");
+-            WriteOutput("==============");
++            if (attachProcessId)
++            {
++                output += "Process ID is " + pid + "\r\n";
++                WriteOutput("Process ID is " + pid + "\r\n");
++                WriteOutput("==============");
++            }
+ 
+-            output += "Process ID is " + pid + "\r\n";
+             return output;
+ 
+             void WriteOutput(string data)
+diff --git a/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.csproj b/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.csproj
+index 0a1b8f974fc..33d8c992326 100644
+--- a/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.csproj
++++ b/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.csproj
+@@ -36,10 +36,10 @@
+ 
+     <ItemGroup>
+     <!-- Update the collection of items to pack with the DLLs from the NuGet packages -->
+-    <None Include="@(_PackagesToPack)" Pack="true" PackagePath="lib" Visible="false" />
++    <None Include="@(_PackagesToPack)" Pack="true" PackagePath="build" Visible="false" />
+ 
+     <!-- Add the DLL produced by the current project to the NuGet package -->
+-    <None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="lib" Visible="false" />
++    <None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="build" Visible="false" />
+     </ItemGroup>
+   </Target>
+ </Project>
+diff --git a/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.props b/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.props
+index 3b752b831cc..5a606b3cac6 100644
+--- a/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.props
++++ b/template_feed/Microsoft.AnalyzerTemplate/Company.AnalyzerTemplate.props
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <Project>
+   <PropertyGroup>
+-	  <MSBuildAnalyzer>$([MSBuild]::RegisterAnalyzer($(MSBuildThisFileDirectory)..\lib\Company.AnalyzerTemplate.dll))</MSBuildAnalyzer>
++	  <MSBuildAnalyzer>$([MSBuild]::RegisterBuildCheck($(MSBuildThisFileDirectory)Company.AnalyzerTemplate.dll))</MSBuildAnalyzer>
+   </PropertyGroup>
+   <ItemGroup>
+     <PackageVersion Include="Microsoft.Build" Version="1.0.0-MicrosoftBuildPackageVersion" />

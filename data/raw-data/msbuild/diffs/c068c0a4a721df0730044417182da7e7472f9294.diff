@@ -1,0 +1,289 @@
+diff --git a/eng/Version.Details.xml b/eng/Version.Details.xml
+index bb63ab75a15..70a03422fa5 100644
+--- a/eng/Version.Details.xml
++++ b/eng/Version.Details.xml
+@@ -6,9 +6,9 @@
+       <Sha>6812704fe5a1baead5da5c1c8bf723752ab728b5</Sha>
+       <SourceBuild RepoName="arcade" ManagedOnly="true" />
+     </Dependency>
+-    <Dependency Name="NuGet.Build.Tasks" Version="6.4.0-preview.3.100">
++    <Dependency Name="NuGet.Build.Tasks" Version="6.4.0-preview.3.107">
+       <Uri>https://github.com/nuget/nuget.client</Uri>
+-      <Sha>451713c59f5206f77c97d093dd5191be13f9d0e0</Sha>
++      <Sha>1a082949ae5b6da7ca2cce047396c53ae1afdde7</Sha>
+     </Dependency>
+     <Dependency Name="Microsoft.Net.Compilers.Toolset" Version="4.4.0-2.22458.3">
+       <Uri>https://github.com/dotnet/roslyn</Uri>
+diff --git a/eng/Versions.props b/eng/Versions.props
+index 7da12f1ecc8..8bbc8f0ae87 100644
+--- a/eng/Versions.props
++++ b/eng/Versions.props
+@@ -46,7 +46,7 @@
+     <MicrosoftExtensionsDependencyModelVersion>6.0.0-preview.2.21154.6</MicrosoftExtensionsDependencyModelVersion>
+     <MicrosoftIORedistVersion>6.0.0</MicrosoftIORedistVersion>
+     <MicrosoftNetCompilersToolsetVersion>4.4.0-2.22458.3</MicrosoftNetCompilersToolsetVersion>
+-    <NuGetBuildTasksVersion>6.4.0-preview.3.100</NuGetBuildTasksVersion>
++    <NuGetBuildTasksVersion>6.4.0-preview.3.107</NuGetBuildTasksVersion>
+     <SystemRuntimeCompilerServicesUnsafeVersion>6.0.0</SystemRuntimeCompilerServicesUnsafeVersion>
+     <SystemTextJsonVersion>6.0.0</SystemTextJsonVersion>
+     <SystemThreadingTasksDataflowVersion>6.0.0</SystemThreadingTasksDataflowVersion>
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 523cb72e62d..262b3eedd79 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -8,7 +8,6 @@
+ using System.Globalization;
+ using System.IO;
+ using System.IO.Pipes;
+-using System.Linq;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Client;
+@@ -165,33 +164,46 @@ public MSBuildClientExitResult Execute(CancellationToken cancellationToken)
+ #endif
+ 
+             CommunicationsUtilities.Trace("Executing build with command line '{0}'", descriptiveCommandLine);
+-            bool serverIsAlreadyRunning = ServerIsRunning();
+-            if (KnownTelemetry.BuildTelemetry != null)
+-            {
+-                KnownTelemetry.BuildTelemetry.InitialServerState = serverIsAlreadyRunning ? "hot" : "cold";
+-            }
+-            if (!serverIsAlreadyRunning)
++
++            try
+             {
+-                CommunicationsUtilities.Trace("Server was not running. Starting server now.");
+-                if (!TryLaunchServer())
++                bool serverIsAlreadyRunning = ServerIsRunning();
++                if (KnownTelemetry.BuildTelemetry != null)
++                {
++                    KnownTelemetry.BuildTelemetry.InitialServerState = serverIsAlreadyRunning ? "hot" : "cold";
++                }
++                if (!serverIsAlreadyRunning)
+                 {
+-                    _exitResult.MSBuildClientExitType = MSBuildClientExitType.LaunchError;
++                    CommunicationsUtilities.Trace("Server was not running. Starting server now.");
++                    if (!TryLaunchServer())
++                    {
++                        _exitResult.MSBuildClientExitType = (_exitResult.MSBuildClientExitType == MSBuildClientExitType.Success) ? MSBuildClientExitType.LaunchError : _exitResult.MSBuildClientExitType;
++                        return _exitResult;
++                    }
++                }
++
++                // Check that server is not busy.
++                bool serverWasBusy = ServerWasBusy();
++                if (serverWasBusy)
++                {
++                    CommunicationsUtilities.Trace("Server is busy, falling back to former behavior.");
++                    _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
+                     return _exitResult;
+                 }
+-            }
+ 
+-            // Check that server is not busy.
+-            bool serverWasBusy = ServerWasBusy();
+-            if (serverWasBusy)
+-            {
+-                CommunicationsUtilities.Trace("Server is busy, falling back to former behavior.");
+-                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
+-                return _exitResult;
++                // Connect to server.
++                if (!TryConnectToServer(serverIsAlreadyRunning ? 1_000 : 20_000))
++                {
++                    return _exitResult;
++                }
+             }
+-
+-            // Connect to server.
+-            if (!TryConnectToServer(serverIsAlreadyRunning ? 1_000 : 20_000))
++            catch (IOException ex) when (ex is not PathTooLongException)
+             {
++                // For unknown root cause, Mutex.TryOpenExisting can sometimes throw 'Connection timed out' exception preventing to obtain the build server state through it (Running or not, Busy or not).
++                // See: https://github.com/dotnet/msbuild/issues/7993
++                CommunicationsUtilities.Trace("Failed to obtain the current build server state: {0}", ex);
++                CommunicationsUtilities.Trace("HResult: {0}.", ex.HResult);
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.UnknownServerState;
+                 return _exitResult;
+             }
+ 
+@@ -364,8 +376,7 @@ private void ConfigureAndQueryConsoleProperties()
+                     if (NativeMethodsShared.GetConsoleMode(stdOut, out uint consoleMode))
+                     {
+                         bool success;
+-                        if ((consoleMode & NativeMethodsShared.ENABLE_VIRTUAL_TERMINAL_PROCESSING) == NativeMethodsShared.ENABLE_VIRTUAL_TERMINAL_PROCESSING &&
+-                            (consoleMode & NativeMethodsShared.DISABLE_NEWLINE_AUTO_RETURN) == NativeMethodsShared.DISABLE_NEWLINE_AUTO_RETURN)
++                        if ((consoleMode & NativeMethodsShared.ENABLE_VIRTUAL_TERMINAL_PROCESSING) == NativeMethodsShared.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+                         {
+                             // Console is already in required state
+                             success = true;
+@@ -373,7 +384,7 @@ private void ConfigureAndQueryConsoleProperties()
+                         else
+                         {
+                             _originalConsoleMode = consoleMode;
+-                            consoleMode |= NativeMethodsShared.ENABLE_VIRTUAL_TERMINAL_PROCESSING | NativeMethodsShared.DISABLE_NEWLINE_AUTO_RETURN;
++                            consoleMode |= NativeMethodsShared.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                             success = NativeMethodsShared.SetConsoleMode(stdOut, consoleMode);
+                         }
+ 
+@@ -465,10 +476,12 @@ private bool TrySendPacket(Func<INodePacket> packetResolver)
+         private bool TryLaunchServer()
+         {
+             string serverLaunchMutexName = $@"Global\msbuild-server-launch-{_handshake.ComputeHash()}";
++
+             try
+             {
+                 // For unknown root cause, opening mutex can sometimes throw 'Connection timed out' exception. See: https://github.com/dotnet/msbuild/issues/7993
+                 using var serverLaunchMutex = ServerNamedMutex.OpenOrCreateMutex(serverLaunchMutexName, out bool mutexCreatedNew);
++
+                 if (!mutexCreatedNew)
+                 {
+                     // Some other client process launching a server and setting a build request for it. Fallback to usual msbuild app build.
+@@ -476,12 +489,21 @@ private bool TryLaunchServer()
+                     _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
+                     return false;
+                 }
++            }
++            catch (IOException ex) when (ex is not PathTooLongException)
++            {
++                CommunicationsUtilities.Trace("Failed to obtain the current build server state: {0}",  ex);
++                CommunicationsUtilities.Trace("HResult: {0}.", ex.HResult);
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.UnknownServerState;
++                return false;
++            }
+ 
++            try
++            {
+                 string[] msBuildServerOptions = new string[] {
+                     "/nologo",
+                     "/nodemode:8"
+                 };
+-
+                 NodeLauncher nodeLauncher = new NodeLauncher();
+                 CommunicationsUtilities.Trace("Starting Server...");
+                 Process msbuildProcess = nodeLauncher.Start(_msbuildLocation, string.Join(" ", msBuildServerOptions));
+diff --git a/src/Build/BackEnd/Client/MSBuildClientExitType.cs b/src/Build/BackEnd/Client/MSBuildClientExitType.cs
+index e9916bd5414..9ac0d49652a 100644
+--- a/src/Build/BackEnd/Client/MSBuildClientExitType.cs
++++ b/src/Build/BackEnd/Client/MSBuildClientExitType.cs
+@@ -24,6 +24,14 @@ public enum MSBuildClientExitType
+         /// The build stopped unexpectedly, for example,
+         /// because a named pipe between the server and the client was unexpectedly closed.
+         /// </summary>
+-        Unexpected
++        Unexpected,
++        /// <summary>
++        /// The client is not able to identify the server state.
++        /// </summary>
++        /// <remarks>
++        /// This may happen when mutex that is regulating the server state throws.
++        /// See: https://github.com/dotnet/msbuild/issues/7993.
++        /// </remarks>
++        UnknownServerState
+     }
+ }
+diff --git a/src/Framework/NativeMethods.cs b/src/Framework/NativeMethods.cs
+index 92658250199..be193fff3ed 100644
+--- a/src/Framework/NativeMethods.cs
++++ b/src/Framework/NativeMethods.cs
+@@ -36,7 +36,6 @@ internal static class NativeMethods
+     internal const uint RUNTIME_INFO_DONT_SHOW_ERROR_DIALOG = 0x40;
+     internal const uint FILE_TYPE_CHAR = 0x0002;
+     internal const Int32 STD_OUTPUT_HANDLE = -11;
+-    internal const uint DISABLE_NEWLINE_AUTO_RETURN = 0x0008;
+     internal const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+     internal const uint RPC_S_CALLPENDING = 0x80010115;
+     internal const uint E_ABORT = (uint)0x80004004;
+diff --git a/src/MSBuild/MSBuildClientApp.cs b/src/MSBuild/MSBuildClientApp.cs
+index 9177f76aa19..0fd4ea40181 100644
+--- a/src/MSBuild/MSBuildClientApp.cs
++++ b/src/MSBuild/MSBuildClientApp.cs
+@@ -76,6 +76,7 @@ public static MSBuildApp.ExitType Execute(
+ 
+             if (exitResult.MSBuildClientExitType == MSBuildClientExitType.ServerBusy ||
+                 exitResult.MSBuildClientExitType == MSBuildClientExitType.UnableToConnect ||
++                exitResult.MSBuildClientExitType == MSBuildClientExitType.UnknownServerState ||
+                 exitResult.MSBuildClientExitType == MSBuildClientExitType.LaunchError)
+             {
+                 if (KnownTelemetry.BuildTelemetry != null)
+diff --git a/src/Package/MSBuild.VSSetup.Arm64/files.arm64.swr b/src/Package/MSBuild.VSSetup.Arm64/files.arm64.swr
+index dbdb1d17ad5..f001f9d07ca 100644
+--- a/src/Package/MSBuild.VSSetup.Arm64/files.arm64.swr
++++ b/src/Package/MSBuild.VSSetup.Arm64/files.arm64.swr
+@@ -9,11 +9,11 @@ vs.relatedProcessFiles
+   vs.relatedProcessFile Path="[InstallDir]\MSBuild\Current\Bin\arm64\Microsoft.Build.Tasks.Core.dll"
+ 
+ folder InstallDir:\MSBuild\Current\Bin\arm64
+-  file source=$(Arm64BinPath)MSBuild.exe vs.file.ngenArchitecture=all
++  file source=$(Arm64BinPath)MSBuild.exe vs.file.ngenArchitecture=arm64
+   file source=$(Arm64BinPath)MSBuild.exe.config
+ 
+   file source=$(FrameworkBinPath)x64\Microsoft.Build.Framework.tlb
+-  file source=$(Arm64BinPath)Microsoft.Build.Tasks.Core.dll vs.file.ngenArchitecture=all
++  file source=$(Arm64BinPath)Microsoft.Build.Tasks.Core.dll vs.file.ngenArchitecture=arm64
+   file source=$(Arm64BinPath)Microsoft.Common.CurrentVersion.targets
+   file source=$(Arm64BinPath)Microsoft.Common.CrossTargeting.targets
+   file source=$(Arm64BinPath)Microsoft.Common.overridetasks
+diff --git a/src/Shared/TaskLoggingHelper.cs b/src/Shared/TaskLoggingHelper.cs
+index d9cdca05e73..ff2b4901582 100644
+--- a/src/Shared/TaskLoggingHelper.cs
++++ b/src/Shared/TaskLoggingHelper.cs
+@@ -923,6 +923,17 @@ public void LogErrorFromException(Exception exception, bool showStackTrace, bool
+             // global state.
+             ErrorUtilities.VerifyThrowArgumentNull(exception, nameof(exception));
+ 
++            // For an AggregateException call LogErrorFromException on each inner exception
++            if (exception is AggregateException aggregateException)
++            {
++                foreach (Exception innerException in aggregateException.Flatten().InnerExceptions)
++                {
++                    LogErrorFromException(innerException, showStackTrace, showDetail, file);
++                }
++
++                return;
++            }
++
+             string message;
+ 
+             if (!showDetail && (Environment.GetEnvironmentVariable("MSBUILDDIAGNOSTICS") == null)) // This env var is also used in ToolTask
+diff --git a/src/Utilities.UnitTests/TaskLoggingHelper_Tests.cs b/src/Utilities.UnitTests/TaskLoggingHelper_Tests.cs
+index a66d88e48dc..36670c64bc3 100644
+--- a/src/Utilities.UnitTests/TaskLoggingHelper_Tests.cs
++++ b/src/Utilities.UnitTests/TaskLoggingHelper_Tests.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.IO;
++using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Utilities;
+@@ -283,5 +284,29 @@ public void TestLogFromException()
+                 engine.AssertLogContains("InvalidOperationException");
+             }
+         }
++
++        /// <summary>
++        /// Verify that <see cref="TaskLoggingHelper.LogErrorFromException(Exception, bool, bool, string)" /> logs inner exceptions from an <see cref="AggregateException" />.
++        /// </summary>
++        [Fact]
++        public void TestLogFromExceptionWithAggregateException()
++        {
++            AggregateException aggregateException = new AggregateException(
++                new InvalidOperationException("The operation was invalid"),
++                new IOException("An I/O error occurred"));
++
++            MockEngine engine = new MockEngine();
++            MockTask task = new MockTask
++            {
++                BuildEngine = engine
++            };
++
++            task.Log.LogErrorFromException(aggregateException);
++
++            engine.Errors.ShouldBe(2);
++
++            engine.AssertLogContains("The operation was invalid");
++            engine.AssertLogContains("An I/O error occurred");
++        }
+     }
+ }

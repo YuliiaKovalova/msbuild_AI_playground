@@ -1,0 +1,223 @@
+diff --git a/src/Shared/Traits.cs b/src/Shared/Traits.cs
+index a356b2ead3b..56e86f8b5e5 100644
+--- a/src/Shared/Traits.cs
++++ b/src/Shared/Traits.cs
+@@ -122,6 +122,11 @@ internal class EscapeHatches
+         /// </summary>
+         public readonly bool DisableNuGetSdkResolver = Environment.GetEnvironmentVariable("MSBUILDDISABLENUGETSDKRESOLVER") == "1";
+ 
++        /// <summary>
++        /// Enables the user of autorun functionality in CMD.exe on Windows which is disabled by default in MSBuild.
++        /// </summary>
++        public readonly bool UseAutoRunWhenLaunchingProcessUnderCmd = Environment.GetEnvironmentVariable("MSBUILDUSERAUTORUNINCMD") == "1";
++
+         private static bool? ParseNullableBoolFromEnvironmentVariable(string environmentVariable)
+         {
+             var value = Environment.GetEnvironmentVariable(environmentVariable);
+diff --git a/src/Tasks.UnitTests/Exec_Tests.cs b/src/Tasks.UnitTests/Exec_Tests.cs
+index b77c70d7c70..1dbd99ab056 100644
+--- a/src/Tasks.UnitTests/Exec_Tests.cs
++++ b/src/Tasks.UnitTests/Exec_Tests.cs
+@@ -3,11 +3,14 @@
+ 
+ using System;
+ using System.IO;
++using System.Reflection;
+ using System.Text;
++using Microsoft.Build.Engine.UnitTests;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Tasks;
+ using Microsoft.Build.Utilities;
+ using Microsoft.Build.Shared;
++using Shouldly;
+ using Xunit;
+ using PlatformID = Xunit.PlatformID;
+ 
+@@ -432,6 +435,36 @@ public void ExecTaskUtf8NeverWithAnsi()
+             RunExec(false, EncodingUtilities.CurrentSystemOemEncoding.EncodingName, "Never");
+         }
+ 
++        [Theory]
++        [InlineData("MSBUILDUSERAUTORUNINCMD", null, true)]
++        [InlineData("MSBUILDUSERAUTORUNINCMD", "1", false)]
++        [Trait("Category", "nonosxtests")]
++        [Trait("Category", "nonlinuxtests")]
++        public void ExecTaskDisablesAutoRun(string environmentVariableName, string environmentVariableValue, bool autoRunShouldBeDisabled)
++        {
++            using (TestEnvironment testEnvironment = TestEnvironment.Create())
++            {
++                testEnvironment.SetEnvironmentVariable(environmentVariableName, environmentVariableValue);
++
++                Exec exec = PrepareExec("exit 0");
++
++                Type execType = typeof(Exec);
++
++                MethodInfo generateCommandLineCommandsMethod = execType.GetMethod("GenerateCommandLineCommands", BindingFlags.Instance | BindingFlags.NonPublic);
++
++                string commandLine = generateCommandLineCommandsMethod.Invoke(exec, new object[0]) as string;
++
++                if (autoRunShouldBeDisabled)
++                {
++                    commandLine.ShouldContain("/D ");
++                }
++                else
++                {
++                    commandLine.ShouldNotContain("/D ");
++                }
++            }
++        }
++
+ 
+         /// <summary>
+         /// Helper function to run the Exec task with or without ANSI characters in the Command and check for an expected encoding.
+diff --git a/src/Tasks.UnitTests/project.json b/src/Tasks.UnitTests/project.json
+index e8bc45e0578..f52eb8a1fa9 100644
+--- a/src/Tasks.UnitTests/project.json
++++ b/src/Tasks.UnitTests/project.json
+@@ -35,6 +35,7 @@
+         "Microsoft.NETCore.Runtime.CoreCLR": "1.0.2",
+         "Microsoft.NETCore.TestHost": "1.0.0",
+         "System.Reflection.Metadata": "1.3.0",
++        "System.Reflection.TypeExtensions": "4.1.0",
+         "System.Runtime.InteropServices.RuntimeInformation": "4.0.0"
+       },
+       "imports": [
+diff --git a/src/Tasks/Exec.cs b/src/Tasks/Exec.cs
+index b77aedd3c12..3d98e10a689 100644
+--- a/src/Tasks/Exec.cs
++++ b/src/Tasks/Exec.cs
+@@ -616,6 +616,10 @@ protected internal override void AddCommandLineCommands(CommandLineBuilderExtens
+                 if (NativeMethodsShared.IsWindows)
+                 {
+                     commandLine.AppendSwitch("/Q"); // echo off
++                    if(!Traits.Instance.EscapeHatches.UseAutoRunWhenLaunchingProcessUnderCmd)
++                    {
++                        commandLine.AppendSwitch("/D"); // do not load AutoRun configuration from the registry (perf)
++                    }
+                     commandLine.AppendSwitch("/C"); // run then terminate
+ 
+                     // If for some crazy reason the path has a & character and a space in it
+diff --git a/src/UnitTests.Shared/RunnerUtilities.cs b/src/UnitTests.Shared/RunnerUtilities.cs
+index d2d57785547..90f1050e057 100644
+--- a/src/UnitTests.Shared/RunnerUtilities.cs
++++ b/src/UnitTests.Shared/RunnerUtilities.cs
+@@ -1,4 +1,5 @@
+ ﻿using Microsoft.Build.Shared;
++using Microsoft.Build.Utilities;
+ using System;
+ using System.Diagnostics;
+ 
+@@ -39,7 +40,8 @@ private static void AdjustForShellExecution(ref string pathToExecutable, ref str
+             {
+                 var comSpec = Environment.GetEnvironmentVariable("ComSpec");
+ 
+-                arguments = $"/C \"{pathToExecutable} {arguments}\"";
++                // /D: Do not load AutoRun configuration from the registry (perf)
++                arguments = $"{(Traits.Instance.EscapeHatches.UseAutoRunWhenLaunchingProcessUnderCmd ? String.Empty : "/D ")}/C \"{pathToExecutable} {arguments}\"";
+                 pathToExecutable = comSpec;
+             }
+             else
+diff --git a/src/Utilities.UnitTests/ToolTask_Tests.cs b/src/Utilities.UnitTests/ToolTask_Tests.cs
+index bf59ad249c7..ebe3744924d 100644
+--- a/src/Utilities.UnitTests/ToolTask_Tests.cs
++++ b/src/Utilities.UnitTests/ToolTask_Tests.cs
+@@ -795,5 +795,73 @@ public void VisualBasicLikeEscapedQuotesInCommandAreNotMadeForwardSlashes()
+             engine.AssertLogContains("echo \"hello \\\"world\\\"\"");
+             engine.Errors.ShouldBe(0);
+         }
++
++        /// <summary>
++        /// Verifies that a ToolTask running under the command processor on Windows has autorun
++        /// disabled or enabled depending on an escape hatch.
++        /// </summary>
++        [Theory]
++        [InlineData("MSBUILDUSERAUTORUNINCMD", null, true)]
++        [InlineData("MSBUILDUSERAUTORUNINCMD", "0", true)]
++        [InlineData("MSBUILDUSERAUTORUNINCMD", "1", false)]
++        [Trait("Category", "nonosxtests")]
++        [Trait("Category", "nonlinuxtests")]
++        public void ExecTaskDisablesAutoRun(string environmentVariableName, string environmentVariableValue, bool autoRunShouldBeDisabled)
++        {
++            using (TestEnvironment testEnvironment = TestEnvironment.Create())
++            {
++                testEnvironment.SetEnvironmentVariable(environmentVariableName, environmentVariableValue);
++
++                ToolTaskThatGetsCommandLine task = new ToolTaskThatGetsCommandLine
++                {
++                    UseCommandProcessor = true
++                };
++
++                task.Execute();
++
++                if (autoRunShouldBeDisabled)
++                {
++                    task.CommandLineCommands.ShouldContain("/D ");
++                }
++                else
++                {
++                    task.CommandLineCommands.ShouldNotContain("/D ");
++                }
++            }
++        }
++
++        /// <summary>
++        /// A simple implementation of <see cref="ToolTask"/> that allows tests to verify the command-line that was generated.
++        /// </summary>
++        internal sealed class ToolTaskThatGetsCommandLine : ToolTask
++        {
++            protected override string ToolName
++            {
++                get { return "cmd.exe"; }
++            }
++
++            protected override string GenerateFullPathToTool()
++            {
++                return null;
++            }
++
++            protected override int ExecuteTool(string pathToTool, string responseFileCommands, string commandLineCommands)
++            {
++                PathToTool = pathToTool;
++                ResponseFileCommands = responseFileCommands;
++                CommandLineCommands = commandLineCommands;
++
++                return 0;
++            }
++            protected override void LogToolCommand(string message)
++            {
++            }
++
++            public string CommandLineCommands { get; private set; }
++
++            public string PathToTool { get; private set; }
++
++            public string ResponseFileCommands { get; private set; }
++        }
+     }
+ }
+diff --git a/src/Utilities/ToolTask.cs b/src/Utilities/ToolTask.cs
+index 38dcad86d4d..c91d21a6085 100644
+--- a/src/Utilities/ToolTask.cs
++++ b/src/Utilities/ToolTask.cs
+@@ -1545,7 +1545,9 @@ public override bool Execute()
+                             batchFileForCommandLine = batchFileForCommandLine.Replace("&", "^&");
+                         }
+ 
+-                        commandLineCommands = "/C \"" + batchFileForCommandLine + "\"";
++                        // /D: Do not load AutoRun configuration from the registry (perf)
++                        commandLineCommands = $"{(Traits.Instance.EscapeHatches.UseAutoRunWhenLaunchingProcessUnderCmd ? String.Empty : "/D ")}/C \"{batchFileForCommandLine}\"";
++
+                         if (EchoOff)
+                         {
+                             commandLineCommands = "/Q " + commandLineCommands;
+diff --git a/src/Utilities/TrackedDependencies/FileTracker.cs b/src/Utilities/TrackedDependencies/FileTracker.cs
+index afe90596e63..93e882655ff 100644
+--- a/src/Utilities/TrackedDependencies/FileTracker.cs
++++ b/src/Utilities/TrackedDependencies/FileTracker.cs
+@@ -869,4 +869,4 @@ internal static void LogWarningWithCodeFromResources(TaskLoggingHelper Log, stri
+     public delegate bool DependencyFilter(string fullPath);
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif

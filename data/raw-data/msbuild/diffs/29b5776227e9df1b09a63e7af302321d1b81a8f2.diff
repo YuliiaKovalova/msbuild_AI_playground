@@ -1,0 +1,285 @@
+diff --git a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+index d40ff64ac73..2703a3ebb1f 100644
+--- a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
++++ b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+@@ -5,10 +5,11 @@
+ using System.Collections.Generic;
+ using Microsoft.Build.BuildCheck.Infrastructure;
+ using Microsoft.Build.Construction;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Checks;
+ 
+-internal sealed class NoEnvironmentVariablePropertyCheck : Check
++internal sealed class NoEnvironmentVariablePropertyCheck : Check, IDisposable
+ {
+     public static CheckRule SupportedRule = new CheckRule(
+                 "BC0103",
+@@ -21,6 +22,10 @@ internal sealed class NoEnvironmentVariablePropertyCheck : Check
+ 
+     private const string VerboseEnvVariableOutputKey = "allow_displaying_environment_variable_value";
+ 
++    private readonly List<BuildCheckResult> _buildCheckResults = new List<BuildCheckResult>();
++
++    private BuildCheckDataContext<EnvironmentVariableCheckData>? _dataContext;
++
+     /// <summary>
+     /// Contains the list of reported environment variables.
+     /// </summary>
+@@ -39,8 +44,21 @@ public override void Initialize(ConfigurationContext configurationContext)
+         foreach (CustomConfigurationData customConfigurationData in configurationContext.CustomConfigurationData)
+         {
+             bool? isVerboseEnvVarOutput = GetVerboseEnvVarOutputConfig(customConfigurationData, RuleId);
+-            _isVerboseEnvVarOutput = isVerboseEnvVarOutput.HasValue && isVerboseEnvVarOutput.Value;           
++            _isVerboseEnvVarOutput = isVerboseEnvVarOutput.HasValue && isVerboseEnvVarOutput.Value;
+         }
++
++        CheckScopeClassifier.NotifyOnScopingReadiness += (string? projectFilePath) =>
++        {
++            foreach (BuildCheckResult result in _buildCheckResults)
++            {
++                if (!CheckScopeClassifier.IsActionInObservedScope(_scope, result.Location.File, projectFilePath ?? string.Empty))
++                {
++                    continue;
++                }
++
++                _dataContext?.ReportResult(result);
++            }
++        };
+     }
+ 
+     public override void RegisterActions(IBuildCheckRegistrationContext registrationContext) => registrationContext.RegisterEnvironmentVariableReadAction(ProcessEnvironmentVariableReadAction);
+@@ -51,31 +69,29 @@ private void ProcessEnvironmentVariableReadAction(BuildCheckDataContext<Environm
+         {
+             foreach (var envVariableData in context.Data.EvaluatedEnvironmentVariables)
+             {
+-                if (!CheckScopeClassifier.IsActionInObservedScope(_scope, envVariableData.Value.File, context.Data.ProjectFilePath))
+-                {
+-                    continue;
+-                }
+-                EnvironmentVariableIdentityKey identityKey = new(envVariableData.Key, envVariableData.Value.File, envVariableData.Value.Line, envVariableData.Value.Column);
++                EnvironmentVariableIdentityKey identityKey = new(envVariableData.Key, envVariableData.Value.Location);
+                 if (!_environmentVariablesReported.Contains(identityKey))
+                 {
+                     if (_isVerboseEnvVarOutput)
+                     {
+-                        context.ReportResult(BuildCheckResult.Create(
++                        _buildCheckResults.Add(BuildCheckResult.Create(
+                             SupportedRule,
+-                            ElementLocation.Create(envVariableData.Value.File, envVariableData.Value.Line, envVariableData.Value.Column),
++                            ElementLocation.Create(envVariableData.Value.Location.File, envVariableData.Value.Location.Line, envVariableData.Value.Location.Column),
+                             $"'{envVariableData.Key}' with value: '{envVariableData.Value.EnvVarValue}'"));
+                     }
+                     else
+                     {
+-                        context.ReportResult(BuildCheckResult.Create(
++                        _buildCheckResults.Add(BuildCheckResult.Create(
+                             SupportedRule,
+-                            ElementLocation.Create(envVariableData.Value.File, envVariableData.Value.Line, envVariableData.Value.Column),
++                            ElementLocation.Create(envVariableData.Value.Location.File, envVariableData.Value.Location.Line, envVariableData.Value.Location.Column),
+                             $"'{envVariableData.Key}'"));
+                     }
+ 
+                     _environmentVariablesReported.Add(identityKey);
+                 }
+             }
++
++            _dataContext = context;
+         }
+     }
+ 
+@@ -84,31 +100,28 @@ private void ProcessEnvironmentVariableReadAction(BuildCheckDataContext<Environm
+             ? bool.Parse(configVal)
+             : null;
+ 
+-    internal class EnvironmentVariableIdentityKey(string environmentVariableName, string file, int line, int column) : IEquatable<EnvironmentVariableIdentityKey>
++    internal class EnvironmentVariableIdentityKey(string environmentVariableName, IMsBuildElementLocation location) : IEquatable<EnvironmentVariableIdentityKey>
+     {
+         public string EnvironmentVariableName { get; } = environmentVariableName;
+ 
+-        public string File { get; } = file;
+-
+-        public int Line { get; } = line;
+-
+-        public int Column { get; } = column;
++        public IMsBuildElementLocation Location { get; } = location;
+ 
+         public override bool Equals(object? obj) => Equals(obj as EnvironmentVariableIdentityKey);
+ 
+         public bool Equals(EnvironmentVariableIdentityKey? other) =>
+             other != null &&
+             EnvironmentVariableName == other.EnvironmentVariableName &&
+-            File == other.File &&
+-            Line == other.Line &&
+-            Column == other.Column;
++            Location.File == other.Location.File &&
++            Location.Line == other.Location.Line &&
++            Location.Column == other.Location.Column;
+ 
+         public override int GetHashCode()
+         {
+             int hashCode = 17;
+-            hashCode = hashCode * 31 + (File != null ? File.GetHashCode() : 0);
+-            hashCode = hashCode * 31 + Line.GetHashCode();
+-            hashCode = hashCode * 31 + Column.GetHashCode();
++            hashCode = hashCode * 31 + (Location.File != null ? Location.File.GetHashCode() : 0);
++            hashCode = hashCode * 31 + Location.Line.GetHashCode();
++            hashCode = hashCode * 31 + Location.Column.GetHashCode();
++
+             return hashCode;
+         }
+     }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index dffe18b24d8..464e72ba5fb 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -118,8 +118,7 @@ internal void RunEvaluatedPropertiesActions(
+         ICheckContext checkContext,
+         Action<CheckWrapper, ICheckContext, CheckConfigurationEffective[], BuildCheckResult>
+             resultHandler)
+-        => RunRegisteredActions(_globalCallbacks.EvaluatedPropertiesActions, evaluatedPropertiesCheckData,
+-            checkContext, resultHandler);
++        => RunRegisteredActions(_globalCallbacks.EvaluatedPropertiesActions, evaluatedPropertiesCheckData, checkContext, resultHandler);
+ 
+     internal void RunParsedItemsActions(
+         ParsedItemsCheckData parsedItemsCheckData,
+@@ -197,9 +196,7 @@ private void RunRegisteredActions<T>(
+             }
+             else
+             {
+-                configPerRule =
+-                    _configurationProvider.GetMergedConfigurations(projectFullPath,
+-                        checkCallback.Item1.Check);
++                configPerRule = _configurationProvider.GetMergedConfigurations(projectFullPath, checkCallback.Item1.Check);
+                 if (configPerRule.All(c => !c.IsEnabled))
+                 {
+                     return;
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index c4d18165cc4..680632d4cde 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -328,6 +328,7 @@ public void ProcessEvaluationFinishedEventArgs(
+             ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs)
+         {
+             Dictionary<string, string>? propertiesLookup = null;
++
+             // The FileClassifier is normally initialized by executing build requests.
+             // However, if we are running in a main node that has no execution nodes - we need to initialize it here (from events).
+             if (!IsInProcNode)
+@@ -343,6 +344,8 @@ public void ProcessEvaluationFinishedEventArgs(
+ 
+             _buildEventsProcessor
+                 .ProcessEvaluationFinishedEventArgs(checkContext, evaluationFinishedEventArgs, propertiesLookup);
++
++            CheckScopeClassifier.RaiseNotifyOnScopingReadiness(evaluationFinishedEventArgs?.ProjectFile);
+         }
+ 
+         public void ProcessEnvironmentVariableReadEventArgs(ICheckContext checkContext, EnvironmentVariableReadEventArgs projectEvaluationEventArgs)
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index c9f25eb37ea..eeee147c479 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -38,7 +38,7 @@ public TaskKey(BuildEventContext context)
+ 
+     private readonly SimpleProjectRootElementCache _cache = new SimpleProjectRootElementCache();
+     private readonly BuildCheckCentralContext _buildCheckCentralContext = buildCheckCentralContext;
+-    private Dictionary<string, (string EnvVarValue, string File, int Line, int Column)> _evaluatedEnvironmentVariables = new Dictionary<string, (string EnvVarValue, string File, int Line, int Column)>();
++    private Dictionary<string, (string EnvVarValue, IMsBuildElementLocation Location)> _evaluatedEnvironmentVariables = new();
+ 
+     /// <summary>
+     /// Keeps track of in-flight tasks. Keyed by task ID as passed in <see cref="BuildEventContext.TaskId"/>.
+@@ -94,7 +94,7 @@ internal void ProcessEnvironmentVariableReadEventArgs(ICheckContext checkContext
+     {
+         if (!_evaluatedEnvironmentVariables.ContainsKey(envVarName))
+         {
+-            _evaluatedEnvironmentVariables.Add(envVarName, (envVarValue, file, line, column));
++            _evaluatedEnvironmentVariables.Add(envVarName, (envVarValue, ElementLocation.Create(file, line, column)));
+ 
+             EnvironmentVariableCheckData checkData =
+                new(file,
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+index fdd3e04ebcc..fc8652eb383 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+@@ -7,8 +7,11 @@
+ using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.BuildCheck.Infrastructure;
+-internal static class CheckScopeClassifier
++
++internal class CheckScopeClassifier : IDisposable
+ {
++    internal static event Action<string?>? NotifyOnScopingReadiness;
++
+     /// <summary>
+     /// Indicates whether given location is in the observed scope, based on currently built project path.
+     /// </summary>
+@@ -52,9 +55,23 @@ internal static bool IsActionInObservedScope(
+         }
+     }
+ 
+-    private static bool IsGeneratedNugetImport(string file)
++    internal static void RaiseNotifyOnScopingReadiness(string? projectFilePath) => NotifyOnScopingReadiness?.Invoke(projectFilePath);
++
++    private static bool IsGeneratedNugetImport(string file) => file.EndsWith("nuget.g.props", StringComparison.OrdinalIgnoreCase) ||
++        file.EndsWith("nuget.g.targets", StringComparison.OrdinalIgnoreCase);
++
++    public void Dispose()
+     {
+-        return file.EndsWith("nuget.g.props", StringComparison.OrdinalIgnoreCase) ||
+-               file.EndsWith("nuget.g.targets", StringComparison.OrdinalIgnoreCase);
++        // Remove all subscribers
++        if (NotifyOnScopingReadiness != null)
++        {
++            foreach (Delegate d in NotifyOnScopingReadiness.GetInvocationList())
++            {
++                NotifyOnScopingReadiness -= (Action<string>)d;
++            }
++        }
++
++        // Set the event to null
++        NotifyOnScopingReadiness = null;
+     }
+ }
+diff --git a/src/Build/BuildCheck/OM/EnvironmentVariableCheckData.cs b/src/Build/BuildCheck/OM/EnvironmentVariableCheckData.cs
+index 084e428d861..4e0b5e58bdf 100644
+--- a/src/Build/BuildCheck/OM/EnvironmentVariableCheckData.cs
++++ b/src/Build/BuildCheck/OM/EnvironmentVariableCheckData.cs
+@@ -2,6 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Collections.Generic;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+@@ -13,11 +14,11 @@ public class EnvironmentVariableCheckData : CheckData
+     internal EnvironmentVariableCheckData(
+         string projectFilePath,
+         int? projectConfigurationId,
+-        IReadOnlyDictionary<string, (string EnvVarValue, string File, int Line, int Column)> evaluatedEnvironmentVariables)
++        IReadOnlyDictionary<string, (string EnvVarValue, IMsBuildElementLocation Location)> evaluatedEnvironmentVariables)
+         : base(projectFilePath, projectConfigurationId) => EvaluatedEnvironmentVariables = evaluatedEnvironmentVariables;
+ 
+     /// <summary>
+     /// Gets the evaluated environment variables and their metadata.
+     /// </summary>
+-    public IReadOnlyDictionary<string, (string EnvVarValue, string File, int Line, int Column)> EvaluatedEnvironmentVariables { get; }
++    public IReadOnlyDictionary<string, (string EnvVarValue, IMsBuildElementLocation Location)> EvaluatedEnvironmentVariables { get; }
+ }
+diff --git a/src/Shared/IElementLocation.cs b/src/Shared/IElementLocation.cs
+index 39f520475ba..8b8a2bbb845 100644
+--- a/src/Shared/IElementLocation.cs
++++ b/src/Shared/IElementLocation.cs
+@@ -18,9 +18,9 @@ internal interface IElementLocation : IMsBuildElementLocation, ITranslatable { }
+     /// </summary>
+     /// <remarks>
+     /// This is currently internal - but it is prepared to be made public once it will be needed by other public BuildCheck OM
+-    /// (e.g. by property read/write OM)
++    /// (e.g. by property read/write OM).
+     /// </remarks>
+-    internal interface IMsBuildElementLocation
++    public interface IMsBuildElementLocation
+     {
+         /// <summary>
+         /// The file from which this particular element originated.  It may

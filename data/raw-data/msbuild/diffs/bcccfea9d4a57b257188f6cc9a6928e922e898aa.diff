@@ -1,0 +1,227 @@
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index 77d4d8d22eb..fd16c77ae57 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -666,11 +666,17 @@ public IReadOnlyDictionary<string, string> GetGlobalProperties()
+         #endregion
+ 
+         int runningTotal = 0;
++        Semaphore cpuCount;
+ 
+         public int RequestCores(ITask task, int requestedCores)
+         {
+-            Semaphore cpuCount = Semaphore.OpenExisting("cpuCount");
+             int coresAcquiredBeforeMoreCoresGetAcquired = runningTotal;
++
++            if (cpuCount == null)
++            {
++                cpuCount = Semaphore.OpenExisting("cpuCount");
++            }
++
+             // Keep requesting cores until we can't anymore, or we've gotten the number of cores we wanted.
+             for (int i = 0; i < requestedCores; i++)
+             {
+@@ -689,7 +695,10 @@ public int RequestCores(ITask task, int requestedCores)
+ 
+         public void ReleaseCores(ITask task, int coresToRelease)
+         {
+-            Semaphore cpuCount = Semaphore.OpenExisting("cpuCount");
++            if (cpuCount == null)
++            {
++                cpuCount = Semaphore.OpenExisting("cpuCount");
++            }
+ 
+             coresToRelease = Math.Min(runningTotal, coresToRelease);
+ 
+diff --git a/src/Shared/UnitTests/MockEngine.cs b/src/Shared/UnitTests/MockEngine.cs
+index 4e8bea7d34c..477f9b1534e 100644
+--- a/src/Shared/UnitTests/MockEngine.cs
++++ b/src/Shared/UnitTests/MockEngine.cs
+@@ -6,6 +6,7 @@
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Text;
++using System.Threading;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+@@ -31,7 +32,7 @@ namespace Microsoft.Build.UnitTests
+      * is somewhat of a no-no for task assemblies.
+      * 
+      **************************************************************************/
+-    internal sealed class MockEngine : IBuildEngine6
++    internal sealed class MockEngine : IBuildEngine7
+     {
+         private readonly object _lockObj = new object();  // Protects _log, _output
+         private readonly ITestOutputHelper _output;
+@@ -484,5 +485,48 @@ public object UnregisterTaskObject(object key, RegisteredTaskObjectLifetime life
+             _objectCache.TryRemove(key, out object obj);
+             return obj;
+         }
++
++        int runningTotal = 0;
++        Semaphore cpuCount;
++        public int RequestCores(ITask task, int requestedCores)
++        {
++            if (cpuCount == null)
++            {
++                cpuCount = Semaphore.OpenExisting("cpuCount");
++            }
++
++            int coresAcquiredBeforeMoreCoresGetAcquired = runningTotal;
++            // Keep requesting cores until we can't anymore, or we've gotten the number of cores we wanted.
++            for (int i = 0; i < requestedCores; i++)
++            {
++                if (cpuCount.WaitOne(0))
++                {
++                    runningTotal++;
++                }
++                else
++                {
++                    break;
++                }
++            }
++
++            return runningTotal - coresAcquiredBeforeMoreCoresGetAcquired;
++        }
++
++        public void ReleaseCores(ITask task, int coresToRelease)
++        {
++            if(cpuCount == null)
++            {
++                cpuCount = Semaphore.OpenExisting("cpuCount");
++            }
++
++            coresToRelease = Math.Min(runningTotal, coresToRelease);
++
++            // if we attempt to release 0 cores, Release throws an exception.
++            if(coresToRelease > 0)
++            {
++                cpuCount.Release(coresToRelease);
++            }
++
++        }
+     }
+ }
+diff --git a/src/Tasks.UnitTests/Semaphore_Tests.cs b/src/Tasks.UnitTests/Semaphore_Tests.cs
+new file mode 100644
+index 00000000000..3b511003c17
+--- /dev/null
++++ b/src/Tasks.UnitTests/Semaphore_Tests.cs
+@@ -0,0 +1,70 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Xunit;
++using Shouldly;
++using Microsoft.Build.UnitTests;
++using System.Threading;
++
++namespace Microsoft.Build.Tasks.UnitTests
++{
++    public class Semaphore_Tests
++    {
++        [Fact]
++        public void TestRequestingInvalidNumCores()
++        {
++            // assume multiproc build of 40
++            new Semaphore(40, 40, "cpuCount");
++            MockEngine mockEngine = new MockEngine();
++            
++            SemaphoreCPUTask test = new SemaphoreCPUTask();
++            test.BuildEngine = mockEngine;
++
++            // 40 - 80 = 0 cores left (claimed 40)
++            test.BuildEngine7.RequestCores(test, 12312).ShouldBe(40);
++            test.BuildEngine7.RequestCores(test, 10).ShouldBe(0);
++
++            // 0 + 39 = 39 cores left
++            test.BuildEngine7.ReleaseCores(test, 39);
++
++            // 39 - 100 = 0 cores left (claimed 39)
++            test.BuildEngine7.RequestCores(test, 100).ShouldBe(39);
++
++            // 0 + 0 = 0 cores left
++            test.BuildEngine7.ReleaseCores(test, 0);
++            test.BuildEngine7.RequestCores(test, 2).ShouldBe(0);
++
++            //0 + 1 = 1 cores left
++            test.BuildEngine7.ReleaseCores(test, 1);
++
++            // 1 - 2 = 0 cores left (only claimed 1)
++            test.BuildEngine7.RequestCores(test, 2).ShouldBe(1);
++        }
++
++        [Fact]
++        public void TestReleasingInvalidNumCores()
++        {
++            // assume multiproc build of 40
++            new Semaphore(40, 40, "cpuCount");
++            MockEngine mockEngine = new MockEngine();
++
++            SemaphoreCPUTask test = new SemaphoreCPUTask();
++            test.BuildEngine = mockEngine;
++
++            // should still be 40 cores
++            test.BuildEngine7.ReleaseCores(test, -100);
++            test.BuildEngine7.RequestCores(test, 41).ShouldBe(40);
++
++            // should be 40 cores to take
++            test.BuildEngine7.ReleaseCores(test, 50);
++            test.BuildEngine7.RequestCores(test, 39).ShouldBe(39);
++
++            test.BuildEngine7.RequestCores(test, 2).ShouldBe(1);
++        }
++    }
++}
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index c89e12c27e3..410f1991f93 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -484,7 +484,7 @@
+     <Compile Include="RoslynCodeTaskFactory\RoslynCodeTaskFactoryCodeType.cs" />
+     <Compile Include="RoslynCodeTaskFactory\RoslynCodeTaskFactoryCompilers.cs" />
+     <Compile Include="RoslynCodeTaskFactory\RoslynCodeTaskFactoryTaskInfo.cs" />
+-    <Compile Include="SemaphoreCPUTests.cs" />
++    <Compile Include="SemaphoreCPUTask.cs" />
+     <Compile Include="System.Design.cs" />
+     <Compile Include="system.design\stronglytypedresourcebuilder.cs" />
+     <Compile Include="TaskExtension.cs">
+diff --git a/src/Tasks/SemaphoreCPUTests.cs b/src/Tasks/SemaphoreCPUTask.cs
+similarity index 80%
+rename from src/Tasks/SemaphoreCPUTests.cs
+rename to src/Tasks/SemaphoreCPUTask.cs
+index a0b8030a597..a11027402c1 100644
+--- a/src/Tasks/SemaphoreCPUTests.cs
++++ b/src/Tasks/SemaphoreCPUTask.cs
+@@ -1,12 +1,11 @@
+-﻿using Microsoft.Build.Utilities;
+-using System;
+-using System.Collections.Generic;
+-using System.Linq;
+-using System.Text;
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using Microsoft.Build.Utilities;
+ 
+ namespace Microsoft.Build.Tasks
+ {
+-    class SemaphoreCPUTests : Task
++    class SemaphoreCPUTask : Task
+     {
+         public override bool Execute()
+         {
+@@ -26,5 +25,7 @@ public override bool Execute()
+ 
+             return !Log.HasLoggedErrors;
+         }
++
++
+     }
+ }

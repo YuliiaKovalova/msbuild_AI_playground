@@ -1,0 +1,430 @@
+diff --git a/eng/Versions.props b/eng/Versions.props
+index c96bc40e7dd..6fe5bda61fc 100644
+--- a/eng/Versions.props
++++ b/eng/Versions.props
+@@ -2,7 +2,7 @@
+ <!-- Copyright (c) .NET Foundation and contributors. All rights reserved. Licensed under the MIT license. See License.txt in the project root for full license information. -->
+ <Project>
+   <PropertyGroup>
+-    <VersionPrefix>17.11.1</VersionPrefix><DotNetFinalVersionKind>release</DotNetFinalVersionKind>
++    <VersionPrefix>17.11.2</VersionPrefix><DotNetFinalVersionKind>release</DotNetFinalVersionKind>
+     <PackageValidationBaselineVersion>17.10.4</PackageValidationBaselineVersion>
+     <AssemblyVersion>15.1.0.0</AssemblyVersion>
+     <PreReleaseVersionLabel>preview</PreReleaseVersionLabel>
+diff --git a/src/Build.UnitTests/BackEnd/ResultsCache_Tests.cs b/src/Build.UnitTests/BackEnd/ResultsCache_Tests.cs
+index ac421399121..7fc43eccc59 100644
+--- a/src/Build.UnitTests/BackEnd/ResultsCache_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/ResultsCache_Tests.cs
+@@ -383,6 +383,7 @@ public static IEnumerable<object[]> CacheSerializationTestData
+             }
+         }
+ 
++        // Serialize latest version and deserialize latest version of the cache
+         [Theory]
+         [MemberData(nameof(CacheSerializationTestData))]
+         public void TestResultsCacheTranslation(object obj)
+@@ -393,12 +394,49 @@ public void TestResultsCacheTranslation(object obj)
+ 
+             var copy = new ResultsCache(TranslationHelpers.GetReadTranslator());
+ 
+-            copy.ResultsDictionary.Keys.ToHashSet().SetEquals(resultsCache.ResultsDictionary.Keys.ToHashSet()).ShouldBeTrue();
++            CompareResultsCache(resultsCache, copy);
++        }
++
++        [Theory]
++        [InlineData(1, 1)] // Serialize version 0 and deserialize version 0 
++        [InlineData(1, 0)] // Serialize version 0 and deserialize latest version
++        public void TestResultsCacheTranslationAcrossVersions(int envValue1, int envValue2)
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                env.SetEnvironmentVariable("MSBUILDDONOTVERSIONBUILDRESULT", $"{envValue1}");
++
++                // Create a ResultsCache
++                var request1 = new BuildRequest(1, 2, 3, new[] { "target1" }, null, BuildEventContext.Invalid, null);
++                var request2 = new BuildRequest(4, 5, 6, new[] { "target2" }, null, BuildEventContext.Invalid, null);
++
++                var br1 = new BuildResult(request1);
++                var br2 = new BuildResult(request2);
++                br2.AddResultsForTarget("target2", BuildResultUtilities.GetEmptyFailingTargetResult());
++
++                var resultsCache = new ResultsCache();
++                resultsCache.AddResult(br1.Clone());
++                resultsCache.AddResult(br2.Clone());
++
++                resultsCache.Translate(TranslationHelpers.GetWriteTranslator());
++
++                env.SetEnvironmentVariable("MSBUILDDONOTVERSIONBUILDRESULT", $"{envValue2}");
++                Traits.UpdateFromEnvironment();
++
++                var copy = new ResultsCache(TranslationHelpers.GetReadTranslator());
++
++                CompareResultsCache(resultsCache, copy);
++            }
++        }
++
++        private void CompareResultsCache(ResultsCache resultsCache1, ResultsCache resultsCache2)
++        {
++            resultsCache2.ResultsDictionary.Keys.ToHashSet().SetEquals(resultsCache1.ResultsDictionary.Keys.ToHashSet()).ShouldBeTrue();
+ 
+-            foreach (var configId in copy.ResultsDictionary.Keys)
++            foreach (var configId in resultsCache2.ResultsDictionary.Keys)
+             {
+-                var copiedBuildResult = copy.ResultsDictionary[configId];
+-                var initialBuildResult = resultsCache.ResultsDictionary[configId];
++                var copiedBuildResult = resultsCache2.ResultsDictionary[configId];
++                var initialBuildResult = resultsCache1.ResultsDictionary[configId];
+ 
+                 copiedBuildResult.SubmissionId.ShouldBe(initialBuildResult.SubmissionId);
+                 copiedBuildResult.ConfigurationId.ShouldBe(initialBuildResult.ConfigurationId);
+diff --git a/src/Build/BackEnd/Components/Caching/ResultsCache.cs b/src/Build/BackEnd/Components/Caching/ResultsCache.cs
+index 34480ff2142..e34dd90c5b1 100644
+--- a/src/Build/BackEnd/Components/Caching/ResultsCache.cs
++++ b/src/Build/BackEnd/Components/Caching/ResultsCache.cs
+@@ -350,9 +350,14 @@ private static bool CheckResults(BuildResult result, List<string> targets, HashS
+         /// <param name="buildResult">The candidate build result.</param>
+         /// <returns>True if the flags and project state filter of the build request is compatible with the build result.</returns>
+         private static bool AreBuildResultFlagsCompatible(BuildRequest buildRequest, BuildResult buildResult)
+-        {
++        { 
++            if (buildResult.BuildRequestDataFlags is null)
++            {
++                return true;
++            }
++
+             BuildRequestDataFlags buildRequestDataFlags = buildRequest.BuildRequestDataFlags;
+-            BuildRequestDataFlags buildResultDataFlags = buildResult.BuildRequestDataFlags;
++            BuildRequestDataFlags buildResultDataFlags = (BuildRequestDataFlags) buildResult.BuildRequestDataFlags;
+ 
+             if ((buildRequestDataFlags & FlagsAffectingBuildResults) != (buildResultDataFlags & FlagsAffectingBuildResults))
+             {
+diff --git a/src/Build/BackEnd/Shared/BuildResult.cs b/src/Build/BackEnd/Shared/BuildResult.cs
+index 208fa2e7b9a..81b2cbc9a7b 100644
+--- a/src/Build/BackEnd/Shared/BuildResult.cs
++++ b/src/Build/BackEnd/Shared/BuildResult.cs
+@@ -9,6 +9,7 @@
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Shared.FileSystem;
++using Microsoft.Build.Framework;
+ 
+ #nullable disable
+ 
+@@ -33,6 +34,9 @@ public enum BuildResultCode
+     /// <summary>
+     /// Contains the current results for all of the targets which have produced results for a particular configuration.
+     /// </summary>
++    /// <remarks>
++    /// When modifying serialization/deserialization, bump the version and support previous versions in order to keep <see cref="ResultsCache"/> backwards compatible.
++    /// </remarks>
+     public class BuildResult : INodePacket, IBuildResults
+     {
+         /// <summary>
+@@ -77,6 +81,14 @@ public class BuildResult : INodePacket, IBuildResults
+         /// </summary>
+         private ConcurrentDictionary<string, TargetResult> _resultsByTarget;
+ 
++        /// <summary>
++        /// Version of the build result.
++        /// </summary>
++        /// <remarks>
++        /// Allows to serialize and deserialize different versions of the build result.
++        /// </remarks>
++        private int _version = Traits.Instance.EscapeHatches.DoNotVersionBuildResult ? 0 : 1;
++
+         /// <summary>
+         /// The request caused a circular dependency in scheduling.
+         /// </summary>
+@@ -100,6 +112,16 @@ public class BuildResult : INodePacket, IBuildResults
+         /// </summary>
+         private Dictionary<string, string> _savedEnvironmentVariables;
+ 
++        /// <summary>
++        /// When this key is in the dictionary <see cref="_savedEnvironmentVariables"/>, serialize the build result version.
++        /// </summary>
++        private const string SpecialKeyForVersion = "=MSBUILDFEATUREBUILDRESULTHASVERSION=";
++
++        /// <summary>
++        /// Set of additional keys tat might be added to the dictionary <see cref="_savedEnvironmentVariables"/>.
++        /// </summary>
++        private static readonly HashSet<string> s_additionalEntriesKeys = new HashSet<string> { SpecialKeyForVersion };
++
+         /// <summary>
+         /// Snapshot of the current directory from the configuration this result comes from.
+         /// This should only be populated when the configuration for this result is moved between nodes.
+@@ -119,6 +141,9 @@ public class BuildResult : INodePacket, IBuildResults
+         /// <summary>
+         /// The flags provide additional control over the build results and may affect the cached value.
+         /// </summary>
++        /// <remarks>
++        /// Is optional, the field is expected to be present starting <see cref="_version"/> 1.
++        /// </remarks>
+         private BuildRequestDataFlags _buildRequestDataFlags;
+ 
+         private string _schedulerInducedError;
+@@ -396,7 +421,10 @@ public ProjectInstance ProjectStateAfterBuild
+         /// Gets the flags that were used in the build request to which these results are associated.
+         /// See <see cref="Execution.BuildRequestDataFlags"/> for examples of the available flags.
+         /// </summary>
+-        public BuildRequestDataFlags BuildRequestDataFlags => _buildRequestDataFlags;
++        /// <remarks>
++        /// Is optional, this property exists starting <see cref="_version"/> 1.
++        /// </remarks>
++        public BuildRequestDataFlags? BuildRequestDataFlags => (_version > 0) ? _buildRequestDataFlags : null;
+ 
+         /// <summary>
+         /// Returns the node packet type.
+@@ -598,8 +626,62 @@ void ITranslatable.Translate(ITranslator translator)
+             translator.Translate(ref _projectStateAfterBuild, ProjectInstance.FactoryForDeserialization);
+             translator.Translate(ref _savedCurrentDirectory);
+             translator.Translate(ref _schedulerInducedError);
+-            translator.TranslateDictionary(ref _savedEnvironmentVariables, StringComparer.OrdinalIgnoreCase);
+-            translator.TranslateEnum(ref _buildRequestDataFlags, (int)_buildRequestDataFlags);
++
++            // This is a work-around for the bug https://github.com/dotnet/msbuild/issues/10208
++            // We are adding a version field to this class to make the ResultsCache backwards compatible with at least 2 previous releases.
++            // The adding of a version field is done without a breaking change in 3 steps, each separated with at least 1 intermediate release.
++            //
++            // 1st step (done): Add a special key to the _savedEnvironmentVariables dictionary during the serialization. A workaround overload of the TranslateDictionary function is created to achieve it.
++            // The presence of this key will indicate that the version is serialized next.
++            // When serializing, add a key to the dictionary and serialize a version field.
++            // Do not actually save the special key to dictionary during the deserialization, but read a version as a next field if it presents.
++            //
++            // 2nd step: Stop serialize a special key with the dictionary _savedEnvironmentVariables using the TranslateDictionary function workaround overload. Always serialize and de-serialize the version field.
++            // Continue to deserialize _savedEnvironmentVariables with the TranslateDictionary function workaround overload in order not to deserialize dictionary with the special keys.
++            //
++            // 3rd step: Stop using the TranslateDictionary function workaround overload during _savedEnvironmentVariables deserialization.
++            if (_version == 0)
++            {
++                // Escape hatch: serialize/deserialize without version field.
++                translator.TranslateDictionary(ref _savedEnvironmentVariables, StringComparer.OrdinalIgnoreCase);
++            }
++            else
++            {
++                Dictionary<string, string> additionalEntries = new();
++
++                if (translator.Mode == TranslationDirection.WriteToStream)
++                {
++                    // Add the special key SpecialKeyForVersion to additional entries indicating the presence of a version to the _savedEnvironmentVariables dictionary.
++                    additionalEntries.Add(SpecialKeyForVersion, String.Empty);
++
++                    // Serialize the special key together with _savedEnvironmentVariables dictionary using the workaround overload of TranslateDictionary:
++                    translator.TranslateDictionary(ref _savedEnvironmentVariables, StringComparer.OrdinalIgnoreCase, ref additionalEntries, s_additionalEntriesKeys);
++
++                    // Serialize version
++                    translator.Translate(ref _version);
++                }
++                else if (translator.Mode == TranslationDirection.ReadFromStream)
++                {
++                    // Read the dictionary using the workaround overload of TranslateDictionary: special keys (additionalEntriesKeys) would be read to additionalEntries instead of the _savedEnvironmentVariables dictionary.
++                    translator.TranslateDictionary(ref _savedEnvironmentVariables, StringComparer.OrdinalIgnoreCase, ref additionalEntries, s_additionalEntriesKeys);
++
++                    // If the special key SpecialKeyForVersion present in additionalEntries, also read a version, otherwise set it to 0.
++                    if (additionalEntries is not null && additionalEntries.ContainsKey(SpecialKeyForVersion))
++                    {
++                        translator.Translate(ref _version);
++                    }
++                    else
++                    {
++                        _version = 0;
++                    }
++                }
++            }
++
++            // Starting version 1 this _buildRequestDataFlags field is present.
++            if (_version > 0)
++            {
++                translator.TranslateEnum(ref _buildRequestDataFlags, (int)_buildRequestDataFlags);
++            }
+         }
+ 
+         /// <summary>
+diff --git a/src/Framework/BinaryTranslator.cs b/src/Framework/BinaryTranslator.cs
+index d3ae3878226..a2a72ede9eb 100644
+--- a/src/Framework/BinaryTranslator.cs
++++ b/src/Framework/BinaryTranslator.cs
+@@ -22,6 +22,14 @@ namespace Microsoft.Build.BackEnd
+     /// </summary>
+     internal static class BinaryTranslator
+     {
++        /// <summary>
++        /// Presence of this key in the dictionary indicates that it was null.
++        /// </summary>
++        /// <remarks>
++        /// This constant is needed for a workaround concerning serializing BuildResult with a version.
++        /// </remarks>
++        private const string SpecialKeyForDictionaryBeingNull = "=MSBUILDDICTIONARYWASNULL=";
++
+ #nullable enable
+         /// <summary>
+         /// Returns a read-only serializer.
+@@ -590,6 +598,53 @@ public void TranslateDictionary(ref Dictionary<string, string> dictionary, IEqua
+                 dictionary = (Dictionary<string, string>)copy;
+             }
+ 
++            /// <summary>
++            /// Translates a dictionary of { string, string } with additional entries. The dictionary might be null despite being populated.
++            /// </summary>
++            /// <param name="dictionary">The dictionary to be translated.</param>
++            /// <param name="comparer">The comparer used to instantiate the dictionary.</param>
++            /// <param name="additionalEntries">Additional entries to be translated</param>
++            /// <param name="additionalEntriesKeys">Additional entries keys</param>
++            /// <remarks>
++            /// This overload is needed for a workaround concerning serializing BuildResult with a version.
++            /// It deserializes additional entries together with the main dictionary.
++            /// </remarks>
++            public void TranslateDictionary(ref Dictionary<string, string> dictionary, IEqualityComparer<string> comparer, ref Dictionary<string, string> additionalEntries, HashSet<string> additionalEntriesKeys)
++            {
++                if (!TranslateNullable(dictionary))
++                {
++                    return;
++                }
++
++                int count = _reader.ReadInt32();
++                dictionary = new Dictionary<string, string>(count, comparer);
++                additionalEntries = new();
++
++                for (int i = 0; i < count; i++)
++                {
++                    string key = null;
++                    Translate(ref key);
++                    string value = null;
++                    Translate(ref value);
++                    if (additionalEntriesKeys.Contains(key))
++                    {
++                        additionalEntries[key] = value;
++                    }
++                    else if (comparer.Equals(key, SpecialKeyForDictionaryBeingNull))
++                    {
++                        // Presence of special key SpecialKeyForDictionaryBeingNull indicates that the dictionary was null.
++                        dictionary = null;
++
++                        // If the dictionary is null, we should have only two keys: SpecialKeyForDictionaryBeingNull, SpecialKeyForVersion
++                        Debug.Assert(count == 2);
++                    }
++                    else if (dictionary is not null)
++                    {
++                        dictionary[key] = value;
++                    }
++                }
++            }
++
+             public void TranslateDictionary(ref IDictionary<string, string> dictionary, NodePacketCollectionCreator<IDictionary<string, string>> dictionaryCreator)
+             {
+                 if (!TranslateNullable(dictionary))
+@@ -1261,6 +1316,72 @@ public void TranslateDictionary(ref Dictionary<string, string> dictionary, IEqua
+                 TranslateDictionary(ref copy, (NodePacketCollectionCreator<IDictionary<string, string>>)null);
+             }
+ 
++            /// <summary>
++            /// Translates a dictionary of { string, string } adding additional entries.
++            /// </summary>
++            /// <param name="dictionary">The dictionary to be translated.</param>
++            /// <param name="comparer">The comparer used to instantiate the dictionary.</param>
++            /// <param name="additionalEntries">Additional entries to be translated.</param>
++            /// <param name="additionalEntriesKeys">Additional entries keys.</param>
++            /// <remarks>
++            /// This overload is needed for a workaround concerning serializing BuildResult with a version.
++            /// It serializes additional entries together with the main dictionary.
++            /// </remarks>
++            public void TranslateDictionary(ref Dictionary<string, string> dictionary, IEqualityComparer<string> comparer, ref Dictionary<string, string> additionalEntries, HashSet<string> additionalEntriesKeys)
++            {
++                // Translate whether object is null
++                if ((dictionary is null) && ((additionalEntries is null) || (additionalEntries.Count == 0)))
++                {
++                    _writer.Write(false);
++                    return;
++                }
++                else
++                {
++                    // Translate that object is not null
++                    _writer.Write(true);
++                }
++
++                // Writing a dictionary, additional entries and special key if dictionary was null. We need the special key for distinguishing whether the initial dictionary was null or empty.
++                int count = (dictionary is null ? 1 : 0) +
++                            (additionalEntries is null ? 0 : additionalEntries.Count) +
++                            (dictionary is null ? 0 : dictionary.Count);
++
++                _writer.Write(count);
++
++                // If the dictionary was null, serialize a special key SpecialKeyForDictionaryBeingNull.
++                if (dictionary is null)
++                {
++                    string key = SpecialKeyForDictionaryBeingNull;
++                    Translate(ref key);
++                    string value = string.Empty;
++                    Translate(ref value);
++                }
++
++                // Serialize additional entries
++                if (additionalEntries is not null)
++                {
++                    foreach (KeyValuePair<string, string> pair in additionalEntries)
++                    {
++                        string key = pair.Key;
++                        Translate(ref key);
++                        string value = pair.Value;
++                        Translate(ref value);
++                    }
++                }
++
++                // Serialize dictionary
++                if (dictionary is not null)
++                {
++                    foreach (KeyValuePair<string, string> pair in dictionary)
++                    {
++                        string key = pair.Key;
++                        Translate(ref key);
++                        string value = pair.Value;
++                        Translate(ref value);
++                    }
++                }
++            }
++
+             public void TranslateDictionary(ref IDictionary<string, string> dictionary, NodePacketCollectionCreator<IDictionary<string, string>> dictionaryCreator)
+             {
+                 if (!TranslateNullable(dictionary))
+diff --git a/src/Framework/ITranslator.cs b/src/Framework/ITranslator.cs
+index edb6e96dfc7..edf5b47765e 100644
+--- a/src/Framework/ITranslator.cs
++++ b/src/Framework/ITranslator.cs
+@@ -319,6 +319,19 @@ void TranslateArray<T>(ref T[] array)
+         /// <param name="comparer">The comparer used to instantiate the dictionary.</param>
+         void TranslateDictionary(ref Dictionary<string, string> dictionary, IEqualityComparer<string> comparer);
+ 
++        /// <summary>
++        /// Translates a dictionary of { string, string } adding additional entries.
++        /// </summary>
++        /// <param name="dictionary">The dictionary to be translated.</param>
++        /// <param name="comparer">The comparer used to instantiate the dictionary.</param>
++        /// <param name="additionalEntries">Additional entries to be translated</param>
++        /// <param name="additionalEntriesKeys">Additional entries keys</param>
++        /// <remarks>
++        /// This overload is needed for a workaround concerning serializing BuildResult with a version.
++        /// It serializes/deserializes additional entries together with the main dictionary.
++        /// </remarks>
++        void TranslateDictionary(ref Dictionary<string, string> dictionary, IEqualityComparer<string> comparer, ref Dictionary<string, string> additionalEntries, HashSet<string> additionalEntriesKeys);
++
+         void TranslateDictionary(ref IDictionary<string, string> dictionary, NodePacketCollectionCreator<IDictionary<string, string>> collectionCreator);
+ 
+         void TranslateDictionary(ref Dictionary<string, DateTime> dictionary, StringComparer comparer);
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index 8e9d1e09d00..9bca9afa1a5 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -359,6 +359,14 @@ public bool? LogPropertiesAndItemsAfterEvaluation
+         /// </remarks>
+         public readonly bool UseMinimalResxParsingInCoreScenarios = Environment.GetEnvironmentVariable("MSBUILDUSEMINIMALRESX") == "1";
+ 
++        /// <summary>
++        /// Escape hatch to ensure msbuild produces the compatible build results cache without versioning.
++        /// </summary>
++        /// <remarks>
++        /// Escape hatch for problems arising from https://github.com/dotnet/msbuild/issues/10208.
++        /// </remarks>
++        public readonly bool DoNotVersionBuildResult = Environment.GetEnvironmentVariable("MSBUILDDONOTVERSIONBUILDRESULT") == "1";
++
+         private bool _sdkReferencePropertyExpansionInitialized;
+         private SdkReferencePropertyExpansionMode? _sdkReferencePropertyExpansionValue;
+ 

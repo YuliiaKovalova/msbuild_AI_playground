@@ -1,0 +1,84 @@
+{
+  "number": 11872,
+  "title": "GetFileSpecInfoWithRegexObject allocates Regex",
+  "body": "I noticed this allocates too much:\n\nhttps://github.com/dotnet/msbuild/blob/4b2d01ad2b0ef3ee4a05ed29ff1ec2b558b51f17/src/Shared/FileMatcher.cs#L1498\n\n![Image](https://github.com/user-attachments/assets/f0644e12-a497-47b1-940c-ba6443757ec4)\n\nLet's investigate if we can cache these regexes, I suspect there's a very limited number of expressions here that we can reuse regexes for",
+  "state": "OPEN",
+  "createdAt": "2025-05-20T19:25:57Z",
+  "updatedAt": "2025-06-03T00:35:00Z",
+  "closedAt": null,
+  "author": {
+    "login": "KirillOsenkov"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": [
+      {
+        "login": "SimaTian"
+      }
+    ]
+  },
+  "labels": [
+    "Area: Performance",
+    "triaged"
+  ],
+  "comments": {
+    "nodes": [
+      {
+        "body": "This simple change:\n\n```csharp\n        private ConcurrentDictionary<string, (Regex regex, bool needsRecursion, bool isLegalFileSpec)> regexCache =\n            new(StringComparer.Ordinal);\n\n        internal void GetFileSpecInfoWithRegexObject(\n            string filespec,\n            out Regex regexFileMatch,\n            out bool needsRecursion,\n            out bool isLegalFileSpec)\n        {\n            var result = regexCache.GetOrAdd(filespec, spec =>\n            {\n                GetFileSpecInfoWithRegexObjectCore(spec, out var regex, out var needsRec, out var isLegal);\n                return (regex, needsRec, isLegal);\n            });\n            regexFileMatch = result.regex;\n            needsRecursion = result.needsRecursion;\n            isLegalFileSpec = result.isLegalFileSpec;\n        }\n```\n\nShaves off 0.6 seconds from our incremental build, 13.9s -> 13.3s:\n\nOriginal:\n```\n13.707\n13.717\n14.019\n13.601\n14.755\nAverage: 13.960 s\n```\n\nAfter the fix:\n```\n13.473\n13.242\n13.598\n13.057\n13.361\nAverage: 13.346 s\n```",
+        "createdAt": "2025-05-20T23:16:00Z",
+        "author": {
+          "login": "KirillOsenkov"
+        }
+      },
+      {
+        "body": "it creates a regex for every metadata for every globbed file, resulting in >20,000 identical regexes in our relatively simple build.",
+        "createdAt": "2025-05-20T23:16:50Z",
+        "author": {
+          "login": "KirillOsenkov"
+        }
+      },
+      {
+        "body": "The PR is out, at least the first iteration.",
+        "createdAt": "2025-05-30T08:12:33Z",
+        "author": {
+          "login": "SimaTian"
+        }
+      },
+      {
+        "body": "> it creates a regex for every metadata for every globbed file\n\nThat sounds bad, what's the callstack here? Do we actually need different things for different metadata? For that matter do we need different things for different globs?\n\n@SimaTian I'd like to understand a bit more before we go with the cache.",
+        "createdAt": "2025-05-30T15:31:40Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Here's a repro:\n\n```xml\n<Project>\n\n  <Target Name=\"Build\">\n    <PropertyGroup>\n      <SourceDir>C:\\temp\\largedir</SourceDir>\n      <DestinationDir>C:\\temp\\2</DestinationDir>\n    </PropertyGroup>\n    <ItemGroup>\n      <File Include=\"$(SourceDir)\\**\\*\" />\n    </ItemGroup>\n    <Copy SourceFiles=\"@(File)\" DestinationFiles=\"@(File->'$(DestinationDir)\\%(RecursiveDir)%(Filename)%(Extension)')\" SkipUnchangedFiles=\"True\" />\n  </Target>\n\n</Project>\n```\n\nPlace a breakpoint in `GetFileSpecInfoWithRegexObject()`, ensure the C:\\temp\\largedir has more than one file, the method will be hit for every file with the same filespec parameter value.",
+        "createdAt": "2025-05-31T00:55:58Z",
+        "author": {
+          "login": "KirillOsenkov"
+        }
+      },
+      {
+        "body": "Bonus if you can compare the perf and memory usage of the fix on a very large directory before and after the fix.",
+        "createdAt": "2025-05-31T00:56:27Z",
+        "author": {
+          "login": "KirillOsenkov"
+        }
+      },
+      {
+        "body": "Nice self-contained repro. So the calls are:\n\n```\n>\tMicrosoft.Build.dll!Microsoft.Build.Shared.FileMatcher.GetFileSpecInfoWithRegexObject(string filespec, out System.Text.RegularExpressions.Regex regexFileMatch, out bool needsRecursion, out bool isLegalFileSpec) Line 1494\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Shared.FileMatcher.FileMatch(string filespec, string fileToMatch) Line 1827\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.BuiltInMetadata.GetRecursiveDirValue(string evaluatedIncludeBeforeWildcardExpansionEscaped, string evaluatedIncludeEscaped) Line 110\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.BuiltInMetadata.GetMetadataValueEscaped(string currentDirectory, string evaluatedIncludeBeforeWildcardExpansionEscaped, string evaluatedIncludeEscaped, string definingProjectEscaped, string name, ref string fullPath) Line 81\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Execution.ProjectItemInstance.TaskItem.GetBuiltInMetadataEscaped(string name) Line 1938\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Execution.ProjectItemInstance.TaskItem.GetMetadataEscaped(string metadataName) Line 1353\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Execution.ProjectItemInstance.Microsoft.Build.Evaluation.IItem.GetMetadataValueEscaped(string name) Line 448\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.MetadataMatchEvaluator.GetMetadataValueFromMatch(System.Text.RegularExpressions.Match match) Line 3082\tC#\n \tSystem.Text.RegularExpressions.dll!System.Text.RegularExpressions.Regex.Replace.AnonymousMethod__99_0(ref (System.Text.StructListBuilder<System.ReadOnlyMemory<char>> segments, System.Text.RegularExpressions.MatchEvaluator evaluator, int prevat, string input, int count) state, System.Text.RegularExpressions.Match match)\tUnknown\n \tSystem.Text.RegularExpressions.dll!System.Text.RegularExpressions.Regex.RunAllMatchesWithCallback<(System.Text.StructListBuilder<System.ReadOnlyMemory<char>>, System.Text.RegularExpressions.MatchEvaluator, int, string, int)>(string inputString, System.ReadOnlySpan<char> inputSpan, int startat, ref (System.Text.StructListBuilder<System.ReadOnlyMemory<char>>, System.Text.RegularExpressions.MatchEvaluator, int, string, int) state, System.Text.RegularExpressions.MatchCallback<(System.Text.StructListBuilder<System.ReadOnlyMemory<char>>, System.Text.RegularExpressions.MatchEvaluator, int, string, int)> callback, System.Text.RegularExpressions.RegexRunnerMode mode, bool reuseMatchObject)\tUnknown\n \tSystem.Text.RegularExpressions.dll!System.Text.RegularExpressions.Regex.RunAllMatchesWithCallback<(System.Text.StructListBuilder<System.ReadOnlyMemory<char>>, System.Text.RegularExpressions.MatchEvaluator, int, string, int)>(string input, int startat, ref (System.Text.StructListBuilder<System.ReadOnlyMemory<char>>, System.Text.RegularExpressions.MatchEvaluator, int, string, int) state, System.Text.RegularExpressions.MatchCallback<(System.Text.StructListBuilder<System.ReadOnlyMemory<char>>, System.Text.RegularExpressions.MatchEvaluator, int, string, int)> callback, System.Text.RegularExpressions.RegexRunnerMode mode, bool reuseMatchObject)\tUnknown\n \tSystem.Text.RegularExpressions.dll!System.Text.RegularExpressions.Regex.Replace(System.Text.RegularExpressions.MatchEvaluator evaluator, System.Text.RegularExpressions.Regex regex, string input, int count, int startat)\tUnknown\n \tSystem.Text.RegularExpressions.dll!System.Text.RegularExpressions.Regex.Replace(string input, System.Text.RegularExpressions.MatchEvaluator evaluator)\tUnknown\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.IntrinsicItemFunctions<Microsoft.Build.Execution.ProjectItemInstance>.ExpandQuotedExpressionFunction(Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance> expander, Microsoft.Build.Shared.IElementLocation elementLocation, bool includeNullEntries, string functionName, System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string, Microsoft.Build.Execution.ProjectItemInstance>> itemsOfType, string[] arguments) Line 2732\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.Transform<Microsoft.Build.Execution.ProjectItemInstance>(Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance> expander, bool includeNullEntries, System.Collections.Generic.Stack<Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.TransformFunction<Microsoft.Build.Execution.ProjectItemInstance>> transformFunctionStack, System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string, Microsoft.Build.Execution.ProjectItemInstance>> itemsOfType) Line 1812\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.Transform<Microsoft.Build.Execution.ProjectItemInstance>(Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance> expander, bool includeNullEntries, System.Collections.Generic.Stack<Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.TransformFunction<Microsoft.Build.Execution.ProjectItemInstance>> transformFunctionStack, System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string, Microsoft.Build.Execution.ProjectItemInstance>> itemsOfType) Line 1803\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.ExpandExpressionCapture<Microsoft.Build.Execution.ProjectItemInstance>(Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance> expander, Microsoft.Build.Evaluation.ExpressionShredder.ItemExpressionCapture expressionCapture, Microsoft.Build.Evaluation.IItemProvider<Microsoft.Build.Execution.ProjectItemInstance> evaluatedItems, Microsoft.Build.Shared.IElementLocation elementLocation, Microsoft.Build.Evaluation.ExpanderOptions options, bool includeNullEntries, out bool isTransformExpression, out System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, Microsoft.Build.Execution.ProjectItemInstance>> itemsFromCapture) Line 2062\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.ExpandExpressionCaptureIntoStringBuilder<Microsoft.Build.Execution.ProjectItemInstance>(Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance> expander, Microsoft.Build.Evaluation.ExpressionShredder.ItemExpressionCapture capture, Microsoft.Build.Evaluation.IItemProvider<Microsoft.Build.Execution.ProjectItemInstance> evaluatedItems, Microsoft.Build.Shared.IElementLocation elementLocation, Microsoft.NET.StringTools.SpanBasedStringBuilder builder, Microsoft.Build.Evaluation.ExpanderOptions options) Line 2197\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ItemExpander.ExpandItemVectorsIntoString<Microsoft.Build.Execution.ProjectItemInstance>(Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance> expander, string expression, Microsoft.Build.Evaluation.IItemProvider<Microsoft.Build.Execution.ProjectItemInstance> items, Microsoft.Build.Evaluation.ExpanderOptions options, Microsoft.Build.Shared.IElementLocation elementLocation) Line 2123\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ExpandIntoStringLeaveEscaped(string expression, Microsoft.Build.Evaluation.ExpanderOptions options, Microsoft.Build.Shared.IElementLocation elementLocation) Line 500\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.Evaluation.Expander<Microsoft.Build.Execution.ProjectPropertyInstance, Microsoft.Build.Execution.ProjectItemInstance>.ExpandIntoStringAndUnescape(string expression, Microsoft.Build.Evaluation.ExpanderOptions options, Microsoft.Build.Shared.IElementLocation elementLocation) Line 477\tC#\n \tMicrosoft.Build.dll!Microsoft.Build.BackEnd.TaskExecutionHost.InitializeTaskScalarParameter(Microsoft.Build.Framework.TaskPropertyInfo parameter, System.Type parameterType, string parameterValue, Microsoft.Build.Construction.ElementLocation parameterLocation, out bool taskParameterSet) Line 1187\tC#\n```\n\nSo intrinsic-item-function metadata expansion calls GetMetadataValue on the item, which calls\n\n\nhttps://github.com/dotnet/msbuild/blob/b62685dbb1f119aeaa76fab4432a4d90f40b85f5/src/Build/Definition/BuiltInMetadata.cs#L81\n\nso \"given a file and the wildcard-laden expression that produced it, break out the glob parts\". Not _too_ unreasonable though it'd be nice if we could retroactively know this when expanding the glob and just save all the bits and bobs.\n\nThis then creates a string that looks something like\n\n```regex\n^S:[/\\\\]+msbuild[/\\\\]+(?<WILDCARDDIR>((.*/)|(.*\\\\)|()))(?<FILENAME>[^/\\\\]*)$\n```\n\nand constructs the regex.\n\nMSBuildGlob solves my unlimited-growth problems with a WeakDictionary cache:\n\nhttps://github.com/dotnet/msbuild/blob/d0d0b2b62116d489b395be617f38ae9c01ad8594/src/Build/Globbing/MSBuildGlob.cs#L203-L226\n\n(at the cost of rebuilding the regex after GCs a bunch, probably).\n\nHonestly I'm torn between \"I bet a WeakDictionary fixes all the real problems\" and \"use this as an excuse to stop misusing Regex here!\"",
+        "createdAt": "2025-06-02T20:07:03Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "I'd be curious to see the size of the cache after Orchard build",
+        "createdAt": "2025-06-03T00:34:59Z",
+        "author": {
+          "login": "KirillOsenkov"
+        }
+      }
+    ]
+  }
+}

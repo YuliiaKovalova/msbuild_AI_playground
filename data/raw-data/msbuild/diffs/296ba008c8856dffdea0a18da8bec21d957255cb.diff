@@ -1,0 +1,318 @@
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index c6fa9be4658..0cfb9fa10f3 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -207,7 +207,6 @@ public void BinaryLoggerShouldEmbedFilesViaTaskOutput()
+             zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith("testtaskoutputfile.txt"));
+         }
+ 
+-#if FEATURE_SYMLINK_TARGET
+         [Fact]
+         public void BinaryLoggerShouldEmbedSymlinkFilesViaTaskOutput()
+         {
+@@ -217,7 +216,8 @@ public void BinaryLoggerShouldEmbedSymlinkFilesViaTaskOutput()
+             TransientTestFile testFile = testFolder.CreateFile(testFileName, string.Join(Environment.NewLine, new[] { "123", "456" }));
+             string symlinkPath = Path.Combine(testFolder2.Path, testFileName);
+ 
+-            File.CreateSymbolicLink(symlinkPath, testFile.Path);
++            string errorMessage = string.Empty;
++            Assert.True(NativeMethodsShared.MakeSymbolicLink(symlinkPath, testFile.Path, ref errorMessage), errorMessage);
+ 
+             using var buildManager = new BuildManager();
+             var binaryLogger = new BinaryLogger()
+@@ -254,7 +254,6 @@ public void BinaryLoggerShouldEmbedSymlinkFilesViaTaskOutput()
+             zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith("testtaskoutputfile.txt"));
+             zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith(testFileName));
+         }
+-#endif
+ 
+         [Fact]
+         public void BinaryLoggerShouldNotThrowWhenMetadataCannotBeExpanded()
+diff --git a/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs b/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
+index a2653600234..d7aabc68bda 100644
+--- a/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
++++ b/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
+@@ -130,16 +130,7 @@ private void AddFileCore(string filePath)
+                 return;
+             }
+ 
+-            var fileInfo = new FileInfo(filePath);
+-
+-#if FEATURE_SYMLINK_TARGET
+-            if (fileInfo.Length == 0 && fileInfo.Exists && !string.IsNullOrEmpty(fileInfo.LinkTarget))
+-            {
+-                fileInfo = new FileInfo(fileInfo.LinkTarget);
+-            }
+-#endif
+-
+-            if (!fileInfo.Exists || fileInfo.Length == 0)
++            if (!File.Exists(filePath))
+             {
+                 _processedFiles.Add(filePath);
+                 return;
+@@ -153,11 +144,9 @@ private void AddFileCore(string filePath)
+                 return;
+             }
+ 
+-            using (Stream entryStream = OpenArchiveEntry(filePath))
+-            using (FileStream content = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
+-            {
+-                content.CopyTo(entryStream);
+-            }
++            using FileStream content = NativeMethodsShared.OpenReadFileThroughSymlinks(filePath);
++            using Stream entryStream = OpenArchiveEntry(filePath);
++            content.CopyTo(entryStream);
+         }
+ 
+         /// <remarks>
+diff --git a/src/Framework/NativeMethods.cs b/src/Framework/NativeMethods.cs
+index daaf0387950..b92612196a2 100644
+--- a/src/Framework/NativeMethods.cs
++++ b/src/Framework/NativeMethods.cs
+@@ -200,9 +200,16 @@ internal enum ProcessorArchitectures
+         Unknown
+     }
+ 
+-#endregion
++    internal enum SymbolicLink
++    {
++        File = 0,
++        Directory = 1,
++        AllowUnprivilegedCreate = 2,
++    }
++
++    #endregion
+ 
+-#region Structs
++    #region Structs
+ 
+     /// <summary>
+     /// Structure that contain information about the system on which we are running
+@@ -1035,6 +1042,94 @@ internal static MemoryStatus GetMemoryStatus()
+         return null;
+     }
+ 
++    internal static bool IsSymLink(string fullPath)
++    {
++#if NET
++        var fileInfo = new FileInfo(fullPath);
++
++        return fileInfo.Exists && fileInfo.Length == 0 && !string.IsNullOrEmpty(fileInfo.LinkTarget);
++#else
++        if (!IsWindows)
++        {
++            return false;
++        }
++
++        WIN32_FILE_ATTRIBUTE_DATA data = new WIN32_FILE_ATTRIBUTE_DATA();
++
++        return NativeMethods.GetFileAttributesEx(fullPath, 0, ref data) &&
++               (data.fileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) == 0 &&
++               (data.fileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == FILE_ATTRIBUTE_REPARSE_POINT;
++#endif
++    }
++
++    internal static void ReadFileThroughSymlinks(string filePath, Action<FileStream> contentConsumer)
++    {
++        filePath = Path.GetFullPath(filePath);
++
++        if (IsSymLink(filePath))
++        {
++            using SafeFileHandle handle = OpenFileThroughSymlinks(filePath);
++            if (!handle.IsInvalid)
++            {
++                using FileStream content = new FileStream(handle, FileAccess.Read);
++                contentConsumer(content);
++            }
++        }
++        else
++        {
++            using FileStream content = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
++            contentConsumer(content);
++        }
++    }
++
++    /// <summary>
++    /// Opens file for reading, if the file is symlink file - it reads the target file content.
++    /// </summary>
++    /// <param name="fullPath"></param>
++    /// <returns></returns>
++    internal static FileStream OpenReadFileThroughSymlinks(string fullPath)
++    {
++        if (IsSymLink(fullPath))
++        {
++            SafeFileHandle handle = OpenFileThroughSymlinks(fullPath);
++            if (handle.IsInvalid)
++            {
++                handle.Dispose();
++                return null;
++            }
++
++            return new FileStream(handle, FileAccess.Read);
++        }
++        else
++        {
++            return new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
++        }
++    }
++
++    internal static bool MakeSymbolicLink(string newFileName, string exitingFileName, ref string errorMessage)
++    {
++        bool symbolicLinkCreated;
++        if (IsWindows)
++        {
++            Version osVersion = Environment.OSVersion.Version;
++            SymbolicLink flags = SymbolicLink.File;
++            if (osVersion.Major >= 11 || (osVersion.Major == 10 && osVersion.Build >= 14972))
++            {
++                flags |= SymbolicLink.AllowUnprivilegedCreate;
++            }
++
++            symbolicLinkCreated = CreateSymbolicLink(newFileName, exitingFileName, flags);
++            errorMessage = symbolicLinkCreated ? null : Marshal.GetExceptionForHR(Marshal.GetHRForLastWin32Error()).Message;
++        }
++        else
++        {
++            symbolicLinkCreated = symlink(exitingFileName, newFileName) == 0;
++            errorMessage = symbolicLinkCreated ? null : "The link() library call failed with the following error code: " + Marshal.GetLastWin32Error();
++        }
++
++        return symbolicLinkCreated;
++    }
++
+     /// <summary>
+     /// Get the last write time of the fullpath to the file.
+     /// </summary>
+@@ -1111,6 +1206,23 @@ DateTime LastWriteFileUtcTime(string path)
+         }
+     }
+ 
++    /// <summary>
++    /// Get the SafeFileHandle for a file, while skipping reparse points (going directly to target file).
++    /// </summary>
++    /// <param name="fullPath">Full path to the file in the filesystem</param>
++    /// <returns>the SafeFileHandle for a file (target file in case of symlinks)</returns>
++    [SupportedOSPlatform("windows")]
++    private static SafeFileHandle OpenFileThroughSymlinks(string fullPath)
++    {
++        return CreateFile(fullPath,
++            GENERIC_READ,
++            FILE_SHARE_READ,
++            IntPtr.Zero,
++            OPEN_EXISTING,
++            FILE_ATTRIBUTE_NORMAL, /* No FILE_FLAG_OPEN_REPARSE_POINT; read through to content */
++            IntPtr.Zero);
++    }
++
+     /// <summary>
+     /// Get the last write time of the content pointed to by a file path.
+     /// </summary>
+@@ -1125,14 +1237,7 @@ private static DateTime GetContentLastWriteFileUtcTime(string fullPath)
+     {
+         DateTime fileModifiedTime = DateTime.MinValue;
+ 
+-        using (SafeFileHandle handle =
+-            CreateFile(fullPath,
+-                GENERIC_READ,
+-                FILE_SHARE_READ,
+-                IntPtr.Zero,
+-                OPEN_EXISTING,
+-                FILE_ATTRIBUTE_NORMAL, /* No FILE_FLAG_OPEN_REPARSE_POINT; read through to content */
+-                IntPtr.Zero))
++        using (SafeFileHandle handle = OpenFileThroughSymlinks(fullPath))
+         {
+             if (!handle.IsInvalid)
+             {
+@@ -1635,9 +1740,18 @@ out FILETIME lpLastWriteTime
+     [SupportedOSPlatform("windows")]
+     internal static extern bool SetThreadErrorMode(int newMode, out int oldMode);
+ 
+-#endregion
++    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
++    [return: MarshalAs(UnmanagedType.I1)]
++    [SupportedOSPlatform("windows")]
++    internal static extern bool CreateSymbolicLink(string symLinkFileName, string targetFileName, SymbolicLink dwFlags);
++
++    [DllImport("libc", SetLastError = true)]
++    [SupportedOSPlatform("linux")]
++    internal static extern int symlink(string oldpath, string newpath);
++
++    #endregion
+ 
+-#region helper methods
++    #region helper methods
+ 
+     internal static bool DirectoryExists(string fullPath)
+     {
+diff --git a/src/Tasks/Copy.cs b/src/Tasks/Copy.cs
+index 45a3a11ae8d..912389ab9e4 100644
+--- a/src/Tasks/Copy.cs
++++ b/src/Tasks/Copy.cs
+@@ -284,7 +284,7 @@ FileState destinationFileState  // The destination file
+             }
+             else if (UseSymboliclinksIfPossible)
+             {
+-                TryCopyViaLink(SymbolicLinkComment, MessageImportance.Normal, sourceFileState, destinationFileState, ref destinationFileExists, out linkCreated, ref errorMessage, (source, destination, errMessage) => NativeMethods.MakeSymbolicLink(destination, source, ref errorMessage));
++                TryCopyViaLink(SymbolicLinkComment, MessageImportance.Normal, sourceFileState, destinationFileState, ref destinationFileExists, out linkCreated, ref errorMessage, (source, destination, errMessage) => NativeMethodsShared.MakeSymbolicLink(destination, source, ref errorMessage));
+             }
+ 
+             if (ErrorIfLinkFails && !linkCreated)
+diff --git a/src/Tasks/NativeMethods.cs b/src/Tasks/NativeMethods.cs
+index 0d789b07af4..0ff4125961f 100644
+--- a/src/Tasks/NativeMethods.cs
++++ b/src/Tasks/NativeMethods.cs
+@@ -514,13 +514,6 @@ internal struct PROCESS_INFORMATION
+         public int dwThreadId;
+     }
+ 
+-    internal enum SymbolicLink
+-    {
+-        File = 0,
+-        Directory = 1,
+-        AllowUnprivilegedCreate = 2,
+-    }
+-
+     /// <summary>
+     /// Interop methods.
+     /// </summary>
+@@ -819,40 +812,6 @@ internal static bool MakeHardLink(string newFileName, string exitingFileName, re
+             return hardLinkCreated;
+         }
+ 
+-        //------------------------------------------------------------------------------
+-        // CreateSymbolicLink
+-        //------------------------------------------------------------------------------
+-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+-        [return: MarshalAs(UnmanagedType.I1)]
+-        internal static extern bool CreateSymbolicLink(string symLinkFileName, string targetFileName, SymbolicLink dwFlags);
+-
+-        [DllImport("libc", SetLastError = true)]
+-        internal static extern int symlink(string oldpath, string newpath);
+-
+-        internal static bool MakeSymbolicLink(string newFileName, string exitingFileName, ref string errorMessage)
+-        {
+-            bool symbolicLinkCreated;
+-            if (NativeMethodsShared.IsWindows)
+-            {
+-                Version osVersion = Environment.OSVersion.Version;
+-                SymbolicLink flags = SymbolicLink.File;
+-                if (osVersion.Major >= 11 || (osVersion.Major == 10 && osVersion.Build >= 14972))
+-                {
+-                    flags |= SymbolicLink.AllowUnprivilegedCreate;
+-                }
+-
+-                symbolicLinkCreated = CreateSymbolicLink(newFileName, exitingFileName, flags);
+-                errorMessage = symbolicLinkCreated ? null : Marshal.GetExceptionForHR(Marshal.GetHRForLastWin32Error()).Message;
+-            }
+-            else
+-            {
+-                symbolicLinkCreated = symlink(exitingFileName, newFileName) == 0;
+-                errorMessage = symbolicLinkCreated ? null : "The link() library call failed with the following error code: " + Marshal.GetLastWin32Error();
+-            }
+-
+-            return symbolicLinkCreated;
+-        }
+-
+         //------------------------------------------------------------------------------
+         // MoveFileEx
+         //------------------------------------------------------------------------------

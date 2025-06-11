@@ -1,0 +1,202 @@
+diff --git a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+index 0c500b571d5..d9012131511 100644
+--- a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
++++ b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+@@ -2058,19 +2058,52 @@ internal void ReadStateFile(FileExists fileExists)
+         /// </summary>
+         internal void WriteStateFile()
+         {
+-            if (!String.IsNullOrEmpty(AssemblyInformationCacheOutputPath))
++            if (!string.IsNullOrEmpty(AssemblyInformationCacheOutputPath))
+             {
+                 _cache.SerializePrecomputedCache(AssemblyInformationCacheOutputPath, Log);
+             }
+-            else if (!String.IsNullOrEmpty(_stateFile) && _cache.IsDirty)
++            else if (!string.IsNullOrEmpty(_stateFile))
+             {
+-                if (FailIfNotIncremental)
++                if (!_cache.IsInstanceLocalCacheEmpty && !_cache.IsDiskCacheLoaded && !_cache.IsDirty)
+                 {
+-                    Log.LogErrorFromResources("ResolveAssemblyReference.WritingCacheFile", _stateFile);
+-                    return;
++                    // At least one cache entry was used during this RAR task execution (!IsInstanceLocalCacheEmpty), it was not loaded
++                    // from the cache file, meaning that everything came from the process-wide cache (!IsDiskCacheLoaded), and everything
++                    // was up-to-date, no cache updates needed (!IsDirty). This is the expected happy path when building incrementally and
++                    // having the ability to keep state in memory between executions, i.e. when we're in a long-running process.
++                    //
++                    // We have a couple of options in this case with respect to serializing the cache to disk.
++                    //
++                    // 1. We can skip serialization.
++                    // This is safe to do, obviously the fastest option too, but it would leave the cache file in an unknown state. Maybe
++                    // next time the user is going to build some other combination of projects or in a different order and we would actually
++                    // benefit from having the entries relevant for this project loaded from the disk cache.
++                    //
++                    // 2. We can serialize the cache if we can't prove that it's up to date.
++                    // This produces a cache with correct and deterministic contents. It may, however, result in an unneeded file system
++                    // write if the file does in fact contain up-to-date data and we just failed to prove it given the information we have.
++                    //
++                    // 3. We can deserialize the existing cache file if we can't prove it's up to date. Then serialize it if it needs a write.
++                    // This is the best option because, like 2., it produces a cache with correct and deterministic contents. Additionally,
++                    // it performs a write only if the file really needs updating. There may be cases where the file has to be read and then
++                    // written (just like before this cache optimization was introduced), but those will be rare. The expected case is that
++                    // we've lost our in-memory timestamps (long-running process has been restarted) so we're not sure if the file is stale
++                    // or not, we read it, see that it's *not* stale, and we're done.
++
++                    // TODO: Implement timestamp-based check for up-to-date cache file.
++
++                    _cache.EnsureResolveAssemblyReferenceCacheLoaded();
+                 }
+ 
+-                _cache.SerializeCache(_stateFile, Log);
++                if (_cache.IsDirty)
++                {
++                    if (FailIfNotIncremental)
++                    {
++                        Log.LogErrorFromResources("ResolveAssemblyReference.WritingCacheFile", _stateFile);
++                        return;
++                    }
++
++                    _cache.SerializeCache(_stateFile, Log);
++                }
+             }
+         }
+         #endregion
+diff --git a/src/Tasks/ResolveAssemblyReferenceCache.cs b/src/Tasks/ResolveAssemblyReferenceCache.cs
+index 1d6f34c370c..76acb7f63c3 100644
+--- a/src/Tasks/ResolveAssemblyReferenceCache.cs
++++ b/src/Tasks/ResolveAssemblyReferenceCache.cs
+@@ -41,10 +41,15 @@ internal bool IsDirty
+             set { isDirty = value; }
+         }
+ 
++        /// <summary>
++        /// True if we this cache is empty.
++        /// </summary>
++        internal bool IsInstanceLocalCacheEmpty => instanceLocalFileStateCache.Count == 0;
++
+         /// <summary>
+         /// Class that holds the current file state.
+         /// </summary>
+-        internal record class FileState : ITranslatable
++        internal sealed class FileState : ITranslatable, IEquatable<FileState>
+         {
+             /// <summary>
+             /// The last modified time for this file.
+@@ -109,6 +114,17 @@ public void Translate(ITranslator translator)
+                 translator.Translate(ref frameworkName);
+             }
+ 
++            public bool Equals(FileState other)
++            {
++                return
++                    lastModified == other.LastModified &&
++                    assemblyName.Equals(other.assemblyName) &&
++                    Enumerable.SequenceEqual(dependencies, other.dependencies) &&
++                    Enumerable.SequenceEqual(scatterFiles, other.scatterFiles) &&
++                    frameworkName.Equals(other.frameworkName) &&
++                    runtimeVersion == other.runtimeVersion;
++            }
++
+             /// <summary>
+             /// Gets the last modified date.
+             /// </summary>
+diff --git a/src/Tasks/SystemState.cs b/src/Tasks/SystemState.cs
+index 9a382009786..b4e7de3aad6 100644
+--- a/src/Tasks/SystemState.cs
++++ b/src/Tasks/SystemState.cs
+@@ -57,6 +57,11 @@ internal sealed class SystemState : ResolveAssemblyReferenceCache
+         /// </summary>
+         private Func<ResolveAssemblyReferenceCache> _loadDiskCacheCallback;
+ 
++        /// <summary>
++        /// True if we've already loaded (or attempted to load) the disk cache.
++        /// </summary>
++        internal bool IsDiskCacheLoaded => _loadDiskCacheCallback == null;
++
+         /// <summary>
+         /// XML tables of installed assemblies.
+         /// </summary>
+@@ -188,6 +193,17 @@ internal GetAssemblyRuntimeVersion CacheDelegate(GetAssemblyRuntimeVersion getAs
+             return GetRuntimeVersion;
+         }
+ 
++        /// <summary>
++        /// Sets <see cref="ResolveAssemblyReferenceCache.IsDirty"/> flag to true if we have loaded (or attempted to load) the disk casche.
++        /// </summary>
++        private void SetIsDirty()
++        {
++            if (IsDiskCacheLoaded)
++            {
++                isDirty = true;
++            }
++        }
++
+         private FileState GetFileState(string path)
+         {
+             // Looking up an assembly to get its metadata can be expensive for projects that reference large amounts
+@@ -218,7 +234,7 @@ private FileState ComputeFileStateFromCachesAndDisk(string path)
+             bool isInstanceFileStateUpToDate = isCachedInInstance && lastModified == cachedInstanceFileState.LastModified;
+             bool isProcessFileStateUpToDate = isCachedInProcess && lastModified == cachedProcessFileState.LastModified;
+ 
+-            if (!isProcessFileStateUpToDate && !isInstanceFileStateUpToDate)
++            if (!isProcessFileStateUpToDate && !isInstanceFileStateUpToDate && lastModified != FileState.ImmutableFileLastModifiedMarker)
+             {
+                 // If we haven't loaded the disk cache yet, do it now.
+                 if (EnsureResolveAssemblyReferenceCacheLoaded())
+@@ -235,7 +251,7 @@ private FileState ComputeFileStateFromCachesAndDisk(string path)
+                 if (!isInstanceFileStateUpToDate && cachedProcessFileState.IsWorthPersisting)
+                 {
+                     instanceLocalFileStateCache[path] = cachedProcessFileState;
+-                    isDirty = true;
++                    SetIsDirty();
+                 }
+                 return cachedProcessFileState;
+             }
+@@ -267,7 +283,7 @@ private FileState InitializeFileState(string path, DateTime lastModified)
+             if (fileState.IsWorthPersisting)
+             {
+                 instanceLocalFileStateCache[path] = fileState;
+-                isDirty = true;
++                SetIsDirty();
+             }
+ 
+             s_processWideFileStateCache[path] = fileState;
+@@ -281,9 +297,9 @@ private FileState InitializeFileState(string path, DateTime lastModified)
+         /// <returns>
+         /// True if this method loaded the cache, false otherwise.
+         /// </returns>
+-        private bool EnsureResolveAssemblyReferenceCacheLoaded()
++        internal bool EnsureResolveAssemblyReferenceCacheLoaded()
+         {
+-            if (_loadDiskCacheCallback == null)
++            if (IsDiskCacheLoaded)
+             {
+                 // We've already loaded (or attempted to load) the disk cache, nothing to do.
+                 return false;
+@@ -347,7 +363,7 @@ private AssemblyNameExtension GetAssemblyName(string path)
+                 }
+                 if (fileState.IsWorthPersisting)
+                 {
+-                    isDirty = true;
++                    SetIsDirty();
+                 }
+             }
+ 
+@@ -371,7 +387,7 @@ private string GetRuntimeVersion(string path)
+                 fileState.RuntimeVersion = getAssemblyRuntimeVersion(path);
+                 if (fileState.IsWorthPersisting)
+                 {
+-                    isDirty = true;
++                    SetIsDirty();
+                 }
+             }
+ 
+@@ -406,7 +422,7 @@ private void GetAssemblyMetadata(
+ 
+                 if (fileState.IsWorthPersisting)
+                 {
+-                    isDirty = true;
++                    SetIsDirty();
+                 }
+             }
+ 

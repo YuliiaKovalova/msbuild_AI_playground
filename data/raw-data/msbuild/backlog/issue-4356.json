@@ -1,0 +1,47 @@
+{
+  "number": 4356,
+  "title": "_GenerateCompileDependencyCache target should not contain the full path of ReferencePaths",
+  "body": "Not having full paths of the RegerencePaths in the _GenerateCompileDependencyCache target will enable the remote cache scenario where one can build the code in one machine and download it to another machine so only the local changes are built and the rest is taken from the remote cache. ",
+  "state": "OPEN",
+  "createdAt": "2019-05-06T19:27:02Z",
+  "updatedAt": "2024-02-21T16:31:22Z",
+  "closedAt": null,
+  "author": {
+    "login": "edgarrs"
+  },
+  "labels": [
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "I don't see how we could avoid this, since there's no concept of a source cone in MSBuild proper. Do you have implementation ideas?",
+        "createdAt": "2019-05-06T19:33:19Z",
+        "updatedAt": "2019-05-06T19:33:19Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Talked with Andy about it and seems like storing the filename with the file size would be enough. What do you think?",
+        "createdAt": "2019-05-06T19:35:52Z",
+        "updatedAt": "2019-05-06T19:35:52Z",
+        "author": {
+          "login": "edgarrs"
+        }
+      },
+      {
+        "body": "In case anyone else hits this issue, we ended up just overwriting that target (`_GenerateCompileDependencyCache`) in a `Directory.Build.targets` file which stripped out common roots (NuGet package cache and root of the repo). When it wasn't rooted we just get the name of the file and its size which is likely enough but causes extra IO. Since this isn't actually an up-to-date check just an input to that mechanism a lot of the information in there is not relevant.\r\n\r\nNot really sure of a long-term solution. We'll see how this goes internally and if we can generalize it.\r\n\r\nOne additional note is since #3978 includes DefineConstants you need to be careful not to have define constants that include something like `$BuildingInsideVisualStudio)`. If you do you will end up completely breaking incremental builds between VS and command-line.\r\n\r\n```XML\r\n  <!-- Workaround CoreCompileInputs issue to enable caching in VS. -->\r\n  <!-- The problem is that msbuild calculates the CoreCompileInputs hash using the absolute paths for the ReferencePaths.\r\n       Those paths are very likely to be unique per machine so the hash will never match triggering a new build for the project.\r\n       The workaround is overriding the target _GenerateCompileDependencyCache to replace absolute paths for more more generic paths.\r\n   -->\r\n  <PropertyGroup>\r\n    <WorkaroundCoreCompileInputFullPaths Condition=\"'$(WorkaroundCoreCompileInputFullPaths)' == ''\">true</WorkaroundCoreCompileInputFullPaths>\r\n  </PropertyGroup>\r\n  <!-- Replaces the absolute paths with generic paths that can work across machines. -->\r\n  <UsingTask\r\n    TaskName=\"RemoveAbsolutePathsFromItems\"\r\n    TaskFactory=\"RoslynCodeTaskFactory\"\r\n    AssemblyFile=\"$(MSBuildToolsPath)\\Microsoft.Build.Tasks.Core.dll\" >\r\n    <ParameterGroup>\r\n      <Files ParameterType=\"Microsoft.Build.Framework.ITaskItem[]\" Required=\"true\" />\r\n      <RootPath />\r\n      <NugetPackagesRootPath />\r\n    <ItemsWithNoAbsolutePaths ParameterType=\"Microsoft.Build.Framework.ITaskItem[]\" Output=\"true\"/>\r\n  </ParameterGroup>\r\n    <Task>\r\n      <Using Namespace=\"System.IO\"/>\r\n      <Code Type=\"Fragment\" Language=\"cs\"><![CDATA[\r\n        ItemsWithNoAbsolutePaths = new TaskItem[Files.Length];\r\n        int i=0;\r\n        foreach (var item in Files)\r\n        {\r\n          if (Path.IsPathRooted(item.ItemSpec))\r\n          {\r\n            if (RootPath != null &&\r\n              item.ItemSpec.StartsWith(RootPath, StringComparison.OrdinalIgnoreCase) &&\r\n              item.ItemSpec.Length >= RootPath.Length)\r\n            {\r\n              string path = item.ItemSpec.Substring(RootPath.Length, item.ItemSpec.Length - RootPath.Length);\r\n              ItemsWithNoAbsolutePaths[i++] = new TaskItem($@\"#BaseDir{path}\");\r\n            } \r\n            else if (NugetPackagesRootPath != null &&\r\n              item.ItemSpec.StartsWith(NugetPackagesRootPath, StringComparison.OrdinalIgnoreCase) &&\r\n              item.ItemSpec.Length >= NugetPackagesRootPath.Length)\r\n            {\r\n              string path = item.ItemSpec.Substring(NugetPackagesRootPath.Length, item.ItemSpec.Length - NugetPackagesRootPath.Length);\r\n              ItemsWithNoAbsolutePaths[i++] = new TaskItem($@\"#NUGET_PACKAGES{path}\");\r\n            }\r\n            else\r\n            {\r\n              FileInfo fi = new FileInfo(item.ItemSpec);\r\n              ItemsWithNoAbsolutePaths[i++] = new TaskItem($\"{Path.GetFileName(item.ItemSpec)}#{fi.Length}\");\r\n            }\r\n          }\r\n          else\r\n          {\r\n            ItemsWithNoAbsolutePaths[i++] = new TaskItem(item.ItemSpec);\r\n          }\r\n        }\r\n        ]]>\r\n      </Code>\r\n    </Task>\r\n  </UsingTask>\r\n  <Target Name=\"_GenerateCompileDependencyCache\" DependsOnTargets=\"ResolveAssemblyReferences\" Condition=\"'$(WorkaroundCoreCompileInputFullPaths)' == 'true'\">\r\n    <RemoveAbsolutePathsFromItems Files=\"@(ReferencePath)\" RootPath=\"$(BaseDir)\" NugetPackagesRootPath=\"$(NUGET_PACKAGES)\">\r\n      <Output TaskParameter=\"ItemsWithNoAbsolutePaths\" ItemName=\"ReferencesWithNoAbsolutePaths\" />\r\n    </RemoveAbsolutePathsFromItems>\r\n    <ItemGroup>\r\n      <CustomAdditionalCompileInputs Include=\"$(IntermediateOutputPath)$(MSBuildProjectFile).CoreCompileInputs.cache\" />\r\n      <CoreCompileCache Include=\"@(Compile)\" />\r\n      <CoreCompileCache Include=\"@(ReferencesWithNoAbsolutePaths)\" />\r\n    </ItemGroup>\r\n    <Hash ItemsToHash=\"@(CoreCompileCache)\" >\r\n      <Output TaskParameter=\"HashResult\" PropertyName=\"CoreCompileDependencyHash\" />\r\n    </Hash>\r\n    <WriteLinesToFile Lines=\"$(CoreCompileDependencyHash)\" File=\"$(IntermediateOutputPath)$(MSBuildProjectFile).CoreCompileInputs.cache\" Overwrite=\"True\" WriteOnlyWhenDifferent=\"True\" />\r\n    <ItemGroup>\r\n      <FileWrites Include=\"$(IntermediateOutputPath)$(MSBuildProjectFile).CoreCompileInputs.cache\" />\r\n    </ItemGroup>\r\n  </Target>\r\n  <!-- END: Workaround CoreCompileInputs issue to enable hashing VS -->\r\n```",
+        "createdAt": "2019-05-09T19:58:47Z",
+        "updatedAt": "2019-05-09T19:58:47Z",
+        "author": {
+          "login": "AndyGerlicher"
+        }
+      }
+    ]
+  }
+}

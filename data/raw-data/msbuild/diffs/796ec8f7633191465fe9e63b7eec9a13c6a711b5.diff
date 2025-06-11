@@ -1,0 +1,177 @@
+diff --git a/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs b/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs
+index 0c80b6d9539..3b8bf0326ce 100644
+--- a/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs
++++ b/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs
+@@ -2,8 +2,11 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
++using System.Collections.Concurrent;
++using System.IO;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
++using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework.FileAccess;
+ using Microsoft.Build.Shared;
+ 
+@@ -13,12 +16,20 @@ internal sealed class FileAccessManager : IFileAccessManager, IBuildComponent
+     {
+         private record Handlers(Action<BuildRequest, FileAccessData> FileAccessHander, Action<BuildRequest, ProcessData> ProcessHandler);
+ 
++        // In order to synchronize between the node communication and the file access reporting, a special file access
++        // is used to mark when the file accesses should be considered complete. Only after both this special file access is seen
++        // and the build result is reported can plugins be notified about project completion.
++        private static readonly string FileAccessCompletionPrefix = BuildParameters.StartupDirectory[0] + @":\{MSBuildFileAccessCompletion}\";
++
+         private IScheduler? _scheduler;
+         private IConfigCache? _configCache;
+ 
+         private object _handlersWriteLock = new object();
+         private Handlers[] _handlers = Array.Empty<Handlers>();
+ 
++        // Keyed on global request id
++        private readonly ConcurrentDictionary<int, ManualResetEventSlim> _fileAccessCompletionWaitHandles = new();
++
+         public static IBuildComponent CreateComponent(BuildComponentType type)
+         {
+             ErrorUtilities.VerifyThrowArgumentOutOfRange(type == BuildComponentType.FileAccessManager, nameof(type));
+@@ -35,17 +46,33 @@ public void ShutdownComponent()
+         {
+             _scheduler = null;
+             _configCache = null;
++            _fileAccessCompletionWaitHandles.Clear();
+         }
+ 
+         public void ReportFileAccess(FileAccessData fileAccessData, int nodeId)
+         {
+-            BuildRequest? buildRequest = GetBuildRequest(nodeId);
+-            if (buildRequest != null)
++            string fileAccessPath = fileAccessData.Path;
++
++            // Intercept and avoid forwarding the file access completion
++            if (fileAccessPath.StartsWith(FileAccessCompletionPrefix, StringComparison.Ordinal))
+             {
+-                Handlers[] localHandlers = _handlers;
+-                foreach (Handlers handlers in localHandlers)
++                // Parse out the global request id. Note, this must match what NotifyFileAccessCompletion does.
++                int globalRequestId = int.Parse(fileAccessPath.Substring(FileAccessCompletionPrefix.Length));
++
++                ManualResetEventSlim handle = _fileAccessCompletionWaitHandles.GetOrAdd(globalRequestId, static _ => new ManualResetEventSlim());
++                handle.Set();
++            }
++            else
++            {
++                // Forward the file access to handlers.
++                BuildRequest? buildRequest = GetBuildRequest(nodeId);
++                if (buildRequest != null)
+                 {
+-                    handlers.FileAccessHander.Invoke(buildRequest, fileAccessData);
++                    Handlers[] localHandlers = _handlers;
++                    foreach (Handlers handlers in localHandlers)
++                    {
++                        handlers.FileAccessHander.Invoke(buildRequest, fileAccessData);
++                    }
+                 }
+             }
+         }
+@@ -98,6 +125,25 @@ private void UnregisterHandlers(Handlers handlersToRemove)
+             }
+         }
+ 
++        public static void NotifyFileAccessCompletion(int globalRequestId)
++        {
++            // Make a dummy file access to use as a notification that the file accesses should be completed for a project.
++            string filePath = FileAccessCompletionPrefix + globalRequestId.ToString();
++            _ = File.Exists(filePath);
++        }
++
++        public void WaitForFileAccessReportCompletion(int globalRequestId, CancellationToken cancellationToken)
++        {
++            ManualResetEventSlim handle = _fileAccessCompletionWaitHandles.GetOrAdd(globalRequestId, static _ => new ManualResetEventSlim());
++            if (!handle.IsSet)
++            {
++                handle.Wait(cancellationToken);
++            }
++
++            // Try to keep the collection clean. A request should not need to be completed twice.
++            _fileAccessCompletionWaitHandles.TryRemove(globalRequestId, out _);
++        }
++
+         private BuildRequest? GetBuildRequest(int nodeId)
+         {
+             ErrorUtilities.VerifyThrow(
+diff --git a/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs b/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs
+index 2834759f55b..5772ad93d21 100644
+--- a/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs
++++ b/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs
+@@ -2,6 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
++using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Framework.FileAccess;
+ 
+@@ -17,5 +18,7 @@ internal interface IFileAccessManager
+         FileAccessManager.HandlerRegistration RegisterHandlers(
+             Action<BuildRequest, FileAccessData> fileAccessHandler,
+             Action<BuildRequest, ProcessData> processHandler);
++
++        void WaitForFileAccessReportCompletion(int globalRequestId, CancellationToken cancellationToken);
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+index 54506dbc2a0..7a9c31cb310 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+@@ -34,6 +34,7 @@ internal sealed class ProjectCacheService : IAsyncDisposable
+         private static HashSet<string> s_projectSpecificPropertyNames = new(StringComparer.OrdinalIgnoreCase) { "TargetFramework", "Configuration", "Platform", "TargetPlatform", "OutputType" };
+ 
+         private readonly BuildManager _buildManager;
++        private readonly IBuildComponentHost _componentHost;
+         private readonly ILoggingService _loggingService;
+         private readonly IFileAccessManager _fileAccessManager;
+         private readonly IConfigCache _configCache;
+@@ -76,6 +77,7 @@ public ProjectCacheService(
+             ProjectCacheDescriptor? globalProjectCacheDescriptor)
+         {
+             _buildManager = buildManager;
++            _componentHost = buildManager;
+             _loggingService = loggingService;
+             _fileAccessManager = fileAccessManager;
+             _configCache = configCache;
+@@ -656,6 +658,10 @@ public async Task HandleBuildResultAsync(
+                 return;
+             }
+ 
++            if (_componentHost.BuildParameters.ReportFileAccesses)
++            {
++                _fileAccessManager.WaitForFileAccessReportCompletion(buildResult.GlobalRequestId, cancellationToken);
++            }
+ 
+             IReadOnlyDictionary<string, string> globalProperties = GetGlobalProperties(requestConfiguration);
+ 
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index c0c3531ff34..ab9f554f82b 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -14,6 +14,7 @@
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.Evaluation;
++using Microsoft.Build.FileAccesses;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+@@ -368,6 +369,11 @@ private void OnRequestComplete(BuildRequest request, BuildResult result)
+             {
+                 _nodeEndpoint.SendData(result);
+             }
++
++            if (_buildParameters.ReportFileAccesses)
++            {
++                FileAccessManager.NotifyFileAccessCompletion(result.GlobalRequestId);
++            }
+         }
+ 
+         /// <summary>

@@ -1,0 +1,249 @@
+diff --git a/src/Build/BuildCheck/API/BuildCheckResult.cs b/src/Build/BuildCheck/API/BuildCheckResult.cs
+index 10f12ced880..7b808ed2445 100644
+--- a/src/Build/BuildCheck/API/BuildCheckResult.cs
++++ b/src/Build/BuildCheck/API/BuildCheckResult.cs
+@@ -2,7 +2,6 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
+-using System.IO;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+@@ -13,14 +12,11 @@ namespace Microsoft.Build.Experimental.BuildCheck;
+ /// Representation of a single report of a single finding from a Check
+ /// Each rule has upfront known message format - so only the concrete arguments are added
+ /// Optionally a location is attached - in the near future we might need to support multiple locations
+-///  (for 2 cases - a) grouped result for multiple occurrences; b) a single report for a finding resulting from combination of multiple locations)
++///  (for 2 cases - a) grouped result for multiple occurrences; b) a single report for a finding resulting from combination of multiple locations).
+ /// </summary>
+ public sealed class BuildCheckResult : IBuildCheckResult
+ {
+-    public static BuildCheckResult Create(CheckRule rule, IMSBuildElementLocation location, params string[] messageArgs)
+-    {
+-        return new BuildCheckResult(rule, location, messageArgs);
+-    }
++    public static BuildCheckResult Create(CheckRule rule, IMSBuildElementLocation location, params string[] messageArgs) => new BuildCheckResult(rule, location, messageArgs);
+ 
+     public BuildCheckResult(CheckRule checkConfig, IMSBuildElementLocation location, string[] messageArgs)
+     {
+diff --git a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+index 012490886e6..b75a7e28f92 100644
+--- a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
++++ b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+@@ -21,7 +21,7 @@ internal sealed class NoEnvironmentVariablePropertyCheck : Check
+ 
+     private const string VerboseEnvVariableOutputKey = "allow_displaying_environment_variable_value";
+ 
+-    private readonly Stack<BuildCheckResult> _buildCheckResults = new Stack<BuildCheckResult>();
++    private readonly Queue<(string projectPath, BuildCheckResult checkResult)> _buildCheckResults = new Queue<(string, BuildCheckResult)>();
+ 
+     private BuildCheckDataContext<EnvironmentVariableCheckData>? _dataContext;
+ 
+@@ -61,18 +61,20 @@ private void ProcessEnvironmentVariableReadAction(BuildCheckDataContext<Environm
+             string buildCheckResultMessageArgs = _isVerboseEnvVarOutput ? $"'{context.Data.EvaluatedEnvironmentVariable.EnvVarKey}' with value: '{context.Data.EvaluatedEnvironmentVariable.EnvVarValue}'" : $"'{context.Data.EvaluatedEnvironmentVariable.EnvVarKey}'";
+ 
+             // Scope information is available after evaluation of the project file. If it is not ready, we will report the check later.
+-            if (CheckScopeClassifier.IsScopingReady && CheckScopeClassifier.IsActionInObservedScope(_scope, context.Data.EvaluatedEnvironmentVariable.Location.File, context.Data.ProjectFilePath ?? string.Empty))
+-            {
+-                context.ReportResult(BuildCheckResult.Create(
+-                    SupportedRule,
+-                    context.Data.EvaluatedEnvironmentVariable.Location,
+-                    buildCheckResultMessageArgs));
+-            }
+-            else
++            if (!CheckScopeClassifier.IsScopingReady(_scope))
+             {
+                 _dataContext ??= context;
+ 
+-                _buildCheckResults.Push(BuildCheckResult.Create(
++                _buildCheckResults.Enqueue(
++                    (context.Data.ProjectFilePath,
++                     BuildCheckResult.Create(
++                         SupportedRule,
++                         context.Data.EvaluatedEnvironmentVariable.Location,
++                         buildCheckResultMessageArgs)));
++            }
++            else if (CheckScopeClassifier.IsActionInObservedScope(_scope, context.Data.EvaluatedEnvironmentVariable.Location.File, context.Data.ProjectFilePath))
++            {
++                context.ReportResult(BuildCheckResult.Create(
+                     SupportedRule,
+                     context.Data.EvaluatedEnvironmentVariable.Location,
+                     buildCheckResultMessageArgs));
+@@ -87,12 +89,12 @@ private void ProcessEnvironmentVariableReadAction(BuildCheckDataContext<Environm
+             ? bool.Parse(configVal)
+             : null;
+ 
+-    private void HandleScopeReadiness(string? projectFilePath)
++    private void HandleScopeReadiness()
+     {
+         while (_buildCheckResults.Count > 0)
+         {
+-            BuildCheckResult result = _buildCheckResults.Pop();
+-            if (!CheckScopeClassifier.IsActionInObservedScope(_scope, result.Location.File, projectFilePath ?? string.Empty))
++            (string projectPath, BuildCheckResult result) = _buildCheckResults.Dequeue();
++            if (!CheckScopeClassifier.IsActionInObservedScope(_scope, result.Location.File, projectPath))
+             {
+                 continue;
+             }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index fd37c2e79aa..f9b49cb3881 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -4,18 +4,17 @@
+ using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Linq;
+ using System.Threading;
+-using System.Diagnostics;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.BuildCheck.Infrastructure;
++using Microsoft.Build.Construction;
+ using Microsoft.Build.Experimental.BuildCheck.Acquisition;
+ using Microsoft.Build.Experimental.BuildCheck.Checks;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+-using Microsoft.Build.Evaluation;
+-using Microsoft.Build.BuildCheck.Infrastructure;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+@@ -349,20 +348,24 @@ public void ProcessEvaluationFinishedEventArgs(
+             _buildEventsProcessor
+                 .ProcessEvaluationFinishedEventArgs(checkContext, evaluationFinishedEventArgs, propertiesLookup);
+ 
+-            CheckScopeClassifier.RaiseNotifyOnScopingReadiness(evaluationFinishedEventArgs?.ProjectFile);
++            CheckScopeClassifier.RaiseNotifyOnScopingReadiness();
+         }
+ 
+         public void ProcessEnvironmentVariableReadEventArgs(ICheckContext checkContext, EnvironmentVariableReadEventArgs projectEvaluationEventArgs)
+         {
+             if (projectEvaluationEventArgs is EnvironmentVariableReadEventArgs evr)
+             {
+-                _buildEventsProcessor.ProcessEnvironmentVariableReadEventArgs(
+-                    checkContext,
+-                    evr.EnvironmentVariableName,
+-                    evr.Message ?? string.Empty,
+-                    evr.File,
+-                    evr.LineNumber,
+-                    evr.ColumnNumber);
++                TryGetProjectFullPath(checkContext.BuildEventContext, out string projectPath);
++
++                if (!string.IsNullOrEmpty(projectPath))
++                {
++                    _buildEventsProcessor.ProcessEnvironmentVariableReadEventArgs(
++                        checkContext,
++                        projectPath,
++                        evr.EnvironmentVariableName,
++                        evr.Message ?? string.Empty,
++                        ElementLocation.Create(evr.File, evr.LineNumber, evr.ColumnNumber));
++                }
+             }
+         }
+ 
+@@ -417,7 +420,7 @@ public void FinalizeProcessing(LoggingContext loggingContext)
+             loggingContext.LogBuildEvent(checkEventArg);
+         }
+ 
+-        private readonly ConcurrentDictionary<int, string> _projectsByInstnaceId = new();
++        private readonly ConcurrentDictionary<int, string> _projectsByInstanceId = new();
+         private readonly ConcurrentDictionary<int, string> _projectsByEvaluationId = new();
+ 
+         /// <summary>
+@@ -440,15 +443,15 @@ private bool TryGetProjectFullPath(BuildEventContext buildEventContext, out stri
+             }
+             else if (buildEventContext.ProjectInstanceId >= 0)
+             {
+-                if (_projectsByInstnaceId.TryGetValue(buildEventContext.ProjectInstanceId, out string? val))
++                if (_projectsByInstanceId.TryGetValue(buildEventContext.ProjectInstanceId, out string? val))
+                 {
+                     projectFullPath = val;
+                     return true;
+                 }
+             }
+-            else if (_projectsByInstnaceId.Count == 1)
++            else if (_projectsByInstanceId.Count == 1)
+             {
+-                projectFullPath = _projectsByInstnaceId.FirstOrDefault().Value;
++                projectFullPath = _projectsByInstanceId.FirstOrDefault().Value;
+                 // This is for a rare possibility of a race where other thread removed the item (between the if check and fetch here).
+                 // We currently do not support multiple projects in parallel in a single node anyway.
+                 if (!string.IsNullOrEmpty(projectFullPath))
+@@ -506,7 +509,7 @@ public void EndProjectEvaluation(BuildEventContext buildEventContext)
+         public void StartProjectRequest(BuildEventContext buildEventContext, string projectFullPath)
+         {
+             // There can be multiple ProjectStarted-ProjectFinished per single configuration project build (each request for different target)
+-            _projectsByInstnaceId[buildEventContext.ProjectInstanceId] = projectFullPath;
++            _projectsByInstanceId[buildEventContext.ProjectInstanceId] = projectFullPath;
+         }
+ 
+         public void EndProjectRequest(
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index a33a140bf16..956ddc7fb5b 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -89,9 +89,9 @@ internal void ProcessEvaluationFinishedEventArgs(
+     /// <summary>
+     /// The method collects events associated with the used environment variables in projects.
+     /// </summary>
+-    internal void ProcessEnvironmentVariableReadEventArgs(ICheckContext checkContext, string envVarName, string envVarValue, string file, int line, int column)
++    internal void ProcessEnvironmentVariableReadEventArgs(ICheckContext checkContext, string projectPath, string envVarKey, string envVarValue, IElementLocation elementLocation)
+     {
+-        EnvironmentVariableCheckData checkData = new(file, checkContext.BuildEventContext?.ProjectInstanceId, (envVarName, envVarValue, ElementLocation.Create(file, line, column)));
++        EnvironmentVariableCheckData checkData = new(projectPath, checkContext.BuildEventContext?.ProjectInstanceId, (envVarKey, envVarValue, elementLocation));
+ 
+         _buildCheckCentralContext.RunEnvironmentVariableActions(checkData, checkContext, ReportResult);
+     }
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+index 42da4a0d41d..4e18456d4bc 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+@@ -10,9 +10,9 @@ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+ internal class CheckScopeClassifier
+ {
+-    internal static event Action<string?>? NotifyOnScopingReadiness;
++    internal static event Action? NotifyOnScopingReadiness;
+ 
+-    internal static bool IsScopingReady;
++    internal static Func<EvaluationCheckScope, bool> IsScopingReady => (scope) => scope == EvaluationCheckScope.ProjectFileOnly;
+ 
+     /// <summary>
+     /// Indicates whether given location is in the observed scope, based on currently built project path.
+@@ -57,11 +57,7 @@ internal static bool IsActionInObservedScope(
+         }
+     }
+ 
+-    internal static void RaiseNotifyOnScopingReadiness(string? projectFilePath)
+-    {
+-        IsScopingReady = true;
+-        NotifyOnScopingReadiness?.Invoke(projectFilePath);
+-    }
++    internal static void RaiseNotifyOnScopingReadiness() => NotifyOnScopingReadiness?.Invoke();
+ 
+     private static bool IsGeneratedNugetImport(string file) => file.EndsWith("nuget.g.props", StringComparison.OrdinalIgnoreCase) ||
+         file.EndsWith("nuget.g.targets", StringComparison.OrdinalIgnoreCase);
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 6d2b14dfdc6..ac58b5a67a2 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -1554,12 +1554,12 @@ private static object LookupProperty(IPropertyProvider<T> properties, string pro
+ 
+                 object propertyValue;
+ 
+-                bool isArtifical = property == null && ((endIndex - startIndex) >= 7) &&
++                bool isArtificial = property == null && ((endIndex - startIndex) >= 7) &&
+                                    MSBuildNameIgnoreCaseComparer.Default.Equals("MSBuild", propertyName, startIndex, 7);
+ 
+-                propertiesUseTracker.TrackRead(propertyName, startIndex, endIndex, elementLocation, property == null, isArtifical);
++                propertiesUseTracker.TrackRead(propertyName, startIndex, endIndex, elementLocation, property == null, isArtificial);
+ 
+-                if (isArtifical)
++                if (isArtificial)
+                 {
+                     // It could be one of the MSBuildThisFileXXXX properties,
+                     // whose values vary according to the file they are in.

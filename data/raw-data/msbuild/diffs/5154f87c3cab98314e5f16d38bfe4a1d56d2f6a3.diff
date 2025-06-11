@@ -1,0 +1,328 @@
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index 453f4c8a367..9a4f52a513f 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -922,11 +922,29 @@ private bool ProcessHeaderBytesRead(int bytesRead)
+                 return true;
+             }
+ 
++            private Dictionary<int, MemoryMappedFile> _readEndpoints = new Dictionary<int, MemoryMappedFile>();
++
++            private MemoryMappedFile getOrOpenFile(int nodeId)
++            {
++                if (_readEndpoints.TryGetValue(nodeId, out MemoryMappedFile MMF))
++                {
++                    return MMF;
++                }
++                else
++                {
++                    MMF = MemoryMappedFile.OpenExisting(String.Format("D:/bld/MSBuild_side_channel_other{0}", nodeId));
++                    _readEndpoints[nodeId] = MMF;
++                    return MMF;
++                }
++            }
++
++
++
+ #if FEATURE_APM
+             /// <summary>
+             /// Callback invoked by the completion of a read of a header byte on one of the named pipes.
+             /// </summary>
+-            private void HeaderReadComplete(IAsyncResult result)
++            private async void HeaderReadComplete(IAsyncResult result)
+             {
+                 int bytesRead;
+                 try
+@@ -960,7 +978,37 @@ private void HeaderReadComplete(IAsyncResult result)
+                 if ((NodePacketType)_headerByte[0] == NodePacketType.MemoryMappedFilePacket)
+                 {
+                     byte[] packetData = _readBufferMemoryStream.GetBuffer();
+-                    _clientToServerStream.BeginRead(packetData, 0, 4, PickupBodyFromSideChannel, new Tuple<byte[], int>(packetData, 4));
++
++                    await _clientToServerStream.ReadAsync(packetData, 0, 4);
++
++                    int nodeId = _headerByte[1];
++                    nodeId += (int)_headerByte[2] << 8;
++                    nodeId += (int)_headerByte[3] << 16;
++                    nodeId += (int)_headerByte[4] << 24;
++                    int mmfOffset = BinaryPrimitives.ReadInt32LittleEndian(new Span<byte>(packetData, 0, 3));
++
++                    var accessor = getOrOpenFile(nodeId).CreateViewStream(mmfOffset, 5);
++                    var realPacketType = (NodePacketType)accessor.ReadByte();
++
++                    var length = accessor.ReadByte();
++                    length += accessor.ReadByte() << 8;
++                    length += accessor.ReadByte() << 16;
++                    length += accessor.ReadByte() << 24;
++                    accessor.Dispose();
++                    accessor = getOrOpenFile(nodeId).CreateViewStream(mmfOffset + 5, length - 5);
++                    
++                    ITranslator readTranslator = BinaryTranslator.GetReadTranslator(accessor, _binaryReaderFactory);
++                    _packetFactory.DeserializeAndRoutePacket(_nodeId, realPacketType, readTranslator);
++                    if (realPacketType != NodePacketType.NodeShutdown)
++                    {
++                        // Read the next packet.
++                        BeginAsyncPacketRead();
++                    }
++                    else
++                    {
++                        Close();
++                    }
++
+                 }
+                 else
+                 {
+@@ -1012,80 +1060,7 @@ private bool ReadAndRoutePacket(NodePacketType packetType, byte[] packetData, in
+                 return true;
+             }
+ 
+-            private MemoryMappedFile _mappedFileRead
+-            {
+-                get
+-                {
+-                    if (_mappedFileRead == null)
+-                    {
+-                        _mappedFileRead = MemoryMappedFile.CreateOrOpen(String.Format("D:/bld/MSBuild_side_channel_other{0}", _nodeId), _mappedFileLength, MemoryMappedFileAccess.ReadWrite);
+-                    }
+-                    return _mappedFileRead;
+-                }
+-                set { }
+-            }
+-            private int _mappedFileReadIdx = 0;
+-
+-         
+-
+-            private void PickupBodyFromSideChannel(IAsyncResult result)
+-            {
+-                NodePacketType packetType = (NodePacketType)_headerByte[1];
+-                // this should be long enough for the node ID
+-                int nodeId = _headerByte[2];
+-                nodeId += (int)_headerByte[3] << 8;
+-                nodeId += (int)_headerByte[4] << 16;
+-
+-                var state = (Tuple<byte[], int>)result.AsyncState;
+-                byte[] packetData = state.Item1;
+-                int packetLength = state.Item2;
+-                int bytesRead;
+-
+-
+-                try
+-                {
+-                    try
+-                    {
+-                        bytesRead = _clientToServerStream.EndRead(result);
+-                    }
+-
+-                    // Workaround for CLR stress bug; it sporadically calls us twice on the same async
+-                    // result, and EndRead will throw on the second one. Pretend the second one never happened.
+-                    catch (ArgumentException)
+-                    {
+-                        CommunicationsUtilities.Trace(_nodeId, "Hit CLR bug #825607: called back twice on same async result; ignoring");
+-                        return;
+-                    }
+ 
+-                    if (!ProcessBodyBytesRead(bytesRead, packetLength, packetType))
+-                    {
+-                        return;
+-                    }
+-                }
+-                catch (IOException e)
+-                {
+-                    CommunicationsUtilities.Trace(_nodeId, "EXCEPTION in BodyReadComplete (Reading): {0}", e);
+-                    _packetFactory.RoutePacket(_nodeId, new NodeShutdown(NodeShutdownReason.ConnectionFailed));
+-                    Close();
+-                    return;
+-                }
+-
+-                // Read and route the packet.
+-                if (!ReadAndRoutePacket(packetType, packetData, packetLength))
+-                {
+-                    return;
+-                }
+-
+-                if (packetType != NodePacketType.NodeShutdown)
+-                {
+-                    // Read the next packet.
+-                    BeginAsyncPacketRead();
+-                }
+-                else
+-                {
+-                    Close();
+-                }
+-            }
+ 
+ #if FEATURE_APM
+             /// <summary>
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index d56acbd0db0..02123789d20 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -708,6 +708,7 @@ private void HandleNodeConfiguration(NodeConfiguration configuration)
+ 
+             _buildParameters.ProjectRootElementCache = s_projectRootElementCacheBase;
+ 
++
+             // Snapshot the current environment
+             _savedEnvironment = CommunicationsUtilities.GetEnvironmentVariables();
+ 
+@@ -847,6 +848,10 @@ private void HandleNodeConfiguration(NodeConfiguration configuration)
+ 
+             _buildRequestEngine.InitializeForBuild(_loggingContext);
+ 
++#if NET472_OR_GREATER
++            _nodeEndpoint.currentNodeId = configuration.NodeId;
++#endif
++
+             // Finally store off this configuration packet.
+             _currentConfiguration = configuration;
+         }
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index dc9c11dc56a..cffcaab22f8 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -525,6 +525,10 @@ private void PacketPumpProc()
+         }
+ #if NET472_OR_GREATER
+         private Dictionary<int, MemoryMappedFile> _sideChannels = new Dictionary<int, MemoryMappedFile>();
++        private Dictionary<int, MemoryMappedFile> _sideChannelsWrite = new Dictionary<int, MemoryMappedFile>();
++
++        internal int currentNodeId = 0;
++        internal int mmfWriteOffset = 0;
+ 
+         private MemoryMappedFile getOrOpenFile(int nodeId)
+         {
+@@ -539,11 +543,26 @@ private MemoryMappedFile getOrOpenFile(int nodeId)
+                 return MMF;
+             }
+         }
++        // TODO figure a better way to do this - node ID can change, which is a pain.
++        // Probably in a setter for the "current node ID" property?
++        private MemoryMappedFile getOrOpenWriteFile(int nodeId)
++        {
++            if (_sideChannelsWrite.TryGetValue(nodeId, out MemoryMappedFile MMF))
++            {
++                return MMF;
++            }
++            else
++            {
++                MMF = MemoryMappedFile.CreateOrOpen(String.Format("D:/bld/MSBuild_side_channel_other{0}", nodeId), 10000000);
++                _sideChannelsWrite[nodeId] = MMF;
++                return MMF;
++            }
+ 
+-
++        }
+ #endif
+ 
+         private void RunReadLoop(BufferedReadStream localReadPipe, NamedPipeServerStream localWritePipe,
++
+             ConcurrentQueue<INodePacket> localPacketQueue, AutoResetEvent localPacketAvailable, AutoResetEvent localTerminatePacketPump)
+         {
+             // Ordering of the wait handles is important.  The first signalled wait handle in the array
+@@ -650,15 +669,17 @@ private void RunReadLoop(BufferedReadStream localReadPipe, NamedPipeServerStream
+                                 nodeId += ((int)headerByte[3]) << 16;
+                                 nodeId += ((int)headerByte[4]) << 24;
+ 
++                                byte[] data = new byte[4];
++                                // TODO handle the reading in a more graceful manner
+                                 var offset = localReadPipe.ReadByte();
+                                 offset += localReadPipe.ReadByte() << 8;
+                                 offset += localReadPipe.ReadByte() << 16;
+                                 offset += localReadPipe.ReadByte() << 24;
+-                                // Debugger.Launch();
+ 
+                                 // Debugger.Launch();
+                                 var accessor = getOrOpenFile(nodeId).CreateViewStream(offset, 5);
+                                 var realPacketType = (NodePacketType)accessor.ReadByte();
++                             
+                                 var length = accessor.ReadByte();
+                                 length += accessor.ReadByte() << 8;
+                                 length += accessor.ReadByte() << 16;
+@@ -713,26 +734,74 @@ private void RunReadLoop(BufferedReadStream localReadPipe, NamedPipeServerStream
+                             INodePacket packet;
+                             while (localPacketQueue.TryDequeue(out packet))
+                             {
+-                                var packetStream = _packetStream;
+-                                packetStream.SetLength(0);
++#if NET472_OR_GREATER
++                                if (packet.Type == NodePacketType.MemoryMappedFilePacket)
++                                {
++                                    if (mmfWriteOffset + 100000 > 10000000)
++                                    {
++                                        mmfWriteOffset = 0;
++                                    }
++                                    // Note: Recycle view stream instead?
++                                    var accessor = getOrOpenWriteFile(currentNodeId).CreateViewStream(mmfWriteOffset, 10000000 - mmfWriteOffset);
+ 
+-                                ITranslator writeTranslator = BinaryTranslator.GetWriteTranslator(packetStream);
++                                    // The remnant of the pipe to use for ping.
++                                    var packetStream = _packetStream;
++                                    packetStream.SetLength(0);
++                                    packetStream.WriteByte((byte)NodePacketType.MemoryMappedFilePacket);
++                                    byte[] nodeId = { (byte)currentNodeId, (byte)(currentNodeId >> 8), (byte)(currentNodeId >> 16), (byte)(currentNodeId >> 24) };
++                                    packetStream.Write(nodeId, 0, 4);
++                                    byte[] offset = { (byte)mmfWriteOffset, (byte)(mmfWriteOffset >> 8), (byte)(mmfWriteOffset >> 16), (byte)(mmfWriteOffset >> 24) };
++                                    packetStream.Write(nodeId, 0, 4);
++                                    // end of pipe remnant.
+ 
+-                                packetStream.WriteByte((byte)packet.Type);
+ 
+-                                // Pad for packet length
+-                                _binaryWriter.Write(0);
++                                    ITranslator writeTranslator = BinaryTranslator.GetWriteTranslator(packetStream);
+ 
+-                                // Reset the position in the write buffer.
+-                                packet.Translate(writeTranslator);
++                                    
+ 
+-                                int packetStreamLength = (int)packetStream.Position;
+ 
+-                                // Now write in the actual packet length
+-                                packetStream.Position = 1;
+-                                _binaryWriter.Write(packetStreamLength - 5);
++                                    byte[] x = { (byte)packet.Type };
++                                    accessor.Write(x, 0, 1);
++                                    accessor.Position = 5;
++                                    var fileTranslator = BinaryTranslator.GetWriteTranslator(accessor);
++
++                                    packet.Translate(fileTranslator);
++                                    var packetSize = accessor.Position;
++                                    accessor.Position = 1;
++                                    byte[] length = { (byte)packetSize, (byte)(packetSize >> 8), (byte)(packetSize >> 16), (byte)(packetSize >> 24) };
++                                    accessor.Write(length, 0, 4);
++                                    mmfWriteOffset = (int)accessor.Position;
++                                    accessor.Dispose();
++
++                                    localWritePipe.Write(packetStream.GetBuffer(), 0, 9);
++
++                                }
++                                else
++                                {
++#endif
++                                    var packetStream = _packetStream;
++                                    packetStream.SetLength(0);
++
++                                    ITranslator writeTranslator = BinaryTranslator.GetWriteTranslator(packetStream);
++
++                                    packetStream.WriteByte((byte)packet.Type);
++
++                                    // Pad for packet length
++                                    _binaryWriter.Write(0);
++
++                                    // Reset the position in the write buffer.
++                                    packet.Translate(writeTranslator);
++
++                                    int packetStreamLength = (int)packetStream.Position;
++
++                                    // Now write in the actual packet length
++                                    packetStream.Position = 1;
++                                    _binaryWriter.Write(packetStreamLength - 5);
++                                    localWritePipe.Write(packetStream.GetBuffer(), 0, packetStreamLength);
++#if NET472_OR_GREATER
++                                }
++#endif
+ 
+-                                localWritePipe.Write(packetStream.GetBuffer(), 0, packetStreamLength);
+                             }
+                         }
+                         catch (Exception e)

@@ -1,0 +1,198 @@
+diff --git a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+index 62f6b5df9bc..3f0052b8d85 100644
+--- a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
++++ b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using Microsoft.Build.BuildCheck.Infrastructure;
+ using Microsoft.Build.Construction;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Checks;
+@@ -26,6 +27,7 @@ internal sealed class NoEnvironmentVariablePropertyCheck : Check
+     private readonly HashSet<EnvironmentVariableIdentityKey> _environmentVariablesReported = new HashSet<EnvironmentVariableIdentityKey>();
+ 
+     private bool _isVerboseEnvVarOutput;
++    private EvaluationCheckScope _scope;
+ 
+     public override string FriendlyName => "MSBuild.NoEnvironmentVariablePropertyCheck";
+ 
+@@ -33,6 +35,7 @@ internal sealed class NoEnvironmentVariablePropertyCheck : Check
+ 
+     public override void Initialize(ConfigurationContext configurationContext)
+     {
++        _scope = configurationContext.CheckConfig[0].EvaluationCheckScope;
+         foreach (CustomConfigurationData customConfigurationData in configurationContext.CustomConfigurationData)
+         {
+             bool? isVerboseEnvVarOutput = GetVerboseEnvVarOutputConfig(customConfigurationData, RuleId);
+@@ -48,6 +51,11 @@ private void ProcessEnvironmentVariableReadAction(BuildCheckDataContext<Evaluate
+         {
+             foreach (var envVariableData in context.Data.EvaluatedEnvironmentVariables)
+             {
++                if (!CheckScopeClassifier.IsActionInObservedScope(_scope, envVariableData.Value.File,
++                        context.Data.ProjectFilePath))
++                {
++                    continue;
++                }
+                 EnvironmentVariableIdentityKey identityKey = new(envVariableData.Key, envVariableData.Value.File, envVariableData.Value.Line, envVariableData.Value.Column);
+                 if (!_environmentVariablesReported.Contains(identityKey))
+                 {
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+index b8bb1c15d78..fdd3e04ebcc 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+@@ -21,16 +21,30 @@ internal static bool IsActionInObservedScope(
+         EvaluationCheckScope scope,
+         IMsBuildElementLocation? location,
+         string projectFileFullPath)
++        => IsActionInObservedScope(scope, location?.File, projectFileFullPath);
++
++    /// <summary>
++    /// Indicates whether given location is in the observed scope, based on currently built project path.
++    /// </summary>
++    /// <param name="scope"></param>
++    /// <param name="filePathOfEvent"></param>
++    /// <param name="projectFileFullPath"></param>
++    /// <returns></returns>
++    /// <exception cref="ArgumentOutOfRangeException"></exception>
++    internal static bool IsActionInObservedScope(
++        EvaluationCheckScope scope,
++        string? filePathOfEvent,
++        string projectFileFullPath)
+     {
+         switch (scope)
+         {
+             case EvaluationCheckScope.ProjectFileOnly:
+-                return location != null && location.File == projectFileFullPath;
++                return filePathOfEvent == projectFileFullPath;
+             case EvaluationCheckScope.WorkTreeImports:
+                 return
+-                    location != null &&
+-                    !FileClassifier.Shared.IsNonModifiable(location.File) &&
+-                    !IsGeneratedNugetImport(location.File);
++                    filePathOfEvent != null &&
++                    !FileClassifier.Shared.IsNonModifiable(filePathOfEvent) &&
++                    !IsGeneratedNugetImport(filePathOfEvent);
+             case EvaluationCheckScope.All:
+                 return true;
+             default:
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 319fcb2aafc..f1a77277d4b 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -7,6 +7,7 @@
+ using System.IO.Ports;
+ using System.Linq;
+ using System.Xml;
++using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.UnitTests;
+ using Microsoft.Build.UnitTests.Shared;
+@@ -209,11 +210,51 @@ public void NoEnvironmentVariableProperty_Test(bool? customConfigEnabled, string
+             customConfigData);
+ 
+         string output = RunnerUtilities.ExecBootstrapedMSBuild(
+-            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -check", out bool success, false, _env.Output, timeoutMilliseconds: 120_000);
++            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -check", out bool success, false, _env.Output);
+ 
+         output.ShouldContain(expectedMessage);
+     }
+ 
++    [Theory]
++    [InlineData(EvaluationCheckScope.ProjectFileOnly)]
++    [InlineData(EvaluationCheckScope.WorkTreeImports)]
++    [InlineData(EvaluationCheckScope.All)]
++    public void NoEnvironmentVariableProperty_Scoping(EvaluationCheckScope scope)
++    {
++        List<(string RuleId, (string ConfigKey, string Value) CustomConfig)>? customConfigData = null;
++
++        string editorconfigScope = scope switch
++        {
++            EvaluationCheckScope.ProjectFileOnly => "project_file",
++            EvaluationCheckScope.WorkTreeImports => "work_tree_imports",
++            EvaluationCheckScope.All => "all",
++            _ => throw new ArgumentOutOfRangeException(nameof(scope), scope, null),
++        };
++
++        customConfigData = new List<(string, (string, string))>()
++        {
++            ("BC0103", ("scope", editorconfigScope)),
++        };
++
++        PrepareSampleProjectsAndConfig(
++            buildInOutOfProcessNode: true,
++            out TransientTestFile projectFile,
++            new List<(string, string)>() { ("BC0103", "error") },
++            customConfigData);
++
++        string output = RunnerUtilities.ExecBootstrapedMSBuild(
++            $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore -check", out bool success, false, _env.Output);
++
++        if(scope == EvaluationCheckScope.ProjectFileOnly)
++        {
++            output.ShouldNotContain("Property is derived from environment variable: 'TestImported'. Properties should be passed explicitly using the /p option.");
++        }
++        else
++        {
++            output.ShouldContain("Property is derived from environment variable: 'TestImported'. Properties should be passed explicitly using the /p option.");
++        }
++    }
++
+     [Theory]
+     [InlineData("CheckCandidate", new[] { "CustomRule1", "CustomRule2" })]
+     [InlineData("CheckCandidateWithMultipleChecksInjected", new[] { "CustomRule1", "CustomRule2", "CustomRule3" }, true)]
+@@ -325,9 +366,11 @@ private void PrepareSampleProjectsAndConfig(
+ 
+         string contents = ReadAndAdjustProjectContent("Project1");
+         string contents2 = ReadAndAdjustProjectContent("Project2");
++        string contentsImported = ReadAndAdjustProjectContent("ImportedFile1");
+ 
+         projectFile = _env.CreateFile(workFolder, "FooBar.csproj", contents);
+         TransientTestFile projectFile2 = _env.CreateFile(workFolder, "FooBar-Copy.csproj", contents2);
++        TransientTestFile importedFile1 = _env.CreateFile(workFolder, "ImportedFile1.props", contentsImported);
+ 
+         _env.CreateFile(workFolder, ".editorconfig", ReadEditorConfig(ruleToSeverity, ruleToCustomConfig, testAssetsFolderName));
+ 
+@@ -340,6 +383,7 @@ private void PrepareSampleProjectsAndConfig(
+         _env.SetEnvironmentVariable("MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION", "1");
+ 
+         _env.SetEnvironmentVariable("TEST", "FromEnvVariable");
++        _env.SetEnvironmentVariable("TestImported", "FromEnv");
+ 
+         string ReadAndAdjustProjectContent(string fileName) =>
+             File.ReadAllText(Path.Combine(TestAssetsRootPath, testAssetsFolderName, fileName))
+diff --git a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/ImportedFile1 b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/ImportedFile1
+new file mode 100644
+index 00000000000..ff344c1d281
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/ImportedFile1
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project>
++
++    <PropertyGroup Condition="$(TestImported) == true">
++        <TestProperty>TestImported</TestProperty>
++    </PropertyGroup>
++
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project1 b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project1
+index 15f7efc4ff6..4412879248c 100644
+--- a/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project1
++++ b/src/BuildCheck.UnitTests/TestAssets/SampleCheckIntegrationTest/Project1
+@@ -6,12 +6,13 @@
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+-     
++
++   <Import Project="ImportedFile1.props" />
++
+    <PropertyGroup Condition="$(Test) == true">
+        <TestProperty>Test</TestProperty>
+    </PropertyGroup>
+ 
+-
+    <Target Name="Hello">
+        <Message Importance="High" Condition="$(Test2) == true" Text="XYZABC" />
+        <Copy SourceFiles="TestFilePath" DestinationFolder="WorkFolderPath" />

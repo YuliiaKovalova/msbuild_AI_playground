@@ -1,0 +1,600 @@
+diff --git a/src/Shared/NodePipeBase.cs b/src/Shared/NodePipeBase.cs
+new file mode 100644
+index 00000000000..02c94ed85bf
+--- /dev/null
++++ b/src/Shared/NodePipeBase.cs
+@@ -0,0 +1,272 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++using System.IO.Pipes;
++using System.Threading;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++#if !TASKHOST
++using System.Buffers.Binary;
++using System.Threading.Tasks;
++using Microsoft.Build.Eventing;
++#endif
++
++namespace Microsoft.Build.Internal
++{
++    internal abstract class NodePipeBase : IDisposable
++    {
++        /// <summary>
++        /// A packet header consists of 1 byte (enum) for the packet type + 4 bytes (int32) for the packet length.
++        /// </summary>
++        private const int HeaderLength = 5;
++
++        /// <summary>
++        /// The size of the intermediate in-memory buffers.
++        /// </summary>
++        private const int InitialBufferSize = 131_072;
++
++        /// <summary>
++        /// The maximum number of bytes to write in a single operation.
++        /// </summary>
++        private const int MaxPacketWriteSize = 104_8576;
++
++        /// <summary>
++        /// A reusable buffer for reading the packet header.
++        /// </summary>
++        private readonly byte[] _headerData = new byte[HeaderLength];
++
++        /// <summary>
++        /// A buffer typically big enough to handle a packet body.
++        /// We use this as a convenient way to manage and cache a byte[] that's resized
++        /// automatically to fit our payload.
++        /// </summary>
++        private readonly MemoryStream _readBuffer = new(InitialBufferSize);
++
++        /// <summary>
++        /// A buffer typically big enough to handle a packet body.
++        /// We use this as a convenient way to manage and cache a byte[] that's resized
++        /// automatically to fit our payload.
++        /// </summary>
++        private readonly MemoryStream _writeBuffer = new(InitialBufferSize);
++
++        private readonly ITranslator _readTranslator;
++
++        private readonly ITranslator _writeTranslator;
++
++        /// <summary>
++        /// The packet factory to be used for deserialization, as packet types may have custom factory logic.
++        /// </summary>
++        private INodePacketFactory? _packetFactory;
++
++        protected NodePipeBase(string pipeName, Handshake handshake)
++        {
++            PipeName = pipeName;
++            HandshakeComponents = handshake.RetrieveHandshakeComponents();
++            _readTranslator = BinaryTranslator.GetReadTranslator(_readBuffer, InterningBinaryReader.CreateSharedBuffer());
++            _writeTranslator = BinaryTranslator.GetWriteTranslator(_writeBuffer);
++        }
++
++        protected abstract PipeStream NodeStream { get; }
++
++        protected string PipeName { get; }
++
++        protected int[] HandshakeComponents { get; }
++
++        public void Dispose()
++        {
++            _readBuffer.Dispose();
++            _writeBuffer.Dispose();
++            _readTranslator.Dispose();
++            _writeTranslator.Dispose();
++            NodeStream.Dispose();
++        }
++
++        internal void RegisterPacketFactory(INodePacketFactory packetFactory) => _packetFactory = packetFactory;
++
++        internal void WritePacket(INodePacket packet)
++        {
++            int messageLength = WritePacketToBuffer(packet);
++            byte[] buffer = _writeBuffer.GetBuffer();
++
++            for (int i = 0; i < messageLength; i += MaxPacketWriteSize)
++            {
++                int lengthToWrite = Math.Min(messageLength - i, MaxPacketWriteSize);
++                NodeStream.Write(buffer, i, lengthToWrite);
++            }
++        }
++
++        internal INodePacket ReadPacket()
++        {
++            // Read the header.
++            int headerBytesRead = Read(_headerData, HeaderLength);
++
++            // When an active connection is broken, any pending read will return 0 bytes before the pipe transitions to
++            // the broken state. As this is expected behavior, don't throw an exception if no packet is pending, A node
++            // may disconnect without waiting on the other end to gracefully cancel, and the caller can decide whether
++            // this was intentional.
++            if (headerBytesRead == 0)
++            {
++                return new NodeShutdown(NodeShutdownReason.ConnectionFailed);
++            }
++            else if (headerBytesRead != HeaderLength)
++            {
++                throw new IOException($"Incomplete header read.  {headerBytesRead} of {HeaderLength} bytes read.");
++            }
++
++#if TASKHOST
++            int packetLength = BitConverter.ToInt32(_headerData, 1);
++#else
++            int packetLength = BinaryPrimitives.ReadInt32LittleEndian(new Span<byte>(_headerData, 1, 4));
++            MSBuildEventSource.Log.PacketReadSize(packetLength);
++#endif
++
++            // Read the packet. Set the buffer length now to avoid additional resizing during the read.
++            _readBuffer.Position = 0;
++            _readBuffer.SetLength(packetLength);
++            int packetBytesRead = Read(_readBuffer.GetBuffer(), packetLength);
++
++            if (packetBytesRead < packetLength)
++            {
++                throw new IOException($"Incomplete packet read. {packetBytesRead} of {packetLength} bytes read.");
++            }
++
++            return DeserializePacket();
++        }
++
++#if !TASKHOST
++        internal async Task WritePacketAsync(INodePacket packet, CancellationToken cancellationToken = default)
++        {
++            int messageLength = WritePacketToBuffer(packet);
++            byte[] buffer = _writeBuffer.GetBuffer();
++
++            for (int i = 0; i < messageLength; i += MaxPacketWriteSize)
++            {
++                int lengthToWrite = Math.Min(messageLength - i, MaxPacketWriteSize);
++#if NETCOREAPP
++                await NodeStream.WriteAsync(buffer.AsMemory(i, lengthToWrite), cancellationToken).ConfigureAwait(false);
++#else
++                await NodeStream.WriteAsync(buffer, i, lengthToWrite, cancellationToken).ConfigureAwait(false);
++#endif
++            }
++        }
++
++        internal async Task<INodePacket> ReadPacketAsync(CancellationToken cancellationToken = default)
++        {
++            // Read the header.
++            int headerBytesRead = await ReadAsync(_headerData, HeaderLength, cancellationToken).ConfigureAwait(false);
++
++            // When an active connection is broken, any pending read will return 0 bytes before the pipe transitions to
++            // the broken state. As this is expected behavior, don't throw an exception if no packet is pending, A node
++            // may disconnect without waiting on the other end to gracefully cancel, and the caller can decide whether
++            // this was intentional.
++            if (headerBytesRead == 0)
++            {
++                return new NodeShutdown(NodeShutdownReason.ConnectionFailed);
++            }
++            else if (headerBytesRead != HeaderLength)
++            {
++                throw new IOException($"Incomplete header read.  {headerBytesRead} of {HeaderLength} bytes read.");
++            }
++
++            int packetLength = BinaryPrimitives.ReadInt32LittleEndian(new Span<byte>(_headerData, 1, 4));
++            MSBuildEventSource.Log.PacketReadSize(packetLength);
++
++            // Read the packet. Set the buffer length now to avoid additional resizing during the read.
++            _readBuffer.Position = 0;
++            _readBuffer.SetLength(packetLength);
++            int packetBytesRead = await ReadAsync(_readBuffer.GetBuffer(), packetLength, cancellationToken).ConfigureAwait(false);
++
++            if (packetBytesRead < packetLength)
++            {
++                throw new IOException($"Incomplete packet read. {packetBytesRead} of {packetLength} bytes read.");
++            }
++
++            return DeserializePacket();
++        }
++#endif
++
++        private int WritePacketToBuffer(INodePacket packet)
++        {
++            // Clear the buffer but keep the underlying capacity to avoid reallocations.
++            _writeBuffer.SetLength(HeaderLength);
++            _writeBuffer.Position = HeaderLength;
++
++            // Serialize and write the packet to the buffer.
++            packet.Translate(_writeTranslator);
++
++            // Write the header to the buffer.
++            _writeBuffer.Position = 0;
++            _writeBuffer.WriteByte((byte)packet.Type);
++            int messageLength = (int)_writeBuffer.Length;
++            _writeTranslator.Writer.Write(messageLength - HeaderLength);
++
++            return messageLength;
++        }
++
++        private int Read(byte[] buffer, int bytesToRead)
++        {
++            int totalBytesRead = 0;
++            while (totalBytesRead < bytesToRead)
++            {
++                int bytesRead = NodeStream.Read(buffer, totalBytesRead, bytesToRead - totalBytesRead);
++
++                // 0 byte read will occur if the pipe disconnects.
++                if (bytesRead == 0)
++                {
++                    break;
++                }
++
++                totalBytesRead += bytesRead;
++            }
++
++            return totalBytesRead;
++        }
++
++#if !TASKHOST
++        private async Task<int> ReadAsync(byte[] buffer, int bytesToRead, CancellationToken cancellationToken)
++        {
++            int totalBytesRead = 0;
++            while (totalBytesRead < bytesToRead)
++            {
++#if NETCOREAPP
++                int bytesRead = await NodeStream.ReadAsync(buffer.AsMemory(totalBytesRead, bytesToRead - totalBytesRead), cancellationToken).ConfigureAwait(false);
++#else
++                int bytesRead = await NodeStream.ReadAsync(buffer, totalBytesRead, bytesToRead - totalBytesRead, cancellationToken).ConfigureAwait(false);
++#endif
++
++                // 0 byte read will occur if the pipe disconnects.
++                if (bytesRead == 0)
++                {
++                    break;
++                }
++
++                totalBytesRead += bytesRead;
++            }
++
++            return totalBytesRead;
++        }
++#endif
++
++        private INodePacket DeserializePacket()
++        {
++            if (_packetFactory == null)
++            {
++                throw new InternalErrorException("No packet factory is registered for deserialization.");
++            }
++
++            NodePacketType packetType = (NodePacketType)_headerData[0];
++            try
++            {
++                return _packetFactory.DeserializePacket(packetType, _readTranslator);
++            }
++            catch (Exception e) when (e is not InternalErrorException)
++            {
++                throw new InternalErrorException($"Exception while deserializing packet {packetType}: {e}");
++            }
++        }
++    }
++}
+diff --git a/src/Shared/NodePipeClient.cs b/src/Shared/NodePipeClient.cs
+new file mode 100644
+index 00000000000..6be1e0e422b
+--- /dev/null
++++ b/src/Shared/NodePipeClient.cs
+@@ -0,0 +1,90 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++using System.IO.Pipes;
++using System.Security.Principal;
++using Microsoft.Build.BackEnd;
++
++namespace Microsoft.Build.Internal
++{
++    internal sealed class NodePipeClient : NodePipeBase
++    {
++        /// <summary>
++        /// If true, sets a timeout for the handshake. This is only used on Unix-like socket implementations, because the
++        /// timeout on the PipeStream connection is ignore.
++        /// </summary>
++        private static readonly bool s_useHandhakeTimeout = !NativeMethodsShared.IsWindows;
++
++        private readonly NamedPipeClientStream _pipeClient;
++
++        internal NodePipeClient(string pipeName, Handshake handshake)
++            : base(pipeName, handshake) =>
++#pragma warning disable SA1111, SA1009 // Closing parenthesis should be on line of last parameter
++            _pipeClient = new(
++                serverName: ".",
++                pipeName,
++                PipeDirection.InOut,
++                PipeOptions.Asynchronous
++#if FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++                | PipeOptions.CurrentUserOnly
++#endif
++            );
++#pragma warning restore SA1111, SA1009 // Closing parenthesis should be on line of last parameter
++
++        protected override PipeStream NodeStream => _pipeClient;
++
++        internal void ConnectToServer(int timeout)
++        {
++            CommunicationsUtilities.Trace("Attempting connect to pipe {0} with timeout {1} ms", PipeName, timeout);
++            _pipeClient.Connect(timeout);
++#if !FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++            // Verify that the owner of the pipe is us.  This prevents a security hole where a remote node has
++            // been faked up with ACLs that would let us attach to it.  It could then issue fake build requests back to
++            // us, potentially causing us to execute builds that do harmful or unexpected things.  The pipe owner can
++            // only be set to the user's own SID by a normal, unprivileged process.  The conditions where a faked up
++            // remote node could set the owner to something else would also let it change owners on other objects, so
++            // this would be a security flaw upstream of us.
++            ValidateRemotePipeOwner();
++#endif
++            PerformHandshake(s_useHandhakeTimeout ? timeout : 0);
++            CommunicationsUtilities.Trace("Successfully connected to pipe {0}...!", PipeName);
++        }
++
++#if !FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++        // This code needs to be in a separate method so that we don't try (and fail) to load the Windows-only APIs when JIT-ing the code
++        //  on non-Windows operating systems
++        private void ValidateRemotePipeOwner()
++        {
++            SecurityIdentifier identifier = WindowsIdentity.GetCurrent().Owner;
++            PipeSecurity remoteSecurity = _pipeClient.GetAccessControl();
++            IdentityReference remoteOwner = remoteSecurity.GetOwner(typeof(SecurityIdentifier));
++
++            if (remoteOwner != identifier)
++            {
++                CommunicationsUtilities.Trace("The remote pipe owner {0} does not match {1}", remoteOwner.Value, identifier.Value);
++                throw new UnauthorizedAccessException();
++            }
++        }
++#endif
++
++        /// <summary>
++        /// Connect to named pipe stream and ensure validate handshake and security.
++        /// </summary>
++        private void PerformHandshake(int timeout)
++        {
++            for (int i = 0; i < HandshakeComponents.Length; i++)
++            {
++                CommunicationsUtilities.Trace("Writing handshake part {0} ({1}) to pipe {2}", i, HandshakeComponents[i], PipeName);
++                _pipeClient.WriteIntForHandshake(HandshakeComponents[i]);
++            }
++
++            // This indicates that we have finished all the parts of our handshake; hopefully the endpoint has as well.
++            _pipeClient.WriteEndOfHandshakeSignal();
++
++            CommunicationsUtilities.Trace("Reading handshake from pipe {0}", PipeName);
++            _pipeClient.ReadEndOfHandshakeSignal(true, timeout);
++        }
++    }
++}
+diff --git a/src/Shared/NodePipeServer.cs b/src/Shared/NodePipeServer.cs
+new file mode 100644
+index 00000000000..ff217a9f1c3
+--- /dev/null
++++ b/src/Shared/NodePipeServer.cs
+@@ -0,0 +1,220 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++using System.IO.Pipes;
++using System.Security.AccessControl;
++using System.Security.Principal;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Shared;
++
++#if !TASKHOST
++using System.Threading.Tasks;
++#endif
++
++namespace Microsoft.Build.Internal
++{
++    internal sealed class NodePipeServer : NodePipeBase
++    {
++        /// <summary>
++        /// The size of kernel-level buffers used by the named pipe. If the total size of pending reads or write requests exceed
++        /// this amount (known as the quota), IO will block until either pending operations complete, or the OS increases the quota.
++        /// </summary>
++        private const int PipeBufferSize = 131_072;
++
++        /// <summary>
++        /// A timeout for the handshake. This is only used on Unix-like socket implementations, because the
++        /// timeout on the PipeStream connection is ignore.
++        /// </summary>
++        private static readonly int s_handshakeTimeout = NativeMethodsShared.IsWindows ? 0 : 60_000;
++
++        private readonly NamedPipeServerStream _pipeServer;
++
++        internal NodePipeServer(string pipeName, Handshake handshake, int maxNumberOfServerInstances = 1)
++            : base(pipeName, handshake)
++        {
++            PipeOptions pipeOptions = PipeOptions.Asynchronous;
++#if FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++            pipeOptions |= PipeOptions.CurrentUserOnly;
++#else
++            // Restrict access to just this account.  We set the owner specifically here, and on the
++            // pipe client side they will check the owner against this one - they must have identical
++            // SIDs or the client will reject this server.  This is used to avoid attacks where a
++            // hacked server creates a less restricted pipe in an attempt to lure us into using it and
++            // then sending build requests to the real pipe client (which is the MSBuild Build Manager.)
++            PipeAccessRule rule = new(WindowsIdentity.GetCurrent().Owner, PipeAccessRights.ReadWrite, AccessControlType.Allow);
++            PipeSecurity security = new();
++            security.AddAccessRule(rule);
++            security.SetOwner(rule.IdentityReference);
++#endif
++
++            _pipeServer = new NamedPipeServerStream(
++                pipeName,
++                PipeDirection.InOut,
++                maxNumberOfServerInstances,
++                PipeTransmissionMode.Byte,
++                pipeOptions,
++                inBufferSize: PipeBufferSize,
++                outBufferSize: PipeBufferSize
++#if !FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++                , security,
++                HandleInheritability.None
++#endif
++#pragma warning disable SA1111 // Closing parenthesis should be on line of last parameter
++                );
++#pragma warning restore SA1111 // Closing parenthesis should be on line of last parameter
++        }
++
++        protected override PipeStream NodeStream => _pipeServer;
++
++        internal LinkStatus WaitForConnection()
++        {
++            DateTime originalWaitStartTime = DateTime.UtcNow;
++            bool gotValidConnection = false;
++
++            while (!gotValidConnection)
++            {
++                gotValidConnection = true;
++                DateTime restartWaitTime = DateTime.UtcNow;
++
++                // We only wait to wait the difference between now and the last original start time, in case we have multiple hosts attempting
++                // to attach.  This prevents each attempt from resetting the timer.
++                TimeSpan usedWaitTime = restartWaitTime - originalWaitStartTime;
++                int waitTimeRemaining = Math.Max(0, CommunicationsUtilities.NodeConnectionTimeout - (int)usedWaitTime.TotalMilliseconds);
++
++                try
++                {
++                    // Wait for a connection
++#if TASKHOST
++                    IAsyncResult resultForConnection = _pipeServer.BeginWaitForConnection(null, null);
++                    CommunicationsUtilities.Trace("Waiting for connection {0} ms...", waitTimeRemaining);
++                    bool connected = resultForConnection.AsyncWaitHandle.WaitOne(waitTimeRemaining, false);
++                    _pipeServer.EndWaitForConnection(resultForConnection);
++#else
++                    Task connectionTask = _pipeServer.WaitForConnectionAsync();
++                    CommunicationsUtilities.Trace("Waiting for connection {0} ms...", waitTimeRemaining);
++                    bool connected = connectionTask.Wait(waitTimeRemaining);
++#endif
++                    if (!connected)
++                    {
++                        CommunicationsUtilities.Trace("Connection timed out waiting a host to contact us.  Exiting comm thread.");
++                        return LinkStatus.ConnectionFailed;
++                    }
++
++                    CommunicationsUtilities.Trace("Parent started connecting. Reading handshake from parent");
++
++                    // The handshake protocol is a series of int exchanges.  The host sends us a each component, and we
++                    // verify it. Afterwards, the host sends an "End of Handshake" signal, to which we respond in kind.
++                    // Once the handshake is complete, both sides can be assured the other is ready to accept data.
++                    try
++                    {
++                        gotValidConnection = ValidateHandshake();
++#if !FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++                        gotValidConnection &= ValidateClientIdentity();
++#endif
++                    }
++                    catch (IOException e)
++                    {
++                        // We will get here when:
++                        // 1. The host (OOP main node) connects to us, it immediately checks for user privileges
++                        //    and if they don't match it disconnects immediately leaving us still trying to read the blank handshake
++                        // 2. The host is too old sending us bits we automatically reject in the handshake
++                        // 3. We expected to read the EndOfHandshake signal, but we received something else
++                        CommunicationsUtilities.Trace("Client connection failed but we will wait for another connection. Exception: {0}", e.Message);
++                        gotValidConnection = false;
++                    }
++                    catch (InvalidOperationException)
++                    {
++                        gotValidConnection = false;
++                    }
++
++                    if (!gotValidConnection && _pipeServer.IsConnected)
++                    {
++                        _pipeServer.Disconnect();
++                    }
++                }
++                catch (Exception e) when (!ExceptionHandling.IsCriticalException(e))
++                {
++                    CommunicationsUtilities.Trace("Client connection failed.  Exiting comm thread. {0}", e);
++                    if (_pipeServer.IsConnected)
++                    {
++                        _pipeServer.Disconnect();
++                    }
++
++                    ExceptionHandling.DumpExceptionToFile(e);
++                    return LinkStatus.Failed;
++                }
++            }
++
++            return LinkStatus.Active;
++        }
++
++        internal void Disconnect()
++        {
++            try
++            {
++                if (_pipeServer.IsConnected)
++                {
++#if NETCOREAPP // OperatingSystem.IsWindows() is new in .NET 5.0
++                    if (OperatingSystem.IsWindows())
++#endif
++                    {
++                        _pipeServer.WaitForPipeDrain();
++                    }
++
++                    _pipeServer.Disconnect();
++                }
++            }
++            catch (Exception)
++            {
++                // We don't really care if Disconnect somehow fails, but it gives us a chance to do the right thing.
++            }
++        }
++
++        private bool ValidateHandshake()
++        {
++            for (int i = 0; i < HandshakeComponents.Length; i++)
++            {
++                // This will disconnect a < 16.8 host; it expects leading 00 or F5 or 06. 0x00 is a wildcard.
++                int handshakePart = _pipeServer.ReadIntForHandshake(byteToAccept: i == 0 ? CommunicationsUtilities.handshakeVersion : null, s_handshakeTimeout);
++
++                if (handshakePart != HandshakeComponents[i])
++                {
++                    CommunicationsUtilities.Trace("Handshake failed. Received {0} from host not {1}. Probably the host is a different MSBuild build.", handshakePart, HandshakeComponents[i]);
++                    _pipeServer.WriteIntForHandshake(i + 1);
++                    return false;
++                }
++            }
++
++            // To ensure that our handshake and theirs have the same number of bytes, receive and send a magic number indicating EOS.
++            _pipeServer.ReadEndOfHandshakeSignal(false, s_handshakeTimeout);
++
++            CommunicationsUtilities.Trace("Successfully connected to parent.");
++            _pipeServer.WriteEndOfHandshakeSignal();
++
++            return true;
++        }
++
++#if !FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++        private bool ValidateClientIdentity()
++        {
++            // We will only talk to a host that was started by the same user as us.  Even though the pipe access is set to only allow this user, we want to ensure they
++            // haven't attempted to change those permissions out from under us.  This ensures that the only way they can truly gain access is to be impersonating the
++            // user we were started by.
++            WindowsIdentity currentIdentity = WindowsIdentity.GetCurrent();
++            WindowsIdentity? clientIdentity = null;
++            _pipeServer.RunAsClient(() => { clientIdentity = WindowsIdentity.GetCurrent(true); });
++
++            if (clientIdentity == null || !string.Equals(clientIdentity.Name, currentIdentity.Name, StringComparison.OrdinalIgnoreCase))
++            {
++                CommunicationsUtilities.Trace("Handshake failed. Host user is {0} but we were created by {1}.", (clientIdentity == null) ? "<unknown>" : clientIdentity.Name, currentIdentity.Name);
++                return false;
++            }
++
++            return true;
++        }
++#endif
++
++    }
++}

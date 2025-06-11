@@ -1,0 +1,137 @@
+diff --git a/src/MSBuild.UnitTests/XMake_Tests.cs b/src/MSBuild.UnitTests/XMake_Tests.cs
+index d92d9cdf5e2..3e497c7e409 100644
+--- a/src/MSBuild.UnitTests/XMake_Tests.cs
++++ b/src/MSBuild.UnitTests/XMake_Tests.cs
+@@ -1524,6 +1524,44 @@ public void ResponseFileInProjectDirectoryButCommandLineNoAutoResponseSwitch()
+             }
+         }
+ 
++        /// <summary>
++        /// Directory.Build.rsp in the directory of the specified project/solution should be respected when searching the files (solution/proj) to build.
++        /// </summary>
++        [Fact]
++        public void ResponseFileInProjectDirectoryWithSolutionProjectDifferentNamesShouldBeRespected()
++        {
++            string directory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
++            string projectPath = Path.Combine(directory, "projectFile.proj");
++            string solutionPath = Path.Combine(directory, "solutionFile.sln");
++            string rspPath = Path.Combine(directory, "Directory.Build.rsp");
++
++            try
++            {
++                Directory.CreateDirectory(directory);
++
++                string content = ObjectModelHelpers.CleanupFileContents("<Project ToolsVersion='msbuilddefaulttoolsversion' xmlns='msbuildnamespace'><Target Name='t'><Message Text='Completed'/></Target></Project>");
++                File.WriteAllText(projectPath, content);
++
++                string rspContent = "-ignoreProjectExtensions:.sln";
++                File.WriteAllText(rspPath, rspContent);
++
++                // Incorrect sln file format, which will result fail if picked by msbuild for building
++                File.WriteAllText(solutionPath, string.Empty);
++
++                var msbuildParameters = "\"" + directory + "\"";
++
++                string output = RunnerUtilities.ExecMSBuild(msbuildParameters, out var successfulExit, _output);
++                successfulExit.ShouldBeTrue();
++            }
++            finally
++            {
++                File.Delete(projectPath);
++                File.Delete(solutionPath);
++                File.Delete(rspPath);
++                FileUtilities.DeleteWithoutTrailingBackslash(directory);
++            }
++        }
++
+         /// <summary>
+         /// Any msbuild.rsp in the directory of the specified project/solution should be read, and should
+         /// take priority over any other response files. Sanity test when there isn't one.
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 2e4733340a5..48359da7d70 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -307,11 +307,11 @@ private static bool CanRunServerBasedOnCommandLineSwitches(
+             {
+                 GatherAllSwitches(commandLine, out var switchesFromAutoResponseFile, out var switchesNotFromAutoResponseFile, out string fullCommandLine);
+                 CommandLineSwitches commandLineSwitches = CombineSwitchesRespectingPriority(switchesFromAutoResponseFile, switchesNotFromAutoResponseFile, fullCommandLine);
+-                if (CheckAndGatherProjectAutoResponseFile(switchesFromAutoResponseFile, commandLineSwitches, false, fullCommandLine, out string projectFile))
++                if (CheckAndGatherProjectAutoResponseFile(switchesFromAutoResponseFile, commandLineSwitches, false, fullCommandLine))
+                 {
+                     commandLineSwitches = CombineSwitchesRespectingPriority(switchesFromAutoResponseFile, switchesNotFromAutoResponseFile, fullCommandLine);
+                 }
+-
++                string projectFile = ProcessProjectSwitch(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.Project], commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.IgnoreProjectExtensions], Directory.GetFiles);
+                 if (commandLineSwitches[CommandLineSwitches.ParameterlessSwitch.Help] ||
+                     commandLineSwitches.IsParameterizedSwitchSet(CommandLineSwitches.ParameterizedSwitch.NodeMode) ||
+                     commandLineSwitches[CommandLineSwitches.ParameterlessSwitch.Version] ||
+@@ -2503,7 +2503,7 @@ private static bool ProcessCommandLineSwitches(
+                 }
+                 else
+                 {
+-                    bool foundProjectAutoResponseFile = CheckAndGatherProjectAutoResponseFile(switchesFromAutoResponseFile, commandLineSwitches, recursing, commandLine, out projectFile);
++                    bool foundProjectAutoResponseFile = CheckAndGatherProjectAutoResponseFile(switchesFromAutoResponseFile, commandLineSwitches, recursing, commandLine);
+ 
+                     if (foundProjectAutoResponseFile)
+                     {
+@@ -2556,6 +2556,9 @@ private static bool ProcessCommandLineSwitches(
+                                                            commandLine);
+                     }
+ 
++                    // why not process the project parameter here?
++                    projectFile = ProcessProjectSwitch(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.Project], commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.IgnoreProjectExtensions], Directory.GetFiles);
++
+                     // figure out which targets we are building
+                     targets = ProcessTargetSwitch(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.Target]);
+ 
+@@ -2912,18 +2915,43 @@ private static CommandLineSwitches CombineSwitchesRespectingPriority(CommandLine
+             return commandLineSwitches;
+         }
+ 
+-        private static bool CheckAndGatherProjectAutoResponseFile(CommandLineSwitches switchesFromAutoResponseFile, CommandLineSwitches commandLineSwitches, bool recursing, string commandLine, out string projectFile)
++        private static string GetProjectDirectory(string[] projectSwitchParameters)
+         {
+-            bool found = false;
++            string projectDirectory = ".";
++            ErrorUtilities.VerifyThrow(projectSwitchParameters.Length <= 1, "It should not be possible to specify more than 1 project at a time.");
+ 
+-            // figure out what project we are building
+-            projectFile = ProcessProjectSwitch(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.Project], commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.IgnoreProjectExtensions], Directory.GetFiles);
++            if (projectSwitchParameters.Length == 1)
++            {
++                var projectFile = FileUtilities.FixFilePath(projectSwitchParameters[0]);
++
++                if (FileSystems.Default.DirectoryExists(projectFile))
++                {
++                    // the provided argument value is actually the directory
++                    projectDirectory = projectFile;
++                }
++                else
++                {
++                    InitializationException.VerifyThrow(FileSystems.Default.FileExists(projectFile), "ProjectNotFoundError", projectFile);
++                    projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectFile));
++                }
++            }
++
++            return projectDirectory;
++        }
++
++
++        /// <summary>
++        /// Identifies if there is rsp files near the project file 
++        /// </summary>
++        /// <returns>true if there autoresponse file was found</returns>
++        private static bool CheckAndGatherProjectAutoResponseFile(CommandLineSwitches switchesFromAutoResponseFile, CommandLineSwitches commandLineSwitches, bool recursing, string commandLine)
++        {
++            bool found = false;
++           
++            var projectDirectory = GetProjectDirectory(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.Project]);
+ 
+             if (!recursing && !commandLineSwitches[CommandLineSwitches.ParameterlessSwitch.NoAutoResponse])
+             {
+-                // gather any switches from an msbuild.rsp that is next to the project or solution file itself
+-                string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectFile));
+-
+                 // gather any switches from the first Directory.Build.rsp found in the project directory or above
+                 string directoryResponseFile = FileUtilities.GetPathOfFileAbove(directoryResponseFileName, projectDirectory);
+ 

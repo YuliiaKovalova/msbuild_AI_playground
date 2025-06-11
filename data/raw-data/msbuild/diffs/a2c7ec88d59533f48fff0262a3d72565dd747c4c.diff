@@ -1,0 +1,820 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 98fc6c1a7fb..ebcf659b996 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -765,6 +765,9 @@ public GraphBuildSubmission PendBuildRequest(GraphBuildRequestData requestData)
+                 ErrorIfState(BuildManagerState.WaitingForBuildToComplete, "WaitingForEndOfBuild");
+                 ErrorIfState(BuildManagerState.Idle, "NoBuildInProgress");
+                 VerifyStateInternal(BuildManagerState.Building);
++                // Make sure that if we schedule a graph build request with isolate projects (caching)
++                // the build parameters should be configured accordingly
++                ErrorUtilities.VerifyThrowInvalidOperation(_buildParameters.IsolateProjects == requestData.IsolateProjects, "InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters", _buildParameters.IsolateProjects, requestData.IsolateProjects);
+ 
+                 var newSubmission = new GraphBuildSubmission(this, GetNextSubmissionId(), requestData);
+                 _graphBuildSubmissions.Add(newSubmission.SubmissionId, newSubmission);
+@@ -1655,7 +1658,11 @@ private static void AddBuildRequestToSubmission(BuildSubmission submission, int
+                 BuildEventContext.Invalid,
+                 null,
+                 submission.BuildRequestData.Flags,
+-                submission.BuildRequestData.RequestedProjectState);
++                submission.BuildRequestData.RequestedProjectState)
++            {
++                InputResultsCacheFiles = submission.BuildRequestData.InputResultsCacheFiles,
++                OutputResultsCacheFile = submission.BuildRequestData.OutputResultsCacheFile,
++            };
+         }
+ 
+         private static void AddProxyBuildRequestToSubmission(BuildSubmission submission, int configurationId, ProxyTargets proxyTargets)
+@@ -1667,7 +1674,11 @@ private static void AddProxyBuildRequestToSubmission(BuildSubmission submission,
+                 proxyTargets,
+                 submission.BuildRequestData.HostServices,
+                 submission.BuildRequestData.Flags,
+-                submission.BuildRequestData.RequestedProjectState);
++                submission.BuildRequestData.RequestedProjectState)
++            {
++                InputResultsCacheFiles = submission.BuildRequestData.InputResultsCacheFiles,
++                OutputResultsCacheFile = submission.BuildRequestData.OutputResultsCacheFile,
++            };
+         }
+ 
+         /// <summary>
+@@ -1921,8 +1932,51 @@ GraphBuildRequestData graphBuildRequestData
+             var waitHandle = new AutoResetEvent(true);
+             var graphBuildStateLock = new object();
+ 
+-            var blockedNodes = new HashSet<ProjectGraphNode>(projectGraph.ProjectNodes);
++            var blockedNodes = new HashSet<ProjectGraphNode>(projectGraph.ProjectNodes.Count);
+             var finishedNodes = new HashSet<ProjectGraphNode>(projectGraph.ProjectNodes.Count);
++
++            // Collect starting nodes or all nodes
++            var startingNodes = graphBuildRequestData.StartingGraphNodes;
++            if (startingNodes != null && startingNodes.Count > 0)
++            {
++                var direction = graphBuildRequestData.ProjectGraphNodeDirection;
++
++                var collector = new ProjectGraphVisitor();
++                foreach (var startingNode in startingNodes)
++                {
++                    if (direction != ProjectGraphNodeDirection.Current)
++                    {
++                        // Collect all the projects downward that we need to compile
++                        foreach (var project in collector.FindAll(startingNode, direction))
++                        {
++                            blockedNodes.Add(project);
++                        }
++                    }
++
++                    // if we want to recompile upward or current, tag the downward projects as finished
++                    if (direction != ProjectGraphNodeDirection.Down)
++                    {
++                        foreach (var project in collector.FindAll(startingNode, ProjectGraphNodeDirection.Down))
++                        {
++                            finishedNodes.Add(project);
++                        }
++                    }
++
++                    // Always recompile the current node 
++                    blockedNodes.Add(startingNode);
++                }
++            }
++            else
++            {
++                // Else we visit the entire graph
++                foreach (var node in projectGraph.ProjectNodes)
++                {
++                    blockedNodes.Add(node);
++                }
++            }
++
++            var getResultsCacheFilePath = graphBuildRequestData.GraphBuildCacheFilePath;
++
+             var buildingNodes = new Dictionary<BuildSubmission, ProjectGraphNode>();
+             var resultsPerNode = new Dictionary<ProjectGraphNode, BuildResult>(projectGraph.ProjectNodes.Count);
+             Exception submissionException = null;
+@@ -1963,6 +2017,21 @@ GraphBuildRequestData graphBuildRequestData
+                             graphBuildRequestData.HostServices,
+                             graphBuildRequestData.Flags);
+ 
++
++                        if (getResultsCacheFilePath != null)
++                        {
++                            // We don't store a cache for the root project
++                            if (node.ReferencingProjects.Count != 0)
++                            {
++                                request.OutputResultsCacheFile = getResultsCacheFilePath(node);
++                            }
++
++                            if (node.ProjectReferences.Count > 0)
++                            {
++                                request.InputResultsCacheFiles = node.ProjectReferences.Select(x => getResultsCacheFilePath(x)).ToArray();
++                            }
++                        }
++
+                         // TODO Tack onto the existing submission instead of pending a whole new submission for every node
+                         // Among other things, this makes BuildParameters.DetailedSummary produce a summary for each node, which is not desirable.
+                         // We basically want to submit all requests to the scheduler all at once and describe dependencies by requests being blocked by other requests.
+@@ -1985,6 +2054,13 @@ GraphBuildRequestData graphBuildRequestData
+                                 buildingNodes.Remove(finishedBuildSubmission);
+ 
+                                 resultsPerNode.Add(finishedNode, finishedBuildSubmission.BuildResult);
++
++                                // TODO: Do we want to cache results?
++                                //// If we are handling cache, we store 
++                                //if (getResultsCacheFilePath != null)
++                                //{
++                                //    _resultsCache.AddResult(finishedBuildSubmission.BuildResult);
++                                //}
+                             }
+ 
+                             waitHandle.Set();
+diff --git a/src/Build/BackEnd/BuildManager/BuildRequestData.cs b/src/Build/BackEnd/BuildManager/BuildRequestData.cs
+index 6f3a29a5765..5613fa97e69 100644
+--- a/src/Build/BackEnd/BuildManager/BuildRequestData.cs
++++ b/src/Build/BackEnd/BuildManager/BuildRequestData.cs
+@@ -304,5 +304,17 @@ public ProjectInstance ProjectInstance
+         /// Returns the global properties as a dictionary.
+         /// </summary>
+         internal PropertyDictionary<ProjectPropertyInstance> GlobalPropertiesDictionary { get; }
++
++        /// <summary>
++        /// Input cache files that MSBuild will use to read build results from.
++        /// Setting this also turns on isolated builds.
++        /// </summary>
++        public string[] InputResultsCacheFiles { get; set; }
++
++        /// <summary>
++        /// Output cache file where MSBuild will write the contents of its build result caches during EndBuild.
++        /// Setting this also turns on isolated builds.
++        /// </summary>
++        public string OutputResultsCacheFile { get; set; }
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index 7204146c1cd..394f6828b19 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -1178,6 +1178,16 @@ private async Task<BuildResult> BuildProject()
+                 ErrorUtilities.VerifyThrow(_requestEntry.RequestConfiguration.ResultsNodeId == _componentHost.BuildParameters.NodeId, "Results for configuration {0} were not retrieved from node {1}", _requestEntry.RequestConfiguration.ConfigurationId, _requestEntry.RequestConfiguration.ResultsNodeId);
+             }
+ 
++
++            // Make sure that we mark specify that we work in isolation if input/output cache files are specified
++            if (!_componentHost.BuildParameters.IsolateProjects && (_requestEntry.Request.InputResultsCacheFiles != null || _requestEntry.Request.OutputResultsCacheFile != null))
++            {
++                _projectLoggingContext.LogErrorFromText(null, null, null, BuildEventFileInfo.Empty, "Error. IsolateProjects is set to false while the request has input/output results cache files");
++            }
++
++            // Update the cache of the entry request
++            UpdateCacheFromInputResultsCacheFiles();
++
+             // Build the targets
+             BuildResult result = await _targetBuilder.BuildTargets(_projectLoggingContext, _requestEntry, this, allTargets, _requestEntry.RequestConfiguration.BaseLookup, _cancellationTokenSource.Token);
+ 
+@@ -1185,6 +1195,13 @@ private async Task<BuildResult> BuildProject()
+                 ? result
+                 : CopyTargetResultsFromProxyTargetsToRealTargets(result);
+ 
++
++            // Only cache when we had a success
++            if (result.OverallResult == BuildResultCode.Success && _requestEntry.Request.OutputResultsCacheFile != null)
++            {
++                WriteOutputResultsCacheFile(result, allTargets);
++            }
++            
+             if (MSBuildEventSource.Log.IsEnabled())
+             {
+                 MSBuildEventSource.Log.BuildProjectStop(_requestEntry.RequestConfiguration.ProjectFullPath, string.Join(", ", allTargets));
+@@ -1379,6 +1396,79 @@ private ISet<string> ParseWarningCodes(string warnings)
+             return new HashSet<string>(ExpressionShredder.SplitSemiColonSeparatedList(warnings), StringComparer.OrdinalIgnoreCase);
+         }
+ 
++
++        private void UpdateCacheFromInputResultsCacheFiles()
++        {
++            var inputCacheFiles = _requestEntry.Request.InputResultsCacheFiles;
++
++            if (inputCacheFiles == null || inputCacheFiles.Length == 0)
++            {
++                return;
++            }
++
++            if (inputCacheFiles.Any(f => !File.Exists(f)))
++            {
++                _projectLoggingContext.LogError(BuildEventFileInfo.Empty, "InputCacheFilesDoNotExist", string.Join(";", inputCacheFiles.Where(f => !File.Exists(f))));
++                return;
++            }
++
++            var globalConfigCache = (IConfigCache)_componentHost.GetComponent(BuildComponentType.ConfigCache);
++            var globalResultCache = (IResultsCache)_componentHost.GetComponent(BuildComponentType.ResultsCache);
++
++            foreach (var inputCacheFile in inputCacheFiles)
++            {
++                var (configCache, resultsCache, exception) = CacheSerialization.DeserializeCaches(inputCacheFile);
++
++                if (exception != null)
++                {
++                    _projectLoggingContext.LogError(BuildEventFileInfo.Empty, "ErrorReadingCacheFile", inputCacheFile, exception.Message);
++                    return;
++                }
++
++                var configs = configCache.GetEnumerator().ToArray();
++                var results = resultsCache.GetEnumerator().ToArray();
++                ErrorUtilities.VerifyThrow(configs.Length == results.Length, "Assuming 1-to-1 mapping between configs and results. Otherwise it means the caches are either not minimal or incomplete");
++
++                // Make sure that the config is matching the result
++                foreach (var config in configs)
++                {
++                    ErrorUtilities.VerifyThrow(resultsCache.GetResultsForConfiguration(config.ConfigurationId) != null, "Input caches should not contain entries for the same configuration");
++                }
++
++                foreach (var config in configs)
++                {
++                    if (!globalConfigCache.HasConfiguration(config.ConfigurationId))
++                    {
++                        globalConfigCache.AddConfiguration(config);
++#if DEBUG
++                        ErrorUtilities.VerifyThrow(globalResultCache.GetResultsForConfiguration(config.ConfigurationId) == null, "Invalid result already stored for a not ");
++#endif
++                        globalResultCache.AddResult(resultsCache.GetResultsForConfiguration(config.ConfigurationId));
++                    }
++                }
++            }
++        }
++
++        private void WriteOutputResultsCacheFile(BuildResult buildResult, string[] targetNames)
++        {
++            IConfigCache existingConfigCache = (IConfigCache)_componentHost.GetComponent(BuildComponentType.ConfigCache);
++
++            // Extract only the configuration and result for the current request
++            var localConfigCache = new ConfigCache();
++            localConfigCache.AddConfiguration(existingConfigCache[buildResult.ConfigurationId]);
++
++            var localResultCache = new ResultsCache();
++            // Filter the results with the requested targetNames
++            var result = new BuildResult(_requestEntry.Request, buildResult, targetNames, null);
++            localResultCache.AddResult(result);
++
++            var errorMessage = CacheSerialization.SerializeCaches(localConfigCache, localResultCache, _requestEntry.Request.OutputResultsCacheFile);
++            if (errorMessage != null)
++            {
++                _projectLoggingContext.LogErrorFromText(null, null, null, BuildEventFileInfo.Empty, errorMessage);
++            }
++        }
++
+         private sealed class DedicatedThreadsTaskScheduler : TaskScheduler
+         {
+             private readonly BlockingCollection<Task> _tasks = new BlockingCollection<Task>();
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index baa4c5b1a44..23a57ff8325 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -1655,7 +1655,9 @@ private void HandleRequestBlockedOnInProgressTarget(SchedulableRequest blockedRe
+         private void HandleRequestBlockedOnResultsTransfer(SchedulableRequest parentRequest, List<ScheduleResponse> responses)
+         {
+             // Create the new request which will go to the configuration's results node.
+-            BuildRequest newRequest = new BuildRequest(parentRequest.BuildRequest.SubmissionId, BuildRequest.ResultsTransferNodeRequestId, parentRequest.BuildRequest.ConfigurationId, Array.Empty<string>(), null, parentRequest.BuildRequest.BuildEventContext, parentRequest.BuildRequest, parentRequest.BuildRequest.BuildRequestDataFlags);
++            BuildRequest newRequest =
++                new BuildRequest(parentRequest.BuildRequest.SubmissionId, BuildRequest.ResultsTransferNodeRequestId, parentRequest.BuildRequest.ConfigurationId, Array.Empty<string>(), null, parentRequest.BuildRequest.BuildEventContext,
++                    parentRequest.BuildRequest, parentRequest.BuildRequest.BuildRequestDataFlags) { InputResultsCacheFiles = parentRequest.BuildRequest.InputResultsCacheFiles, OutputResultsCacheFile = parentRequest.BuildRequest.OutputResultsCacheFile, };
+ 
+             // Assign a new global request id - always different from any other.
+             newRequest.GlobalRequestId = _nextGlobalRequestId;
+diff --git a/src/Build/BackEnd/Shared/BuildRequest.cs b/src/Build/BackEnd/Shared/BuildRequest.cs
+index 2bde7843447..23bfbe2c7e6 100644
+--- a/src/Build/BackEnd/Shared/BuildRequest.cs
++++ b/src/Build/BackEnd/Shared/BuildRequest.cs
+@@ -348,6 +348,26 @@ public RequestedProjectState RequestedProjectState
+             set => _requestedProjectState = value;
+         }
+ 
++        /// <summary>
++        /// Input cache files that MSBuild will use to read build results from.
++        /// Setting this also turns on isolated builds.
++        /// </summary>
++        public string[] InputResultsCacheFiles
++        {
++            get => _inputResultsCacheFiles;
++            set => _inputResultsCacheFiles = value;
++        }
++
++        /// <summary>
++        /// Output cache file where MSBuild will write the contents of its build result caches during EndBuild.
++        /// Setting this also turns on isolated builds.
++        /// </summary>
++        public string OutputResultsCacheFile
++        {
++            get => _outputResultsCacheFile;
++            set => _outputResultsCacheFile = value;
++        }
++
+         /// <summary>
+         /// The route for host-aware tasks back to the host
+         /// </summary>
+@@ -359,6 +379,8 @@ internal HostServices HostServices
+         }
+ 
+         private HostServices _hostServices;
++        private string[] _inputResultsCacheFiles;
++        private string _outputResultsCacheFile;
+ 
+         /// <summary>
+         /// Returns true if this is a root request (one which has no parent.)
+@@ -406,6 +428,8 @@ public void Translate(ITranslator translator)
+             translator.Translate(ref _requestedProjectState);
+             translator.Translate(ref _hostServices);
+             translator.Translate(ref _proxyTargets, ProxyTargets.FactoryForDeserialization);
++            translator.Translate(ref _inputResultsCacheFiles);
++            translator.Translate(ref _outputResultsCacheFile);
+ 
+             // UNDONE: (Compat) Serialize the host object.
+         }
+diff --git a/src/Build/Graph/GraphBuildCacheFilePathDelegate.cs b/src/Build/Graph/GraphBuildCacheFilePathDelegate.cs
+new file mode 100644
+index 00000000000..c78a4a234b8
+--- /dev/null
++++ b/src/Build/Graph/GraphBuildCacheFilePathDelegate.cs
+@@ -0,0 +1,11 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Graph;
++
++/// <summary>
++/// A delegate that should return the filepath where associated cache file for a graph node is stored.
++/// </summary>
++/// <param name="graphNode">A graph node.</param>
++/// <returns>The filepath where associated cache file for a graph node is stored</returns>
++public delegate string GraphBuildCacheFilePathDelegate(ProjectGraphNode graphNode);
+diff --git a/src/Build/Graph/GraphBuildRequestData.cs b/src/Build/Graph/GraphBuildRequestData.cs
+index 0a1e008820b..e29f756462c 100644
+--- a/src/Build/Graph/GraphBuildRequestData.cs
++++ b/src/Build/Graph/GraphBuildRequestData.cs
+@@ -56,6 +56,34 @@ public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targ
+             ProjectGraph = projectGraph;
+         }
+ 
++        /// <summary>
++        /// Constructs a GraphBuildRequestData for build requests based on a project graph.
++        /// </summary>
++        /// <param name="projectGraph">The graph to build.</param>
++        /// <param name="targetsToBuild">The targets to build.</param>
++        /// <param name="hostServices">The host services to use, if any.  May be null.</param>
++        /// <param name="flags">Flags controlling this build request.</param>
++        /// <param name="startingNodes">The nodes to start visiting from.</param>
++        /// <param name="direction">The direction to compute the requested graph from the starting nodes.</param>
++        /// <param name="graphBuildCacheFilePathDelegate">The delegate to compute the cache filepath from a graph node.</param>
++        public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags, ICollection<ProjectGraphNode> startingNodes, ProjectGraphNodeDirection direction = ProjectGraphNodeDirection.Current, GraphBuildCacheFilePathDelegate graphBuildCacheFilePathDelegate = null)
++            : this(targetsToBuild, hostServices, flags)
++        {
++            ErrorUtilities.VerifyThrowArgumentNull(projectGraph, nameof(projectGraph));
++            ErrorUtilities.VerifyThrowArgumentNull(startingNodes, nameof(startingNodes));
++            StartingGraphNodes = new List<ProjectGraphNode>(startingNodes);
++            ProjectGraphNodeDirection = direction;
++            ProjectGraph = projectGraph;
++            GraphBuildCacheFilePath = graphBuildCacheFilePathDelegate;
++
++            // Verify that all nodes are part of the project graph
++            var allNodes = new HashSet<ProjectGraphNode>(projectGraph.ProjectNodes);
++            foreach (var startingGraphNode in StartingGraphNodes)
++            {
++                ErrorUtilities.VerifyThrowArgument(allNodes.Contains(startingGraphNode), $"The node {startingGraphNode.ProjectInstance.FullPath} is not part of the project graph");
++            }
++        }
++
+         /// <summary>
+         /// Constructs a GraphBuildRequestData for build requests based on project files.
+         /// </summary>
+@@ -209,5 +237,28 @@ private GraphBuildRequestData(ICollection<string> targetsToBuild, HostServices h
+         /// Gets the HostServices object for this request.
+         /// </summary>
+         public HostServices HostServices { get; }
++
++        /// <summary>
++        /// Gets the starting nodes used to visit the graph.
++        /// May be null.
++        /// </summary>
++        public ICollection<ProjectGraphNode> StartingGraphNodes { get; }
++
++        /// <summary>
++        /// Gets the starting nodes used to visit the graph.
++        /// May be null.
++        /// </summary>
++        public ProjectGraphNodeDirection ProjectGraphNodeDirection { get; }
++
++        /// <summary>
++        /// Gets the delegate to compute the cache filepath from a graph node.
++        /// May be null.
++        /// </summary>
++        public GraphBuildCacheFilePathDelegate GraphBuildCacheFilePath { get; }
++
++        /// <summary>
++        /// Gets a boolean indicating if this request requires isolate projects (if <see cref="GraphBuildCacheFilePath"/> is not null)
++        /// </summary>
++        public bool IsolateProjects => GraphBuildCacheFilePath != null;
+     }
+ }
+diff --git a/src/Build/Graph/ProjectGraphNodeDirection.cs b/src/Build/Graph/ProjectGraphNodeDirection.cs
+new file mode 100644
+index 00000000000..49e4efb602d
+--- /dev/null
++++ b/src/Build/Graph/ProjectGraphNodeDirection.cs
+@@ -0,0 +1,25 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Graph;
++
++/// <summary>
++/// Defines the direction to find nodes.
++/// </summary>
++public enum ProjectGraphNodeDirection
++{
++    /// <summary>
++    /// Return only the stating node.
++    /// </summary>
++    Current,
++
++    /// <summary>
++    /// Return all the nodes referenced transitively by the starting node.
++    /// </summary>
++    Down,
++
++    /// <summary>
++    /// Return all the nodes referencing transitively the starting node.
++    /// </summary>
++    Up,
++}
+diff --git a/src/Build/Graph/ProjectGraphVisitor.cs b/src/Build/Graph/ProjectGraphVisitor.cs
+new file mode 100644
+index 00000000000..a9e02d7b513
+--- /dev/null
++++ b/src/Build/Graph/ProjectGraphVisitor.cs
+@@ -0,0 +1,76 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Graph;
++
++/// <summary>
++/// This class helps to visit a graph of nodes.
++/// </summary>
++public class ProjectGraphVisitor
++{
++    private readonly HashSet<ProjectGraphNode> _cache;
++    private ProjectGraphNode _startingNode;
++    private ProjectGraphNodeDirection _direction;
++
++    /// <summary>
++    /// Create an instance of this class.
++    /// </summary>
++    public ProjectGraphVisitor()
++    {
++        _cache = new HashSet<ProjectGraphNode>();
++    }
++
++    /// <summary>
++    /// Find all the nodes with the specified direction.
++    /// </summary>
++    /// <param name="graphNode">The starting node from which to find other nodes.</param>
++    /// <param name="direction">The direction to search for nodes.</param>
++    /// <returns>An enumeration of nodes.</returns>
++    public IEnumerable<ProjectGraphNode> FindAll(ProjectGraphNode graphNode, ProjectGraphNodeDirection direction)
++    {
++        ErrorUtilities.VerifyThrowArgumentNull(graphNode, nameof(graphNode));
++
++        if (direction == ProjectGraphNodeDirection.Current)
++        {
++            yield return graphNode;
++            yield break;
++        }
++
++        _direction = direction;
++        _startingNode = graphNode;
++        try
++        {
++            foreach (var node in Find(graphNode))
++            {
++                yield return node;
++            }
++        }
++        finally
++        {
++            _cache.Clear();
++        }
++    }
++
++    private IEnumerable<ProjectGraphNode> Find(ProjectGraphNode graphNode)
++    {
++        if (!_cache.Add(graphNode)) yield break;
++
++        foreach (var node in _direction == ProjectGraphNodeDirection.Down ? graphNode.ProjectReferences : graphNode.ReferencingProjects)
++        {
++            foreach (var subnode in Find(node))
++            {
++                yield return subnode;
++            }
++        }
++
++        // Don't report the starting node
++        if (_startingNode != graphNode)
++        {
++            yield return graphNode;
++        }
++    }
++}
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 19c39093f3f..afcdb9be65c 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -149,6 +149,9 @@
+     <Compile Include="BackEnd\Components\SdkResolution\SdkResolverException.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+     <Compile Include="FileSystem\*.cs" />
++    <Compile Include="Graph\GraphBuildCacheFilePathDelegate.cs" />
++    <Compile Include="Graph\ProjectGraphNodeDirection.cs" />
++    <Compile Include="Graph\ProjectGraphVisitor.cs" />
+     <Compile Include="Utilities\ImmutableCollectionsExtensions.cs" />
+     <Compile Include="Utilities\NuGetFrameworkWrapper.cs" />
+     <Compile Include="ObjectModelRemoting\ConstructionObjectLinks\ProjectUsingTaskParameterElementLink.cs" />
+diff --git a/src/Build/PublicAPI/net/PublicAPI.Shipped.txt b/src/Build/PublicAPI/net/PublicAPI.Shipped.txt
+index 027d79e6239..81343548286 100644
+--- a/src/Build/PublicAPI/net/PublicAPI.Shipped.txt
++++ b/src/Build/PublicAPI/net/PublicAPI.Shipped.txt
+@@ -1047,6 +1047,10 @@ Microsoft.Build.Execution.BuildRequestData.ProjectInstance.get -> Microsoft.Buil
+ Microsoft.Build.Execution.BuildRequestData.PropertiesToTransfer.get -> System.Collections.Generic.IEnumerable<string>
+ Microsoft.Build.Execution.BuildRequestData.RequestedProjectState.get -> Microsoft.Build.Execution.RequestedProjectState
+ Microsoft.Build.Execution.BuildRequestData.TargetNames.get -> System.Collections.Generic.ICollection<string>
++Microsoft.Build.Execution.BuildRequestData.InputResultsCacheFiles.get -> string[]
++Microsoft.Build.Execution.BuildRequestData.InputResultsCacheFiles.set -> void
++Microsoft.Build.Execution.BuildRequestData.OutputResultsCacheFile.get -> string
++Microsoft.Build.Execution.BuildRequestData.OutputResultsCacheFile.set -> void
+ Microsoft.Build.Execution.BuildRequestDataFlags
+ Microsoft.Build.Execution.BuildRequestDataFlags.ClearCachesAfterBuild = 8 -> Microsoft.Build.Execution.BuildRequestDataFlags
+ Microsoft.Build.Execution.BuildRequestDataFlags.FailOnUnresolvedSdk = 128 -> Microsoft.Build.Execution.BuildRequestDataFlags
+@@ -1370,6 +1374,7 @@ Microsoft.Build.Globbing.MSBuildGlobWithGaps.IsMatch(string stringToMatch) -> bo
+ Microsoft.Build.Globbing.MSBuildGlobWithGaps.MainGlob.get -> Microsoft.Build.Globbing.IMSBuildGlob
+ Microsoft.Build.Globbing.MSBuildGlobWithGaps.MSBuildGlobWithGaps(Microsoft.Build.Globbing.IMSBuildGlob mainGlob, params Microsoft.Build.Globbing.IMSBuildGlob[] gaps) -> void
+ Microsoft.Build.Globbing.MSBuildGlobWithGaps.MSBuildGlobWithGaps(Microsoft.Build.Globbing.IMSBuildGlob mainGlob, System.Collections.Generic.IEnumerable<Microsoft.Build.Globbing.IMSBuildGlob> gaps) -> void
++Microsoft.Build.Graph.GraphBuildCacheFilePathDelegate
+ Microsoft.Build.Graph.GraphBuildOptions
+ Microsoft.Build.Graph.GraphBuildOptions.Build.get -> bool
+ Microsoft.Build.Graph.GraphBuildOptions.Build.init -> void
+@@ -1379,6 +1384,7 @@ Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildOptions.get -> Microsoft.B
+ Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildRequestData(Microsoft.Build.Graph.ProjectGraph projectGraph, System.Collections.Generic.ICollection<string> targetsToBuild) -> void
+ Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildRequestData(Microsoft.Build.Graph.ProjectGraph projectGraph, System.Collections.Generic.ICollection<string> targetsToBuild, Microsoft.Build.Execution.HostServices hostServices) -> void
+ Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildRequestData(Microsoft.Build.Graph.ProjectGraph projectGraph, System.Collections.Generic.ICollection<string> targetsToBuild, Microsoft.Build.Execution.HostServices hostServices, Microsoft.Build.Execution.BuildRequestDataFlags flags) -> void
++Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildRequestData(Microsoft.Build.Graph.ProjectGraph projectGraph, System.Collections.Generic.ICollection<string> targetsToBuild, Microsoft.Build.Execution.HostServices hostServices, Microsoft.Build.Execution.BuildRequestDataFlags flags, System.Collections.Generic.ICollection<Microsoft.Build.Graph.ProjectGraphNode> startingNodes, Microsoft.Build.Graph.ProjectGraphNodeDirection direction = Microsoft.Build.Graph.ProjectGraphNodeDirection.Current, Microsoft.Build.Graph.GraphBuildCacheFilePathDelegate graphBuildCacheFilePathDelegate = null) -> void
+ Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildRequestData(Microsoft.Build.Graph.ProjectGraphEntryPoint projectGraphEntryPoint, System.Collections.Generic.ICollection<string> targetsToBuild) -> void
+ Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildRequestData(Microsoft.Build.Graph.ProjectGraphEntryPoint projectGraphEntryPoint, System.Collections.Generic.ICollection<string> targetsToBuild, Microsoft.Build.Execution.HostServices hostServices) -> void
+ Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildRequestData(Microsoft.Build.Graph.ProjectGraphEntryPoint projectGraphEntryPoint, System.Collections.Generic.ICollection<string> targetsToBuild, Microsoft.Build.Execution.HostServices hostServices, Microsoft.Build.Execution.BuildRequestDataFlags flags) -> void
+@@ -1392,6 +1398,10 @@ Microsoft.Build.Graph.GraphBuildRequestData.HostServices.get -> Microsoft.Build.
+ Microsoft.Build.Graph.GraphBuildRequestData.ProjectGraph.get -> Microsoft.Build.Graph.ProjectGraph
+ Microsoft.Build.Graph.GraphBuildRequestData.ProjectGraphEntryPoints.get -> System.Collections.Generic.IEnumerable<Microsoft.Build.Graph.ProjectGraphEntryPoint>
+ Microsoft.Build.Graph.GraphBuildRequestData.TargetNames.get -> System.Collections.Generic.ICollection<string>
++Microsoft.Build.Graph.GraphBuildRequestData.StartingGraphNodes.get -> System.Collections.Generic.ICollection<Microsoft.Build.Graph.ProjectGraphNode>
++Microsoft.Build.Graph.GraphBuildRequestData.ProjectGraphNodeDirection.get -> Microsoft.Build.Graph.ProjectGraphNodeDirection
++Microsoft.Build.Graph.GraphBuildRequestData.GraphBuildCacheFilePath.get -> Microsoft.Build.Graph.GraphBuildCacheFilePathDelegate
++Microsoft.Build.Graph.GraphBuildRequestData.IsolateProjects.get -> bool
+ Microsoft.Build.Graph.GraphBuildResult
+ Microsoft.Build.Graph.GraphBuildResult.CircularDependency.get -> bool
+ Microsoft.Build.Graph.GraphBuildResult.Exception.get -> System.Exception
+@@ -1448,6 +1458,13 @@ Microsoft.Build.Graph.ProjectGraphNode
+ Microsoft.Build.Graph.ProjectGraphNode.ProjectInstance.get -> Microsoft.Build.Execution.ProjectInstance
+ Microsoft.Build.Graph.ProjectGraphNode.ProjectReferences.get -> System.Collections.Generic.IReadOnlyCollection<Microsoft.Build.Graph.ProjectGraphNode>
+ Microsoft.Build.Graph.ProjectGraphNode.ReferencingProjects.get -> System.Collections.Generic.IReadOnlyCollection<Microsoft.Build.Graph.ProjectGraphNode>
++Microsoft.Build.Graph.ProjectGraphVisitor
++Microsoft.Build.Graph.ProjectGraphVisitor.ProjectGraphVisitor() -> void
++Microsoft.Build.Graph.ProjectGraphVisitor.FindAll(Microsoft.Build.Graph.ProjectGraphNode graphNode, Microsoft.Build.Graph.ProjectGraphNodeDirection direction) -> System.Collections.Generic.IEnumerable<Microsoft.Build.Graph.ProjectGraphNode>
++Microsoft.Build.Graph.ProjectGraphNodeDirection
++Microsoft.Build.Graph.ProjectGraphNodeDirection.Current = 0 -> Microsoft.Build.Graph.ProjectGraphNodeDirection
++Microsoft.Build.Graph.ProjectGraphNodeDirection.Down = 1 -> Microsoft.Build.Graph.ProjectGraphNodeDirection
++Microsoft.Build.Graph.ProjectGraphNodeDirection.Up = 2 -> Microsoft.Build.Graph.ProjectGraphNodeDirection
+ Microsoft.Build.Logging.BinaryLogger
+ Microsoft.Build.Logging.BinaryLogger.BinaryLogger() -> void
+ Microsoft.Build.Logging.BinaryLogger.CollectProjectImports.get -> Microsoft.Build.Logging.BinaryLogger.ProjectImportsCollectionMode
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index db27d0712c8..852cf036e36 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -142,6 +142,9 @@
+   <data name="WaitingForEndOfBuild" xml:space="preserve">
+     <value>The operation cannot be completed because EndBuild has already been called but existing submissions have not yet completed.</value>
+   </data>
++  <data name="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters" xml:space="preserve">
++    <value>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</value>
++  </data>
+   <data name="SubmissionAlreadyComplete" xml:space="preserve">
+     <value>The operation cannot be completed because the submission has already been executed.</value>
+   </data>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index bdf7ebe0340..7f252ba2cc2 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: Následující vstupní soubory mezipaměti pro výsledky neexistují: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">Řetězec verze nemá správný formát.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 189016ff8b6..275bea81771 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: Die folgenden Cachedateien für Eingabeergebnisse sind nicht vorhanden: "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">Die Versionszeichenfolge liegt nicht im richtigen Format vor.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 01daa41d62b..95980035bf7 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: Los siguientes archivos de caché de resultados de entrada no existen: "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">La cadena de versión no tenía el formato correcto.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 84593fc74d6..4b019b7fcf7 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: Les fichiers cache des résultats d'entrée suivants n'existent pas : "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">La chaîne de version n'était pas au format approprié.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index a3c2a92531e..1147d925564 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: i file della cache dei risultati di input seguenti non esistono: "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">Il formato della stringa di versione non è corretto.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 66e3a864ded..2e8d6e7d868 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: 以下の入力結果キャッシュ ファイルが存在しません: "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">バージョン文字列の形式が正しくありません。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index a7d18597b51..552287c6531 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: 다음 입력 결과 캐시 파일이 존재하지 않습니다. "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">버전 문자열의 형식이 잘못되었습니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 7430b42c9b1..ae7e13dde02 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: Następujące pliki wejściowej pamięci podręcznej wyników nie istnieją: „{0}”</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">Nieprawidłowy format ciągu wersji.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 511d8aa41d5..e5aafda3ad4 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: os arquivos de cache do resultado de entrada a seguir não existem: "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">A cadeia de caracteres de versão não estava em um formato correto.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index f19945c2240..0f4badaeea0 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: следующие входные файлы кэша результатов не существуют: "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">Строка версии имела неверный формат.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 6ba8540f344..1498e52abd6 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: Şu giriş sonucu önbellek dosyaları mevcut değil: "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">Sürüm dizesi doğru biçimde değildi.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index bed465c1a19..accc2e39ea9 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: 以下输入结果缓存文件不存在:“{0}”</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">版本字符串的格式不正确。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index fa8a07b3ae3..ec4dae378dd 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -122,6 +122,11 @@
+         <target state="translated">MSB4255: 下列輸入結果快取檔案不存在: "{0}"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="InvalidIsolateBetweenGraphBuildRequestDataAndBuildParameters">
++        <source>The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</source>
++        <target state="new">The operation cannot be completed because IsolateProjects is different between BuildParameters ({0}) and the GraphBuildRequestData ({1}).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="InvalidVersionFormat">
+         <source>Version string was not in a correct format.</source>
+         <target state="translated">版本字串格式不正確。</target>

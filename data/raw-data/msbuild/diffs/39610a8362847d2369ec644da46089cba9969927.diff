@@ -1,0 +1,1600 @@
+diff --git a/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs b/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
+index c994283bdbe..0e97f31437c 100644
+--- a/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
++++ b/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
+@@ -843,7 +843,7 @@ private void AssertBuildResultForCacheHit(
+             // If it's not a cache result by proxy targets then the cache constructed the target results by hand and only the real target result
+             // exists in the BuildResult.
+ 
+-            var targetResult = buildResult.ResultsByTarget["Build"];
++            var targetResult = buildResult.ResultsByTarget!["Build"];
+ 
+             targetResult.Items.ShouldHaveSingleItem();
+             var itemResult = targetResult.Items.First();
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 99acd7b5ac8..e133037726e 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -922,7 +922,7 @@ public GraphBuildSubmission PendBuildRequest(GraphBuildRequestData requestData)
+                 {
+                     // Project graph can have multiple entry points, for purposes of identifying event for same build project,
+                     // we believe that including only one entry point will provide enough precision.
+-                    _buildTelemetry.Project ??= requestData.ProjectGraphEntryPoints?.FirstOrDefault().ProjectFile;
++                    _buildTelemetry.Project ??= requestData.EntryProjectsFullPath.FirstOrDefault();
+                     _buildTelemetry.Target ??= string.Join(",", requestData.TargetNames);
+                 }
+ 
+@@ -1394,6 +1394,22 @@ private void IssueCacheRequestForBuildSubmission(CacheRequest cacheRequest)
+             });
+         }
+ 
++        internal void ExecuteSubmission<TRequestData, TResultData>(
++            BuildSubmission<TRequestData, TResultData> submission, bool allowMainThreadBuild)
++            where TRequestData : BuildRequestDataBase
++            where TResultData : BuildResultBase
++        {
++            // TODO - unify the behavior in BuildManager as well
++            if (submission is BuildSubmission buildSubmission)
++            {
++                ExecuteSubmission(buildSubmission, allowMainThreadBuild);
++            }
++            else if (submission is GraphBuildSubmission graphBuildSubmission)
++            {
++                ExecuteSubmission(graphBuildSubmission);
++            }
++        }
++
+         /// <summary>
+         /// This method adds the graph build request in the specified submission to the set of requests being handled by the scheduler.
+         /// </summary>
+@@ -2011,7 +2027,7 @@ private Dictionary<ProjectGraphNode, BuildResult> BuildGraph(
+ 
+             var blockedNodes = new HashSet<ProjectGraphNode>(projectGraph.ProjectNodes);
+             var finishedNodes = new HashSet<ProjectGraphNode>(projectGraph.ProjectNodes.Count);
+-            var buildingNodes = new Dictionary<BuildSubmission, ProjectGraphNode>();
++            var buildingNodes = new Dictionary<BuildSubmissionBase, ProjectGraphNode>();
+             var resultsPerNode = new Dictionary<ProjectGraphNode, BuildResult>(projectGraph.ProjectNodes.Count);
+             ExceptionDispatchInfo submissionException = null;
+ 
+diff --git a/src/Build/BackEnd/BuildManager/BuildRequestData.cs b/src/Build/BackEnd/BuildManager/BuildRequestData.cs
+index b8ae83411b2..5dd3ea6dc2f 100644
+--- a/src/Build/BackEnd/BuildManager/BuildRequestData.cs
++++ b/src/Build/BackEnd/BuildManager/BuildRequestData.cs
+@@ -2,13 +2,15 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
++using System.Collections;
+ using System.Collections.Generic;
++using System.Collections.Immutable;
++using System.Linq;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation;
++using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Shared;
+ 
+-#nullable disable
+-
+ namespace Microsoft.Build.Execution
+ {
+     /// <summary>
+@@ -89,7 +91,7 @@ public enum BuildRequestDataFlags
+     /// <summary>
+     /// BuildRequestData encapsulates all of the data needed to submit a build request.
+     /// </summary>
+-    public class BuildRequestData
++    public sealed class BuildRequestData : BuildRequestDataBase
+     {
+         /// <summary>
+         /// Constructs a BuildRequestData for build requests based on project instances.
+@@ -119,7 +121,7 @@ public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use, if any.  May be null.</param>
+         /// <param name="flags">Flags controlling this build request.</param>
+-        public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags)
++        public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags)
+             : this(projectInstance, targetsToBuild, hostServices, flags, null)
+         {
+         }
+@@ -132,8 +134,8 @@ public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild
+         /// <param name="hostServices">The host services to use, if any.  May be null.</param>
+         /// <param name="flags">Flags controlling this build request.</param>
+         /// <param name="propertiesToTransfer">The list of properties whose values should be transferred from the project to any out-of-proc node.</param>
+-        public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags, IEnumerable<string> propertiesToTransfer)
+-            : this(targetsToBuild, hostServices, flags)
++        public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags, IEnumerable<string>? propertiesToTransfer)
++            : this(targetsToBuild, hostServices, flags, projectInstance.FullPath)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(projectInstance, nameof(projectInstance));
+ 
+@@ -144,7 +146,6 @@ public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild
+ 
+             ProjectInstance = projectInstance;
+ 
+-            ProjectFullPath = projectInstance.FullPath;
+             GlobalPropertiesDictionary = projectInstance.GlobalPropertiesDictionary;
+             ExplicitlySpecifiedToolsVersion = projectInstance.ExplicitToolsVersion;
+             if (propertiesToTransfer != null)
+@@ -162,7 +163,7 @@ public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild
+         /// <param name="flags">Flags controlling this build request.</param>
+         /// <param name="propertiesToTransfer">The list of properties whose values should be transferred from the project to any out-of-proc node.</param>
+         /// <param name="requestedProjectState">A <see cref="Execution.RequestedProjectState"/> describing properties, items, and metadata that should be returned. Requires setting <see cref="BuildRequestDataFlags.ProvideSubsetOfStateAfterBuild"/>.</param>
+-        public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags, IEnumerable<string> propertiesToTransfer, RequestedProjectState requestedProjectState)
++        public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags, IEnumerable<string>? propertiesToTransfer, RequestedProjectState requestedProjectState)
+             : this(projectInstance, targetsToBuild, hostServices, flags, propertiesToTransfer)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(requestedProjectState, nameof(requestedProjectState));
+@@ -179,7 +180,7 @@ public BuildRequestData(ProjectInstance projectInstance, string[] targetsToBuild
+         /// <param name="toolsVersion">The tools version to use for the build.  May be null.</param>
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use.  May be null.</param>
+-        public BuildRequestData(string projectFullPath, IDictionary<string, string> globalProperties, string toolsVersion, string[] targetsToBuild, HostServices hostServices)
++        public BuildRequestData(string projectFullPath, IDictionary<string, string?> globalProperties, string? toolsVersion, string[] targetsToBuild, HostServices? hostServices)
+             : this(projectFullPath, globalProperties, toolsVersion, targetsToBuild, hostServices, BuildRequestDataFlags.None)
+         {
+         }
+@@ -194,8 +195,8 @@ public BuildRequestData(string projectFullPath, IDictionary<string, string> glob
+         /// <param name="hostServices">The host services to use.  May be null.</param>
+         /// <param name="flags">The <see cref="BuildRequestDataFlags"/> to use.</param>
+         /// <param name="requestedProjectState">A <see cref="Execution.RequestedProjectState"/> describing properties, items, and metadata that should be returned. Requires setting <see cref="BuildRequestDataFlags.ProvideSubsetOfStateAfterBuild"/>.</param>
+-        public BuildRequestData(string projectFullPath, IDictionary<string, string> globalProperties,
+-            string toolsVersion, string[] targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags,
++        public BuildRequestData(string projectFullPath, IDictionary<string, string?> globalProperties,
++            string? toolsVersion, string[] targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags,
+             RequestedProjectState requestedProjectState)
+             : this(projectFullPath, globalProperties, toolsVersion, targetsToBuild, hostServices, flags)
+         {
+@@ -213,15 +214,14 @@ public BuildRequestData(string projectFullPath, IDictionary<string, string> glob
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use.  May be null.</param>
+         /// <param name="flags">The <see cref="BuildRequestDataFlags"/> to use.</param>
+-        public BuildRequestData(string projectFullPath, IDictionary<string, string> globalProperties, string toolsVersion, string[] targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags)
+-            : this(targetsToBuild, hostServices, flags)
++        public BuildRequestData(string projectFullPath, IDictionary<string, string?> globalProperties, string? toolsVersion, string[] targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags)
++            : this(targetsToBuild, hostServices, flags, FileUtilities.NormalizePath(projectFullPath)!)
+         {
+             ErrorUtilities.VerifyThrowArgumentLength(projectFullPath, nameof(projectFullPath));
+             ErrorUtilities.VerifyThrowArgumentNull(globalProperties, nameof(globalProperties));
+ 
+-            ProjectFullPath = FileUtilities.NormalizePath(projectFullPath);
+             GlobalPropertiesDictionary = new PropertyDictionary<ProjectPropertyInstance>(globalProperties.Count);
+-            foreach (KeyValuePair<string, string> propertyPair in globalProperties)
++            foreach (KeyValuePair<string, string?> propertyPair in globalProperties)
+             {
+                 GlobalPropertiesDictionary.Set(ProjectPropertyInstance.Create(propertyPair.Key, propertyPair.Value));
+             }
+@@ -232,13 +232,10 @@ public BuildRequestData(string projectFullPath, IDictionary<string, string> glob
+         /// <summary>
+         /// Common constructor.
+         /// </summary>
+-        private BuildRequestData(string[] targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags)
++        private BuildRequestData(string[] targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags, string projectFullPath)
++            : base(targetsToBuild, flags, hostServices)
+         {
+-            ErrorUtilities.VerifyThrowArgumentNull(targetsToBuild, nameof(targetsToBuild));
+-
+-            HostServices = hostServices;
+-            TargetNames = new List<string>(targetsToBuild);
+-            Flags = flags;
++            ProjectFullPath = projectFullPath;
+         }
+ 
+         /// <summary>
+@@ -246,7 +243,7 @@ private BuildRequestData(string[] targetsToBuild, HostServices hostServices, Bui
+         /// May be null.
+         /// </summary>
+         /// <value>The project instance.</value>
+-        public ProjectInstance ProjectInstance
++        public ProjectInstance? ProjectInstance
+         {
+             get;
+         }
+@@ -255,16 +252,7 @@ public ProjectInstance ProjectInstance
+         /// <value>The project file to be built.</value>
+         public string ProjectFullPath { get; internal set; }
+ 
+-        /// <summary>
+-        /// The name of the targets to build.
+-        /// </summary>
+-        /// <value>An array of targets in the project to be built.</value>
+-        public ICollection<string> TargetNames { get; }
+-
+-        /// <summary>
+-        /// Extra flags for this BuildRequest.
+-        /// </summary>
+-        public BuildRequestDataFlags Flags { get; }
++        public override IEnumerable<string> EntryProjectsFullPath => ProjectFullPath.AsSingleItemEnumerable();
+ 
+         /// <summary>
+         /// The global properties to use.
+@@ -274,26 +262,23 @@ public ProjectInstance ProjectInstance
+             (ICollection<ProjectPropertyInstance>)ReadOnlyEmptyCollection<ProjectPropertyInstance>.Instance :
+             new ReadOnlyCollection<ProjectPropertyInstance>(GlobalPropertiesDictionary);
+ 
+-        /// <summary>
+-        /// The explicitly requested tools version to use.
+-        /// </summary>
+-        public string ExplicitlySpecifiedToolsVersion { get; }
++        public override bool IsGraphRequest => false;
+ 
+         /// <summary>
+-        /// Gets the HostServices object for this request.
++        /// The explicitly requested tools version to use.
+         /// </summary>
+-        public HostServices HostServices { get; }
++        public string? ExplicitlySpecifiedToolsVersion { get; }
+ 
+         /// <summary>
+         /// Returns a list of properties to transfer out of proc for the build.
+         /// </summary>
+-        public IEnumerable<string> PropertiesToTransfer { get; }
++        public IEnumerable<string>? PropertiesToTransfer { get; }
+ 
+         /// <summary>
+         /// Returns the properties, items, and metadata that will be returned
+         /// by this build.
+         /// </summary>
+-        public RequestedProjectState RequestedProjectState { get; }
++        public RequestedProjectState? RequestedProjectState { get; }
+ 
+         /// <summary>
+         /// Whether the tools version used originated from an explicit specification,
+@@ -304,6 +289,12 @@ public ProjectInstance ProjectInstance
+         /// <summary>
+         /// Returns the global properties as a dictionary.
+         /// </summary>
+-        internal PropertyDictionary<ProjectPropertyInstance> GlobalPropertiesDictionary { get; }
++        internal PropertyDictionary<ProjectPropertyInstance>? GlobalPropertiesDictionary { get; }
++
++        private IReadOnlyDictionary<string, string?>? _globalPropertiesLookup;
++
++        /// <inheritdoc cref="BuildRequestDataBase"/>
++        public override IReadOnlyDictionary<string, string?> GlobalPropertiesLookup => _globalPropertiesLookup ??=
++            Execution.GlobalPropertiesLookup.ToGlobalPropertiesLookup(GlobalPropertiesDictionary);
+     }
+ }
+diff --git a/src/Build/BackEnd/BuildManager/BuildRequestDataBase.cs b/src/Build/BackEnd/BuildManager/BuildRequestDataBase.cs
+new file mode 100644
+index 00000000000..c10a49b6fa4
+--- /dev/null
++++ b/src/Build/BackEnd/BuildManager/BuildRequestDataBase.cs
+@@ -0,0 +1,52 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System.Collections.Generic;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Execution
++{
++    public abstract class BuildRequestDataBase
++    {
++        protected BuildRequestDataBase(
++            ICollection<string> targetNames,
++            BuildRequestDataFlags flags,
++            HostServices? hostServices)
++        {
++            ErrorUtilities.VerifyThrowArgumentNull(targetNames, nameof(targetNames));
++            foreach (string targetName in targetNames)
++            {
++                ErrorUtilities.VerifyThrowArgumentNull(targetName, "target");
++            }
++
++            TargetNames = new List<string>(targetNames);
++            Flags = flags;
++            HostServices = hostServices;
++        }
++
++        public abstract IEnumerable<string> EntryProjectsFullPath { get; }
++
++        /// <summary>
++        /// The name of the targets to build.
++        /// </summary>
++        /// <value>An array of targets in the project to be built.</value>
++        public ICollection<string> TargetNames { get; protected set; }
++
++        /// <summary>
++        /// Extra flags for this BuildRequest.
++        /// </summary>
++        public BuildRequestDataFlags Flags { get; protected set; }
++
++        /// <summary>
++        /// Gets the global properties to use for this entry point.
++        /// </summary>
++        public abstract IReadOnlyDictionary<string, string?> GlobalPropertiesLookup { get; }
++
++        public abstract bool IsGraphRequest { get; }
++
++        /// <summary>
++        /// Gets the HostServices object for this request.
++        /// </summary>
++        public HostServices? HostServices { get; }
++    }
++}
+diff --git a/src/Build/BackEnd/BuildManager/BuildSubmission.cs b/src/Build/BackEnd/BuildManager/BuildSubmission.cs
+index ca2147dfae2..63764af82ba 100644
+--- a/src/Build/BackEnd/BuildManager/BuildSubmission.cs
++++ b/src/Build/BackEnd/BuildManager/BuildSubmission.cs
+@@ -5,6 +5,7 @@
+ using System.Globalization;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
++using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+ #nullable disable
+@@ -17,21 +18,21 @@ namespace Microsoft.Build.Execution
+     /// <remarks>
+     /// When this delegate is invoked, the WaitHandle on the BuildSubmission will have been be signalled and the OverallBuildResult will be valid.
+     /// </remarks>
+-    public delegate void BuildSubmissionCompleteCallback(BuildSubmission submission);
++    public delegate void BuildSubmissionCompleteCallback<TRequestData, TResultData>(
++        BuildSubmission<TRequestData, TResultData> submission)
++        where TRequestData : BuildRequestDataBase
++        where TResultData : BuildResultBase;
+ 
+-    /// <summary>
+-    /// A BuildSubmission represents an build request which has been submitted to the BuildManager for processing.  It may be used to
+-    /// execute synchronous or asynchronous build requests and provides access to the results upon completion.
+-    /// </summary>
+-    /// <remarks>
+-    /// This class is thread-safe.
+-    /// </remarks>
+-    public class BuildSubmission
++    public abstract class BuildSubmissionBase { }
++
++    public abstract class BuildSubmission<TRequestData, TResultData> : BuildSubmissionBase
++        where TRequestData : BuildRequestDataBase
++        where TResultData : BuildResultBase
+     {
+         /// <summary>
+         /// The callback to invoke when the submission is complete.
+         /// </summary>
+-        private BuildSubmissionCompleteCallback _completionCallback;
++        private BuildSubmissionCompleteCallback<TRequestData, TResultData> _completionCallback;
+ 
+         /// <summary>
+         /// The completion event.
+@@ -48,15 +49,10 @@ public class BuildSubmission
+         /// </summary>
+         private int _completionInvoked;
+ 
+-        /// <summary>
+-        /// Flag indicating whether synchronous wait should support legacy threading semantics.
+-        /// </summary>
+-        private readonly bool _legacyThreadingSemantics;
+-
+         /// <summary>
+         /// Constructor
+         /// </summary>
+-        internal BuildSubmission(BuildManager buildManager, int submissionId, BuildRequestData requestData, bool legacyThreadingSemantics)
++        internal protected BuildSubmission(BuildManager buildManager, int submissionId, TRequestData requestData)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(buildManager, nameof(buildManager));
+             ErrorUtilities.VerifyThrowArgumentNull(requestData, nameof(requestData));
+@@ -67,7 +63,6 @@ internal BuildSubmission(BuildManager buildManager, int submissionId, BuildReque
+             _completionEvent = new ManualResetEvent(false);
+             LoggingCompleted = false;
+             _completionInvoked = 0;
+-            _legacyThreadingSemantics = legacyThreadingSemantics;
+         }
+ 
+         /// <summary>
+@@ -81,12 +76,12 @@ internal BuildSubmission(BuildManager buildManager, int submissionId, BuildReque
+         public int SubmissionId { get; }
+ 
+         /// <summary>
+-        /// The asynchronous context provided to <see cref="BuildSubmission.ExecuteAsync(BuildSubmissionCompleteCallback, object)"/>, if any.
++        /// The asynchronous context provided to <see cref="BuildSubmission{TRequestData,TResultData}.ExecuteAsync(BuildSubmissionCompleteCallback, object)"/>, if any.
+         /// </summary>
+         public Object AsyncContext { get; private set; }
+ 
+         /// <summary>
+-        /// A <see cref="System.Threading.WaitHandle"/> which will be signalled when the build is complete.  Valid after <see cref="BuildSubmission.Execute()"/> or <see cref="BuildSubmission.ExecuteAsync(BuildSubmissionCompleteCallback, object)"/> returns, otherwise null.
++        /// A <see cref="System.Threading.WaitHandle"/> which will be signalled when the build is complete.  Valid after <see cref="BuildSubmission{TRequestData,TResultData}.Execute()"/> or <see cref="BuildSubmission{TRequestData,TResultData}.ExecuteAsync(BuildSubmissionCompleteCallback, object)"/> returns, otherwise null.
+         /// </summary>
+         public WaitHandle WaitHandle => _completionEvent;
+ 
+@@ -96,72 +91,44 @@ internal BuildSubmission(BuildManager buildManager, int submissionId, BuildReque
+         public bool IsCompleted => WaitHandle.WaitOne(new TimeSpan(0));
+ 
+         /// <summary>
+-        /// The result of the build.  Valid only after WaitHandle has become signalled.
++        /// The results of the build per graph node.  Valid only after WaitHandle has become signalled.
+         /// </summary>
+-        public BuildResult BuildResult { get; set; }
++        public TResultData BuildResult { get; internal set; }
+ 
+         /// <summary>
+         /// The BuildRequestData being used for this submission.
+         /// </summary>
+-        internal BuildRequestData BuildRequestData { get; }
++        internal TRequestData BuildRequestData { get; }
+ 
+         /// <summary>
+-        /// The build request for execution.
++        /// Whether the graph build has started.
+         /// </summary>
+-        internal BuildRequest BuildRequest { get; set; }
++        internal bool IsStarted { get; set; }
+ 
+         /// <summary>
+         /// Starts the request and blocks until results are available.
+         /// </summary>
+         /// <exception cref="System.InvalidOperationException">The request has already been started or is already complete.</exception>
+-        public BuildResult Execute()
+-        {
+-            LegacyThreadingData legacyThreadingData = ((IBuildComponentHost)BuildManager).LegacyThreadingData;
+-            legacyThreadingData.RegisterSubmissionForLegacyThread(SubmissionId);
+-
+-            ExecuteAsync(null, null, _legacyThreadingSemantics);
+-            if (_legacyThreadingSemantics)
+-            {
+-                RequestBuilder.WaitWithBuilderThreadStart(new[] { WaitHandle }, false, legacyThreadingData, SubmissionId);
+-            }
+-            else
+-            {
+-                WaitHandle.WaitOne();
+-            }
+-
+-            legacyThreadingData.UnregisterSubmissionForLegacyThread(SubmissionId);
+-
+-            return BuildResult;
+-        }
++        public abstract TResultData Execute();
+ 
+         /// <summary>
+         /// Starts the request asynchronously and immediately returns control to the caller.
+         /// </summary>
+         /// <exception cref="System.InvalidOperationException">The request has already been started or is already complete.</exception>
+-        public void ExecuteAsync(BuildSubmissionCompleteCallback callback, object context)
++        public void ExecuteAsync(BuildSubmissionCompleteCallback<TRequestData, TResultData> callback, object context)
+         {
+-            ExecuteAsync(callback, context, false);
++            ExecuteAsync(callback, context, allowMainThreadBuild: false);
+         }
+ 
+-        /// <summary>
+-        /// Sets the event signaling that the build is complete.
+-        /// </summary>
+-        internal void CompleteResults(BuildResult result)
++        protected void ExecuteAsync(
++            BuildSubmissionCompleteCallback<TRequestData, TResultData> callback,
++            object context,
++            bool allowMainThreadBuild)
+         {
+-            ErrorUtilities.VerifyThrowArgumentNull(result, nameof(result));
+-
+-            // We verify that we got results from the same configuration, but not necessarily the same request, because we are
+-            // rather flexible in how users are allowed to submit multiple requests for the same configuration.  In this case, the
+-            // request id of the result will match the first request, even though it will contain results for all requests (including
+-            // this one.)
+-            ErrorUtilities.VerifyThrow(result.ConfigurationId == BuildRequest.ConfigurationId, "BuildResult doesn't match BuildRequest configuration");
+-
+-            if (BuildResult == null)
+-            {
+-                BuildResult = result;
+-            }
+-
+-            CheckForCompletion();
++            ErrorUtilities.VerifyThrowInvalidOperation(!IsCompleted, "SubmissionAlreadyComplete");
++            _completionCallback = callback;
++            AsyncContext = context;
++            BuildManager.ExecuteSubmission(this, allowMainThreadBuild);
+         }
+ 
+         /// <summary>
+@@ -174,17 +141,21 @@ internal void CompleteLogging()
+         }
+ 
+         /// <summary>
+-        /// Starts the request asynchronously and immediately returns control to the caller.
++        /// Sets the event signaling that the build is complete.
+         /// </summary>
+-        /// <exception cref="System.InvalidOperationException">The request has already been started or is already complete.</exception>
+-        private void ExecuteAsync(BuildSubmissionCompleteCallback callback, object context, bool allowMainThreadBuild)
++        internal void CompleteResults(TResultData result)
+         {
+-            ErrorUtilities.VerifyThrowInvalidOperation(!IsCompleted, "SubmissionAlreadyComplete");
+-            _completionCallback = callback;
+-            AsyncContext = context;
+-            BuildManager.ExecuteSubmission(this, allowMainThreadBuild);
++            ErrorUtilities.VerifyThrowArgumentNull(result, nameof(result));
++            ErrorUtilities.VerifyThrow(result.SubmissionId == SubmissionId,
++                "GraphBuildResult's submission id doesn't match GraphBuildSubmission's");
++
++            BuildResult ??= result;
++
++            CheckForCompletion();
+         }
+ 
++        protected internal virtual void OnCompletition() { }
++
+         /// <summary>
+         /// Determines if we are completely done with this submission and can complete it so the user may access results.
+         /// </summary>
+@@ -195,12 +166,13 @@ private void CheckForCompletion()
+                 bool hasCompleted = (Interlocked.Exchange(ref _completionInvoked, 1) == 1);
+                 if (!hasCompleted)
+                 {
+-                    // Did this submission have warnings elevated to errors? If so, mark it as
+-                    // failed even though it succeeded (with warnings--but they're errors).
+-                    if (((IBuildComponentHost)BuildManager).LoggingService.HasBuildSubmissionLoggedErrors(BuildResult.SubmissionId))
+-                    {
+-                        BuildResult.SetOverallResult(overallResult: false);
+-                    }
++                    OnCompletition();
++                    ////// Did this submission have warnings elevated to errors? If so, mark it as
++                    ////// failed even though it succeeded (with warnings--but they're errors).
++                    ////if (((IBuildComponentHost)BuildManager).LoggingService.HasBuildSubmissionLoggedErrors(BuildResult.SubmissionId))
++                    ////{
++                    ////    BuildResult.SetOverallResult(overallResult: false);
++                    ////}
+ 
+                     _completionEvent.Set();
+ 
+@@ -217,4 +189,72 @@ void Callback(object state)
+             }
+         }
+     }
++
++
++    /// <summary>
++    /// A callback used to receive notification that a build has completed.
++    /// </summary>
++    /// <remarks>
++    /// When this delegate is invoked, the WaitHandle on the BuildSubmission will have been be signalled and the OverallBuildResult will be valid.
++    /// </remarks>
++    public delegate void BuildSubmissionCompleteCallback(BuildSubmission submission);
++
++    public sealed class BuildSubmission : BuildSubmission<BuildRequestData, BuildResult>
++    {
++        /// <summary>
++        /// Flag indicating whether synchronous wait should support legacy threading semantics.
++        /// </summary>
++        private readonly bool _legacyThreadingSemantics;
++
++        /// <summary>
++        /// The build request for execution.
++        /// </summary>
++        internal BuildRequest BuildRequest { get; set; }
++
++        internal BuildSubmission(BuildManager buildManager, int submissionId, BuildRequestData requestData, bool legacyThreadingSemantics)
++            : base(buildManager, submissionId, requestData)
++        {
++            _legacyThreadingSemantics = legacyThreadingSemantics;
++        }
++
++        /// <summary>
++        /// Starts the request and blocks until results are available.
++        /// </summary>
++        /// <exception cref="System.InvalidOperationException">The request has already been started or is already complete.</exception>
++        public override BuildResult Execute()
++        {
++            // TODO: here
++            // ((IBuildComponentHost)BuildManager).LoggingService.LogBuildEvent()
++            // BuildEventContext buildEventContext = new BuildEventContext(this.SubmissionId, 1, BuildEventContext.InvalidProjectInstanceId, BuildEventContext.InvalidProjectContextId, BuildEventContext.InvalidTargetId, BuildEventContext.InvalidTaskId);
++
++            // async as well !!
++
++            LegacyThreadingData legacyThreadingData = ((IBuildComponentHost)BuildManager).LegacyThreadingData;
++            legacyThreadingData.RegisterSubmissionForLegacyThread(SubmissionId);
++
++            ExecuteAsync(null, null, _legacyThreadingSemantics);
++            if (_legacyThreadingSemantics)
++            {
++                RequestBuilder.WaitWithBuilderThreadStart(new[] { WaitHandle }, false, legacyThreadingData, SubmissionId);
++            }
++            else
++            {
++                WaitHandle.WaitOne();
++            }
++
++            legacyThreadingData.UnregisterSubmissionForLegacyThread(SubmissionId);
++
++            return BuildResult;
++        }
++
++        protected internal override void OnCompletition()
++        {
++            // Did this submission have warnings elevated to errors? If so, mark it as
++            // failed even though it succeeded (with warnings--but they're errors).
++            if (((IBuildComponentHost)BuildManager).LoggingService.HasBuildSubmissionLoggedErrors(BuildResult.SubmissionId))
++            {
++                BuildResult.SetOverallResult(overallResult: false);
++            }
++        }
++    }
+ }
+diff --git a/src/Build/BackEnd/BuildManager/GlobalPropertiesLookup.cs b/src/Build/BackEnd/BuildManager/GlobalPropertiesLookup.cs
+new file mode 100644
+index 00000000000..1cf11aa2068
+--- /dev/null
++++ b/src/Build/BackEnd/BuildManager/GlobalPropertiesLookup.cs
+@@ -0,0 +1,64 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.Collections.Immutable;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.Collections;
++
++namespace Microsoft.Build.Execution
++{
++    internal class GlobalPropertiesLookup : IReadOnlyDictionary<string, string?>
++    {
++        internal static IReadOnlyDictionary<string, string?> ToGlobalPropertiesLookup(
++            PropertyDictionary<ProjectPropertyInstance>? backing)
++        {
++            if (backing == null)
++            {
++                return ImmutableDictionary<string, string?>.Empty;
++            }
++
++            return new GlobalPropertiesLookup(backing);
++        }
++
++        private GlobalPropertiesLookup(IDictionary<string, ProjectPropertyInstance> backingProperties)
++        {
++            _backingProperties = backingProperties;
++        }
++
++        private readonly IDictionary<string, ProjectPropertyInstance> _backingProperties;
++
++        public IEnumerator<KeyValuePair<string, string?>> GetEnumerator()
++            => _backingProperties
++                .Select(p => new KeyValuePair<string, string?>(p.Key, ExtractEscapedValue(p.Value)))
++                .GetEnumerator();
++
++        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
++
++        public int Count => _backingProperties.Count;
++        public bool ContainsKey(string key) => _backingProperties.ContainsKey(key);
++
++        public bool TryGetValue(string key, out string? value)
++        {
++            if (_backingProperties.TryGetValue(key, out var property))
++            {
++                value = ExtractEscapedValue(property);
++                return true;
++            }
++
++            value = null;
++            return false;
++        }
++
++        public string? this[string key] => ExtractEscapedValue(_backingProperties[key]);
++
++        public IEnumerable<string> Keys => _backingProperties.Keys;
++        public IEnumerable<string?> Values => _backingProperties.Values.Select(ExtractEscapedValue);
++
++        private static string? ExtractEscapedValue(ProjectPropertyInstance property) => ((IValued)property).EscapedValue;
++    }
++}
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+index e53d28292d1..69bbe1e0398 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+@@ -519,7 +519,7 @@ private async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildReques
+ 
+             HashSet<ProjectCacheDescriptor> queriedCaches = new(ProjectCacheDescriptorEqualityComparer.Instance);
+             CacheResult? cacheResult = null;
+-            foreach (ProjectCacheDescriptor projectCacheDescriptor in GetProjectCacheDescriptors(buildRequest.ProjectInstance))
++            foreach (ProjectCacheDescriptor projectCacheDescriptor in GetProjectCacheDescriptors(buildRequest.ProjectInstance!))
+             {
+                 // Ensure each unique plugin is only queried once
+                 if (!queriedCaches.Add(projectCacheDescriptor))
+@@ -583,7 +583,7 @@ private async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildReques
+                     // TODO: This should be indented by the console logger. That requires making these log events structured.
+                     if (!buildRequestConfiguration.IsTraversal)
+                     {
+-                        _loggingService.LogComment(buildEventContext, MessageImportance.High, "ProjectCacheHitWithOutputs", buildRequest.ProjectInstance.GetPropertyValue(ReservedPropertyNames.projectName));
++                        _loggingService.LogComment(buildEventContext, MessageImportance.High, "ProjectCacheHitWithOutputs", buildRequest.ProjectInstance!.GetPropertyValue(ReservedPropertyNames.projectName));
+                     }
+ 
+                     break;
+@@ -734,7 +734,7 @@ public async Task HandleBuildResultAsync(
+ 
+             IReadOnlyDictionary<string, string> globalProperties = GetGlobalProperties(requestConfiguration);
+ 
+-            List<string> targets = buildResult.ResultsByTarget.Keys.ToList();
++            List<string> targets = buildResult.ResultsByTarget?.Keys.ToList() ?? new();
+             string? targetNames = string.Join(", ", targets);
+ 
+             FileAccessContext fileAccessContext = new(requestConfiguration.ProjectFullPath, globalProperties, targets);
+diff --git a/src/Build/BackEnd/Shared/BuildResult.cs b/src/Build/BackEnd/Shared/BuildResult.cs
+index 208fa2e7b9a..60d51f2894f 100644
+--- a/src/Build/BackEnd/Shared/BuildResult.cs
++++ b/src/Build/BackEnd/Shared/BuildResult.cs
+@@ -10,8 +10,6 @@
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Shared.FileSystem;
+ 
+-#nullable disable
+-
+ namespace Microsoft.Build.Execution
+ {
+     /// <summary>
+@@ -33,7 +31,7 @@ public enum BuildResultCode
+     /// <summary>
+     /// Contains the current results for all of the targets which have produced results for a particular configuration.
+     /// </summary>
+-    public class BuildResult : INodePacket, IBuildResults
++    public sealed class BuildResult : BuildResultBase, INodePacket, IBuildResults
+     {
+         /// <summary>
+         /// The submission with which this result is associated.
+@@ -64,18 +62,18 @@ public class BuildResult : INodePacket, IBuildResults
+         /// The first build request to generate results for a configuration will set this so that future
+         /// requests may be properly satisfied from the cache.
+         /// </summary>
+-        private List<string> _initialTargets;
++        private List<string>? _initialTargets;
+ 
+         /// <summary>
+         /// The first build request to generate results for a configuration will set this so that future
+         /// requests may be properly satisfied from the cache.
+         /// </summary>
+-        private List<string> _defaultTargets;
++        private List<string>? _defaultTargets;
+ 
+         /// <summary>
+         /// The set of results for each target.
+         /// </summary>
+-        private ConcurrentDictionary<string, TargetResult> _resultsByTarget;
++        private ConcurrentDictionary<string, TargetResult>? _resultsByTarget;
+ 
+         /// <summary>
+         /// The request caused a circular dependency in scheduling.
+@@ -87,7 +85,7 @@ public class BuildResult : INodePacket, IBuildResults
+         /// Note that this can be set if the request itself fails, or if it receives
+         /// an exception from a target or task.
+         /// </summary>
+-        private Exception _requestException;
++        private Exception? _requestException;
+ 
+         /// <summary>
+         /// The overall result calculated in the constructor.
+@@ -98,13 +96,13 @@ public class BuildResult : INodePacket, IBuildResults
+         /// Snapshot of the environment from the configuration this results comes from.
+         /// This should only be populated when the configuration for this result is moved between nodes.
+         /// </summary>
+-        private Dictionary<string, string> _savedEnvironmentVariables;
++        private Dictionary<string, string>? _savedEnvironmentVariables;
+ 
+         /// <summary>
+         /// Snapshot of the current directory from the configuration this result comes from.
+         /// This should only be populated when the configuration for this result is moved between nodes.
+         /// </summary>
+-        private string _savedCurrentDirectory;
++        private string? _savedCurrentDirectory;
+ 
+         /// <summary>
+         /// <see cref="ProjectInstance"/> state after the build. This is only provided if <see cref="BuildRequest.BuildRequestDataFlags"/>
+@@ -114,16 +112,16 @@ public class BuildResult : INodePacket, IBuildResults
+         /// be used to retrieve <see cref="ProjectInstance.Properties"/>, <see cref="ProjectInstance.GlobalProperties"/> and
+         /// <see cref="ProjectInstance.Items"/> from it. No other operation is guaranteed to be supported.
+         /// </summary>
+-        private ProjectInstance _projectStateAfterBuild;
++        private ProjectInstance? _projectStateAfterBuild;
+ 
+         /// <summary>
+         /// The flags provide additional control over the build results and may affect the cached value.
+         /// </summary>
+         private BuildRequestDataFlags _buildRequestDataFlags;
+ 
+-        private string _schedulerInducedError;
++        private string? _schedulerInducedError;
+ 
+-        private HashSet<string> _projectTargets;
++        private HashSet<string>? _projectTargets;
+ 
+         /// <summary>
+         /// Constructor for serialization.
+@@ -146,7 +144,7 @@ internal BuildResult(BuildRequest request)
+         /// </summary>
+         /// <param name="request">The build request to which these results should be associated.</param>
+         /// <param name="exception">The exception, if any.</param>
+-        internal BuildResult(BuildRequest request, Exception exception)
++        internal BuildResult(BuildRequest request, Exception? exception)
+             : this(request, null, exception)
+         {
+         }
+@@ -189,7 +187,7 @@ internal BuildResult(BuildResult existingResults, string[] targetNames)
+         /// <param name="request">The build request with which these results should be associated.</param>
+         /// <param name="existingResults">The existing results, if any.</param>
+         /// <param name="exception">The exception, if any</param>
+-        internal BuildResult(BuildRequest request, BuildResult existingResults, Exception exception)
++        internal BuildResult(BuildRequest request, BuildResult? existingResults, Exception? exception)
+             : this(request, existingResults, null, exception)
+         {
+         }
+@@ -201,9 +199,8 @@ internal BuildResult(BuildRequest request, BuildResult existingResults, Exceptio
+         /// <param name="existingResults">The existing results, if any.</param>
+         /// <param name="targetNames">The list of target names that are the subset of results that should be returned.</param>
+         /// <param name="exception">The exception, if any</param>
+-        internal BuildResult(BuildRequest request, BuildResult existingResults, string[] targetNames, Exception exception)
++        internal BuildResult(BuildRequest request, BuildResult? existingResults, string[]? targetNames, Exception? exception)
+         {
+-            ErrorUtilities.VerifyThrow(request != null, "Must specify a request.");
+             _submissionId = request.SubmissionId;
+             _configurationId = request.ConfigurationId;
+             _globalRequestId = request.GlobalRequestId;
+@@ -275,7 +272,7 @@ private BuildResult(ITranslator translator)
+         /// <summary>
+         /// Returns the submission id.
+         /// </summary>
+-        public int SubmissionId
++        public override int SubmissionId
+         {
+             [DebuggerStepThrough]
+             get
+@@ -325,7 +322,7 @@ public int NodeRequestId
+         /// <summary>
+         /// Returns the exception generated while this result was run, if any.
+         /// </summary>
+-        public Exception Exception
++        public override Exception? Exception
+         {
+             [DebuggerStepThrough]
+             get
+@@ -339,7 +336,7 @@ internal set
+         /// <summary>
+         /// Returns a flag indicating if a circular dependency was detected.
+         /// </summary>
+-        public bool CircularDependency
++        public override bool CircularDependency
+         {
+             [DebuggerStepThrough]
+             get
+@@ -349,7 +346,7 @@ public bool CircularDependency
+         /// <summary>
+         /// Returns the overall result for this result set.
+         /// </summary>
+-        public BuildResultCode OverallResult
++        public override BuildResultCode OverallResult
+         {
+             get
+             {
+@@ -358,7 +355,7 @@ public BuildResultCode OverallResult
+                     return BuildResultCode.Failure;
+                 }
+ 
+-                foreach (KeyValuePair<string, TargetResult> result in _resultsByTarget)
++                foreach (KeyValuePair<string, TargetResult> result in _resultsByTarget ?? Enumerable.Empty<KeyValuePair<string, TargetResult>>())
+                 {
+                     if ((result.Value.ResultCode == TargetResultCode.Failure && !result.Value.TargetFailureDoesntCauseBuildFailure)
+                         || result.Value.AfterTargetsHaveFailed)
+@@ -374,7 +371,7 @@ public BuildResultCode OverallResult
+         /// <summary>
+         /// Returns an enumerator for all target results in this build result
+         /// </summary>
+-        public IDictionary<string, TargetResult> ResultsByTarget
++        public IDictionary<string, TargetResult>? ResultsByTarget
+         {
+             [DebuggerStepThrough]
+             get
+@@ -386,7 +383,7 @@ public IDictionary<string, TargetResult> ResultsByTarget
+         /// be used to retrieve <see cref="ProjectInstance.Properties"/>, <see cref="ProjectInstance.GlobalProperties"/> and
+         /// <see cref="ProjectInstance.Items"/> from it. Any other operation is not guaranteed to be supported.
+         /// </summary>
+-        public ProjectInstance ProjectStateAfterBuild
++        public ProjectInstance? ProjectStateAfterBuild
+         {
+             get => _projectStateAfterBuild;
+             set => _projectStateAfterBuild = value;
+@@ -411,7 +408,7 @@ NodePacketType INodePacket.Type
+         /// <summary>
+         /// Holds a snapshot of the environment at the time we blocked.
+         /// </summary>
+-        Dictionary<string, string> IBuildResults.SavedEnvironmentVariables
++        Dictionary<string, string>? IBuildResults.SavedEnvironmentVariables
+         {
+             get => _savedEnvironmentVariables;
+ 
+@@ -421,7 +418,7 @@ Dictionary<string, string> IBuildResults.SavedEnvironmentVariables
+         /// <summary>
+         /// Holds a snapshot of the current working directory at the time we blocked.
+         /// </summary>
+-        string IBuildResults.SavedCurrentDirectory
++        string? IBuildResults.SavedCurrentDirectory
+         {
+             get => _savedCurrentDirectory;
+ 
+@@ -431,7 +428,7 @@ string IBuildResults.SavedCurrentDirectory
+         /// <summary>
+         /// Returns the initial targets for the configuration which requested these results.
+         /// </summary>
+-        internal List<string> InitialTargets
++        internal List<string>? InitialTargets
+         {
+             [DebuggerStepThrough]
+             get
+@@ -445,7 +442,7 @@ internal List<string> InitialTargets
+         /// <summary>
+         /// Returns the default targets for the configuration which requested these results.
+         /// </summary>
+-        internal List<string> DefaultTargets
++        internal List<string>? DefaultTargets
+         {
+             [DebuggerStepThrough]
+             get
+@@ -459,7 +456,7 @@ internal List<string> DefaultTargets
+         /// <summary>
+         /// The defined targets for the project associated with this build result.
+         /// </summary>
+-        internal HashSet<string> ProjectTargets
++        internal HashSet<string>? ProjectTargets
+         {
+             [DebuggerStepThrough]
+             get => _projectTargets;
+@@ -471,7 +468,7 @@ internal HashSet<string> ProjectTargets
+         /// Container used to transport errors from the scheduler (issued while computing a build result)
+         /// to the TaskHost that has the proper logging context (project id, target id, task id, file location)
+         /// </summary>
+-        internal string SchedulerInducedError
++        internal string? SchedulerInducedError
+         {
+             get => _schedulerInducedError;
+             set => _schedulerInducedError = value;
+@@ -488,7 +485,7 @@ public ITargetResult this[string target]
+         {
+             [DebuggerStepThrough]
+             get
+-            { return _resultsByTarget[target]; }
++            { return _resultsByTarget![target]; }
+         }
+ 
+         /// <summary>
+@@ -506,7 +503,7 @@ public void AddResultsForTarget(string target, TargetResult result)
+                 _resultsByTarget ??= CreateTargetResultDictionary(1);
+             }
+ 
+-            if (_resultsByTarget.TryGetValue(target, out TargetResult targetResult))
++            if (_resultsByTarget.TryGetValue(target, out TargetResult? targetResult))
+             {
+                 ErrorUtilities.VerifyThrow(targetResult.ResultCode == TargetResultCode.Skipped, "Items already exist for target {0}.", target);
+             }
+@@ -524,11 +521,11 @@ internal void KeepSpecificTargetResults(IReadOnlyCollection<string> targetsToKee
+                 targetsToKeep.Count > 0,
+                 $"{nameof(targetsToKeep)} should contain at least one target.");
+ 
+-            foreach (string target in _resultsByTarget.Keys)
++            foreach (string target in _resultsByTarget?.Keys ?? Enumerable.Empty<string>())
+             {
+                 if (!targetsToKeep.Contains(target))
+                 {
+-                    _ = _resultsByTarget.TryRemove(target, out _);
++                    _ = _resultsByTarget!.TryRemove(target, out _);
+                 }
+             }
+         }
+@@ -549,7 +546,7 @@ public void MergeResults(BuildResult results)
+             }
+ 
+             // Merge in the results
+-            foreach (KeyValuePair<string, TargetResult> targetResult in results._resultsByTarget)
++            foreach (KeyValuePair<string, TargetResult> targetResult in results._resultsByTarget ?? Enumerable.Empty<KeyValuePair<string, TargetResult>>())
+             {
+                 // NOTE: I believe that because we only allow results for a given target to be produced and cached once for a given configuration,
+                 // we can never receive conflicting results for that target, since the cache and build request manager would always return the
+@@ -559,7 +556,7 @@ public void MergeResults(BuildResult results)
+                 // ErrorUtilities.VerifyThrow(!HasResultsForTarget(targetResult.Key), "Results already exist");
+ 
+                 // Copy the new results in.
+-                _resultsByTarget[targetResult.Key] = targetResult.Value;
++                _resultsByTarget![targetResult.Key] = targetResult.Value;
+             }
+ 
+             // If there is an exception and we did not previously have one, add it in.
+@@ -573,7 +570,7 @@ public void MergeResults(BuildResult results)
+         /// <returns>True if results exist, false otherwise.</returns>
+         public bool HasResultsForTarget(string target)
+         {
+-            return _resultsByTarget.ContainsKey(target);
++            return _resultsByTarget?.ContainsKey(target) ?? false;
+         }
+ 
+         #region INodePacket Members
+@@ -617,7 +614,7 @@ internal static BuildResult FactoryForDeserialization(ITranslator translator)
+         /// </summary>
+         internal void CacheIfPossible()
+         {
+-            foreach (KeyValuePair<string, TargetResult> targetResultPair in _resultsByTarget)
++            foreach (KeyValuePair<string, TargetResult> targetResultPair in _resultsByTarget ?? Enumerable.Empty<KeyValuePair<string, TargetResult>>())
+             {
+                 targetResultPair.Value.CacheItems(ConfigurationId, targetResultPair.Key);
+             }
+@@ -648,7 +645,7 @@ internal BuildResult Clone()
+                 _parentGlobalRequestId = _parentGlobalRequestId,
+                 _nodeRequestId = _nodeRequestId,
+                 _requestException = _requestException,
+-                _resultsByTarget = new ConcurrentDictionary<string, TargetResult>(
++                _resultsByTarget = _resultsByTarget == null ? null : new ConcurrentDictionary<string, TargetResult>(
+                     _resultsByTarget,
+                     StringComparer.OrdinalIgnoreCase),
+                 _baseOverallResult = OverallResult == BuildResultCode.Success,
+@@ -685,7 +682,7 @@ private static ConcurrentDictionary<string, TargetResult> CreateTargetResultDict
+ 
+             foreach (string target in targetNames)
+             {
+-                if (existingResults.ResultsByTarget.TryGetValue(target, out TargetResult targetResult))
++                if (existingResults.ResultsByTarget?.TryGetValue(target, out TargetResult? targetResult) ?? false)
+                 {
+                     resultsByTarget[target] = targetResult;
+                 }
+diff --git a/src/Build/BackEnd/Shared/BuildResultBase.cs b/src/Build/BackEnd/Shared/BuildResultBase.cs
+new file mode 100644
+index 00000000000..f144bcb778c
+--- /dev/null
++++ b/src/Build/BackEnd/Shared/BuildResultBase.cs
+@@ -0,0 +1,30 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Execution
++{
++    public abstract class BuildResultBase
++    {
++        /// <summary>
++        /// Returns the submission id.
++        /// </summary>
++        public abstract int SubmissionId { get; }
++
++        /// <summary>
++        /// Returns a flag indicating if a circular dependency was detected.
++        /// </summary>
++        public abstract bool CircularDependency { get; }
++
++        /// <summary>
++        /// Returns the exception generated while this result was run, if any.
++        /// </summary>
++        public abstract Exception? Exception { get; internal set; }
++
++        /// <summary>
++        /// Returns the overall result for this result set.
++        /// </summary>
++        public abstract BuildResultCode OverallResult { get; }
++    }
++}
+diff --git a/src/Build/BuildCheck/Utilities/EnumerableExtensions.cs b/src/Build/BuildCheck/Utilities/EnumerableExtensions.cs
+index 96efc8ff2fd..ac3d5762993 100644
+--- a/src/Build/BuildCheck/Utilities/EnumerableExtensions.cs
++++ b/src/Build/BuildCheck/Utilities/EnumerableExtensions.cs
+@@ -3,9 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
+-using System.Linq;
+-using System.Text;
+-using System.Threading.Tasks;
++using System.Collections.ObjectModel;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+@@ -23,6 +21,26 @@ public static string ToCsvString<T>(this IEnumerable<T>? source, bool useSpace =
+         return source == null ? "<NULL>" : string.Join(useSpace ? ", " : ",", source);
+     }
+ 
++    /// <summary>
++    /// Returns the item as and enumerable with single item.
++    /// </summary>
++    /// <typeparam name="T"></typeparam>
++    /// <param name="item"></param>
++    /// <returns></returns>
++    public static IEnumerable<T> AsSingleItemEnumerable<T>(this T item)
++    {
++        yield return item;
++    }
++
++#if !NET
++    /// <summary>
++    /// Returns a read-only <see cref="ReadOnlyDictionary{TKey, TValue}"/> wrapper
++    /// for the current dictionary.
++    /// </summary>
++    public static ReadOnlyDictionary<TKey, TValue> AsReadOnly<TKey, TValue>(this IDictionary<TKey, TValue> dictionary)
++        => new(dictionary);
++#endif
++
+     /// <summary>
+     /// Adds a content of given dictionary to current dictionary.
+     /// </summary>
+diff --git a/src/Build/Graph/GraphBuildRequestData.cs b/src/Build/Graph/GraphBuildRequestData.cs
+index c09a587b106..50ae4772c1d 100644
+--- a/src/Build/Graph/GraphBuildRequestData.cs
++++ b/src/Build/Graph/GraphBuildRequestData.cs
+@@ -2,10 +2,14 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Collections.Generic;
++using System.Collections.Immutable;
++using System.Linq;
+ using Microsoft.Build.Execution;
++using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Shared;
+ 
+ #nullable disable
++#nullable enable
+ 
+ namespace Microsoft.Build.Graph
+ {
+@@ -20,7 +24,7 @@ public record GraphBuildOptions
+     /// <summary>
+     /// GraphBuildRequestData encapsulates all of the data needed to submit a graph build request.
+     /// </summary>
+-    public sealed class GraphBuildRequestData
++    public sealed class GraphBuildRequestData : BuildRequestDataBase
+     {
+         /// <summary>
+         /// Constructs a GraphBuildRequestData for build requests based on a project graph.
+@@ -38,7 +42,7 @@ public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targ
+         /// <param name="projectGraph">The graph to build.</param>
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use, if any.  May be null.</param>
+-        public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targetsToBuild, HostServices hostServices)
++        public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targetsToBuild, HostServices? hostServices)
+             : this(projectGraph, targetsToBuild, hostServices, BuildRequestDataFlags.None)
+         {
+         }
+@@ -50,7 +54,7 @@ public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targ
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use, if any.  May be null.</param>
+         /// <param name="flags">Flags controlling this build request.</param>
+-        public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags)
++        public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags)
+             : this(targetsToBuild, hostServices, flags)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(projectGraph, nameof(projectGraph));
+@@ -65,7 +69,7 @@ public GraphBuildRequestData(ProjectGraph projectGraph, ICollection<string> targ
+         /// <param name="globalProperties">The global properties which should be used during evaluation of the project.  Cannot be null.</param>
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use.  May be null.</param>
+-        public GraphBuildRequestData(string projectFullPath, IDictionary<string, string> globalProperties, ICollection<string> targetsToBuild, HostServices hostServices)
++        public GraphBuildRequestData(string projectFullPath, IDictionary<string, string> globalProperties, ICollection<string> targetsToBuild, HostServices? hostServices)
+             : this(new ProjectGraphEntryPoint(projectFullPath, globalProperties).AsEnumerable(), targetsToBuild, hostServices, BuildRequestDataFlags.None)
+         {
+         }
+@@ -78,7 +82,7 @@ public GraphBuildRequestData(string projectFullPath, IDictionary<string, string>
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use.  May be null.</param>
+         /// <param name="flags">The <see cref="BuildRequestDataFlags"/> to use.</param>
+-        public GraphBuildRequestData(string projectFullPath, IDictionary<string, string> globalProperties, ICollection<string> targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags)
++        public GraphBuildRequestData(string projectFullPath, IDictionary<string, string> globalProperties, ICollection<string> targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags)
+             : this(new ProjectGraphEntryPoint(projectFullPath, globalProperties).AsEnumerable(), targetsToBuild, hostServices, flags)
+         {
+         }
+@@ -99,7 +103,7 @@ public GraphBuildRequestData(ProjectGraphEntryPoint projectGraphEntryPoint, ICol
+         /// <param name="projectGraphEntryPoint">The entry point to use in the build.</param>
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use, if any.  May be null.</param>
+-        public GraphBuildRequestData(ProjectGraphEntryPoint projectGraphEntryPoint, ICollection<string> targetsToBuild, HostServices hostServices)
++        public GraphBuildRequestData(ProjectGraphEntryPoint projectGraphEntryPoint, ICollection<string> targetsToBuild, HostServices? hostServices)
+             : this(projectGraphEntryPoint.AsEnumerable(), targetsToBuild, hostServices, BuildRequestDataFlags.None)
+         {
+         }
+@@ -111,7 +115,7 @@ public GraphBuildRequestData(ProjectGraphEntryPoint projectGraphEntryPoint, ICol
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use, if any.  May be null.</param>
+         /// <param name="flags">Flags controlling this build request.</param>
+-        public GraphBuildRequestData(ProjectGraphEntryPoint projectGraphEntryPoint, ICollection<string> targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags)
++        public GraphBuildRequestData(ProjectGraphEntryPoint projectGraphEntryPoint, ICollection<string> targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags)
+             : this(projectGraphEntryPoint.AsEnumerable(), targetsToBuild, hostServices, flags)
+         {
+         }
+@@ -132,7 +136,7 @@ public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEnt
+         /// <param name="projectGraphEntryPoints">The entry points to use in the build.</param>
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use, if any.  May be null.</param>
+-        public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEntryPoints, ICollection<string> targetsToBuild, HostServices hostServices)
++        public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEntryPoints, ICollection<string> targetsToBuild, HostServices? hostServices)
+             : this(projectGraphEntryPoints, targetsToBuild, hostServices, BuildRequestDataFlags.None)
+         {
+         }
+@@ -144,7 +148,7 @@ public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEnt
+         /// <param name="targetsToBuild">The targets to build.</param>
+         /// <param name="hostServices">The host services to use, if any.  May be null.</param>
+         /// <param name="flags">Flags controlling this build request.</param>
+-        public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEntryPoints, ICollection<string> targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags)
++        public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEntryPoints, ICollection<string> targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags)
+             : this(targetsToBuild, hostServices, flags)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(projectGraphEntryPoints, nameof(projectGraphEntryPoints));
+@@ -152,27 +156,20 @@ public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEnt
+             ProjectGraphEntryPoints = projectGraphEntryPoints;
+         }
+ 
+-        public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEntryPoints, ICollection<string> targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags, GraphBuildOptions graphBuildOptions)
++        public GraphBuildRequestData(IEnumerable<ProjectGraphEntryPoint> projectGraphEntryPoints, ICollection<string> targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags, GraphBuildOptions graphBuildOptions)
+             : this(targetsToBuild, hostServices, flags, graphBuildOptions)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(projectGraphEntryPoints, nameof(projectGraphEntryPoints));
+ 
+-            ProjectGraphEntryPoints = projectGraphEntryPoints;
++            ProjectGraphEntryPoints = projectGraphEntryPoints.ToList();
+         }
+ 
+         /// <summary>
+         /// Common constructor.
+         /// </summary>
+-        private GraphBuildRequestData(ICollection<string> targetsToBuild, HostServices hostServices, BuildRequestDataFlags flags, GraphBuildOptions graphBuildOptions = null)
++        private GraphBuildRequestData(ICollection<string> targetsToBuild, HostServices? hostServices, BuildRequestDataFlags flags, GraphBuildOptions? graphBuildOptions = null)
++        : base(targetsToBuild, flags, hostServices)
+         {
+-            ErrorUtilities.VerifyThrowArgumentNull(targetsToBuild, nameof(targetsToBuild));
+-            foreach (string targetName in targetsToBuild)
+-            {
+-                ErrorUtilities.VerifyThrowArgumentNull(targetName, "target");
+-            }
+-
+-            HostServices = hostServices;
+-            TargetNames = new List<string>(targetsToBuild);
+             Flags = flags;
+             GraphBuildOptions = graphBuildOptions ?? new GraphBuildOptions();
+         }
+@@ -182,34 +179,60 @@ private GraphBuildRequestData(ICollection<string> targetsToBuild, HostServices h
+         /// May be null.
+         /// </summary>
+         /// <value>The project graph.</value>
+-        public ProjectGraph ProjectGraph { get; }
++        public ProjectGraph? ProjectGraph { get; }
+ 
+         /// <summary>
+         /// The project graph entry points.
+         /// May be null.
+         /// </summary>
+         /// <value>The project graph entry points.</value>
+-        public IEnumerable<ProjectGraphEntryPoint> ProjectGraphEntryPoints { get; }
++        public IEnumerable<ProjectGraphEntryPoint>? ProjectGraphEntryPoints { get; }
+ 
+-        /// <summary>
+-        /// The name of the targets to build.
+-        /// </summary>
+-        /// <value>An array of targets in the project to be built.</value>
+-        public ICollection<string> TargetNames { get; }
++        public override IEnumerable<string> EntryProjectsFullPath
++        {
++            get
++            {
++                if (ProjectGraph != null)
++                {
++                    foreach (ProjectGraphNode entryPoint in ProjectGraph.EntryPointNodes)
++                    {
++                        yield return entryPoint.ProjectInstance.FullPath;
++                    }
++                }
++                else if (ProjectGraphEntryPoints != null)
++                {
++                    foreach (ProjectGraphEntryPoint entryPoint in ProjectGraphEntryPoints)
++                    {
++                        yield return entryPoint.ProjectFile;
++                    }
++                }
++            }
++        }
+ 
+-        /// <summary>
+-        /// Extra flags for this BuildRequest.
+-        /// </summary>
+-        public BuildRequestDataFlags Flags { get; }
++        public override IReadOnlyDictionary<string, string?> GlobalPropertiesLookup
++        {
++            get
++            {
++                ProjectGraphNode? node = ProjectGraph?.EntryPointNodes.FirstOrDefault();
++                if (node != null)
++                {
++                    return node.ProjectInstance.GlobalProperties.AsReadOnly();
++                }
++
++                ProjectGraphEntryPoint? entryPoint = ProjectGraphEntryPoints?.FirstOrDefault();
++                if (entryPoint != null)
++                {
++                    return entryPoint.Value.GlobalProperties.AsReadOnly();
++                }
++
++                return ImmutableDictionary<string, string?>.Empty;
++            }
++        }
++        public override bool IsGraphRequest => true;
+ 
+         /// <summary>
+         /// Options for how the graph should be built.
+         /// </summary>
+         public GraphBuildOptions GraphBuildOptions { get; }
+-
+-        /// <summary>
+-        /// Gets the HostServices object for this request.
+-        /// </summary>
+-        public HostServices HostServices { get; }
+     }
+ }
+diff --git a/src/Build/Graph/GraphBuildResult.cs b/src/Build/Graph/GraphBuildResult.cs
+index 6df04a0c899..c13ea8ce105 100644
+--- a/src/Build/Graph/GraphBuildResult.cs
++++ b/src/Build/Graph/GraphBuildResult.cs
+@@ -3,14 +3,13 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Collections.Immutable;
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Execution;
+ 
+-#nullable disable
+-
+ namespace Microsoft.Build.Graph
+ {
+-    public sealed class GraphBuildResult
++    public sealed class GraphBuildResult : BuildResultBase
+     {
+         /// <summary>
+         /// Constructor creates a build result with results for each graph node.
+@@ -32,27 +31,28 @@ internal GraphBuildResult(int submissionId, Exception exception)
+         {
+             SubmissionId = submissionId;
+             Exception = exception;
++            ResultsByNode = ImmutableDictionary<ProjectGraphNode, BuildResult>.Empty;
+         }
+ 
+         /// <summary>
+         /// Returns the submission id.
+         /// </summary>
+-        public int SubmissionId { get; }
++        public override int SubmissionId { get; }
+ 
+         /// <summary>
+         /// Returns a flag indicating if a circular dependency was detected.
+         /// </summary>
+-        public bool CircularDependency => Exception is CircularDependencyException;
++        public override bool CircularDependency => Exception is CircularDependencyException;
+ 
+         /// <summary>
+         /// Returns the exception generated while this result was run, if any.
+         /// </summary>
+-        public Exception Exception { get; internal set; }
++        public override Exception? Exception { get; internal set; }
+ 
+         /// <summary>
+         /// Returns the overall result for this result set.
+         /// </summary>
+-        public BuildResultCode OverallResult
++        public override BuildResultCode OverallResult
+         {
+             get
+             {
+diff --git a/src/Build/Graph/GraphBuildSubmission.cs b/src/Build/Graph/GraphBuildSubmission.cs
+index 9c00b5bb0e4..a9b96008854 100644
+--- a/src/Build/Graph/GraphBuildSubmission.cs
++++ b/src/Build/Graph/GraphBuildSubmission.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Globalization;
+ using System.Threading;
++using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Shared;
+ 
+@@ -11,141 +12,32 @@
+ 
+ namespace Microsoft.Build.Graph
+ {
+-    /// <summary>
+-    /// A callback used to receive notification that a build has completed.
+-    /// </summary>
+-    /// <remarks>
+-    /// When this delegate is invoked, the WaitHandle on the BuildSubmission will have been be signalled and the OverallBuildResult will be valid.
+-    /// </remarks>
+-    public delegate void GraphBuildSubmissionCompleteCallback(GraphBuildSubmission submission);
+-
+-    /// <summary>
+-    /// A GraphBuildSubmission represents a graph build request which has been submitted to the BuildManager for processing.  It may be used to
+-    /// execute synchronous or asynchronous graph build requests and provides access to the results upon completion.
+-    /// </summary>
+-    /// <remarks>
+-    /// This class is thread-safe.
+-    /// </remarks>
+-    public class GraphBuildSubmission
++    public class GraphBuildSubmission : BuildSubmission<GraphBuildRequestData, GraphBuildResult>
+     {
+-        /// <summary>
+-        /// The callback to invoke when the submission is complete.
+-        /// </summary>
+-        private GraphBuildSubmissionCompleteCallback _completionCallback;
+-
+-        /// <summary>
+-        /// The completion event.
+-        /// </summary>
+-        private readonly ManualResetEvent _completionEvent;
+-
+-        /// <summary>
+-        /// True if it has been invoked
+-        /// </summary>
+-        private int _completionInvoked;
+-
+-        /// <summary>
+-        /// Constructor
+-        /// </summary>
+-        internal GraphBuildSubmission(BuildManager buildManager, int submissionId, GraphBuildRequestData requestData)
++        internal GraphBuildSubmission(BuildManager buildManager, int submissionId, GraphBuildRequestData requestData) :
++            base(buildManager, submissionId, requestData)
+         {
+-            ErrorUtilities.VerifyThrowArgumentNull(buildManager, nameof(buildManager));
+-            ErrorUtilities.VerifyThrowArgumentNull(requestData, nameof(requestData));
+-
+-            BuildManager = buildManager;
+-            SubmissionId = submissionId;
+-            BuildRequestData = requestData;
+-            _completionEvent = new ManualResetEvent(false);
+-            _completionInvoked = 0;
++            CompleteLogging();
+         }
+ 
+-        /// <summary>
+-        /// The BuildManager with which this submission is associated.
+-        /// </summary>
+-        public BuildManager BuildManager { get; }
+-
+-        /// <summary>
+-        /// An ID uniquely identifying this request from among other submissions within the same build.
+-        /// </summary>
+-        public int SubmissionId { get; }
+-
+-        /// <summary>
+-        /// The asynchronous context provided to <see cref="BuildSubmission.ExecuteAsync(BuildSubmissionCompleteCallback, object)"/>, if any.
+-        /// </summary>
+-        public Object AsyncContext { get; private set; }
+-
+-        /// <summary>
+-        /// A <see cref="System.Threading.WaitHandle"/> which will be signalled when the build is complete.  Valid after <see cref="BuildSubmission.Execute()"/> or <see cref="BuildSubmission.ExecuteAsync(BuildSubmissionCompleteCallback, object)"/> returns, otherwise null.
+-        /// </summary>
+-        public WaitHandle WaitHandle => _completionEvent;
+-
+-        /// <summary>
+-        /// Returns true if this submission is complete.
+-        /// </summary>
+-        public bool IsCompleted => WaitHandle.WaitOne(new TimeSpan(0));
+-
+-        /// <summary>
+-        /// The results of the build per graph node.  Valid only after WaitHandle has become signalled.
+-        /// </summary>
+-        public GraphBuildResult BuildResult { get; internal set; }
+-
+-        /// <summary>
+-        /// The BuildRequestData being used for this submission.
+-        /// </summary>
+-        internal GraphBuildRequestData BuildRequestData { get; }
+-
+-        /// <summary>
+-        /// Whether the graph build has started.
+-        /// </summary>
+-        internal bool IsStarted { get; set; }
+-
+         /// <summary>
+         /// Starts the request and blocks until results are available.
+         /// </summary>
+         /// <exception cref="System.InvalidOperationException">The request has already been started or is already complete.</exception>
+-        public GraphBuildResult Execute()
++        public override GraphBuildResult Execute()
+         {
+             ExecuteAsync(null, null);
+             WaitHandle.WaitOne();
+ 
+             return BuildResult;
+         }
+-
+-        /// <summary>
+-        /// Starts the request asynchronously and immediately returns control to the caller.
+-        /// </summary>
+-        /// <exception cref="System.InvalidOperationException">The request has already been started or is already complete.</exception>
+-        public void ExecuteAsync(GraphBuildSubmissionCompleteCallback callback, object context)
+-        {
+-            ErrorUtilities.VerifyThrowInvalidOperation(!IsCompleted, "SubmissionAlreadyComplete");
+-            _completionCallback = callback;
+-            AsyncContext = context;
+-            BuildManager.ExecuteSubmission(this);
+-        }
+-
+-        /// <summary>
+-        /// Sets the event signaling that the build is complete.
+-        /// </summary>
+-        internal void CompleteResults(GraphBuildResult result)
+-        {
+-            ErrorUtilities.VerifyThrowArgumentNull(result, nameof(result));
+-            ErrorUtilities.VerifyThrow(result.SubmissionId == SubmissionId, "GraphBuildResult's submission id doesn't match GraphBuildSubmission's");
+-
+-            bool hasCompleted = (Interlocked.Exchange(ref _completionInvoked, 1) == 1);
+-            if (!hasCompleted)
+-            {
+-                BuildResult = result;
+-                _completionEvent.Set();
+-
+-                if (_completionCallback != null)
+-                {
+-                    void Callback(object state)
+-                    {
+-                        _completionCallback(this);
+-                    }
+-
+-                    ThreadPoolExtensions.QueueThreadPoolWorkItemWithCulture(Callback, CultureInfo.CurrentCulture, CultureInfo.CurrentUICulture);
+-                }
+-            }
+-        }
+     }
++
++    /// <summary>
++    /// A callback used to receive notification that a build has completed.
++    /// </summary>
++    /// <remarks>
++    /// When this delegate is invoked, the WaitHandle on the BuildSubmission will have been be signalled and the OverallBuildResult will be valid.
++    /// </remarks>
++    public delegate void GraphBuildSubmissionCompleteCallback(GraphBuildSubmission submission);
+ }
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index d71ce74084b..d5a38fa7d3c 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -132,8 +132,10 @@
+     <Compile Include="AssemblyInfo.cs" />
+     <Compile Include="BackEnd\BuildManager\BuildManager.cs" />
+     <Compile Include="BackEnd\BuildManager\BuildParameters.cs" />
++    <Compile Include="BackEnd\BuildManager\BuildRequestDataBase.cs" />
+     <Compile Include="BackEnd\BuildManager\CacheSerialization.cs" />
+     <Compile Include="BackEnd\BuildManager\CacheAggregator.cs" />
++    <Compile Include="BackEnd\BuildManager\GlobalPropertiesLookup.cs" />
+     <Compile Include="BackEnd\BuildManager\ProjectIsolationMode.cs" />
+     <Compile Include="BackEnd\Client\MSBuildClientPacketPump.cs" />
+     <Compile Include="BackEnd\Client\MSBuildClientExitType.cs" />
+@@ -155,6 +157,7 @@
+     <Compile Include="BackEnd\Components\SdkResolution\SdkResolverException.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+     <Compile Include="FileSystem\*.cs" />
++    <Compile Include="BackEnd\Shared\BuildResultBase.cs" />
+     <Compile Include="BuildCheck\Acquisition\AnalyzerAcquisitionData.cs" />
+     <Compile Include="BuildCheck\Acquisition\BuildCheckAcquisitionModule.cs" />
+     <Compile Include="BuildCheck\Acquisition\IBuildCheckAcquisitionModule.cs" />
+diff --git a/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs b/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
+index 67d7cf784ef..4a87216e0d1 100644
+--- a/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
++++ b/src/BuildCheck.UnitTests/TaskInvocationAnalysisDataTests.cs
+@@ -79,7 +79,7 @@ private void BuildProject(string taskInvocation)
+ 
+                 using (var buildManager = new BuildManager())
+                 {
+-                    var request = new BuildRequestData(testProject.ProjectFile, new Dictionary<string, string>(), MSBuildConstants.CurrentToolsVersion, [], null, BuildRequestDataFlags.None);
++                    var request = new BuildRequestData(testProject.ProjectFile, new Dictionary<string, string?>(), MSBuildConstants.CurrentToolsVersion, [], null, BuildRequestDataFlags.None);
+                     var parameters = new BuildParameters
+                     {
+                         LogTaskInputs = true,
+diff --git a/src/MSBuild/JsonOutputFormatter.cs b/src/MSBuild/JsonOutputFormatter.cs
+index 095f0761386..cdc166849ca 100644
+--- a/src/MSBuild/JsonOutputFormatter.cs
++++ b/src/MSBuild/JsonOutputFormatter.cs
+@@ -132,7 +132,7 @@ internal void AddTargetResultsInJsonFormat(string[] targetNames, BuildResult res
+             JsonObject targetResultsNode = new();
+             foreach (string targetName in targetNames)
+             {
+-                TargetResult targetResult = result.ResultsByTarget[targetName];
++                TargetResult targetResult = result.ResultsByTarget![targetName];
+                 JsonObject targetResults = new();
+                 targetResults["Result"] = targetResult.ResultCode.ToString();
+                 JsonArray outputArray = new();
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 088d2c00179..f408a74d8d2 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -602,6 +602,8 @@ private static string GetFriendlyCounterType(PerformanceCounterType type, string
+         /// </summary>
+         private static void DebuggerLaunchCheck()
+         {
++            Debugger.Launch();
++
+             if (Debugger.IsAttached)
+             {
+                 return;

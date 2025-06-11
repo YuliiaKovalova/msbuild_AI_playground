@@ -1,0 +1,776 @@
+{
+  "number": 8852,
+  "title": "Reduce allocations in SolutionParser by 80-90% and cut CPU time 40-70%",
+  "body": "Fixes [AB#1824106](https://devdiv.visualstudio.com/0bdbc590-a062-4c3f-b0f6-9383f67865ee/_workitems/edit/1824106)\r\nFixes [AB#1825378](https://devdiv.visualstudio.com/0bdbc590-a062-4c3f-b0f6-9383f67865ee/_workitems/edit/1825378)\r\n\r\n### Context\r\n\r\nThe `SolutionParser` class allocates a lot, mostly strings, as it works through the file. It creates substrings, parses with regex, concats other strings, and reads line by line, where each line is a heap-allocated string.\r\n\r\n### Changes Made\r\n\r\nThe main changes here are to:\r\n\r\n- Introduce `StreamLineSpanReader` that reads lines from the solution file into `ReadOnlySpan<char>` rather than `string`, where each span is backed by the same buffer. This allows us to read very large files for the same cost as very small ones.\r\n- Perform all parsing and processing using `ReadOnlySpan<char>` rather than `string`, so that substrings (alllocating) become splits (non-allocating).\r\n- Introduce a mechanism (`StringPool`) to pool strings based on `ReadOnlySpan<char>`. This means you can take a span and look up a string without having to first allocate a string from that span to see if it already exists. There are a lot of strings that can be de-duplicated this way in a solution file (mostly GUIDs and configurations/platforms).\r\n\r\nThose changes cut the allocations roughly in half, and the CPU time as well. Following that I took some fresh traces and tidied up even more allocations and CPU-heavy operations.\r\n\r\n### Results\r\n\r\nRunning a little BenchmarkDotNet harness on two solutions:\r\n\r\n- \"Huge\" which has 5,400 projects\r\n- \"MSBuild\" from this very repo, with 36 projects\r\n\r\nBefore\r\n\r\n|        Method |       Mean |     Error |     StdDev |     Gen 0 |     Gen 1 |     Gen 2 | Allocated |\r\n|-------------- |-----------:|----------:|-----------:|----------:|----------:|----------:|----------:|\r\n|    Parse_Huge | 365.502 ms | 7.1347 ms | 10.4580 ms | 9000.0000 | 8000.0000 | 1000.0000 |     54 MB |\r\n| Parse_MSBuild |   4.544 ms | 0.0827 ms |  0.0645 ms |  375.0000 |  250.0000 |         - |      2 MB |\r\n\r\nAfter\r\n\r\n|        Method |       Mean |     Error |    StdDev |     Gen 0 |     Gen 1 |    Gen 2 | Allocated |\r\n|-------------- |-----------:|----------:|----------:|----------:|----------:|---------:|----------:|\r\n|    Parse_Huge | 102.118 ms | 2.0162 ms | 3.7869 ms | 2200.0000 | 1400.0000 | 600.0000 | 10.71 MB |\r\n| Parse_MSBuild |   2.731 ms | 0.0416 ms | 0.0389 ms |   35.1563 |    3.9063 |        - |    0.18 MB |\r\n\r\n### Testing\r\n\r\nFor correctness, I added a lot of tests and ensured they ran on the prior implementation correctly before changing anything. The previous test suite was quite comprehensive too.\r\n\r\nFor performance, I took traces and ran various microbenchmarks to validate techniques applied.\r\n\r\n### Notes\r\n\r\nI think the `StringPool` and `StreamLineSpanReader` classes are potentially generally useful.\r\n\r\nThis is obviously quite a big change and difficult to review. I left a series of small commits that show the changes in a more tractable way.\r\n\r\nThere were quite a few other nips and tucks done along the way that brought the numbers down, which are explained in the commits.\r\n\r\nIf you want to run the benchmarks, you can use:\r\n\r\n<details><summary>Code to run the benchmarks</summary>\r\n<p>\r\n\r\nNote that `MultiProjectSystem_200.sln` contains 5,400 projects.\r\n\r\nNote that this patch will apply cleaning to `main` and to this branch, so you can benchmark before/after.\r\n\r\n```diff\r\ndiff --git a/src/Build/Construction/Solution/SolutionFile.cs b/src/Build/Construction/Solution/SolutionFile.cs\r\nindex ea9360b90..499093da5 100644\r\n--- a/src/Build/Construction/Solution/SolutionFile.cs\r\n+++ b/src/Build/Construction/Solution/SolutionFile.cs\r\n@@ -23,6 +23,8 @@ using ProjectFileErrorUtilities = Microsoft.Build.Shared.ProjectFileErrorUtiliti\r\n using ResourceUtilities = Microsoft.Build.Shared.ResourceUtilities;\r\n using VisualStudioConstants = Microsoft.Build.Shared.VisualStudioConstants;\r\n\r\n+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo(\"StringTools.Benchmark, PublicKey=002400000480000094000000060200000024000052534131000400000100010007d1fa57c4aed9f0a32e84aa0faefd0de9e8fd6aec8f87fb03766c834c99921eb23be79ad9d5dcc1dd9ad236132102900b723cf980957fc4e177108fc607774f29e8320e92ea05ece4e821c0a5efe8f1645c4c0c93c1ab99285d622caa652c1dfad63d745d6f2de5f17e5eaf0fc4963d261c8a12436518206dc093344d5ad293\")]\r\n+\r\n // Suppress some style rules to reduce the amount of noise in this file. These can be removed in future when the issues are fixed.\r\n #pragma warning disable SA1201 // Elements should appear in the correct order\r\n #pragma warning disable SA1202 // Elements should be ordered by access\r\ndiff --git a/src/StringTools.Benchmark/Program.cs b/src/StringTools.Benchmark/Program.cs\r\nindex 0b51ad900..3bbd60d96 100644\r\n--- a/src/StringTools.Benchmark/Program.cs\r\n+++ b/src/StringTools.Benchmark/Program.cs\r\n@@ -1,8 +1,12 @@\r\n // Licensed to the .NET Foundation under one or more agreements.\r\n // The .NET Foundation licenses this file to you under the MIT license.\r\n\r\n+using BenchmarkDotNet.Attributes;\r\n+using BenchmarkDotNet.Jobs;\r\n using BenchmarkDotNet.Running;\r\n\r\n+using Microsoft.Build.Construction;\r\n+\r\n #nullable disable\r\n\r\n namespace Microsoft.NET.StringTools.Benchmark\r\n@@ -11,7 +15,49 @@ namespace Microsoft.NET.StringTools.Benchmark\r\n     {\r\n         public static void Main(string[] args)\r\n         {\r\n-            BenchmarkRunner.Run<SpanBasedStringBuilder_Benchmark>();\r\n+            // BenchmarkRunner.Run<SpanBasedStringBuilder_Benchmark>();\r\n+            BenchmarkRunner.Run<SolutionParseBenchmark>();\r\n         }\r\n     }\r\n+\r\n+    [SimpleJob(RuntimeMoniker.Net48)]\r\n+    [MemoryDiagnoser]\r\n+    public class SolutionParseBenchmark\r\n+    {\r\n+        private const string HugeSolution = @\"D:\\generated-solutions\\CPS-ProjectSystem\\MultiProjectSystem_200.sln\";\r\n+        private const string MSBuildSolution = @\"D:\\repos\\msbuild\\MSBuild.sln\";\r\n+\r\n+        [Benchmark]\r\n+        public object Parse_Huge() => SolutionFile.Parse(HugeSolution);\r\n+\r\n+        [Benchmark]\r\n+        public object Parse_MSBuild() => SolutionFile.Parse(MSBuildSolution);\r\n+    }\r\n }\r\ndiff --git a/src/StringTools.Benchmark/StringTools.Benchmark.csproj b/src/StringTools.Benchmark/StringTools.Benchmark.csproj\r\nindex 95e3ca90a..5a9fbce66 100644\r\n--- a/src/StringTools.Benchmark/StringTools.Benchmark.csproj\r\n+++ b/src/StringTools.Benchmark/StringTools.Benchmark.csproj\r\n@@ -23,6 +23,7 @@\r\n   </ItemGroup>\r\n\r\n   <ItemGroup>\r\n+    <ProjectReference Include=\"..\\Build\\Microsoft.Build.csproj\" />\r\n     <ProjectReference Include=\"..\\StringTools\\StringTools.csproj\" />\r\n   </ItemGroup>\r\n </Project>\r\n```\r\n\r\n</p>\r\n</details> ",
+  "state": "CLOSED",
+  "createdAt": "2023-06-07T13:14:12Z",
+  "updatedAt": "2024-08-27T13:41:59Z",
+  "closedAt": "2024-08-27T13:41:58Z",
+  "mergedAt": null,
+  "additions": 2610,
+  "deletions": 1318,
+  "changedFiles": 19,
+  "headRefName": "dev/drnoakes/solution-parser-allocations",
+  "isDraft": true,
+  "author": {
+    "login": "drewnoakes"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": [
+      {
+        "login": "rainersigwald"
+      }
+    ]
+  },
+  "labels": [
+    "Area: Performance"
+  ],
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "oid": "481c759e4fa6c77c936cd2d2517eeea781af56a7",
+          "message": "Annotate ProjectFileErrorUtilities\n\nBoth for nullability and in cases where methods do not return (which helps consumers write correct nullable code).",
+          "committedDate": "2023-06-05T04:01:50Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "de89fc11e35dc90c4de23b4872eb91e74a217605",
+          "message": "Reduce allocations during SolutionFile parsing\n\nThis change converts much of the string processing to work with `ReadOnlySpan<char>` to help reduce allocations when parsing a solution file.\n\nAlmost all use of `string.Split` was removed, as this is a significant contibutor to GC pressure in this code.\n\nSome portions of the parsing logic were pulled out to internal helper functions, and unit tests added. These tests were run on the prior implementation to ensure equivalent behaviour after these changes.\n\nAPI documentation was outdated in a few places, so brought up to date.\n\nCalls to `ProjectFileErrorUtilities.VerifyThrowInvalidProjectFile` require an instance of class `BuildEventFileInfo` to be passed. When no error condition is met, this object is unused. Several callers of this method were converted to performing their own check on the condition and calling `ProjectFileErrorUtilities.ThrowInvalidProjectFile` instead when a failure exists.\n\nOther minor formatting changes, mostly guided by IDE diagnostics.",
+          "committedDate": "2023-06-05T05:05:42Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "b0c2fbc0d6718fdf3ac77a9bef53d3520f7d7a28",
+          "message": "Move TrimQuotes to local function\n\nThis pattern of trimming is to be discouraged. However it's only used in the Venus (ASP.NET) parsing logic, so this change moves it within that scope to deter other usage.",
+          "committedDate": "2023-06-05T05:06:38Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "276df9c8b6ce0744646f063d55419df37e46bc60",
+          "message": "Reduce allocations due to error checking\n\nCalls to `ProjectFileErrorUtilities.VerifyThrowInvalidProjectFile` require a few allocations, even when no error exists:\n\n1. An instance of class `BuildEventFileInfo` to be passed.\n1. An array containing string format arguments for the error message.\n\nWhen no error condition is met, these allocations go unused.\n\nAll callers of this helper method in `SolutionFile` were converted to performing their own check on the condition and calling `ProjectFileErrorUtilities.ThrowInvalidProjectFile` instead when a failure actually exists.",
+          "committedDate": "2023-06-05T05:24:33Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "4fe936baebeecefee556ffa0d78faa9af3b5091a",
+          "message": "Add tests for GetSolutionFileAndVisualStudioMajorVersions\n\nI spotted a bug in this method. This change makes the method more easily unit testable (without having to write to disk) and adds a failing test.\n\nThe bug occurs when certain solution header lines are indented. I will fix it in the next commit.\n\nThe large diff here is mostly just undenting the implementation after moving the try/finally to the new calling method.",
+          "committedDate": "2023-06-07T23:45:21Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "eb1d51a205da5405ff4306e98c52cb4d13d9eb1e",
+          "message": "Fix bug in GetSolutionFileAndVisualStudioMajorVersions\n\nAlso convert to use spans, to reduce string allocations slightly.",
+          "committedDate": "2023-06-07T23:45:21Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "84159d897fa41737bc7eea142f3f08c18d2541bc",
+          "message": "Improve regex performance\n\nBecause `.*` is greedy, the prior pattern would do a lot of backtracking, which hurts performance.\n\nWith this change, no backtracking will occur.\n\n| Method |        Mean |     Error |    StdDev | Rank |  Gen 0 | Allocated |\n|------- |------------:|----------:|----------:|-----:|-------:|----------:|\n| Before | 10,672.3 ns | 208.26 ns | 231.49 ns |    2 | 0.0610 |     385 B |\n|  After |    881.4 ns |  16.84 ns |  19.39 ns |    1 | 0.0668 |     385 B |",
+          "committedDate": "2023-06-07T23:45:21Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "b18c26199f9ec2c6932d32216cf4a3a2ea88f1f1",
+          "message": "Code formatting",
+          "committedDate": "2023-06-07T23:45:22Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "6a299cf324bd9492ee593e6257f0e10ff09285a8",
+          "message": "Use explicit string comparer",
+          "committedDate": "2023-06-07T23:45:22Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "b88d066bf9f16b21e3588134b50da6e1f068f3c4",
+          "message": "Use pattern matching",
+          "committedDate": "2023-06-07T23:45:22Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "9ad53f70ee1c57f33e22530e42ffb84bd12ca208",
+          "message": "Cache Path.GetInvalidPathChars()\n\nEach call to this method returns a new instance. That defense is required by the libraries to prevent one caller modifying data seen by another caller, but we can be sure to keep our private instance unmodified.",
+          "committedDate": "2023-06-07T23:45:23Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "8f8baaecd411966d8202421131b56889e3d4bf47",
+          "message": "Simplify expression",
+          "committedDate": "2023-06-07T23:45:23Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "317cffaebd5a1f3b24ca227b0b5bf2e4ea741f62",
+          "message": "Fix typo",
+          "committedDate": "2023-06-07T23:45:23Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "b608df40e984517a225c6e5ef00f9d4bb19ee620",
+          "message": "Make field readonly",
+          "committedDate": "2023-06-07T23:45:24Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "00cd85ae65cb0db6005a1e2d9737b16750ab85b8",
+          "message": "Move field",
+          "committedDate": "2023-06-07T23:45:24Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "ec8ba423b1a08602daaa7e1068772df758a73863",
+          "message": "Update API docs",
+          "committedDate": "2023-06-07T23:45:24Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "b676da9a8b45128d0b3be0970ed3d61a2e1786ac",
+          "message": "Additional unit test case",
+          "committedDate": "2023-06-07T23:45:25Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "2115b49c7e09c0a3c64a7bf2ce0d083a3b4cb5e8",
+          "message": "Reduce file IO buffer size in GetSolutionFileAndVisualStudioMajorVersions\n\nBoth the stream and reader have backing buffers that are, by default, much larger than needed when only reading the first four lines of a solution file.\n\nBenchmarking shows this change reduces the per-call allocation from around 10kB to 2kB.",
+          "committedDate": "2023-06-07T23:45:25Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "b02f92e26f0d9cc6e30340d4309cebc125b92b9b",
+          "message": "More use of Span throughout SolutionFile parsing\n\nMethods for reading lines now return spans only, forcing all downstream code to accept spans.\n\nThis includes the removal of a regular expression, as `Regex` doesn't accept `ROS<char>` on .NET Framework. To avoid having to allocate the line, we use some explicit parsing instead (with unit tests).",
+          "committedDate": "2023-06-07T23:45:25Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "6f8be77b403d9e8126dec28bc2f2a4b7a2d1e261",
+          "message": "Formatting",
+          "committedDate": "2023-06-07T23:45:26Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "3fe34c3cb0b9c7638e7e5cc15b62d19b292bf903",
+          "message": "Still more use of Span in SolutionFile parsing",
+          "committedDate": "2023-06-07T23:45:26Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "4ac15a560353ec13187ec6ae8b84f813dc7427e9",
+          "message": "Formatting",
+          "committedDate": "2023-06-07T23:45:26Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "4b3ef7b260f1855d1a52c5631085464b5e975193",
+          "message": "Reduce string allocations when parsing solution\n\nThis commit has two primary approaches to this:\n\n1. Don't allocate a string for each line in the file while parsing. Instead, the new `StreamLineSpanReader` class will pull data from a `Stream` and produce `ReadOnlySpan<char>` values for further processing.\n1. Allow pooling of strings produced from `ReadOnlySpan<char>` values without having to first allocate the temporary string. This is achieved via the new `StringPool` class.",
+          "committedDate": "2023-06-07T23:45:27Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "620c220f15f8af099bf020e2154f65eb5dee1976",
+          "message": "Null annotate SolutionFile and friends\n\nNote that the design of `SolutionFile` does not lend itself to good annotations. There are many fields that can be null. I've added some suppressions. There are only a few defensive behaviours in here, based mostly on annotations coming from the .NET 7.0 target.",
+          "committedDate": "2023-06-07T23:45:27Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "1f8f14a901f48cb2eb2b97d8fffbc01d7c6de4b5",
+          "message": "Pool more common strings to reduce allocations and retained memory",
+          "committedDate": "2023-06-07T23:45:27Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "7a272fe4a0e50d989099d0ef32c3dc3d17b8ed76",
+          "message": "Reduce diagnostic noise in IDE\n\nThe `SolutionFile.cs` file has loads of warnings shown in the IDE, making it hard to see the more important ones. This commit suppresses some of the stylistic diagnostics, and addresses others, to cut down the amount of noise in the IDE in this file.",
+          "committedDate": "2023-06-07T23:45:28Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "3c1f989e6bf38aef9eb6fcf47b488f6c602f996d",
+          "message": "Update documentation",
+          "committedDate": "2023-06-07T23:45:28Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "7e19e6766b216c738c18fa7067083e96cee3fb7d",
+          "message": "Null annotate tests and use raw strings for test data",
+          "committedDate": "2023-06-07T23:45:28Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "c505d2a5884ba86e80c16a730368d4def217b1f4",
+          "message": "Unit test organisation",
+          "committedDate": "2023-06-07T23:45:29Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "90e47d1261512fee77d88149e510c5cbcd8b4cd0",
+          "message": "Reduce work in ProjectInSolution.CleanseProjectName\n\nThis method is doing an N*M loop. It can actually short circuit a fair bit of that work by reusing the results of the first `IndexOfAny` call to avoid scanning that section of the string N times.",
+          "committedDate": "2023-06-07T23:45:29Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "1f963e61954f31454d406bf41815383b64a14d8a",
+          "message": "Simplify taking a sliced span from a string",
+          "committedDate": "2023-06-07T23:45:29Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "5eb5c18c4dfef20f9737fc8d3431ab48796cb969",
+          "message": "Pool \"config|platform\" strings\n\nThese will come from a very small set. We don't need a unique instance for each caller.",
+          "committedDate": "2023-06-07T23:45:30Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "88dcb0b94baf8723b6595d62d50b43cada64e5fb",
+          "message": "Compute FullName properties lazily\n\nThese are not always used, and assigning them takes work. Delay until needed.\n\n`SolutionConfigurationInSolution.ComputeFullName` is safe for concurrent access, so there's no issue in that regard.",
+          "committedDate": "2023-06-07T23:45:30Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "0ebd4bb506df067207e6f565b97540c4e10a18f5",
+          "message": "Span.IndexOf is twice as fast as Array.IndexOf\n\nRunning some benchmarks led to this change.",
+          "committedDate": "2023-06-07T23:45:30Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "d9ee47b6d8b02cdca90d31b2974b3589e2190bfc",
+          "message": "Pool strings to avoid N*M allocations\n\nThese \"suffix\" strings come from a small set. We pool them here to avoid profligate allocations.",
+          "committedDate": "2023-06-07T23:45:31Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "e26cb881f0cbba4edf01177c8051b0836978bcb5",
+          "message": "Make allocation of AspNetConfigurations lazy\n\nMost code won't populate or read this property.",
+          "committedDate": "2023-06-07T23:45:31Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "a260e377a6582a6a0b9bbe2bae9343b1a224a2a6",
+          "message": "Make allocation of ProjectReferences lazy\n\nMost code won't populate or read this property.",
+          "committedDate": "2023-06-07T23:45:31Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "c9e55322673107a2db23f1afb11972fff685c6dd",
+          "message": "Inline constant",
+          "committedDate": "2023-06-08T04:30:58Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "f4710ea7edddd98a98ad76ca3cb0de15ca870b98",
+          "message": "Clarify comment",
+          "committedDate": "2023-06-08T04:32:50Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "80c0762af0551fd81ff460f324cd04957281e027",
+          "message": "Add extension methods to simplify using spans on .NET Framework",
+          "committedDate": "2023-06-08T05:01:01Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "21dd4e81c71161ad847303a944f3707ea252fb12",
+          "message": "Move `StringPool` and `StreamLineSpanReader` to `Microsoft.NET.StringTools`\n\nThese are general purpose utility classes, suited to this library.",
+          "committedDate": "2023-06-13T04:55:45Z",
+          "author": {
+            "name": "Drew Noakes",
+            "email": "git@drewnoakes.com"
+          }
+        }
+      }
+    ]
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "> I think the `StringPool` and `StreamLineSpanReader` classes are potentially generally useful.\r\n\r\nThis statement suggests that the new classes should be added to the StringTools library. It's consumed primarily by MSBuild but has some external uses as well. The bar is pretty much exactly _potentially generally useful_, no formal API review required.\r\n\r\nThe library lives in this repo https://github.com/dotnet/msbuild/tree/main/src/StringTools so for the PR it would mean just moving files around.",
+        "createdAt": "2023-06-08T09:53:57Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "I moved `StringPool` and `StreamLineSpanReader` over and made them public. I excluded them from the `net35` builds.\r\n\r\n**EDIT** which broke the Source-Build leg. I'll investigate tomorrow.",
+        "createdAt": "2023-06-08T12:24:53Z",
+        "author": {
+          "login": "drewnoakes"
+        }
+      },
+      {
+        "body": "Nice! Does VS use this though? It used to be just command line pretty much.\n\nBTW periodically there are requests to make solution parser publicly supported API.. there are many out there. With this change there's another reason to consider that.",
+        "createdAt": "2023-06-08T12:53:14Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "> Nice! Does VS use this though? It used to be just command line pretty much.\r\n\r\n@danmoseley speaking with @davkean about this, apparently it's used in AnyCode. Usage must be high enough to be appearing in GCPauseWatson data with enough frequency to have registered for this month's perf push.",
+        "createdAt": "2023-06-13T04:44:50Z",
+        "author": {
+          "login": "drewnoakes"
+        }
+      },
+      {
+        "body": "> > Nice! Does VS use this though? It used to be just command line pretty much.\r\n> \r\n> @danmoseley speaking with @davkean about this, apparently it's used in AnyCode. Usage must be high enough to be appearing in GCPauseWatson data with enough frequency to have registered for this month's perf push.\r\n\r\nYes, used in Open Folder scenarios, and when it hits specific large repositories, such as the VS tree.",
+        "createdAt": "2023-06-13T05:58:00Z",
+        "author": {
+          "login": "davkean"
+        }
+      }
+    ]
+  },
+  "reviewThreads": {
+    "nodes": [
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Used anymore?",
+              "createdAt": "2023-06-08T04:18:07Z",
+              "path": "src/Build/Construction/Solution/SolutionConfigurationInSolution.cs",
+              "diffHunk": "@@ -16,7 +16,9 @@ public sealed class SolutionConfigurationInSolution\n         /// </summary>\n         internal const char ConfigurationPlatformSeparator = '|';",
+              "author": {
+                "login": "davkean"
+              }
+            },
+            {
+              "body": "It's still used in `SolutionFile.TryParseConfigurationPlatform`, though now it looks like feature envy. I don't know what the \"house rules\" are in this repo, but I'd just inline the constant in `TryParseConfigurationPlatform` and remove this one personally.",
+              "createdAt": "2023-06-08T04:27:59Z",
+              "path": "src/Build/Construction/Solution/SolutionConfigurationInSolution.cs",
+              "diffHunk": "@@ -16,7 +16,9 @@ public sealed class SolutionConfigurationInSolution\n         /// </summary>\n         internal const char ConfigurationPlatformSeparator = '|';",
+              "author": {
+                "login": "drewnoakes"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "\"int16\" -> UTF-16?",
+              "createdAt": "2023-06-08T04:24:43Z",
+              "path": "src/Build/Utilities/StringPool.cs",
+              "diffHunk": "@@ -0,0 +1,294 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+\n+namespace Microsoft.Build.Utilities;\n+\n+/// <summary>\n+/// Facilitates pooling of strings constructed from <c>ReadOnlySpan&lt;char&gt;</c> values,\n+/// providing zero-allocation lookup for strings that have been seen before.\n+/// </summary>\n+/// <remarks>\n+/// Uses ordinal string comparison.\n+/// </remarks>\n+internal sealed class StringPool\n+{\n+    private int[]? _buckets;\n+    private Slot[]? _slots;\n+    private int _count;\n+\n+    /// <summary>\n+    /// Returns a string containing the content of <paramref name=\"span\"/>.\n+    /// If this <see cref=\"StringPool\"/> has seen such a string before,\n+    /// the previously returned instance is returned again. Otherwise, a string\n+    /// representing the character span is constructed and cached for future usage.\n+    /// </summary>\n+    /// <remarks>\n+    /// Not thread safe.\n+    /// </remarks>\n+    /// <param name=\"span\">The span of characters to return a string for.</param>\n+    /// <returns>A string containing the characters in <paramref name=\"span\"/>, from an internal cache of strings where possible.</returns>\n+    public string Intern(ReadOnlySpan<char> span)\n+    {\n+        if (_buckets is null)\n+        {\n+            const int initialSize = 3; // must be prime\n+            _buckets = new int[initialSize];\n+            _slots = new Slot[initialSize];\n+        }\n+\n+        int hashCode = InternalGetHashCode(span);\n+\n+        int bucketIndex = hashCode % _buckets.Length;\n+\n+        // Search for an existing entry.\n+        for (int probeIndex = _buckets[hashCode % _buckets.Length] - 1; probeIndex >= 0;)\n+        {\n+            ref Slot slot = ref _slots![probeIndex];\n+\n+            if (slot.HashCode == hashCode && InternalEquals(slot.Value, span))\n+            {\n+                // Found a match! Return it.\n+                return slot.Value;\n+            }\n+\n+            // Follow the chain to find the next item.\n+            probeIndex = slot.Next;\n+        }\n+\n+        // We will add a new entry.\n+        // Resize our storage if needed.\n+        if (_count == _slots!.Length)\n+        {\n+            IncreaseCapacity();\n+            bucketIndex = hashCode % _buckets.Length;\n+        }\n+\n+        // Add the new entry in the last slot.\n+        int slotIndex = _count++;\n+\n+        // Materialize a string for the span.\n+        string str = span.ToString();\n+\n+        // Store the string.\n+        _slots[slotIndex].HashCode = hashCode;\n+        _slots[slotIndex].Value = str;\n+        _slots[slotIndex].Next = _buckets[bucketIndex] - 1;\n+        _buckets[bucketIndex] = slotIndex + 1;\n+\n+        // Return the newly created string.\n+        return str;\n+\n+        void IncreaseCapacity()\n+        {\n+            int newSize = HashHelpers.ExpandPrime(_count);\n+\n+            if (newSize <= _count)\n+            {\n+                throw new OverflowException(\"StringPool size overflowed.\");\n+            }\n+\n+            Slot[] newSlots = new Slot[newSize];\n+\n+            if (_slots != null)\n+            {\n+                Array.Copy(_slots, 0, newSlots, 0, _count);\n+            }\n+\n+            int[] newBuckets = new int[newSize];\n+\n+            for (int i = 0; i < _count; i++)\n+            {\n+                int num = newSlots[i].HashCode % newSize;\n+                newSlots[i].Next = newBuckets[num] - 1;\n+                newBuckets[num] = i + 1;\n+            }\n+\n+            _slots = newSlots;\n+            _buckets = newBuckets;\n+        }\n+    }\n+\n+    /// <summary>\n+    /// Determines whether the provided string has equivalent content to the characters\n+    /// in the provided span, using ordinal comparison.\n+    /// </summary>\n+    internal static unsafe bool InternalEquals(string str, ReadOnlySpan<char> span)\n+    {\n+        if (str.Length != span.Length)\n+        {\n+            return false;\n+        }\n+\n+        // Walk both the string and the span\n+        fixed (char* pStr0 = str)\n+        {\n+            fixed (char* pSpan0 = span)\n+            {\n+                // Reinterpret the characters (int16) as int (int32) so that we can",
+              "author": {
+                "login": "davkean"
+              }
+            },
+            {
+              "body": "Okay, I understand what you mean here, just took me a couple of reads.",
+              "createdAt": "2023-06-08T04:26:24Z",
+              "path": "src/Build/Utilities/StringPool.cs",
+              "diffHunk": "@@ -0,0 +1,294 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+\n+namespace Microsoft.Build.Utilities;\n+\n+/// <summary>\n+/// Facilitates pooling of strings constructed from <c>ReadOnlySpan&lt;char&gt;</c> values,\n+/// providing zero-allocation lookup for strings that have been seen before.\n+/// </summary>\n+/// <remarks>\n+/// Uses ordinal string comparison.\n+/// </remarks>\n+internal sealed class StringPool\n+{\n+    private int[]? _buckets;\n+    private Slot[]? _slots;\n+    private int _count;\n+\n+    /// <summary>\n+    /// Returns a string containing the content of <paramref name=\"span\"/>.\n+    /// If this <see cref=\"StringPool\"/> has seen such a string before,\n+    /// the previously returned instance is returned again. Otherwise, a string\n+    /// representing the character span is constructed and cached for future usage.\n+    /// </summary>\n+    /// <remarks>\n+    /// Not thread safe.\n+    /// </remarks>\n+    /// <param name=\"span\">The span of characters to return a string for.</param>\n+    /// <returns>A string containing the characters in <paramref name=\"span\"/>, from an internal cache of strings where possible.</returns>\n+    public string Intern(ReadOnlySpan<char> span)\n+    {\n+        if (_buckets is null)\n+        {\n+            const int initialSize = 3; // must be prime\n+            _buckets = new int[initialSize];\n+            _slots = new Slot[initialSize];\n+        }\n+\n+        int hashCode = InternalGetHashCode(span);\n+\n+        int bucketIndex = hashCode % _buckets.Length;\n+\n+        // Search for an existing entry.\n+        for (int probeIndex = _buckets[hashCode % _buckets.Length] - 1; probeIndex >= 0;)\n+        {\n+            ref Slot slot = ref _slots![probeIndex];\n+\n+            if (slot.HashCode == hashCode && InternalEquals(slot.Value, span))\n+            {\n+                // Found a match! Return it.\n+                return slot.Value;\n+            }\n+\n+            // Follow the chain to find the next item.\n+            probeIndex = slot.Next;\n+        }\n+\n+        // We will add a new entry.\n+        // Resize our storage if needed.\n+        if (_count == _slots!.Length)\n+        {\n+            IncreaseCapacity();\n+            bucketIndex = hashCode % _buckets.Length;\n+        }\n+\n+        // Add the new entry in the last slot.\n+        int slotIndex = _count++;\n+\n+        // Materialize a string for the span.\n+        string str = span.ToString();\n+\n+        // Store the string.\n+        _slots[slotIndex].HashCode = hashCode;\n+        _slots[slotIndex].Value = str;\n+        _slots[slotIndex].Next = _buckets[bucketIndex] - 1;\n+        _buckets[bucketIndex] = slotIndex + 1;\n+\n+        // Return the newly created string.\n+        return str;\n+\n+        void IncreaseCapacity()\n+        {\n+            int newSize = HashHelpers.ExpandPrime(_count);\n+\n+            if (newSize <= _count)\n+            {\n+                throw new OverflowException(\"StringPool size overflowed.\");\n+            }\n+\n+            Slot[] newSlots = new Slot[newSize];\n+\n+            if (_slots != null)\n+            {\n+                Array.Copy(_slots, 0, newSlots, 0, _count);\n+            }\n+\n+            int[] newBuckets = new int[newSize];\n+\n+            for (int i = 0; i < _count; i++)\n+            {\n+                int num = newSlots[i].HashCode % newSize;\n+                newSlots[i].Next = newBuckets[num] - 1;\n+                newBuckets[num] = i + 1;\n+            }\n+\n+            _slots = newSlots;\n+            _buckets = newBuckets;\n+        }\n+    }\n+\n+    /// <summary>\n+    /// Determines whether the provided string has equivalent content to the characters\n+    /// in the provided span, using ordinal comparison.\n+    /// </summary>\n+    internal static unsafe bool InternalEquals(string str, ReadOnlySpan<char> span)\n+    {\n+        if (str.Length != span.Length)\n+        {\n+            return false;\n+        }\n+\n+        // Walk both the string and the span\n+        fixed (char* pStr0 = str)\n+        {\n+            fixed (char* pSpan0 = span)\n+            {\n+                // Reinterpret the characters (int16) as int (int32) so that we can",
+              "author": {
+                "login": "davkean"
+              }
+            },
+            {
+              "body": "How about this?\r\n\r\n```suggestion\r\n                // Reinterpret the characters (16 bit) as int (32 bit) so that we can\r\n```",
+              "createdAt": "2023-06-08T04:29:29Z",
+              "path": "src/Build/Utilities/StringPool.cs",
+              "diffHunk": "@@ -0,0 +1,294 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+\n+namespace Microsoft.Build.Utilities;\n+\n+/// <summary>\n+/// Facilitates pooling of strings constructed from <c>ReadOnlySpan&lt;char&gt;</c> values,\n+/// providing zero-allocation lookup for strings that have been seen before.\n+/// </summary>\n+/// <remarks>\n+/// Uses ordinal string comparison.\n+/// </remarks>\n+internal sealed class StringPool\n+{\n+    private int[]? _buckets;\n+    private Slot[]? _slots;\n+    private int _count;\n+\n+    /// <summary>\n+    /// Returns a string containing the content of <paramref name=\"span\"/>.\n+    /// If this <see cref=\"StringPool\"/> has seen such a string before,\n+    /// the previously returned instance is returned again. Otherwise, a string\n+    /// representing the character span is constructed and cached for future usage.\n+    /// </summary>\n+    /// <remarks>\n+    /// Not thread safe.\n+    /// </remarks>\n+    /// <param name=\"span\">The span of characters to return a string for.</param>\n+    /// <returns>A string containing the characters in <paramref name=\"span\"/>, from an internal cache of strings where possible.</returns>\n+    public string Intern(ReadOnlySpan<char> span)\n+    {\n+        if (_buckets is null)\n+        {\n+            const int initialSize = 3; // must be prime\n+            _buckets = new int[initialSize];\n+            _slots = new Slot[initialSize];\n+        }\n+\n+        int hashCode = InternalGetHashCode(span);\n+\n+        int bucketIndex = hashCode % _buckets.Length;\n+\n+        // Search for an existing entry.\n+        for (int probeIndex = _buckets[hashCode % _buckets.Length] - 1; probeIndex >= 0;)\n+        {\n+            ref Slot slot = ref _slots![probeIndex];\n+\n+            if (slot.HashCode == hashCode && InternalEquals(slot.Value, span))\n+            {\n+                // Found a match! Return it.\n+                return slot.Value;\n+            }\n+\n+            // Follow the chain to find the next item.\n+            probeIndex = slot.Next;\n+        }\n+\n+        // We will add a new entry.\n+        // Resize our storage if needed.\n+        if (_count == _slots!.Length)\n+        {\n+            IncreaseCapacity();\n+            bucketIndex = hashCode % _buckets.Length;\n+        }\n+\n+        // Add the new entry in the last slot.\n+        int slotIndex = _count++;\n+\n+        // Materialize a string for the span.\n+        string str = span.ToString();\n+\n+        // Store the string.\n+        _slots[slotIndex].HashCode = hashCode;\n+        _slots[slotIndex].Value = str;\n+        _slots[slotIndex].Next = _buckets[bucketIndex] - 1;\n+        _buckets[bucketIndex] = slotIndex + 1;\n+\n+        // Return the newly created string.\n+        return str;\n+\n+        void IncreaseCapacity()\n+        {\n+            int newSize = HashHelpers.ExpandPrime(_count);\n+\n+            if (newSize <= _count)\n+            {\n+                throw new OverflowException(\"StringPool size overflowed.\");\n+            }\n+\n+            Slot[] newSlots = new Slot[newSize];\n+\n+            if (_slots != null)\n+            {\n+                Array.Copy(_slots, 0, newSlots, 0, _count);\n+            }\n+\n+            int[] newBuckets = new int[newSize];\n+\n+            for (int i = 0; i < _count; i++)\n+            {\n+                int num = newSlots[i].HashCode % newSize;\n+                newSlots[i].Next = newBuckets[num] - 1;\n+                newBuckets[num] = i + 1;\n+            }\n+\n+            _slots = newSlots;\n+            _buckets = newBuckets;\n+        }\n+    }\n+\n+    /// <summary>\n+    /// Determines whether the provided string has equivalent content to the characters\n+    /// in the provided span, using ordinal comparison.\n+    /// </summary>\n+    internal static unsafe bool InternalEquals(string str, ReadOnlySpan<char> span)\n+    {\n+        if (str.Length != span.Length)\n+        {\n+            return false;\n+        }\n+\n+        // Walk both the string and the span\n+        fixed (char* pStr0 = str)\n+        {\n+            fixed (char* pSpan0 = span)\n+            {\n+                // Reinterpret the characters (int16) as int (int32) so that we can",
+              "author": {
+                "login": "drewnoakes"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Oh, so they don't rewind the stream after opening it for the version?",
+              "createdAt": "2023-06-08T04:33:08Z",
+              "path": "src/Build/Construction/Solution/SolutionFile.cs",
+              "diffHunk": "@@ -468,27 +463,27 @@ internal void ParseSolutionFileForConversion()\n         internal void ParseSolutionFile()\n         {\n             ErrorUtilities.VerifyThrow(!string.IsNullOrEmpty(_solutionFile), \"ParseSolutionFile() got a null solution file!\");\n-            ErrorUtilities.VerifyThrowInternalRooted(_solutionFile);\n+            ErrorUtilities.VerifyThrowInternalRooted(_solutionFile!);\n \n-            FileStream fileStream = null;\n             SolutionReader = null;\n \n             try\n             {\n-                // Open the file\n-                fileStream = File.OpenRead(_solutionFile);\n-                SolutionReader = new StreamReader(fileStream, Encoding.GetEncoding(0)); // HIGHCHAR: If solution files have no byte-order marks, then assume ANSI rather than ASCII.\n+                // Open the file.\n+                using FileStream fileStream = File.OpenRead(_solutionFile!);\n+\n+                SolutionReader = new StreamLineSpanReader(\n+                    fileStream,",
+              "author": {
+                "login": "davkean"
+              }
+            },
+            {
+              "body": "Assuming you're referring to `GetSolutionFileAndVisualStudioMajorVersions`, that's right. That method only accepts a file path, and creates its own stream/reader/etc. I created an overload that accepts a `TextReader` to call from unit tests.\r\n\r\nLooking deeper I think you're right. It would be possible to change `ProjectInstance.LoadSolutionForBuild` such that it sniffs the header, then rewinds the stream and parses the full file again once it calls `GenerateSolutionWrapper`.\r\n\r\nWould you expect this to make much difference? I don't see any direct coverage of these methods from unit tests (I'm sure they're covered elsewhere) so am reluctant to change it in this PR.",
+              "createdAt": "2023-06-08T04:47:15Z",
+              "path": "src/Build/Construction/Solution/SolutionFile.cs",
+              "diffHunk": "@@ -468,27 +463,27 @@ internal void ParseSolutionFileForConversion()\n         internal void ParseSolutionFile()\n         {\n             ErrorUtilities.VerifyThrow(!string.IsNullOrEmpty(_solutionFile), \"ParseSolutionFile() got a null solution file!\");\n-            ErrorUtilities.VerifyThrowInternalRooted(_solutionFile);\n+            ErrorUtilities.VerifyThrowInternalRooted(_solutionFile!);\n \n-            FileStream fileStream = null;\n             SolutionReader = null;\n \n             try\n             {\n-                // Open the file\n-                fileStream = File.OpenRead(_solutionFile);\n-                SolutionReader = new StreamReader(fileStream, Encoding.GetEncoding(0)); // HIGHCHAR: If solution files have no byte-order marks, then assume ANSI rather than ASCII.\n+                // Open the file.\n+                using FileStream fileStream = File.OpenRead(_solutionFile!);\n+\n+                SolutionReader = new StreamLineSpanReader(\n+                    fileStream,",
+              "author": {
+                "login": "drewnoakes"
+              }
+            },
+            {
+              "body": "Yeah I wouldn't change it, just thought it was a bit odd.",
+              "createdAt": "2023-06-08T04:48:40Z",
+              "path": "src/Build/Construction/Solution/SolutionFile.cs",
+              "diffHunk": "@@ -468,27 +463,27 @@ internal void ParseSolutionFileForConversion()\n         internal void ParseSolutionFile()\n         {\n             ErrorUtilities.VerifyThrow(!string.IsNullOrEmpty(_solutionFile), \"ParseSolutionFile() got a null solution file!\");\n-            ErrorUtilities.VerifyThrowInternalRooted(_solutionFile);\n+            ErrorUtilities.VerifyThrowInternalRooted(_solutionFile!);\n \n-            FileStream fileStream = null;\n             SolutionReader = null;\n \n             try\n             {\n-                // Open the file\n-                fileStream = File.OpenRead(_solutionFile);\n-                SolutionReader = new StreamReader(fileStream, Encoding.GetEncoding(0)); // HIGHCHAR: If solution files have no byte-order marks, then assume ANSI rather than ASCII.\n+                // Open the file.\n+                using FileStream fileStream = File.OpenRead(_solutionFile!);\n+\n+                SolutionReader = new StreamLineSpanReader(\n+                    fileStream,",
+              "author": {
+                "login": "davkean"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "The AsSpan() is a sign of a missing overload in .NET?",
+              "createdAt": "2023-06-08T04:34:21Z",
+              "path": "src/Build/Construction/Solution/SolutionFile.cs",
+              "diffHunk": "@@ -506,33 +501,35 @@ internal void ParseSolution()\n             _defaultConfigurationName = null;\n             _defaultPlatformName = null;\n \n+            // Pool strings as we parse them, de-duplicating them in memory.\n+            StringPool pool = new();\n+\n             // the raw list of project configurations in solution configurations, to be processed after it's fully read in.\n-            Dictionary<string, string> rawProjectConfigurationsEntries = null;\n+            Dictionary<ProjectConfigurationKey, string>? rawProjectConfigurationsEntries = null;\n \n             ParseFileHeader();\n \n-            string str;\n-            while ((str = ReadLine()) != null)\n+            while (TryReadLine(out ReadOnlySpan<char> line))\n             {\n-                if (str.StartsWith(\"Project(\", StringComparison.Ordinal))\n+                if (line.StartsWith(\"Project(\".AsSpan(), StringComparison.Ordinal))",
+              "author": {
+                "login": "davkean"
+              }
+            },
+            {
+              "body": "I think the diff would be easier to read if you added an extension for this.",
+              "createdAt": "2023-06-08T04:41:33Z",
+              "path": "src/Build/Construction/Solution/SolutionFile.cs",
+              "diffHunk": "@@ -506,33 +501,35 @@ internal void ParseSolution()\n             _defaultConfigurationName = null;\n             _defaultPlatformName = null;\n \n+            // Pool strings as we parse them, de-duplicating them in memory.\n+            StringPool pool = new();\n+\n             // the raw list of project configurations in solution configurations, to be processed after it's fully read in.\n-            Dictionary<string, string> rawProjectConfigurationsEntries = null;\n+            Dictionary<ProjectConfigurationKey, string>? rawProjectConfigurationsEntries = null;\n \n             ParseFileHeader();\n \n-            string str;\n-            while ((str = ReadLine()) != null)\n+            while (TryReadLine(out ReadOnlySpan<char> line))\n             {\n-                if (str.StartsWith(\"Project(\", StringComparison.Ordinal))\n+                if (line.StartsWith(\"Project(\".AsSpan(), StringComparison.Ordinal))",
+              "author": {
+                "login": "davkean"
+              }
+            },
+            {
+              "body": "An implicit conversion for string to `ReadOnlySpan<char>` was introduced in .NET Core 2.1.\r\n\r\nhttps://learn.microsoft.com/en-us/dotnet/api/system.string.op_implicit?view=net-7.0\r\n\r\nI pushed an update that adds extension methods for .NET Framework only to make the call sites cleaner. Thanks for the suggestion.",
+              "createdAt": "2023-06-08T05:02:13Z",
+              "path": "src/Build/Construction/Solution/SolutionFile.cs",
+              "diffHunk": "@@ -506,33 +501,35 @@ internal void ParseSolution()\n             _defaultConfigurationName = null;\n             _defaultPlatformName = null;\n \n+            // Pool strings as we parse them, de-duplicating them in memory.\n+            StringPool pool = new();\n+\n             // the raw list of project configurations in solution configurations, to be processed after it's fully read in.\n-            Dictionary<string, string> rawProjectConfigurationsEntries = null;\n+            Dictionary<ProjectConfigurationKey, string>? rawProjectConfigurationsEntries = null;\n \n             ParseFileHeader();\n \n-            string str;\n-            while ((str = ReadLine()) != null)\n+            while (TryReadLine(out ReadOnlySpan<char> line))\n             {\n-                if (str.StartsWith(\"Project(\", StringComparison.Ordinal))\n+                if (line.StartsWith(\"Project(\".AsSpan(), StringComparison.Ordinal))",
+              "author": {
+                "login": "drewnoakes"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "@stephentoub Do we have anything like this in .NET Core? Basically `ReadOnlySpan<char>` producing StreamReader?",
+              "createdAt": "2023-06-08T04:44:41Z",
+              "path": "src/Build/Utilities/StreamLineSpanReader.cs",
+              "diffHunk": "@@ -0,0 +1,147 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+using System.IO;\n+using System.Text;\n+\n+namespace Microsoft.Build.Utilities;\n+\n+/// <summary>\n+/// Reads lines of text from a <see cref=\"Stream\"/> into <see cref=\"ReadOnlySpan{T}\"/>s for further processing.\n+/// Allows efficient, low-allocation consumption of textual data from a stream.\n+/// </summary>\n+internal sealed class StreamLineSpanReader",
+              "author": {
+                "login": "davkean"
+              }
+            },
+            {
+              "body": "Nope.  We have a method that enumerates the lines in a span, but no helper for enumerating the lines from a Stream as spans.  We could consider adding something like that to StreamReader, e.g. a variant of ReadLine that returned a span. It's in the gray area of the kinds of things we're comfortable doing on mainline types, as the span that's handed out would have its contents overwritten by subsequent reads, but it's the kind of thing we'll do when there are good motivating scenarios.\r\ncc: @GrabYourPitchforks ",
+              "createdAt": "2023-06-27T03:54:22Z",
+              "path": "src/Build/Utilities/StreamLineSpanReader.cs",
+              "diffHunk": "@@ -0,0 +1,147 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+using System.IO;\n+using System.Text;\n+\n+namespace Microsoft.Build.Utilities;\n+\n+/// <summary>\n+/// Reads lines of text from a <see cref=\"Stream\"/> into <see cref=\"ReadOnlySpan{T}\"/>s for further processing.\n+/// Allows efficient, low-allocation consumption of textual data from a stream.\n+/// </summary>\n+internal sealed class StreamLineSpanReader",
+              "author": {
+                "login": "stephentoub"
+              }
+            },
+            {
+              "body": "@drewnoakes just wrote one for solution parsing, right?\r\n\r\nUpdate: duh that's this PR. Ive looked at about 200 PRs this last few weeks so losing track of them.",
+              "createdAt": "2023-06-27T08:21:50Z",
+              "path": "src/Build/Utilities/StreamLineSpanReader.cs",
+              "diffHunk": "@@ -0,0 +1,147 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+using System.IO;\n+using System.Text;\n+\n+namespace Microsoft.Build.Utilities;\n+\n+/// <summary>\n+/// Reads lines of text from a <see cref=\"Stream\"/> into <see cref=\"ReadOnlySpan{T}\"/>s for further processing.\n+/// Allows efficient, low-allocation consumption of textual data from a stream.\n+/// </summary>\n+internal sealed class StreamLineSpanReader",
+              "author": {
+                "login": "davkean"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "nit: We prefer to use `Shouldly` in new tests. Not sure how official the policy is. I personally find `Shouldly` assertions more readable.",
+              "createdAt": "2023-06-08T14:23:01Z",
+              "path": "src/StringTools.UnitTests/StreamLineSpanReader_Tests.cs",
+              "diffHunk": "@@ -0,0 +1,106 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+using System.IO;\n+using System.Text;\n+\n+using Xunit;\n+\n+namespace Microsoft.NET.StringTools.Tests;\n+\n+public class StreamLineSpanReader_Tests\n+{\n+    [Fact]\n+    public void Basics()\n+    {\n+        MemoryStream stream = new(Encoding.UTF8.GetBytes(\"Hello world!\\nAnother string over here...\\nAnd one last one\"));\n+        StreamLineSpanReader reader = new(stream, Encoding.UTF8, byteBufferSize: 10, charBufferSize: 100);\n+\n+        Assert.True(reader.TryReadLine(out ReadOnlySpan<char> line));",
+              "author": {
+                "login": "ladipro"
+              }
+            },
+            {
+              "body": "I can change if preferred. I guess it's what you're used to. Perhaps this repo could remove the reference to Xunit's assertions, or ban those APIs, so contributors fall into the desired patterns when authoring code.",
+              "createdAt": "2023-06-13T04:46:41Z",
+              "path": "src/StringTools.UnitTests/StreamLineSpanReader_Tests.cs",
+              "diffHunk": "@@ -0,0 +1,106 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+using System.IO;\n+using System.Text;\n+\n+using Xunit;\n+\n+namespace Microsoft.NET.StringTools.Tests;\n+\n+public class StreamLineSpanReader_Tests\n+{\n+    [Fact]\n+    public void Basics()\n+    {\n+        MemoryStream stream = new(Encoding.UTF8.GetBytes(\"Hello world!\\nAnother string over here...\\nAnd one last one\"));\n+        StreamLineSpanReader reader = new(stream, Encoding.UTF8, byteBufferSize: 10, charBufferSize: 100);\n+\n+        Assert.True(reader.TryReadLine(out ReadOnlySpan<char> line));",
+              "author": {
+                "login": "drewnoakes"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "We have a similar string pool data structure implemented in StringTools called `WeakStringCache`. The main difference is that it's \"weak\", so does not guarantee that strings can be recovered if nothing else keeps them alive. It would be interesting to measure how well it would work in the solution file parsing scenario - could be done simply by making the `Intern` method here call `Strings.WeakIntern`.\r\n\r\nI'm also curious about the implementation choices. To avoid reimplementing a hashtable, in `WeakStringCache` we chose to internally keep strings keyed by their hashcode in (essentially) `Dictionary<int, string>`. I can see that a proper implementation as done here may be more efficient but I suspect that it's not by much and the cost of maintaining a hashtable here is somewhat unfortunate. Do you think it would be possible to benchmark the simpler approach of calculating a hash and than relying on `Dictionary<int, string>`? Or `Dictionary<int, object>` with a polymorphic value if we want to support collisions.",
+              "createdAt": "2023-06-08T15:12:45Z",
+              "path": "src/StringTools/StringPool.cs",
+              "diffHunk": "@@ -0,0 +1,294 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+\n+namespace Microsoft.NET.StringTools;\n+\n+/// <summary>\n+/// Facilitates pooling of strings constructed from <c>ReadOnlySpan&lt;char&gt;</c> values,\n+/// providing zero-allocation lookup for strings that have been seen before.\n+/// </summary>\n+/// <remarks>\n+/// Uses ordinal string comparison.\n+/// </remarks>\n+public sealed class StringPool\n+{\n+    private int[]? _buckets;\n+    private Slot[]? _slots;\n+    private int _count;",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "This feels like it should be delegated to `SequenceEqual`, so it can be optimized for us by the runtime team (it's currently [vectorized up to 256](https://github.com/dotnet/runtime/blob/eef8dd9b87363734a6c0103949bff978b723e312/src/libraries/System.Private.CoreLib/src/System/SpanHelpers.Byte.cs#L637) on core and 8 bytes at a time on net472 per disassembly). Did you benchmark that option?",
+              "createdAt": "2023-06-08T15:16:53Z",
+              "path": "src/StringTools/StringPool.cs",
+              "diffHunk": "@@ -0,0 +1,294 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+\n+namespace Microsoft.NET.StringTools;\n+\n+/// <summary>\n+/// Facilitates pooling of strings constructed from <c>ReadOnlySpan&lt;char&gt;</c> values,\n+/// providing zero-allocation lookup for strings that have been seen before.\n+/// </summary>\n+/// <remarks>\n+/// Uses ordinal string comparison.\n+/// </remarks>\n+public sealed class StringPool\n+{\n+    private int[]? _buckets;\n+    private Slot[]? _slots;\n+    private int _count;\n+\n+    /// <summary>\n+    /// Returns a string containing the content of <paramref name=\"span\"/>.\n+    /// If this <see cref=\"StringPool\"/> has seen such a string before,\n+    /// the previously returned instance is returned again. Otherwise, a string\n+    /// representing the character span is constructed and cached for future usage.\n+    /// </summary>\n+    /// <remarks>\n+    /// Not thread safe.\n+    /// </remarks>\n+    /// <param name=\"span\">The span of characters to return a string for.</param>\n+    /// <returns>A string containing the characters in <paramref name=\"span\"/>, from an internal cache of strings where possible.</returns>\n+    public string Intern(ReadOnlySpan<char> span)\n+    {\n+        if (_buckets is null)\n+        {\n+            const int initialSize = 3; // must be prime\n+            _buckets = new int[initialSize];\n+            _slots = new Slot[initialSize];\n+        }\n+\n+        int hashCode = InternalGetHashCode(span);\n+\n+        int bucketIndex = hashCode % _buckets.Length;\n+\n+        // Search for an existing entry.\n+        for (int probeIndex = _buckets[hashCode % _buckets.Length] - 1; probeIndex >= 0;)\n+        {\n+            ref Slot slot = ref _slots![probeIndex];\n+\n+            if (slot.HashCode == hashCode && InternalEquals(slot.Value, span))\n+            {\n+                // Found a match! Return it.\n+                return slot.Value;\n+            }\n+\n+            // Follow the chain to find the next item.\n+            probeIndex = slot.Next;\n+        }\n+\n+        // We will add a new entry.\n+        // Resize our storage if needed.\n+        if (_count == _slots!.Length)\n+        {\n+            IncreaseCapacity();\n+            bucketIndex = hashCode % _buckets.Length;\n+        }\n+\n+        // Add the new entry in the last slot.\n+        int slotIndex = _count++;\n+\n+        // Materialize a string for the span.\n+        string str = span.ToString();\n+\n+        // Store the string.\n+        _slots[slotIndex].HashCode = hashCode;\n+        _slots[slotIndex].Value = str;\n+        _slots[slotIndex].Next = _buckets[bucketIndex] - 1;\n+        _buckets[bucketIndex] = slotIndex + 1;\n+\n+        // Return the newly created string.\n+        return str;\n+\n+        void IncreaseCapacity()\n+        {\n+            int newSize = HashHelpers.ExpandPrime(_count);\n+\n+            if (newSize <= _count)\n+            {\n+                throw new OverflowException(\"StringPool size overflowed.\");\n+            }\n+\n+            Slot[] newSlots = new Slot[newSize];\n+\n+            if (_slots != null)\n+            {\n+                Array.Copy(_slots, 0, newSlots, 0, _count);\n+            }\n+\n+            int[] newBuckets = new int[newSize];\n+\n+            for (int i = 0; i < _count; i++)\n+            {\n+                int num = newSlots[i].HashCode % newSize;\n+                newSlots[i].Next = newBuckets[num] - 1;\n+                newBuckets[num] = i + 1;\n+            }\n+\n+            _slots = newSlots;\n+            _buckets = newBuckets;\n+        }\n+    }\n+\n+    /// <summary>\n+    /// Determines whether the provided string has equivalent content to the characters\n+    /// in the provided span, using ordinal comparison.\n+    /// </summary>\n+    internal static unsafe bool InternalEquals(string str, ReadOnlySpan<char> span)",
+              "author": {
+                "login": "rainersigwald"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "\u2764\ufe0f\u2764\ufe0f\u2764\ufe0f",
+              "createdAt": "2023-06-08T15:18:10Z",
+              "path": "src/Shared/ProjectFileErrorUtilities.cs",
+              "diffHunk": "@@ -2,11 +2,10 @@\n // The .NET Foundation licenses this file to you under the MIT license.\n \n using System;\n+using System.Diagnostics.CodeAnalysis;\n \n using InvalidProjectFileException = Microsoft.Build.Exceptions.InvalidProjectFileException;\n \n-#nullable disable",
+              "author": {
+                "login": "rainersigwald"
+              }
+            },
+            {
+              "body": "I tried annotating `ErrorUtilities` too (which would be really helpful for a lot of other code that's yet to be annotated) but the `net35` target in `MSBuildTaskHost` made that tricky.",
+              "createdAt": "2023-06-13T04:49:09Z",
+              "path": "src/Shared/ProjectFileErrorUtilities.cs",
+              "diffHunk": "@@ -2,11 +2,10 @@\n // The .NET Foundation licenses this file to you under the MIT license.\n \n using System;\n+using System.Diagnostics.CodeAnalysis;\n \n using InvalidProjectFileException = Microsoft.Build.Exceptions.InvalidProjectFileException;\n \n-#nullable disable",
+              "author": {
+                "login": "drewnoakes"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Is the guaranteed-zero-allocation nature here worth having an another class that's very similar to `WeakStringCache`? My first reaction to this was \"didn't @ladipro already do this?\" but it's not exactly the same.\r\n\r\nIt's possible that priming the WeakStringCache with solution substrings would actually help overall scenarios since those strings (like project names) are likely to be pulled back into the build shortly after the solution parse.",
+              "createdAt": "2023-06-08T15:27:16Z",
+              "path": "src/StringTools/StringPool.cs",
+              "diffHunk": "@@ -0,0 +1,294 @@\n+\ufeff// Licensed to the .NET Foundation under one or more agreements.\n+// The .NET Foundation licenses this file to you under the MIT license.\n+\n+using System;\n+\n+namespace Microsoft.NET.StringTools;\n+\n+/// <summary>\n+/// Facilitates pooling of strings constructed from <c>ReadOnlySpan&lt;char&gt;</c> values,\n+/// providing zero-allocation lookup for strings that have been seen before.\n+/// </summary>\n+/// <remarks>\n+/// Uses ordinal string comparison.\n+/// </remarks>\n+public sealed class StringPool",
+              "author": {
+                "login": "rainersigwald"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

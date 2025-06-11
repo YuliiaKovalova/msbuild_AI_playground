@@ -1,0 +1,205 @@
+diff --git a/src/Build/BuildCheck/Checks/TargetFrameworkUnexpectedCheck.cs b/src/Build/BuildCheck/Checks/TargetFrameworkUnexpectedCheck.cs
+index 4d26a0f2e22..17f30cd8938 100644
+--- a/src/Build/BuildCheck/Checks/TargetFrameworkUnexpectedCheck.cs
++++ b/src/Build/BuildCheck/Checks/TargetFrameworkUnexpectedCheck.cs
+@@ -5,6 +5,7 @@
+ using System.IO;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
++using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Checks;
+@@ -28,39 +29,77 @@ public override void Initialize(ConfigurationContext configurationContext)
+     public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
+     {
+         registrationContext.RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction);
++        registrationContext.RegisterEvaluatedItemsAction(EvaluatedItemsAction);
+     }
+ 
+     internal override bool IsBuiltIn => true;
+ 
+     private readonly HashSet<string> _projectsSeen = new(MSBuildNameIgnoreCaseComparer.Default);
++    private string? _tfm;
+ 
+     private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesCheckData> context)
+     {
+-        // We want to avoid repeated checking of a same project (as it might be evaluated multiple times)
+-        //  for this reason we use a hashset with already seen projects.
+-        if (!_projectsSeen.Add(context.Data.ProjectFilePath))
++        // Resetting state for the next project.
++        _tfm = null;
++
++        // See CopyAlwaysCheck.EvaluatedPropertiesAction for explanation. 
++        if (_projectsSeen.Contains(context.Data.ProjectFilePath))
+         {
+             return;
+         }
+ 
+         string? frameworks = null;
+         string? framework = null;
+-        // This is not SDK style project
+-        if ((!context.Data.EvaluatedProperties.TryGetValue(PropertyNames.UsingMicrosoftNETSdk, out string? usingSdkStr) ||
+-            !StringExtensions.IsMSBuildTrueString(usingSdkStr))
++        // TargetFramework(s) is specified
++        if ((context.Data.EvaluatedProperties.TryGetValue(PropertyNames.TargetFrameworks, out frameworks) ||
++             context.Data.EvaluatedProperties.TryGetValue(PropertyNames.TargetFramework, out framework)) &&
++            !string.IsNullOrEmpty(framework ?? frameworks)
+             &&
+-            // But TargetFramework(s) is specified
+-            (context.Data.EvaluatedProperties.TryGetValue(PropertyNames.TargetFrameworks, out frameworks) ||
+-            context.Data.EvaluatedProperties.TryGetValue(PropertyNames.TargetFramework, out framework)) &&
+-            !string.IsNullOrEmpty(framework ?? frameworks))
++            !IsSdkStyleProject(context.Data.EvaluatedProperties) && !IsCppCliProject(context.Data.EvaluatedProperties)
++            )
++        {
++            // Indicating that to the EvaluatedItemsAction, that if this project is recognized as manged - we should emit diagnostics.
++            _tfm = framework ?? frameworks;
++        }
++
++        bool IsSdkStyleProject(IReadOnlyDictionary<string, string> evaluatedProperties)
++            => evaluatedProperties.TryGetValue(PropertyNames.UsingMicrosoftNETSdk, out string? usingSdkStr) &&
++               usingSdkStr.IsMSBuildTrueString();
++
++        bool IsCppCliProject(IReadOnlyDictionary<string, string> evaluatedProperties)
++            => evaluatedProperties.TryGetValue("CLRSupport", out string? clrSupportStr) &&
++               MSBuildNameIgnoreCaseComparer.Default.Equals(clrSupportStr, "NetCore");
++    }
++
++    private void EvaluatedItemsAction(BuildCheckDataContext<EvaluatedItemsCheckData> context)
++    {
++        // Neither TargetFrameworks nor TargetFramework is specified, or the project is not Sdk-style nor C++/CLI project.
++        if (_tfm == null)
+         {
+-            // {0} specifies 'TargetFrameworks' property '{1}' and 'TargetFramework' property '{2}'
+-            context.ReportResult(BuildCheckResult.Create(
+-                SupportedRule,
+-                // Populating precise location tracked via https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=58661732
+-                ElementLocation.EmptyLocation,
+-                Path.GetFileName(context.Data.ProjectFilePath),
+-                framework ?? frameworks ?? string.Empty));
++            return;
++        }
++
++        // We want to avoid repeated checking of a same project (as it might be evaluated multiple times)
++        //  for this reason we use a hashset with already seen projects.
++        if (!_projectsSeen.Add(context.Data.ProjectFilePath))
++        {
++            return;
++        }
++
++        foreach (ItemData itemData in context.Data.EnumerateItemsOfType(ItemNames.ProjectCapability))
++        {
++            if (MSBuildNameIgnoreCaseComparer.Default.Equals(itemData.EvaluatedInclude, ItemMetadataNames.managed))
++            {
++                // {0} specifies 'TargetFramework(s)' property value
++                context.ReportResult(BuildCheckResult.Create(
++                    SupportedRule,
++                    // Populating precise location tracked via https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=58661732
++                    ElementLocation.EmptyLocation,
++                    Path.GetFileName(context.Data.ProjectFilePath),
++                    _tfm));
++
++                break;
++            }
+         }
+     }
+ }
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index fd56b9d388a..357b6c78e8d 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -432,6 +432,74 @@ public void TFMinNonSdkCheckTest()
+         GetWarningsCount(output).ShouldBe(1);
+     }
+ 
++    [Theory]
++    [InlineData(
++        """
++        <Project ToolsVersion="msbuilddefaulttoolsversion">
++            <PropertyGroup>
++              <TargetFramework>net472</TargetFramework>
++            </PropertyGroup>
++            <Target Name="Build">
++                <Message Text="Build done"/>
++            </Target>
++        </Project>
++        """,
++        false)]
++    [InlineData(
++        """
++        <Project Sdk="Microsoft.NET.Sdk">
++          <PropertyGroup>
++            <TargetFramework>net9.0</TargetFramework>
++          </PropertyGroup>
++        </Project>
++        """,
++        false)]
++    [InlineData(
++        """
++        <Project ToolsVersion="12.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
++          <PropertyGroup>
++            <OutputType>Library</OutputType>
++            <TargetFrameworkVersion>v4.6.2</TargetFrameworkVersion>
++            <OutputPath>bin\Debug\</OutputPath>
++        	<NoWarn>CS2008</NoWarn>
++          </PropertyGroup>
++          <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
++        </Project>
++        """,
++        false)]
++    [InlineData(
++        """
++        <Project ToolsVersion="12.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
++          <PropertyGroup>
++            <OutputType>Library</OutputType>
++            <TargetFrameworkVersion>v4.6.2</TargetFrameworkVersion>
++            <TargetFramework>v4.6.2</TargetFramework>
++            <OutputPath>bin\Debug\</OutputPath>
++        	<NoWarn>CS2008</NoWarn>
++          </PropertyGroup>
++          <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
++        </Project>
++        """,
++        true)]
++    public void TFMinNonSdkCheckTest2(string projectContent, bool expectCheckTrigger)
++    {
++        TransientTestFolder workFolder = _env.CreateFolder(createFolder: true);
++
++        workFolder.CreateFile("testproj.csproj", projectContent);
++
++        _env.SetCurrentDirectory(workFolder.Path);
++
++        string output = RunnerUtilities.ExecBootstrapedMSBuild($"-check -restore", out bool success);
++        _env.Output.WriteLine(output);
++        _env.Output.WriteLine("=========================");
++        success.ShouldBeTrue();
++
++        string expectedDiagnostic = "warning BC0108: .* specifies 'TargetFramework\\(s\\)' property";
++        Regex.Matches(output, expectedDiagnostic).Count.ShouldBe(expectCheckTrigger ? 2 : 0);
++
++        GetWarningsCount(output).ShouldBe(expectCheckTrigger ? 1 : 0);
++    }
++
+ 
+     [Fact]
+     public void ConfigChangeReflectedOnReuse()
+diff --git a/src/Shared/Constants.cs b/src/Shared/Constants.cs
+index 03c8646f384..e435d354935 100644
+--- a/src/Shared/Constants.cs
++++ b/src/Shared/Constants.cs
+@@ -210,6 +210,7 @@ internal static class ItemMetadataNames
+         internal const string withCulture = "WithCulture";
+         internal const string copyToOutputDirectory = "CopyToOutputDirectory";
+         internal const string copyAlways = "Always";
++        internal const string managed = "Managed";
+ 
+         /// <summary>
+         /// The output path for a given item.
+@@ -250,5 +251,6 @@ internal static class ItemNames
+         internal const string EmbeddedResource = "EmbeddedResource";
+         internal const string None = "None";
+         internal const string Reference = "Reference";
++        internal const string ProjectCapability = "ProjectCapability";
+     }
+ }

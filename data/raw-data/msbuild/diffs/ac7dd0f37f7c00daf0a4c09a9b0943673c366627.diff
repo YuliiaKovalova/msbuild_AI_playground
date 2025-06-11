@@ -1,0 +1,202 @@
+diff --git a/src/Build/Instance/ProjectItemInstance.cs b/src/Build/Instance/ProjectItemInstance.cs
+index f9dc6429ec1..2a34f84a2d9 100644
+--- a/src/Build/Instance/ProjectItemInstance.cs
++++ b/src/Build/Instance/ProjectItemInstance.cs
+@@ -1068,6 +1068,16 @@ public IEnumerable<KeyValuePair<string, string>> EnumerateMetadata()
+                 var list = _itemDefinitions != null ? MetadataCollection : _directMetadata;
+                 if (list != null)
+                 {
++#if FEATURE_APPDOMAIN
++                    // Can't send a yield-return iterator across AppDomain boundaries
++                    if (!AppDomain.CurrentDomain.IsDefaultAppDomain())
++                    {
++                        return EnumerateMetadataEager(list);
++                    }
++#endif
++                    // Mainline scenario, returns an iterator to avoid allocating an array
++                    // to store the results. With the iterator, results can stream to the
++                    // consumer (e.g. binlog writer) without allocations.
+                     return EnumerateMetadata(list);
+                 }
+                 else
+@@ -1076,6 +1086,28 @@ public IEnumerable<KeyValuePair<string, string>> EnumerateMetadata()
+                 }
+             }
+ 
++            /// <summary>
++            /// Used to return metadata from another AppDomain. Can't use yield return because the
++            /// generated state machine is not marked as [Serializable], so we need to allocate.
++            /// </summary>
++            /// <param name="list">The source list to return metadata from.</param>
++            /// <returns>An array of string key-value pairs representing metadata.</returns>
++            private IEnumerable<KeyValuePair<string, string>> EnumerateMetadataEager(CopyOnWritePropertyDictionary<ProjectMetadataInstance> list)
++            {
++                var result = new List<KeyValuePair<string, string>>(list.Count);
++
++                foreach (var projectMetadataInstance in list)
++                {
++                    if (projectMetadataInstance != null)
++                    {
++                        result.Add(new KeyValuePair<string, string>(projectMetadataInstance.Name, projectMetadataInstance.EvaluatedValue));
++                    }
++                }
++
++                // Probably better to send the raw array across the wire even if it's another allocation.
++                return result.ToArray();
++            }
++
+             private IEnumerable<KeyValuePair<string, string>> EnumerateMetadata(CopyOnWritePropertyDictionary<ProjectMetadataInstance> list)
+             {
+                 foreach (var projectMetadataInstance in list)
+@@ -1152,7 +1184,7 @@ internal CopyOnWritePropertyDictionary<ProjectMetadataInstance> MetadataCollecti
+ 
+             IEnumerable<ProjectMetadataInstance> IItem<ProjectMetadataInstance>.Metadata => MetadataCollection;
+ 
+-            #region Operators
++#region Operators
+ 
+             /// <summary>
+             /// This allows an explicit typecast from a "TaskItem" to a "string", returning the ItemSpec for this item.
+@@ -1193,7 +1225,7 @@ public static explicit operator string(TaskItem that)
+                 return !(left == right);
+             }
+ 
+-            #endregion
++#endregion
+ 
+             /// <summary>
+             /// Produce a string representation.
+@@ -1215,7 +1247,7 @@ public override object InitializeLifetimeService()
+             }
+ #endif
+ 
+-            #region IItem and ITaskItem2 Members
++#region IItem and ITaskItem2 Members
+ 
+             /// <summary>
+             /// Returns the metadata with the specified key.
+@@ -1467,9 +1499,9 @@ IDictionary ITaskItem2.CloneCustomMetadataEscaped()
+                 return clonedMetadata;
+             }
+ 
+-            #endregion
++#endregion
+ 
+-            #region INodePacketTranslatable Members
++#region INodePacketTranslatable Members
+ 
+             /// <summary>
+             /// Reads or writes the packet to the serializer.
+@@ -1499,9 +1531,9 @@ void ITranslatable.Translate(ITranslator translator)
+                 }
+             }
+ 
+-            #endregion
++#endregion
+ 
+-            #region IEquatable<TaskItem> Members
++#region IEquatable<TaskItem> Members
+ 
+             /// <summary>
+             /// Override of GetHashCode.
+@@ -1579,7 +1611,7 @@ public bool Equals(TaskItem other)
+                 return true;
+             }
+ 
+-            #endregion
++#endregion
+ 
+             /// <summary>
+             /// Returns true if a particular piece of metadata is defined on this item (even if
+diff --git a/src/Shared/TaskParameter.cs b/src/Shared/TaskParameter.cs
+index 17cc1269cca..171fd428e47 100644
+--- a/src/Shared/TaskParameter.cs
++++ b/src/Shared/TaskParameter.cs
+@@ -759,6 +759,41 @@ IDictionary ITaskItem2.CloneCustomMetadataEscaped()
+ 
+             public IEnumerable<KeyValuePair<string, string>> EnumerateMetadata()
+             {
++#if FEATURE_APPDOMAIN
++                if (!AppDomain.CurrentDomain.IsDefaultAppDomain())
++                {
++                    return EnumerateMetadataEager();
++                }
++#endif
++
++                return EnumerateMetadataLazy();
++            }
++
++            private IEnumerable<KeyValuePair<string, string>> EnumerateMetadataEager()
++            {
++                if (_customEscapedMetadata == null || _customEscapedMetadata.Count == 0)
++                {
++#if TASKHOST
++                    // MSBuildTaskHost.dll compiles against .NET 3.5 which doesn't have Array.Empty()
++                    return new KeyValuePair<string, string>[0];
++#else
++                    return Array.Empty<KeyValuePair<string, string>>();
++#endif
++                }
++
++                var result = new KeyValuePair<string, string>[_customEscapedMetadata.Count];
++                int index = 0;
++                foreach (var kvp in _customEscapedMetadata)
++                {
++                    var unescaped = new KeyValuePair<string, string>(kvp.Key, EscapingUtilities.UnescapeAll(kvp.Value));
++                    result[index++] = unescaped;
++                }
++
++                return result;
++            }
++
++            private IEnumerable<KeyValuePair<string, string>> EnumerateMetadataLazy()
++            {
+                 if (_customEscapedMetadata == null)
+                 {
+                     yield break;
+diff --git a/src/Utilities/TaskItem.cs b/src/Utilities/TaskItem.cs
+index 1aadd08bfde..1e66ad5bd33 100644
+--- a/src/Utilities/TaskItem.cs
++++ b/src/Utilities/TaskItem.cs
+@@ -465,6 +465,41 @@ IDictionary ITaskItem2.CloneCustomMetadataEscaped() => _metadata == null
+ 
+         IEnumerable<KeyValuePair<string, string>> IMetadataContainer.EnumerateMetadata()
+         {
++#if FEATURE_APPDOMAIN
++            // Can't send a yield-return iterator across AppDomain boundaries
++            // so have to allocate
++            if (!AppDomain.CurrentDomain.IsDefaultAppDomain())
++            {
++                return EnumerateMetadataEager();
++            }
++#endif
++
++            // In general case we want to return an iterator without allocating a collection
++            // to hold the result, so we can stream the items directly to the consumer.
++            return EnumerateMetadataLazy();
++        }
++
++        private IEnumerable<KeyValuePair<string, string>> EnumerateMetadataEager()
++        {
++            if (_metadata == null)
++            {
++                return Array.Empty<KeyValuePair<string, string>>();
++            }
++
++            int count = _metadata.Count;
++            int index = 0;
++            var result = new KeyValuePair<string, string>[count];
++            foreach (var kvp in _metadata)
++            {
++                var unescaped = new KeyValuePair<string, string>(kvp.Key, EscapingUtilities.UnescapeAll(kvp.Value));
++                result[index++] = unescaped;
++            }
++
++            return result;
++        }
++
++        private IEnumerable<KeyValuePair<string, string>> EnumerateMetadataLazy()
++        {
+             if (_metadata == null)
+             {
+                 yield break;

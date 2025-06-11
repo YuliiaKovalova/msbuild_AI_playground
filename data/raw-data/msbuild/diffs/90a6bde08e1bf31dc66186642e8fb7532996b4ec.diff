@@ -1,0 +1,253 @@
+diff --git a/src/Build/Definition/Project.cs b/src/Build/Definition/Project.cs
+index cbd3232a1be..8ba6bbbfc8b 100644
+--- a/src/Build/Definition/Project.cs
++++ b/src/Build/Definition/Project.cs
+@@ -4192,7 +4192,7 @@ internal Data(Project project, PropertyDictionary<ProjectPropertyInstance> globa
+             /// <summary>
+             /// Prepares the data object for evaluation.
+             /// </summary>
+-            public void InitializeForEvaluation(IToolsetProvider toolsetProvider, IFileSystem fileSystem)
++            public void InitializeForEvaluation(IToolsetProvider toolsetProvider, EvaluationContext evaluationContext)
+             {
+                 DefaultTargets = null;
+                 Properties = new PropertyDictionary<ProjectProperty>();
+@@ -4200,7 +4200,7 @@ public void InitializeForEvaluation(IToolsetProvider toolsetProvider, IFileSyste
+                 Items = new ItemDictionary<ProjectItem>();
+                 ItemsIgnoringCondition = new ItemDictionary<ProjectItem>();
+                 ItemsByEvaluatedIncludeCache = new MultiDictionary<string, ProjectItem>(StringComparer.OrdinalIgnoreCase);
+-                Expander = new Expander<ProjectProperty, ProjectItem>(Properties, Items, fileSystem);
++                Expander = new Expander<ProjectProperty, ProjectItem>(Properties, Items, evaluationContext);
+                 ItemDefinitions = new RetrievableEntryHashSet<ProjectItemDefinition>(MSBuildNameIgnoreCaseComparer.Default);
+                 Targets = new RetrievableEntryHashSet<ProjectTargetInstance>(StringComparer.OrdinalIgnoreCase);
+                 ImportClosure = new List<ResolvedImport>();
+diff --git a/src/Build/Evaluation/Context/EvaluationContext.cs b/src/Build/Evaluation/Context/EvaluationContext.cs
+index d0a12e16409..5bc1e2ec3df 100644
+--- a/src/Build/Evaluation/Context/EvaluationContext.cs
++++ b/src/Build/Evaluation/Context/EvaluationContext.cs
+@@ -48,7 +48,7 @@ public enum SharingPolicy
+         /// <summary>
+         /// Key to file entry list. Example usages: cache glob expansion and intermediary directory expansions during glob expansion.
+         /// </summary>
+-        internal ConcurrentDictionary<string, IReadOnlyList<string>> FileEntryExpansionCache { get; }
++        private ConcurrentDictionary<string, IReadOnlyList<string>> FileEntryExpansionCache { get; }
+ 
+         private EvaluationContext(SharingPolicy policy, IFileSystem fileSystem, ISdkResolverService sdkResolverService = null,
+             ConcurrentDictionary<string, IReadOnlyList<string>> fileEntryExpansionCache = null)
+@@ -126,10 +126,17 @@ internal EvaluationContext ContextForNewProject()
+             }
+         }
+ 
++        /// <summary>
++        /// Creates a copy of this <see cref="EvaluationContext"/> with a given <see cref="IFileSystem"/> swapped in.
++        /// </summary>
++        /// <param name="fileSystem">The file system to use by the new evaluation context.</param>
++        /// <returns>The new evaluation context.</returns>
+         internal EvaluationContext ContextWithFileSystem(IFileSystem fileSystem)
+         {
+-            var newContext = new EvaluationContext(this.Policy, fileSystem, this.SdkResolverService, this.FileEntryExpansionCache);
+-            newContext._used = 1;
++            var newContext = new EvaluationContext(this.Policy, fileSystem, this.SdkResolverService, this.FileEntryExpansionCache)
++            {
++                _used = 1
++            };
+             return newContext;
+         }
+     }
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index d35d10df3ae..db93150bdf1 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -19,6 +19,7 @@
+ using Microsoft.Build.Eventing;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Experimental.ProjectCache;
++using Microsoft.Build.FileSystem;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Framework.Profiler;
+ using Microsoft.Build.Internal;
+@@ -32,7 +33,6 @@
+ using EngineFileUtilities = Microsoft.Build.Internal.EngineFileUtilities;
+ using ReservedPropertyNames = Microsoft.Build.Internal.ReservedPropertyNames;
+ using SdkReferencePropertyExpansionMode = Microsoft.Build.Utilities.EscapeHatches.SdkReferencePropertyExpansionMode;
+-using Microsoft.Build.FileSystem;
+ 
+ namespace Microsoft.Build.Evaluation
+ {
+@@ -223,7 +223,7 @@ private Evaluator(
+                 data = new PropertyTrackingEvaluatorDataWrapper<P, I, M, D>(data, _evaluationLoggingContext, Traits.Instance.LogPropertyTracking);
+             }
+ 
+-            // If the host wishes to provide a directory cache for this evaluation, wrap the EvaluationContext to use the right file system.
++            // If the host wishes to provide a directory cache for this evaluation, create a new EvaluationContext with the right file system.
+             _evaluationContext = evaluationContext;
+             IDirectoryCache directoryCache = project?.GetDirectoryCacheForEvaluation(_evaluationLoggingContext.BuildEventContext.EvaluationId);
+             if (directoryCache is not null)
+@@ -233,7 +233,7 @@ private Evaluator(
+             }
+ 
+             // Create containers for the evaluation results
+-            data.InitializeForEvaluation(toolsetProvider, _evaluationContext.FileSystem);
++            data.InitializeForEvaluation(toolsetProvider, _evaluationContext);
+ 
+             _expander = new Expander<P, I>(data, data, _evaluationContext);
+ 
+@@ -369,7 +369,7 @@ internal static List<I> CreateItemsFromInclude(string rootDirectory, ProjectItem
+                     else
+                     {
+                         // The expression is not of the form "@(X)". Treat as string
+-                        string[] includeSplitFilesEscaped = EngineFileUtilities.GetFileListEscaped(rootDirectory, includeSplitEscaped, excludeSpecsEscaped: null, forceEvaluate: false, expander.EvaluationContext.FileMatcher);
++                        string[] includeSplitFilesEscaped = EngineFileUtilities.GetFileListEscaped(rootDirectory, includeSplitEscaped, excludeSpecsEscaped: null, forceEvaluate: false, fileMatcher: expander.EvaluationContext?.FileMatcher);
+ 
+                         if (includeSplitFilesEscaped.Length > 0)
+                         {
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 569b0555c25..1fe132a8d21 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -13,6 +13,7 @@
+ using System.Runtime.CompilerServices;
+ using System.Text.RegularExpressions;
+ using Microsoft.Build.Collections;
++using Microsoft.Build.Evaluation.Context;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+@@ -25,7 +26,6 @@
+ using TaskItemFactory = Microsoft.Build.Execution.ProjectItemInstance.TaskItem.TaskItemFactory;
+ 
+ using Microsoft.NET.StringTools;
+-using Microsoft.Build.Evaluation.Context;
+ 
+ namespace Microsoft.Build.Evaluation
+ {
+diff --git a/src/Build/Evaluation/IEvaluatorData.cs b/src/Build/Evaluation/IEvaluatorData.cs
+index af0265b01d3..7e2c9c5c85c 100644
+--- a/src/Build/Evaluation/IEvaluatorData.cs
++++ b/src/Build/Evaluation/IEvaluatorData.cs
+@@ -8,7 +8,7 @@
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.SdkResolution;
+-using Microsoft.Build.Shared.FileSystem;
++using Microsoft.Build.Evaluation.Context;
+ 
+ namespace Microsoft.Build.Evaluation
+ {
+@@ -210,7 +210,7 @@ List<ProjectItemElement> EvaluatedItemElements
+         /// <summary>
+         /// Prepares the data block for a new evaluation pass
+         /// </summary>
+-        void InitializeForEvaluation(IToolsetProvider toolsetProvider, IFileSystem fileSystem);
++        void InitializeForEvaluation(IToolsetProvider toolsetProvider, EvaluationContext evaluationContext);
+ 
+         /// <summary>
+         /// Indicates to the data block that evaluation has completed,
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.EvaluatorData.cs b/src/Build/Evaluation/LazyItemEvaluator.EvaluatorData.cs
+index 4c88a6d976f..fc3996350a3 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.EvaluatorData.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.EvaluatorData.cs
+@@ -8,7 +8,7 @@
+ using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Execution;
+-using Microsoft.Build.Shared.FileSystem;
++using Microsoft.Build.Evaluation.Context;
+ 
+ namespace Microsoft.Build.Evaluation
+ {
+@@ -285,9 +285,9 @@ public ProjectTargetInstance GetTarget(string targetName)
+                 return _wrappedData.GetTarget(targetName);
+             }
+ 
+-            public void InitializeForEvaluation(IToolsetProvider toolsetProvider, IFileSystem fileSystem)
++            public void InitializeForEvaluation(IToolsetProvider toolsetProvider, EvaluationContext evaluationContext)
+             {
+-                _wrappedData.InitializeForEvaluation(toolsetProvider, fileSystem);
++                _wrappedData.InitializeForEvaluation(toolsetProvider, evaluationContext);
+             }
+ 
+             public void RecordImport(ProjectImportElement importElement, ProjectRootElement import, int versionEvaluated, SdkResult sdkResult)
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs b/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
+index bdafd6087c7..20706932be6 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.LazyItemOperation.cs
+@@ -44,7 +44,7 @@ protected LazyItemOperation(OperationBuilder builder, LazyItemEvaluator<P, I, M,
+ 
+                 _evaluatorData = new EvaluatorData(_lazyEvaluator._outerEvaluatorData, itemType => GetReferencedItems(itemType, ImmutableHashSet<string>.Empty));
+                 _itemFactory = new ItemFactoryWrapper(_itemElement, _lazyEvaluator._itemFactory);
+-                _expander = new Expander<P, I>(_evaluatorData, _evaluatorData, _lazyEvaluator.FileSystem);
++                _expander = new Expander<P, I>(_evaluatorData, _evaluatorData, _lazyEvaluator.EvaluationContext);
+ 
+                 _itemSpec.Expander = _expander;
+             }
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.cs b/src/Build/Evaluation/LazyItemEvaluator.cs
+index 53a92503e47..f5d52eed4ee 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.cs
+@@ -39,22 +39,22 @@ internal partial class LazyItemEvaluator<P, I, M, D>
+             new Dictionary<string, LazyItemList>() :
+             new Dictionary<string, LazyItemList>(StringComparer.OrdinalIgnoreCase);
+ 
+-        protected IFileSystem FileSystem { get; }
++        protected EvaluationContext EvaluationContext { get; }
+ 
+-        protected FileMatcher FileMatcher { get; }
++        protected IFileSystem FileSystem => EvaluationContext.FileSystem;
++        protected FileMatcher FileMatcher => EvaluationContext.FileMatcher;
+ 
+         public LazyItemEvaluator(IEvaluatorData<P, I, M, D> data, IItemFactory<I, I> itemFactory, LoggingContext loggingContext, EvaluationProfiler evaluationProfiler, EvaluationContext evaluationContext)
+         {
+             _outerEvaluatorData = data;
+-            _outerExpander = new Expander<P, I>(_outerEvaluatorData, _outerEvaluatorData, evaluationContext.FileSystem);
++            _outerExpander = new Expander<P, I>(_outerEvaluatorData, _outerEvaluatorData, evaluationContext);
+             _evaluatorData = new EvaluatorData(_outerEvaluatorData, itemType => GetItems(itemType));
+-            _expander = new Expander<P, I>(_evaluatorData, _evaluatorData, evaluationContext.FileSystem);
++            _expander = new Expander<P, I>(_evaluatorData, _evaluatorData, evaluationContext);
+             _itemFactory = itemFactory;
+             _loggingContext = loggingContext;
+             _evaluationProfiler = evaluationProfiler;
+ 
+-            FileSystem = evaluationContext.FileSystem;
+-            FileMatcher = evaluationContext.FileMatcher;
++            EvaluationContext = evaluationContext;
+         }
+ 
+         private ImmutableList<I> GetItems(string itemType)
+diff --git a/src/Build/Evaluation/PropertyTrackingEvaluatorDataWrapper.cs b/src/Build/Evaluation/PropertyTrackingEvaluatorDataWrapper.cs
+index 6e3dc3a3ec7..54effc239c5 100644
+--- a/src/Build/Evaluation/PropertyTrackingEvaluatorDataWrapper.cs
++++ b/src/Build/Evaluation/PropertyTrackingEvaluatorDataWrapper.cs
+@@ -5,10 +5,10 @@
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Execution;
+-using Microsoft.Build.Shared.FileSystem;
+ using System;
+ using System.Collections.Generic;
+ using Microsoft.Build.BackEnd.Components.Logging;
++using Microsoft.Build.Evaluation.Context;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using SdkResult = Microsoft.Build.BackEnd.SdkResolution.SdkResult;
+@@ -135,7 +135,7 @@ public P SetProperty(ProjectPropertyElement propertyElement, string evaluatedVal
+         public ItemDictionary<I> Items => _wrapped.Items;
+         public List<ProjectItemElement> EvaluatedItemElements => _wrapped.EvaluatedItemElements;
+         public PropertyDictionary<ProjectPropertyInstance> EnvironmentVariablePropertiesDictionary => _wrapped.EnvironmentVariablePropertiesDictionary;
+-        public void InitializeForEvaluation(IToolsetProvider toolsetProvider, IFileSystem fileSystem) => _wrapped.InitializeForEvaluation(toolsetProvider, fileSystem);
++        public void InitializeForEvaluation(IToolsetProvider toolsetProvider, EvaluationContext evaluationContext) => _wrapped.InitializeForEvaluation(toolsetProvider, evaluationContext);
+         public void FinishEvaluation() => _wrapped.FinishEvaluation();
+         public void AddItem(I item) => _wrapped.AddItem(item);
+         public void AddItemIgnoringCondition(I item) => _wrapped.AddItemIgnoringCondition(item);
+diff --git a/src/Build/Instance/ProjectInstance.cs b/src/Build/Instance/ProjectInstance.cs
+index 3a8eba5b4a5..502370f337a 100644
+--- a/src/Build/Instance/ProjectInstance.cs
++++ b/src/Build/Instance/ProjectInstance.cs
+@@ -1347,7 +1347,7 @@ ICollection<ProjectItemInstance> IItemProvider<ProjectItemInstance>.GetItems(str
+         /// Only called during evaluation, so does not check for immutability.
+         /// </summary>
+         void IEvaluatorData<ProjectPropertyInstance, ProjectItemInstance, ProjectMetadataInstance, ProjectItemDefinitionInstance>.
+-            InitializeForEvaluation(IToolsetProvider toolsetProvider, IFileSystem fileSystem)
++            InitializeForEvaluation(IToolsetProvider toolsetProvider, EvaluationContext evaluationContext)
+         {
+             // All been done in the constructor.  We don't allow re-evaluation of project instances.
+         }

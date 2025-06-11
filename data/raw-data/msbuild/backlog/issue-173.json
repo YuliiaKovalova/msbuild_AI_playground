@@ -1,0 +1,184 @@
+{
+  "number": 173,
+  "title": "GAC Resolution fallback introduces unexpected bugs - should be an error instead of a warning",
+  "body": "So this one could be fun, because I immediately realize it's going to break some people if implemented. I'm here to argue _that's a good thing_. This was brought up by [an issue we hit while upgrading to .Net 4.6](https://github.com/dotnet/roslyn/issues/4889). But, it's far from the first time I've been bitten by it.\n\nMSBuild currently falls back to the framework assemblies in the GAC if the targeted framework reference assemblies are not on the machine. You get a warning like this:\n\n> C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\Microsoft.Common.targets(983, 5): warning MSB3644: The reference assemblies for framework \".NETFramework,Version=v4.5.2\" were not found. To resolve this, install the SDK or Targeting Pack for this framework version or retarget your application to a version of the framework for which you have the SDK or Targeting Pack installed. Note that assemblies will be resolved from the Global Assembly Cache (GAC) and will be used in place of reference assemblies. Therefore your assembly may not be correctly targeted for the framework you intend.\n\nThat's a warning, not an **error** - the build continues. I'm arguing this should break the build, not produce downstream unexpected results.\n\nHere's the relevant code where the MSBuild decision of \"can't find the target? let's use the GAC instead\", in [`GetPaths()`](https://github.com/Microsoft/msbuild/blob/1510d9a8cf346f01919c5b9545ef0b1a25bfbe9d/src/XMakeTasks/GetReferenceAssemblyPaths.cs#L287) is made. The GAC fallback seems explicitly intentional, [as described here](https://github.com/Microsoft/msbuild/blob/154de6b319ef4a13550f15534b84450914b21623/src/XMakeTasks/Microsoft.Common.CurrentVersion.targets#L529) - but I think that's bad behavior, especially with the framework core libraries.\n\nThe [comment in code](https://github.com/Microsoft/msbuild/blob/1510d9a8cf346f01919c5b9545ef0b1a25bfbe9d/src/XMakeTasks/GetReferenceAssemblyPaths.cs#L284) notes this:\n\n> // No reference assembly paths could be found, log a warning as there could be future errors which may be confusing because of this.\n\nAn example is the one we hit, there `Array.Empty<T>` was used in [a Roslyn compiler optimization](https://github.com/dotnet/roslyn/blob/a3dacb4a5c227cfa42a7156c648443e48790830e/src/Compilers/CSharp/Portable/Lowering/LocalRewriter/LocalRewriter_Call.cs#L624). Roslyn acted correctly here because it was passed a set of .Net 4.6 assemblies (via the GAC path) on our build server - even though MSBuild was told we were targeting Net 4.5.2. The \"helpful\" fallback really wasn't - it led to downstream  runtime breaks.\n\nSemi-related: .Net 4.5.2 is curiously absent from MSBuild altogether: it [doesn't have the paths for .Net 4.5.2 cached](https://github.com/Microsoft/msbuild/blob/1510d9a8cf346f01919c5b9545ef0b1a25bfbe9d/src/XMakeTasks/GetFrameworkPath.cs#L26), and I noticed 4.5.2 [isn't in the `TargetDotNetFrameworkVersion` enum either](https://github.com/Microsoft/msbuild/blob/154de6b319ef4a13550f15534b84450914b21623/src/Utilities/ToolLocationHelper.cs#L61). I assume that's because it has no compile-time relevance between 4.5.1 and 4.6, but I thought I would note it here for completeness sake.\n\nIn my experience (granted, I may have a slanted view), this fallback behavior usually results in a _forward_ fallback, to a newer version of the framework than reference assemblies are installed for and targeting specified. This brings in assumptions of framework features for compilers and tools to make use of that won't be present at runtime.\n\nIf anything, assumptions should be made to _older_ versions of the framework than targeted, since those would be far more likely to be successful. But, I don't think MSBuild should do that either. I think **it should break the build**, with a helpful error message saying where to get and install the reference assemblies. MSBuild already knows where it _tried_ to find the assembly path for that framework moniker, it should relay this information to the user. Note: the existing error message doesn't provide this info either.\n\nWhat happens today is a range of not loading to slightly different behavior to runtime errors to just crashing the application. That's much worse (in my opinion) than breaking the build and telling the user how to fix it.\n\nFrom another view: **MSBuild isn't compiling what I asked it to**. It's subbing in assemblies and causing problems down the line, possibly in the hands of customers.\n\nSo here it is:\nHow about we make failure to find the targeted framework reference assemblies break the build instead of just a warning and silently not compiling what was asked for?\n",
+  "state": "CLOSED",
+  "createdAt": "2015-08-30T17:13:34Z",
+  "updatedAt": "2024-02-21T17:30:57Z",
+  "closedAt": "2016-02-01T20:09:42Z",
+  "author": {
+    "login": "NickCraver"
+  },
+  "labels": [
+    "help wanted",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "Yeah, gonna go ahead and :+1: this\n",
+        "createdAt": "2015-08-30T18:15:38Z",
+        "updatedAt": "2015-08-30T18:15:38Z",
+        "author": {
+          "login": "rossipedia"
+        }
+      },
+      {
+        "body": "Reading the issues I think it would be nice to upgrade this to an error. But as it is a good practice to treat all your warnings as errors on your project, do you miss these kind of messages from MSBuild?\n",
+        "createdAt": "2015-08-30T18:58:45Z",
+        "updatedAt": "2015-08-30T18:58:45Z",
+        "author": {
+          "login": "Niels-V"
+        }
+      },
+      {
+        "body": "@Niels-V I agree it's good practice, however some good practices often aren't practical. For example while we're moving a huge chunk of code from one pipeline to another we'll use an `[Obsolete]` attribute to flag the old thing as dead. These can encompass _huge_ tasks (for example we had to dig through every place we encode output in Stack Overflow) and can't happen as a single build - they span multiple builds or weeks (and we build 2-20 times a day, in prod). If we treat _all_ warning as errors then it's not possible to build at all. I think since this option is default-off, the majority of developers probably don't use it (true of most defaults).\n\nI think for small projects it's an excellent option, and one I typically use. For larger projects, it's just not going to happen in many cases for many reasons. Using `TreatWarningsAsErrors` (or `/nowarn`) is a bit of a nuclear switch because of its global nature. I would happily treat _specific_ warning codes as errors, but that has practical implications as well:\n1) I don't think it's an option, the global switch is all I'm aware of.\n2) Most raise the question: why aren't these errors already? (this issue, for example)\n3) The system isn't really built like that (integer codes we could flag on - there's no registry of codes).\n\nI'm not unsympathetic to the argument for warning as errors, I just disagree on the practical uses of it once a project is large enough and large changes are happening routinely. I think _framework_ libraries are often an exception to the \"large projects\"...if that makes sense. I also admit maybe our use cases are _severely_ skewed and my views here are just insane. If that's the case, I'm very happy to be schooled - let me have it :) Does most everyone else use this option and we're in the minority?\n",
+        "createdAt": "2015-08-30T19:34:39Z",
+        "updatedAt": "2015-08-30T19:34:39Z",
+        "author": {
+          "login": "NickCraver"
+        }
+      },
+      {
+        "body": "@NickCraver, we don't use the options either. It just not feasible for us because of similar grounds as you gave. \nWe updated a library we heavily use and we got a few hundreds of extra warnings... I think we fixed most of the warnings now but we couldn't fix all of them at once because it required to much work and we had a release schedule... like most company's have xD :)\n",
+        "createdAt": "2015-08-30T19:53:46Z",
+        "updatedAt": "2015-08-30T21:05:28Z",
+        "author": {
+          "login": "DickvdBrink"
+        }
+      },
+      {
+        "body": "Is it not feasible to mark this warning as an Error? This seems like a perfect usecase for warningsAsErrors https://msdn.microsoft.com/en-us/library/vstudio/bb629394%28v=vs.100%29.aspx\n",
+        "createdAt": "2015-08-30T23:46:33Z",
+        "updatedAt": "2015-08-30T23:46:50Z",
+        "author": {
+          "login": "aolszowka"
+        }
+      },
+      {
+        "body": "The warnings as errors switch sounds like a good workaround, but given that this behavior is most likely incorrect I agree this should be upgraded to an error so that you don't have to explicitly call it an error. I think this will be an easy change to test and verify, but we will need to evaluate is how much of an impact this would have to the entire ecosystem. And an easy way to opt out and get the old behavior.\n",
+        "createdAt": "2015-08-31T19:52:36Z",
+        "updatedAt": "2015-08-31T19:52:36Z",
+        "author": {
+          "login": "AndyGerlicher"
+        }
+      },
+      {
+        "body": "@aolszowka The TreatWarningsAsErrors switch in the page you linked only applies to compiler warnings, not MSBuild warnings like this one.  I think you're looking for something like #68.\n",
+        "createdAt": "2015-09-01T14:24:02Z",
+        "updatedAt": "2015-09-01T14:24:02Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "This seriously just broke some of our customers. We built against .NET 4.5 and all tests passed. However, when the code is run on a machine that doesn't have .NET 4.6 they get an error: `MissingMethodException: Method not found: !!0[] System.Array.Empty()` This needs to be escalated and not for up-for-grabs.\n",
+        "createdAt": "2016-01-20T14:53:00Z",
+        "updatedAt": "2016-01-20T14:53:00Z",
+        "author": {
+          "login": "niemyjski"
+        }
+      },
+      {
+        "body": "We've discussed this at length in our team standup today. We all agree that this behavior is incorrect and should result in an error. We plan to fix this in the next Visual Studio release. The question is whether or not to include this as part of an Update (i.e. Update 2). A few options we discussed:\n1. Add a feature flag to turn this warning into an error.\n2. Add a more complex feature of warnings as errors and recommend upgrading this warning.\n3. Upgrade this warning to an error.\n\nOption 2 I don't think we will have time to complete by Update 2, so that's probably out. Option 1 seems OK, but likely by the time someone has been affected by this behavior having a blog post that recommends turning it on seems too late. Ultimately the right answer is option 3, but changing the default could affect a large number of people (we don't have a way to know how many). Knowing that it will break a subset of users makes this a tough call. @jaredpar, when this scenario occurs do you have any idea whether the Roslyn optimizations will break just some or all users in this scenario? Or is it hit or miss depending on code? Right now in the interest of compatibility, we're leaning away from including this change in an incremental update (i.e. Update 2), but will make the change for Visual Studio vNext.\n",
+        "createdAt": "2016-01-21T22:14:59Z",
+        "updatedAt": "2016-01-21T22:14:59Z",
+        "author": {
+          "login": "AndyGerlicher"
+        }
+      },
+      {
+        "body": "When you say the next Visual Studio release, does that correspond to a build tools release? A developer with Visual Studio is far more likely to have the reference assemblies than a build server does, so I'd say a great number of people affected by option 3 may not see anything until it hits a build server.\n\nWhen the Roslyn optimizations are hit by building on a 4.6+ server without the 4.5 reference assemblies, the affected users are every consumer on 4.5 that tries to run a method missing the type the optimization thinks is there (`Array.Empty<T>`). This happens in things like `myStringBuilder.AppendFormat(\"test\")`, which has an empty `params` on the end.\n\nI think this should definitely be in Update 2 and it _should_ break people. I wish we broke instead of hitting this and I'd be a very appreciative developer if the break was there. By not fixing this as soon as possible the message is that releasing new framework releases and compilers that break people is fine out of band, but fixes aren't. I know that's not the intent and we want to see the best solution, but that is the reality of a delay. This fix should go out ASAP, it's biting more and more people upgrading to .Net 4.6 every day.\n",
+        "createdAt": "2016-01-21T22:23:01Z",
+        "updatedAt": "2016-01-21T22:23:36Z",
+        "author": {
+          "login": "NickCraver"
+        }
+      },
+      {
+        "body": "I completely agree with @NickCraver, this needs to ship ASAP (maybe even out of band hotfix) and be in Update 2 and it should BREAK people. If it breaks as part of the build its 1000000 times better than it breaking at runtime on a customers machine...\n",
+        "createdAt": "2016-01-21T22:33:15Z",
+        "updatedAt": "2016-01-21T22:33:15Z",
+        "author": {
+          "login": "niemyjski"
+        }
+      },
+      {
+        "body": "> A developer with Visual Studio is far more likely to have the reference assemblies than a build server does, so I'd say a great number of people affected by option 3 may not see anything until it hits a build server\n\n+1, this is spot on and is going to hit a lot of people on their build servers. Nonetheless this is the right thing to do, the current behavior is horrible and should result in an error. Having it in Update 2 would be best if at all possible.\n\nThe error should print a clear explanation of what is going on and how to fix it, preferably with a link to the reference assemblies package that needs to be installed so developers don't need to hunt for the right package (and maybe add a  `MSBUILD_I_KNOW_THIS_IS_TERRIBLE_BUT_PLEASE_IGNORE_THE_ERROR=1` env variable to temporarily revert to the old behavior if you're too concerned about blocking people).\n",
+        "createdAt": "2016-01-21T23:50:46Z",
+        "updatedAt": "2016-01-21T23:51:50Z",
+        "author": {
+          "login": "akoeplinger"
+        }
+      },
+      {
+        "body": "Completely agree with this, I don't see why this was marked as a warning in the first place.\n",
+        "createdAt": "2016-01-22T00:20:44Z",
+        "updatedAt": "2016-01-22T00:20:44Z",
+        "author": {
+          "login": "sklivvz"
+        }
+      },
+      {
+        "body": "I have a PR out for this now and we're testing internally. Unless there's an unforeseen consequence this will most likely ship in Update 2. Thank you everyone for the input on this, it definitely helped us make this decision.\n",
+        "createdAt": "2016-01-26T17:22:33Z",
+        "updatedAt": "2016-01-26T17:22:33Z",
+        "author": {
+          "login": "AndyGerlicher"
+        }
+      },
+      {
+        "body": "Thank you. If there is anything I can do to help, please let me know.\n",
+        "createdAt": "2016-01-26T17:23:48Z",
+        "updatedAt": "2016-01-26T17:23:48Z",
+        "author": {
+          "login": "niemyjski"
+        }
+      },
+      {
+        "body": "Thank you.\n",
+        "createdAt": "2016-02-02T21:13:36Z",
+        "updatedAt": "2016-02-02T21:13:36Z",
+        "author": {
+          "login": "niemyjski"
+        }
+      },
+      {
+        "body": "@NickCraver did this make it into update 2 ctp?\n",
+        "createdAt": "2016-02-10T22:59:35Z",
+        "updatedAt": "2016-02-10T22:59:35Z",
+        "author": {
+          "login": "niemyjski"
+        }
+      },
+      {
+        "body": "@niemyjski Yes, it's in Update 2 CTP. I'll make tags and a GitHub release to make that a bit more obvious shortly.\n\nNote that the update installer should apply just fine on a machine with only Build Tools 2015 installed.\n",
+        "createdAt": "2016-02-10T23:03:23Z",
+        "updatedAt": "2016-02-10T23:03:23Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "@rainersigwald there's no mention of it in the release notes: https://blogs.msdn.microsoft.com/visualstudio/2016/02/10/visual-studio-2015-update-2-ctp/\n\nI think the change deserves a special call out given the impact it'll likely have.\n",
+        "createdAt": "2016-02-11T11:57:43Z",
+        "updatedAt": "2016-02-11T11:57:43Z",
+        "author": {
+          "login": "akoeplinger"
+        }
+      },
+      {
+        "body": "We got this mentioned in the release notes for Update 2 RC: https://blogs.msdn.microsoft.com/visualstudio/2016/03/03/visual-studio-2015-update-2-rc/ (good call, @akoeplinger)\n\nPeople following this bug might also be interested to know that there is now a standalone Build Tools Update 2 RC package (#480) that can be downloaded from http://go.microsoft.com/fwlink/?LinkId=518023. After Update 2 officially releases, you'll be able to install the equivalent package on build servers to pick up this change.\n",
+        "createdAt": "2016-03-04T14:57:16Z",
+        "updatedAt": "2016-03-04T17:51:47Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      }
+    ]
+  }
+}

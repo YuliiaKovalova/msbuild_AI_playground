@@ -1,0 +1,297 @@
+diff --git a/src/Build/BuildCheck/API/BuildCheckResult.cs b/src/Build/BuildCheck/API/BuildCheckResult.cs
+index 7b808ed2445..fe8a234e12d 100644
+--- a/src/Build/BuildCheck/API/BuildCheckResult.cs
++++ b/src/Build/BuildCheck/API/BuildCheckResult.cs
+@@ -28,9 +28,9 @@ public BuildCheckResult(CheckRule checkConfig, IMSBuildElementLocation location,
+     internal BuildEventArgs ToEventArgs(CheckResultSeverity severity)
+         => severity switch
+         {
+-            CheckResultSeverity.Suggestion => new BuildCheckResultMessage(FormatMessage()),
+-            CheckResultSeverity.Warning => new BuildCheckResultWarning(FormatMessage(), CheckRule.Id),
+-            CheckResultSeverity.Error => new BuildCheckResultError(FormatMessage(), CheckRule.Id),
++            CheckResultSeverity.Suggestion => new BuildCheckResultMessage(this),
++            CheckResultSeverity.Warning => new BuildCheckResultWarning(this, CheckRule.Id),
++            CheckResultSeverity.Error => new BuildCheckResultError(this, CheckRule.Id),
+             _ => throw new ArgumentOutOfRangeException(nameof(severity), severity, null),
+         };
+ 
+diff --git a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+index b75a7e28f92..a8f0115acf6 100644
+--- a/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
++++ b/src/Build/BuildCheck/Checks/NoEnvironmentVariablePropertyCheck.cs
+@@ -21,9 +21,7 @@ internal sealed class NoEnvironmentVariablePropertyCheck : Check
+ 
+     private const string VerboseEnvVariableOutputKey = "allow_displaying_environment_variable_value";
+ 
+-    private readonly Queue<(string projectPath, BuildCheckResult checkResult)> _buildCheckResults = new Queue<(string, BuildCheckResult)>();
+-
+-    private BuildCheckDataContext<EnvironmentVariableCheckData>? _dataContext;
++    private readonly Queue<(string projectPath, BuildCheckResult checkResult, BuildCheckDataContext<EnvironmentVariableCheckData>)> _buildCheckResults = new Queue<(string, BuildCheckResult, BuildCheckDataContext<EnvironmentVariableCheckData>)>();
+ 
+     /// <summary>
+     /// Contains the list of viewed environment variables.
+@@ -51,32 +49,29 @@ public override void Initialize(ConfigurationContext configurationContext)
+ 
+     public override void RegisterActions(IBuildCheckRegistrationContext registrationContext) => registrationContext.RegisterEnvironmentVariableReadAction(ProcessEnvironmentVariableReadAction);
+ 
+-    public override void Dispose() => CheckScopeClassifier.NotifyOnScopingReadiness -= HandleScopeReadiness;
+-
+     private void ProcessEnvironmentVariableReadAction(BuildCheckDataContext<EnvironmentVariableCheckData> context)
+     {
+-        EnvironmentVariableIdentityKey identityKey = new(context.Data.EvaluatedEnvironmentVariable.EnvVarValue, context.Data.EvaluatedEnvironmentVariable.Location);
++        EnvironmentVariableIdentityKey identityKey = new(context.Data.EnvironmentVariableName, context.Data.EnvironmentVariableLocation);
+         if (!_environmentVariablesCache.Contains(identityKey))
+         {
+-            string buildCheckResultMessageArgs = _isVerboseEnvVarOutput ? $"'{context.Data.EvaluatedEnvironmentVariable.EnvVarKey}' with value: '{context.Data.EvaluatedEnvironmentVariable.EnvVarValue}'" : $"'{context.Data.EvaluatedEnvironmentVariable.EnvVarKey}'";
++            string buildCheckResultMessageArgs = _isVerboseEnvVarOutput ? $"'{context.Data.EnvironmentVariableName}' with value: '{context.Data.EnvironmentVariableValue}'" : $"'{context.Data.EnvironmentVariableName}'";
+ 
+             // Scope information is available after evaluation of the project file. If it is not ready, we will report the check later.
+             if (!CheckScopeClassifier.IsScopingReady(_scope))
+             {
+-                _dataContext ??= context;
+-
+                 _buildCheckResults.Enqueue(
+                     (context.Data.ProjectFilePath,
+-                     BuildCheckResult.Create(
+-                         SupportedRule,
+-                         context.Data.EvaluatedEnvironmentVariable.Location,
+-                         buildCheckResultMessageArgs)));
++                    BuildCheckResult.Create(
++                        SupportedRule,
++                        context.Data.EnvironmentVariableLocation,
++                        buildCheckResultMessageArgs),
++                    context));
+             }
+-            else if (CheckScopeClassifier.IsActionInObservedScope(_scope, context.Data.EvaluatedEnvironmentVariable.Location.File, context.Data.ProjectFilePath))
++            else if (CheckScopeClassifier.IsActionInObservedScope(_scope, context.Data.EnvironmentVariableLocation.File, context.Data.ProjectFilePath))
+             {
+                 context.ReportResult(BuildCheckResult.Create(
+                     SupportedRule,
+-                    context.Data.EvaluatedEnvironmentVariable.Location,
++                    context.Data.EnvironmentVariableLocation,
+                     buildCheckResultMessageArgs));
+             }
+ 
+@@ -93,14 +88,16 @@ private void HandleScopeReadiness()
+     {
+         while (_buildCheckResults.Count > 0)
+         {
+-            (string projectPath, BuildCheckResult result) = _buildCheckResults.Dequeue();
++            (string projectPath, BuildCheckResult result, BuildCheckDataContext<EnvironmentVariableCheckData> context) = _buildCheckResults.Dequeue();
+             if (!CheckScopeClassifier.IsActionInObservedScope(_scope, result.Location.File, projectPath))
+             {
+                 continue;
+             }
+ 
+-            _dataContext?.ReportResult(result);
++            context.ReportResult(result);
+         }
++
++        CheckScopeClassifier.NotifyOnScopingReadiness -= HandleScopeReadiness;
+     }
+ 
+     internal class EnvironmentVariableIdentityKey(string environmentVariableName, IMSBuildElementLocation location) : IEquatable<EnvironmentVariableIdentityKey>
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index b920968acb3..c152982551d 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -339,17 +339,13 @@ public void ProcessEvaluationFinishedEventArgs(
+ 
+             _buildEventsProcessor
+                 .ProcessEvaluationFinishedEventArgs(checkContext, evaluationFinishedEventArgs, propertiesLookup);
+-
+-            CheckScopeClassifier.RaiseNotifyOnScopingReadiness();
+         }
+ 
+         public void ProcessEnvironmentVariableReadEventArgs(ICheckContext checkContext, EnvironmentVariableReadEventArgs projectEvaluationEventArgs)
+         {
+             if (projectEvaluationEventArgs is EnvironmentVariableReadEventArgs evr)
+             {
+-                TryGetProjectFullPath(checkContext.BuildEventContext, out string projectPath);
+-
+-                if (!string.IsNullOrEmpty(projectPath))
++                if (TryGetProjectFullPath(checkContext.BuildEventContext, out string projectPath))
+                 {
+                     _buildEventsProcessor.ProcessEnvironmentVariableReadEventArgs(
+                         checkContext,
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index 956ddc7fb5b..f2925ff1556 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -91,7 +91,7 @@ internal void ProcessEvaluationFinishedEventArgs(
+     /// </summary>
+     internal void ProcessEnvironmentVariableReadEventArgs(ICheckContext checkContext, string projectPath, string envVarKey, string envVarValue, IElementLocation elementLocation)
+     {
+-        EnvironmentVariableCheckData checkData = new(projectPath, checkContext.BuildEventContext?.ProjectInstanceId, (envVarKey, envVarValue, elementLocation));
++        EnvironmentVariableCheckData checkData = new(projectPath, checkContext.BuildEventContext?.ProjectInstanceId, envVarKey, envVarValue, elementLocation);
+ 
+         _buildCheckCentralContext.RunEnvironmentVariableActions(checkData, checkContext, ReportResult);
+     }
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+index 4e18456d4bc..15a154fcf1c 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckScopeClassifier.cs
+@@ -8,11 +8,24 @@
+ 
+ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+-internal class CheckScopeClassifier
++internal static class CheckScopeClassifier
+ {
++    static CheckScopeClassifier() =>
++        FileClassifier.Shared.OnImmutablePathsInitialized += () =>
++        {
++            NotifyOnScopingReadiness?.Invoke();
++
++            FileClassifier.Shared.OnImmutablePathsInitialized -= () => NotifyOnScopingReadiness?.Invoke();
++        };
++
+     internal static event Action? NotifyOnScopingReadiness;
+ 
+-    internal static Func<EvaluationCheckScope, bool> IsScopingReady => (scope) => scope == EvaluationCheckScope.ProjectFileOnly;
++    internal static bool IsScopingInitialized => FileClassifier.Shared.IsImmutablePathsInitialized;
++
++    /// <summary>
++    /// Notifies the subscribers that the scoping is ready.
++    /// </summary>
++    internal static Func<EvaluationCheckScope, bool> IsScopingReady => (scope) => (scope is EvaluationCheckScope.ProjectFileOnly or EvaluationCheckScope.All) || IsScopingInitialized;
+ 
+     /// <summary>
+     /// Indicates whether given location is in the observed scope, based on currently built project path.
+@@ -57,8 +70,6 @@ internal static bool IsActionInObservedScope(
+         }
+     }
+ 
+-    internal static void RaiseNotifyOnScopingReadiness() => NotifyOnScopingReadiness?.Invoke();
+-
+     private static bool IsGeneratedNugetImport(string file) => file.EndsWith("nuget.g.props", StringComparison.OrdinalIgnoreCase) ||
+         file.EndsWith("nuget.g.targets", StringComparison.OrdinalIgnoreCase);
+ }
+diff --git a/src/Build/BuildCheck/OM/EnvironmentVariableCheckData.cs b/src/Build/BuildCheck/OM/EnvironmentVariableCheckData.cs
+index e3e84d92276..c1e4575b65b 100644
+--- a/src/Build/BuildCheck/OM/EnvironmentVariableCheckData.cs
++++ b/src/Build/BuildCheck/OM/EnvironmentVariableCheckData.cs
+@@ -13,11 +13,28 @@ public class EnvironmentVariableCheckData : CheckData
+     internal EnvironmentVariableCheckData(
+         string projectFilePath,
+         int? projectConfigurationId,
+-        (string EnvVarKey, string EnvVarValue, IMSBuildElementLocation Location) evaluatedEnvironmentVariable)
+-        : base(projectFilePath, projectConfigurationId) => EvaluatedEnvironmentVariable = evaluatedEnvironmentVariable;
++        string envVarName,
++        string envVarValue,
++        IMSBuildElementLocation Location)
++        : base(projectFilePath, projectConfigurationId)
++    {
++        EnvironmentVariableName = envVarName;
++        EnvironmentVariableValue = envVarValue;
++        EnvironmentVariableLocation = Location;
++    }
+ 
+     /// <summary>
+-    /// Gets the evaluated environment variable.
++    /// Gets the evaluated environment variable location.
+     /// </summary>
+-    public (string EnvVarKey, string EnvVarValue, IMSBuildElementLocation Location) EvaluatedEnvironmentVariable { get; }
++    public IMSBuildElementLocation EnvironmentVariableLocation { get; }
++
++    /// <summary>
++    /// Gets the evaluated environment variable name.
++    /// </summary>
++    public string EnvironmentVariableName { get; }
++
++    /// <summary>
++    /// Gets the evaluated environment variable value.
++    /// </summary>
++    public string EnvironmentVariableValue { get; }
+ }
+diff --git a/src/Framework/BuildCheck/BuildCheckEventArgs.cs b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+index 7368ce84a61..5a2d1ad5043 100644
+--- a/src/Framework/BuildCheck/BuildCheckEventArgs.cs
++++ b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+@@ -106,8 +106,13 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+ 
+ internal sealed class BuildCheckResultWarning : BuildWarningEventArgs
+ {
+-    public BuildCheckResultWarning(string formattedMessage, string code)
+-        : base(subcategory: null, code: code, file: null, lineNumber: 0, columnNumber: 0, endLineNumber: 0, endColumnNumber: 0, message: formattedMessage, helpKeyword: null, senderName: null) => RawMessage = formattedMessage;
++    public BuildCheckResultWarning(IBuildCheckResult result, string code)
++        : base(subcategory: null, code: code, file: null, lineNumber: 0, columnNumber: 0, endLineNumber: 0, endColumnNumber: 0, message: result.FormatMessage(), helpKeyword: null, senderName: null) =>
++        RawMessage = result.FormatMessage();
++
++    internal BuildCheckResultWarning(string formattedMessage, string code)
++        : base(subcategory: null, code: code, file: null, lineNumber: 0, columnNumber: 0, endLineNumber: 0, endColumnNumber: 0, message: formattedMessage, helpKeyword: null, senderName: null) =>
++        RawMessage = formattedMessage;
+ 
+     internal BuildCheckResultWarning() { }
+ 
+@@ -128,8 +133,13 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+ 
+ internal sealed class BuildCheckResultError : BuildErrorEventArgs
+ {
+-    public BuildCheckResultError(string formattedMessage, string code)
+-        : base(subcategory: null, code: code, file: null, lineNumber: 0, columnNumber: 0, endLineNumber: 0, endColumnNumber: 0, message: formattedMessage, helpKeyword: null, senderName: null) => RawMessage = formattedMessage;
++    public BuildCheckResultError(IBuildCheckResult result, string code)
++        : base(subcategory: null, code: code, file: null, lineNumber: 0, columnNumber: 0, endLineNumber: 0, endColumnNumber: 0, message: result.FormatMessage(), helpKeyword: null, senderName: null)
++        => RawMessage = result.FormatMessage();
++
++    internal BuildCheckResultError(string formattedMessage, string code)
++        : base(subcategory: null, code: code, file: null, lineNumber: 0, columnNumber: 0, endLineNumber: 0, endColumnNumber: 0, message: formattedMessage, helpKeyword: null, senderName: null)
++        => RawMessage = formattedMessage;
+ 
+     internal BuildCheckResultError() { }
+ 
+@@ -150,7 +160,9 @@ internal override void CreateFromStream(BinaryReader reader, int version)
+ 
+ internal sealed class BuildCheckResultMessage : BuildMessageEventArgs
+ {
+-    public BuildCheckResultMessage(string formattedMessage) => RawMessage = formattedMessage;
++    public BuildCheckResultMessage(IBuildCheckResult result) => RawMessage = result.FormatMessage();
++
++    internal BuildCheckResultMessage(string formattedMessage) => RawMessage = formattedMessage;
+ 
+     internal BuildCheckResultMessage() { }
+ 
+diff --git a/src/Framework/FileClassifier.cs b/src/Framework/FileClassifier.cs
+index 7884bde35af..ad8b8733e07 100644
+--- a/src/Framework/FileClassifier.cs
++++ b/src/Framework/FileClassifier.cs
+@@ -36,6 +36,30 @@ namespace Microsoft.Build.Framework
+     /// </remarks>
+     internal class FileClassifier
+     {
++        private bool _isImmutablePathsInitialized;
++
++        /// <summary>
++        /// This event notifies subscribers when the immutable paths have been initialized.
++        /// </summary>
++        public event Action? OnImmutablePathsInitialized;
++
++        /// <summary>
++        ///  Tracks whether the immutable paths have been initialized.
++        /// </summary>
++        public bool IsImmutablePathsInitialized
++        {
++            get => _isImmutablePathsInitialized;
++            private set
++            {
++                if (!_isImmutablePathsInitialized)
++                {
++                    OnImmutablePathsInitialized?.Invoke();
++                }
++
++                _isImmutablePathsInitialized = value;
++            }
++        }
++
+         /// <summary>
+         ///     StringComparison used for comparing paths on current OS.
+         /// </summary>
+@@ -215,6 +239,8 @@ public void RegisterKnownImmutableLocations(Func<string, string?> getPropertyVal
+             RegisterImmutableDirectory(getPropertyValue("NetCoreRoot")?.Trim());
+             // example: C:\Users\<username>\.nuget\packages\
+             RegisterImmutableDirectory(getPropertyValue("NuGetPackageFolders")?.Trim());
++
++            IsImmutablePathsInitialized = true;
+         }
+ 
+         private static string? GetExistingRootOrNull(string? path)

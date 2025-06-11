@@ -1,0 +1,1186 @@
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index bc9ab3f0cab..dbae5b67cd1 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -758,28 +758,38 @@ private void SendDataCore(INodePacket packet)
+                 // clear the buffer but keep the underlying capacity to avoid reallocations
+                 writeStream.SetLength(0);
+ 
+-                ITranslator writeTranslator = BinaryTranslator.GetWriteTranslator(writeStream);
+                 try
+                 {
+                     writeStream.WriteByte((byte)packet.Type);
+-
+                     // Pad for the packet length
+                     WriteInt32(writeStream, 0);
+-                    packet.Translate(writeTranslator);
+ 
+-                    int writeStreamLength = (int)writeStream.Position;
++#if !TASKHOST
++
++                    if (packet is ITranslatable2 jsonTranslatable)
++                    {
++                        var writeTranslator = JsonTranslator.GetWriteTranslator(writeStream);
++                        jsonTranslatable.Translate(writeTranslator);
++                    }
++                    else
++#endif
++                    {
++                        var writeTranslator = BinaryTranslator.GetWriteTranslator(writeStream);
++                        packet.Translate(writeTranslator);
++                    }
+ 
++                    int writeStreamLength = (int)writeStream.Position;
+                     // Now plug in the real packet length
+                     writeStream.Position = 1;
+                     WriteInt32(writeStream, writeStreamLength - 5);
+ 
+                     byte[] writeStreamBuffer = writeStream.GetBuffer();
+-
+                     for (int i = 0; i < writeStreamLength; i += MaxPacketWriteSize)
+                     {
+                         int lengthToWrite = Math.Min(writeStreamLength - i, MaxPacketWriteSize);
+                         _serverToClientStream.Write(writeStreamBuffer, i, lengthToWrite);
+                     }
++
+                     if (IsExitPacket(packet))
+                     {
+                         _exitPacketState = ExitPacketState.ExitPacketSent;
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcTaskHost.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcTaskHost.cs
+index fd7e4035359..8e2908c93b2 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcTaskHost.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcTaskHost.cs
+@@ -280,7 +280,7 @@ public void UnregisterPacketHandler(NodePacketType packetType)
+         /// <param name="nodeId">The node from which the packet was received.</param>
+         /// <param name="packetType">The packet type.</param>
+         /// <param name="translator">The translator containing the data from which the packet should be reconstructed.</param>
+-        public void DeserializeAndRoutePacket(int nodeId, NodePacketType packetType, ITranslator translator)
++        public void DeserializeAndRoutePacket(int nodeId, NodePacketType packetType, ITranslatorBase translator)
+         {
+             if (_nodeIdToPacketFactory.TryGetValue(nodeId, out INodePacketFactory nodePacketFactory))
+             {
+diff --git a/src/Build/Instance/TaskFactories/TaskHostTask.cs b/src/Build/Instance/TaskFactories/TaskHostTask.cs
+index 4cd98b02228..3d31085a9fb 100644
+--- a/src/Build/Instance/TaskFactories/TaskHostTask.cs
++++ b/src/Build/Instance/TaskFactories/TaskHostTask.cs
+@@ -264,7 +264,6 @@ public bool Execute()
+ 
+             TaskHostConfiguration hostConfiguration =
+                 new TaskHostConfiguration(
+-                        runtime,
+                         _buildComponentHost.BuildParameters.NodeId,
+                         NativeMethodsShared.GetCurrentDirectory(),
+                         CommunicationsUtilities.GetEnvironmentVariables(),
+@@ -368,7 +367,7 @@ public void UnregisterPacketHandler(NodePacketType packetType)
+         /// <param name="nodeId">The node from which the packet was received.</param>
+         /// <param name="packetType">The packet type.</param>
+         /// <param name="translator">The translator containing the data from which the packet should be reconstructed.</param>
+-        public void DeserializeAndRoutePacket(int nodeId, NodePacketType packetType, ITranslator translator)
++        public void DeserializeAndRoutePacket(int nodeId, NodePacketType packetType, ITranslatorBase translator)
+         {
+             _packetFactory.DeserializeAndRoutePacket(nodeId, packetType, translator);
+         }
+diff --git a/src/Framework/BinaryTranslator.cs b/src/Framework/BinaryTranslator.cs
+index c302b537038..662656c91ef 100644
+--- a/src/Framework/BinaryTranslator.cs
++++ b/src/Framework/BinaryTranslator.cs
+@@ -56,11 +56,6 @@ internal static ITranslator GetWriteTranslator(Stream stream)
+         /// </summary>
+         private class BinaryReadTranslator : ITranslator
+         {
+-            /// <summary>
+-            /// The stream used as a source or destination for data.
+-            /// </summary>
+-            private Stream _packetStream;
+-
+             /// <summary>
+             /// The binary reader used in read mode.
+             /// </summary>
+@@ -72,7 +67,6 @@ private class BinaryReadTranslator : ITranslator
+             /// </summary>
+             public BinaryReadTranslator(Stream packetStream, BinaryReaderFactory buffer)
+             {
+-                _packetStream = packetStream;
+                 _reader = buffer.Create(packetStream);
+             }
+ #nullable disable
+@@ -115,6 +109,11 @@ public TranslationDirection Mode
+                 { return TranslationDirection.ReadFromStream; }
+             }
+ 
++            /// <summary>
++            /// Gets the protocol type.
++            /// </summary>
++            public ProtocolType Protocol => ProtocolType.Binary;
++
+             /// <summary>
+             /// Translates a boolean.
+             /// </summary>
+@@ -824,6 +823,11 @@ public void Dispose()
+                 _writer.Close();
+             }
+ 
++            /// <summary>
++            /// Gets the protocol type.
++            /// </summary>
++            public ProtocolType Protocol => ProtocolType.Binary;
++
+             /// <summary>
+             /// Gets the reader, if any.
+             /// </summary>
+diff --git a/src/Framework/JsonTranslator.cs b/src/Framework/JsonTranslator.cs
+new file mode 100644
+index 00000000000..c3917306791
+--- /dev/null
++++ b/src/Framework/JsonTranslator.cs
+@@ -0,0 +1,271 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++#if !TASKHOST && !NETSTANDARD
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Text;
++using System.Text.Json;
++using System.Text.Json.Serialization;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Framework;
++
++#nullable disable
++
++namespace Microsoft.Build.BackEnd
++{
++    internal static class JsonTranslator
++    {
++        internal static IJsonTranslator GetReadTranslator(Stream stream, int packetLength) => new JsonReadTranslator(stream, packetLength);
++
++        internal static IJsonTranslator GetWriteTranslator(Stream stream) => new JsonWriteTranslator(stream);
++
++        private class JsonReadTranslator : IJsonTranslator
++        {
++            private readonly JsonDocument _document;
++            private bool _disposed;
++
++            public JsonReadTranslator(Stream stream, int packetLength)
++            {
++                byte[] buffer = new byte[packetLength];
++                int bytesRead = stream.Read(buffer, 0, packetLength);
++                if (bytesRead != packetLength)
++                {
++                    throw new IOException($"Expected to read {packetLength} bytes but got {bytesRead}");
++                }
++                _document = JsonDocument.Parse(buffer);
++            }
++
++            public TranslationDirection Mode => TranslationDirection.ReadFromStream;
++
++            public ProtocolType Protocol => ProtocolType.Json;
++
++            public void TranslateCulture(string propertyName, ref CultureInfo culture)
++            {
++                if (_document.RootElement.TryGetProperty(propertyName, out JsonElement element))
++                {
++                    string cultureName = element.GetString();
++                    culture = !string.IsNullOrEmpty(cultureName)
++                        ? CultureInfo.GetCultureInfo(cultureName)
++                        : null;
++                }
++            }
++
++            public void TranslateDictionary<TKey, TValue>(
++                JsonSerializerOptions jsonSerializerOptions,
++                string propertyName,
++                ref Dictionary<TKey, TValue> dictionary,
++                IEqualityComparer<TKey> comparer,
++                Func<TValue> valueFactory = null)
++            {
++                if (!_document.RootElement.TryGetProperty(propertyName, out JsonElement element))
++                {
++                    dictionary = null;
++                    return;
++                }
++
++                dictionary = JsonSerializer.Deserialize<Dictionary<TKey, TValue>>(element.GetRawText(), jsonSerializerOptions);
++            }
++
++            public T TranslateFromJson<T>(JsonSerializerOptions jsonSerializerOptions = null) => JsonSerializer.Deserialize<T>(_document.RootElement.GetRawText(), jsonSerializerOptions);
++
++            public void TranslateToJson<T>(T model, JsonSerializerOptions jsonSerializerOptions = null)
++            {
++                throw new InvalidOperationException("Cannot write to a read-only translator");
++            }
++
++            public void Dispose()
++            {
++                if (!_disposed)
++                {
++                    _document?.Dispose();
++                    _disposed = true;
++                }
++            }
++        }
++
++        private class JsonWriteTranslator : IJsonTranslator
++        {
++            private readonly Stream _stream;
++            private readonly Utf8JsonWriter _writer;
++            private bool _disposed;
++
++            public JsonWriteTranslator(Stream stream)
++            {
++                Debugger.Launch();
++                _stream = stream;
++                _writer = new Utf8JsonWriter(_stream, new JsonWriterOptions
++                {
++                    Indented = true
++                });
++            }
++
++            public TranslationDirection Mode => TranslationDirection.WriteToStream;
++
++            public ProtocolType Protocol => ProtocolType.Json;
++
++            public void TranslateCulture(string propertyName, ref CultureInfo culture)
++            {
++                _writer.WritePropertyName(propertyName);
++                if (culture != null)
++                {
++                    _writer.WriteStringValue(culture.Name);
++                }
++                else
++                {
++                    _writer.WriteNullValue();
++                }
++            }
++
++            public void TranslateDictionary<TKey, TValue>(
++                JsonSerializerOptions jsonSerializerOptions,
++                string propertyName,
++                ref Dictionary<TKey, TValue> dictionary,
++                IEqualityComparer<TKey> comparer,
++                Func<TValue> valueFactory = null)
++            {
++                _writer.WritePropertyName(propertyName);
++
++                if (dictionary == null)
++                {
++                    _writer.WriteNullValue();
++                    return;
++                }
++
++                _writer.WriteStartObject();
++
++                foreach (var kvp in dictionary)
++                {
++                    _writer.WritePropertyName(kvp.Key.ToString());
++
++                    JsonSerializer.Serialize(_writer, kvp.Value, typeof(TValue), jsonSerializerOptions);
++                }
++
++                _writer.WriteEndObject();
++            }
++
++
++            private void WriteValue(object value, JsonSerializerOptions jsonSerializerOptions)
++            {
++                switch (value)
++                {
++                    case null:
++                        _writer.WriteNullValue();
++                        break;
++                    case string str:
++                        _writer.WriteStringValue(str);
++                        break;
++                    case int i:
++                        _writer.WriteNumberValue(i);
++                        break;
++                    case long l:
++                        _writer.WriteNumberValue(l);
++                        break;
++                    case double d:
++                        _writer.WriteNumberValue(d);
++                        break;
++                    case float f:
++                        _writer.WriteNumberValue(f);
++                        break;
++                    case decimal dec:
++                        _writer.WriteNumberValue(dec);
++                        break;
++                    case bool b:
++                        _writer.WriteBooleanValue(b);
++                        break;
++                    case DateTime dt:
++                        _writer.WriteStringValue(dt);
++                        break;
++                    case ITaskItem taskItem:
++                        WriteTaskItem(taskItem);
++                        break;
++                    case ITaskItem[] taskItems:
++                        WriteTaskItemArray(taskItems);
++                        break;
++                    case IEnumerable enumerable:
++                        WriteEnumerable(enumerable, jsonSerializerOptions);
++                        break;
++                    default:
++                        JsonSerializer.Serialize(_writer, value, value.GetType(), jsonSerializerOptions);
++                        break;
++                }
++            }
++
++            private void WriteTaskItem(ITaskItem taskItem)
++            {
++                _writer.WriteStartObject();
++
++                _writer.WritePropertyName("itemSpec");
++                _writer.WriteStringValue(taskItem.ItemSpec);
++
++                if (taskItem.MetadataCount > 0)
++                {
++                    _writer.WritePropertyName("metadata");
++                    _writer.WriteStartObject();
++
++                    foreach (string name in taskItem.MetadataNames)
++                    {
++                        _writer.WritePropertyName(name);
++                        _writer.WriteStringValue(taskItem.GetMetadata(name));
++                    }
++
++                    _writer.WriteEndObject();
++                }
++
++                _writer.WriteEndObject();
++            }
++
++            private void WriteTaskItemArray(ITaskItem[] taskItems)
++            {
++                _writer.WriteStartArray();
++
++                foreach (var item in taskItems)
++                {
++                    WriteTaskItem(item);
++                }
++
++                _writer.WriteEndArray();
++            }
++
++            private void WriteEnumerable(IEnumerable enumerable, JsonSerializerOptions jsonSerializerOptions)
++            {
++                _writer.WriteStartArray();
++
++                foreach (var item in enumerable)
++                {
++                    WriteValue(item, jsonSerializerOptions);
++                }
++
++                _writer.WriteEndArray();
++            }
++
++            public T TranslateFromJson<T>(JsonSerializerOptions jsonSerializerOptions = null)
++            {
++                throw new InvalidOperationException("Cannot read from a write-only translator");
++            }
++
++            public void TranslateToJson<T>(T model, JsonSerializerOptions jsonSerializerOptions = null)
++            {
++                JsonSerializer.Serialize(_writer, model, jsonSerializerOptions);
++            }
++
++            public void Dispose()
++            {
++                if (!_disposed)
++                {
++                    _writer?.Dispose();
++                    _stream?.Dispose();
++                    _disposed = true;
++                }
++            }
++        }
++    }
++}
++#endif
+diff --git a/src/Framework/Microsoft.Build.Framework.csproj b/src/Framework/Microsoft.Build.Framework.csproj
+index 271026705ba..c4667d7d031 100644
+--- a/src/Framework/Microsoft.Build.Framework.csproj
++++ b/src/Framework/Microsoft.Build.Framework.csproj
+@@ -22,6 +22,7 @@
+     <!-- Promote CompilerServices.Unsafe from the old version we get from System.Memory on net472. -->
+     <PackageReference Include="System.Runtime.CompilerServices.Unsafe" />
+     <PackageReference Include="Microsoft.VisualStudio.Setup.Configuration.Interop" PrivateAssets="all" />
++    <PackageReference Include="System.Text.Json" />
+     <Reference Include="System.Xaml" />
+   </ItemGroup>
+ 
+diff --git a/src/MSBuild/LogMessagePacket.cs b/src/MSBuild/LogMessagePacket.cs
+index a91d2619447..c0ab194e847 100644
+--- a/src/MSBuild/LogMessagePacket.cs
++++ b/src/MSBuild/LogMessagePacket.cs
+@@ -42,9 +42,9 @@ private LogMessagePacket(ITranslator translator)
+         /// <summary>
+         /// Factory for serialization
+         /// </summary>
+-        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        internal static INodePacket FactoryForDeserialization(ITranslatorBase translator)
+         {
+-            return new LogMessagePacket(translator);
++            return new LogMessagePacket((ITranslator)translator);
+         }
+     }
+ }
+diff --git a/src/MSBuild/OutOfProcTaskHostNode.cs b/src/MSBuild/OutOfProcTaskHostNode.cs
+index 42b71f65fe9..29290009bf2 100644
+--- a/src/MSBuild/OutOfProcTaskHostNode.cs
++++ b/src/MSBuild/OutOfProcTaskHostNode.cs
+@@ -587,7 +587,7 @@ public void UnregisterPacketHandler(NodePacketType packetType)
+         /// <param name="nodeId">The node from which the packet was received.</param>
+         /// <param name="packetType">The packet type.</param>
+         /// <param name="translator">The translator containing the data from which the packet should be reconstructed.</param>
+-        public void DeserializeAndRoutePacket(int nodeId, NodePacketType packetType, ITranslator translator)
++        public void DeserializeAndRoutePacket(int nodeId, NodePacketType packetType, ITranslatorBase translator)
+         {
+             _packetFactory.DeserializeAndRoutePacket(nodeId, packetType, translator);
+         }
+diff --git a/src/Shared/NodeBuildComplete.cs b/src/Shared/NodeBuildComplete.cs
+index 25aa30675f7..06bab065317 100644
+--- a/src/Shared/NodeBuildComplete.cs
++++ b/src/Shared/NodeBuildComplete.cs
+@@ -1,7 +1,11 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Collections.Generic;
++using System;
++using System.Configuration;
+ using System.Diagnostics;
++using System.Globalization;
+ 
+ #nullable disable
+ 
+@@ -11,7 +15,7 @@ namespace Microsoft.Build.BackEnd
+     /// The NodeBuildComplete packet is used to indicate to a node that it should clean up its current build and
+     /// possibly prepare for node reuse.
+     /// </summary>
+-    internal class NodeBuildComplete : INodePacket
++    internal class NodeBuildComplete : INodePacket2
+     {
+         /// <summary>
+         /// Flag indicating if the node should prepare for reuse after cleanup.
+@@ -71,13 +75,43 @@ public void Translate(ITranslator translator)
+         /// <summary>
+         /// Factory for deserialization.
+         /// </summary>
+-        internal static NodeBuildComplete FactoryForDeserialization(ITranslator translator)
++        internal static NodeBuildComplete FactoryForDeserialization(ITranslatorBase translator)
+         {
+             NodeBuildComplete packet = new NodeBuildComplete();
+-            packet.Translate(translator);
++
++            if (translator.Protocol == ProtocolType.Binary)
++            {
++                packet.Translate((ITranslator)translator);
++            }
++#if !TASKHOST
++            else
++            {
++                packet.Translate((IJsonTranslator)translator);
++            }
++#endif
++       
+             return packet;
+         }
+ 
++#if !TASKHOST
++        public void Translate(IJsonTranslator translator)
++        {
++            if (translator.Mode == TranslationDirection.WriteToStream)
++            {
++                var model = new NodeBuildCompleteModel(_prepareForReuse);
++                translator.TranslateToJson(model);
++            }
++            else // ReadFromStream
++            {
++                var model = translator.TranslateFromJson<NodeBuildCompleteModel>();
++                _prepareForReuse = model.prepareForReuse;
++            }
++        }
++
++        internal record NodeBuildCompleteModel(bool prepareForReuse);
++
++#endif
++
+         #endregion
+     }
+ }
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index 9ce88aa9134..2a363529d9e 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -14,9 +14,6 @@
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+ using System.Collections.Generic;
+-using System.Diagnostics;
+-
+-
+ #if FEATURE_SECURITY_PERMISSIONS || FEATURE_PIPE_SECURITY
+ using System.Security.AccessControl;
+ 
+@@ -363,6 +360,7 @@ private void PacketPumpProc()
+ 
+             DateTime originalWaitStartTime = DateTime.UtcNow;
+             bool gotValidConnection = false;
++            bool isNetHost = false;
+             while (!gotValidConnection)
+             {
+                 gotValidConnection = true;
+@@ -415,6 +413,12 @@ private void PacketPumpProc()
+                             );
+ #pragma warning restore SA1111, SA1009 // Closing parenthesis should be on line of last parameter
+ 
++                            // TODO ???
++                            if (handshakeComponents[i].Key == "fileVersionMajor" && handshakeComponents[i].Value == NetTaskHostHandshakeVersion)
++                            {
++                                isNetHost = true;
++                            }
++
+                             if (handshakePart != handshakeComponents[i].Value)
+                             {
+                                 // NET Task host allows to connect to MSBuild.dll with the different handshake version.
+@@ -504,6 +508,7 @@ private void PacketPumpProc()
+             }
+ 
+             RunReadLoop(
++                isNetHost,
+                 new BufferedReadStream(_pipeServer),
+                 _pipeServer,
+                 localPacketQueue, localPacketAvailable, localTerminatePacketPump);
+@@ -531,15 +536,13 @@ private void PacketPumpProc()
+         }
+ 
+         private void RunReadLoop(
++            bool isNetHost,
+             Stream localReadPipe,
+             Stream localWritePipe,
+             ConcurrentQueue<INodePacket> localPacketQueue,
+             AutoResetEvent localPacketAvailable,
+             AutoResetEvent localTerminatePacketPump)
+         {
+-#if NETCOREAPP
+-            Debugger.Launch();
+-#endif
+             // Ordering of the wait handles is important.  The first signaled wait handle in the array
+             // will be returned by WaitAny if multiple wait handles are signaled.  We prefer to have the
+             // terminate event triggered so that we cannot get into a situation where packets are being
+@@ -623,7 +626,15 @@ private void RunReadLoop(
+ 
+                             try
+                             {
++#if !TASKHOST
++                                // Read the packet length (4 bytes after type)
++                                byte[] lengthBytes = new byte[4];
++                                int packetLength = BitConverter.ToInt32(headerByte, 1);
++                                ITranslatorBase translator = isNetHost ? JsonTranslator.GetReadTranslator(localReadPipe, packetLength) : BinaryTranslator.GetReadTranslator(localReadPipe, _sharedReadBuffer);
++                                _packetFactory.DeserializeAndRoutePacket(0, packetType, translator);
++#else
+                                 _packetFactory.DeserializeAndRoutePacket(0, packetType, BinaryTranslator.GetReadTranslator(localReadPipe, _sharedReadBuffer));
++#endif
+                             }
+                             catch (Exception e)
+                             {
+@@ -655,35 +666,61 @@ private void RunReadLoop(
+                                 var packetStream = _packetStream;
+                                 packetStream.SetLength(0);
+ 
+-                                ITranslator writeTranslator = BinaryTranslator.GetWriteTranslator(packetStream);
++#if !TASKHOST
++                                if (packet is ITranslatable2 jsonTranslatable)
++                                {
++                                    // Write packet type
++                                    packetStream.WriteByte((byte)packet.Type);
+ 
+-                                packetStream.WriteByte((byte)packet.Type);
++                                    // Pad for packet length (4 bytes)
++                                    _binaryWriter.Write(0);
+ 
+-                                // Pad for packet length
+-                                _binaryWriter.Write(0);
++                                    // Create JSON translator and write packet
++                                    var writeTranslator = JsonTranslator.GetWriteTranslator(packetStream);
++                                    jsonTranslatable.Translate(writeTranslator);
+ 
+-                                // Reset the position in the write buffer.
+-                                packet.Translate(writeTranslator);
++                                    int packetStreamLength = (int)packetStream.Position;
+ 
+-                                int packetStreamLength = (int)packetStream.Position;
++                                    // Write the actual packet length (excluding header)
++                                    packetStream.Position = 1;
++                                    _binaryWriter.Write(packetStreamLength - 5);
+ 
+-                                // Now write in the actual packet length
+-                                packetStream.Position = 1;
+-                                _binaryWriter.Write(packetStreamLength - 5);
++                                    // Write the complete packet
++                                    localWritePipe.Write(packetStream.GetBuffer(), 0, packetStreamLength);
++                                }
++                                else
++#endif
++                                {
++                                    // Write packet type
++                                    packetStream.WriteByte((byte)packet.Type);
++
++                                    // Pad for packet length
++                                    _binaryWriter.Write(0);
++
++                                    // Create binary translator and write packet
++                                    var writeTranslator = BinaryTranslator.GetWriteTranslator(packetStream);
++                                    packet.Translate(writeTranslator);
++
++                                    int packetStreamLength = (int)packetStream.Position;
+ 
+-                                localWritePipe.Write(packetStream.GetBuffer(), 0, packetStreamLength);
++                                    // Write the actual packet length (excluding header)
++                                    packetStream.Position = 1;
++                                    _binaryWriter.Write(packetStreamLength - 5);
++
++                                    // Write the complete packet
++                                    localWritePipe.Write(packetStream.GetBuffer(), 0, packetStreamLength);
++                                }
+                             }
+                         }
+                         catch (Exception e)
+                         {
+-                            // Error while deserializing or handling packet.  Abort.
++                            // Error while serializing or handling packet. Abort.
+                             CommunicationsUtilities.Trace("Exception while serializing packets: {0}", e);
+                             ExceptionHandling.DumpExceptionToFile(e);
+                             ChangeLinkStatus(LinkStatus.Failed);
+                             exitLoop = true;
+                             break;
+                         }
+-
+                         if (waitId == 2)
+                         {
+                             CommunicationsUtilities.Trace("Disconnecting voluntarily");
+@@ -701,8 +738,8 @@ private void RunReadLoop(
+             while (!exitLoop);
+         }
+ 
+-        #endregion
++#endregion
+ 
+-        #endregion
++#endregion
+     }
+ }
+diff --git a/src/Shared/TaskHostConfiguration.cs b/src/Shared/TaskHostConfiguration.cs
+index 83df9cdc435..e96d2080ee1 100644
+--- a/src/Shared/TaskHostConfiguration.cs
++++ b/src/Shared/TaskHostConfiguration.cs
+@@ -2,9 +2,17 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
++using System.Collections;
+ using System.Collections.Generic;
+ using System.Diagnostics;
+ using System.Globalization;
++
++#if !TASKHOST
++using System.Text.Json.Serialization;
++using System.Text.Json;
++using System.Text.Json.Nodes;
++#endif
++
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+@@ -16,7 +24,12 @@ namespace Microsoft.Build.BackEnd
+     /// TaskHostConfiguration contains information needed for the task host to
+     /// configure itself for to execute a particular task.
+     /// </summary>
+-    internal class TaskHostConfiguration : INodePacket
++    internal class TaskHostConfiguration :
++#if TASKHOST
++        INodePacket
++#else
++        INodePacket2
++#endif
+     {
+         /// <summary>
+         /// The node id (of the parent node, to make the logging work out)
+@@ -43,11 +56,6 @@ internal class TaskHostConfiguration : INodePacket
+         /// </summary>
+         private CultureInfo _uiCulture = CultureInfo.CurrentUICulture;
+ 
+-        /// <summary>
+-        /// Task host runtime.
+-        /// </summary>
+-        private string _runtime;
+-
+ #if FEATURE_APPDOMAIN
+         /// <summary>
+         /// The AppDomainSetup that we may want to use on AppDomainIsolated tasks.
+@@ -213,94 +221,6 @@ public TaskHostConfiguration(
+             _globalParameters = globalParameters ?? new Dictionary<string, string>();
+         }
+ 
+-#if FEATURE_APPDOMAIN
+-        /// <summary>
+-        /// Constructor.
+-        /// </summary>
+-        /// <param name="runtime">Task host runtime.</param>
+-        /// <param name="nodeId">The ID of the node being configured.</param>
+-        /// <param name="startupDirectory">The startup directory for the task being executed.</param>
+-        /// <param name="buildProcessEnvironment">The set of environment variables to apply to the task execution process.</param>
+-        /// <param name="culture">The culture of the thread that will execute the task.</param>
+-        /// <param name="uiCulture">The UI culture of the thread that will execute the task.</param>
+-        /// <param name="appDomainSetup">The AppDomainSetup that may be used to pass information to an AppDomainIsolated task.</param>
+-        /// <param name="lineNumberOfTask">The line number of the location from which this task was invoked.</param>
+-        /// <param name="columnNumberOfTask">The column number of the location from which this task was invoked.</param>
+-        /// <param name="projectFileOfTask">The project file from which this task was invoked.</param>
+-        /// <param name="continueOnError">Flag to continue with the build after a the task failed</param>
+-        /// <param name="taskName">Name of the task.</param>
+-        /// <param name="taskLocation">Location of the assembly the task is to be loaded from.</param>
+-        /// <param name="isTaskInputLoggingEnabled">Whether task inputs are logged.</param>
+-        /// <param name="taskParameters">Parameters to apply to the task.</param>
+-        /// <param name="globalParameters">global properties for the current project.</param>
+-        /// <param name="warningsAsErrors">Warning codes to be treated as errors for the current project.</param>
+-        /// <param name="warningsNotAsErrors">Warning codes not to be treated as errors for the current project.</param>
+-        /// <param name="warningsAsMessages">Warning codes to be treated as messages for the current project.</param>
+-#else
+-        /// <summary>
+-        /// Constructor.
+-        /// </summary>
+-        /// <param name="runtime">Task host runtime.</param>
+-        /// <param name="nodeId">The ID of the node being configured.</param>
+-        /// <param name="startupDirectory">The startup directory for the task being executed.</param>
+-        /// <param name="buildProcessEnvironment">The set of environment variables to apply to the task execution process.</param>
+-        /// <param name="culture">The culture of the thread that will execute the task.</param>
+-        /// <param name="uiCulture">The UI culture of the thread that will execute the task.</param>
+-        /// <param name="lineNumberOfTask">The line number of the location from which this task was invoked.</param>
+-        /// <param name="columnNumberOfTask">The column number of the location from which this task was invoked.</param>
+-        /// <param name="projectFileOfTask">The project file from which this task was invoked.</param>
+-        /// <param name="continueOnError">Flag to continue with the build after a the task failed</param>
+-        /// <param name="taskName">Name of the task.</param>
+-        /// <param name="taskLocation">Location of the assembly the task is to be loaded from.</param>
+-        /// <param name="isTaskInputLoggingEnabled">Whether task inputs are logged.</param>
+-        /// <param name="taskParameters">Parameters to apply to the task.</param>
+-        /// <param name="globalParameters">global properties for the current project.</param>
+-        /// <param name="warningsAsErrors">Warning codes to be logged as errors for the current project.</param>
+-        /// <param name="warningsNotAsErrors">Warning codes not to be treated as errors for the current project.</param>
+-        /// <param name="warningsAsMessages">Warning codes to be treated as messages for the current project.</param>
+-#endif
+-        public TaskHostConfiguration(
+-                string runtime,
+-                int nodeId,
+-                string startupDirectory,
+-                IDictionary<string, string> buildProcessEnvironment,
+-                CultureInfo culture,
+-                CultureInfo uiCulture,
+-#if FEATURE_APPDOMAIN
+-                AppDomainSetup appDomainSetup,
+-#endif
+-                int lineNumberOfTask,
+-                int columnNumberOfTask,
+-                string projectFileOfTask,
+-                bool continueOnError,
+-                string taskName,
+-                string taskLocation,
+-                bool isTaskInputLoggingEnabled,
+-                IDictionary<string, object> taskParameters,
+-                Dictionary<string, string> globalParameters,
+-                ICollection<string> warningsAsErrors,
+-                ICollection<string> warningsNotAsErrors,
+-                ICollection<string> warningsAsMessages)
+-            : this(nodeId,
+-                  startupDirectory,
+-                  buildProcessEnvironment,
+-                  culture,
+-                  uiCulture,
+-#if FEATURE_APPDOMAIN
+-                appDomainSetup,
+-#endif
+-                  lineNumberOfTask,
+-                  columnNumberOfTask,
+-                  projectFileOfTask,
+-                  continueOnError,
+-                  taskName, taskLocation,
+-                  isTaskInputLoggingEnabled,
+-                  taskParameters,
+-                  globalParameters,
+-                  warningsAsErrors,
+-                  warningsNotAsErrors,
+-                  warningsAsMessages) => _runtime = runtime;
+-
+         /// <summary>
+         /// Constructor for deserialization.
+         /// </summary>
+@@ -509,30 +429,6 @@ public void Translate(ITranslator translator)
+             translator.TranslateDictionary(ref _buildProcessEnvironment, StringComparer.OrdinalIgnoreCase);
+             translator.TranslateCulture(ref _culture);
+             translator.TranslateCulture(ref _uiCulture);
+-#if FEATURE_APPDOMAIN
+-
+-            // Skip AppDomain configuration when targeting .NET Task Host (Runtime="Net").
+-            // Although MSBuild.exe runs under .NET Framework and has AppDomain support,
+-            // we don't transmit AppDomain config when communicating with dotnet.exe (it is not supported in .NET 5+).
+-            if (!string.Equals(_runtime, "Net", StringComparison.OrdinalIgnoreCase))
+-            {
+-                byte[] appDomainConfigBytes = null;
+-
+-                // Set the configuration bytes just before serialization in case the SetConfigurationBytes was invoked during lifetime of this instance.
+-                if (translator.Mode == TranslationDirection.WriteToStream)
+-                {
+-                    appDomainConfigBytes = _appDomainSetup?.GetConfigurationBytes();
+-                }
+-
+-                translator.Translate(ref appDomainConfigBytes);
+-
+-                if (translator.Mode == TranslationDirection.ReadFromStream)
+-                {
+-                    _appDomainSetup = new AppDomainSetup();
+-                    _appDomainSetup.SetConfigurationBytes(appDomainConfigBytes);
+-                }
+-            }
+-#endif
+             translator.Translate(ref _lineNumberOfTask);
+             translator.Translate(ref _columnNumberOfTask);
+             translator.Translate(ref _projectFileOfTask);
+@@ -565,15 +461,285 @@ public void Translate(ITranslator translator)
+ #endif
+         }
+ 
++#if !TASKHOST
++        public void Translate(IJsonTranslator translator)
++        {
++            if (translator.Mode == TranslationDirection.WriteToStream)
++            {
++                var model = new
++                {
++                    nodeId = _nodeId,
++                    startupDirectory = _startupDirectory,
++                    buildProcessEnvironment = _buildProcessEnvironment,
++                    culture = _culture?.Name,
++                    uiCulture = _uiCulture?.Name,
++                    lineNumberOfTask = _lineNumberOfTask,
++                    columnNumberOfTask = _columnNumberOfTask,
++                    projectFileOfTask = _projectFileOfTask,
++                    continueOnError = _continueOnError,
++                    taskName = _taskName,
++                    taskLocation = _taskLocation,
++                    isTaskInputLoggingEnabled = _isTaskInputLoggingEnabled,
++                    taskParameters = _taskParameters,
++                    globalParameters = _globalParameters,
++                    warningsAsErrors = _warningsAsErrors,
++                    warningsNotAsErrors = _warningsNotAsErrors,
++                    warningsAsMessages = _warningsAsMessages
++                };
++
++                translator.TranslateToJson(model, _jsonSerializerOptions);
++            }
++            else // ReadFromStream
++            {
++                var model = translator.TranslateFromJson<TaskHostConfigurationModel>(_jsonSerializerOptions);
++
++                _nodeId = model.nodeId;
++                _startupDirectory = model.startupDirectory;
++                _buildProcessEnvironment = model.buildProcessEnvironment;
++                _culture = !string.IsNullOrEmpty(model.culture) ? CultureInfo.GetCultureInfo(model.culture) : null;
++                _uiCulture = !string.IsNullOrEmpty(model.uiCulture) ? CultureInfo.GetCultureInfo(model.uiCulture) : null;
++                _lineNumberOfTask = model.lineNumberOfTask;
++                _columnNumberOfTask = model.columnNumberOfTask;
++                _projectFileOfTask = model.projectFileOfTask;
++                _continueOnError = model.continueOnError;
++                _taskName = model.taskName;
++                _taskLocation = model.taskLocation;
++                _isTaskInputLoggingEnabled = model.isTaskInputLoggingEnabled;
++                _taskParameters = model.taskParameters;
++                _globalParameters = model.globalParameters;
++                _warningsAsErrors = model.warningsAsErrors != null
++                    ? new HashSet<string>(model.warningsAsErrors, StringComparer.OrdinalIgnoreCase)
++                    : null;
++                _warningsNotAsErrors = model.warningsNotAsErrors != null
++                    ? new HashSet<string>(model.warningsNotAsErrors, StringComparer.OrdinalIgnoreCase)
++                    : null;
++                _warningsAsMessages = model.warningsAsMessages != null
++                    ? new HashSet<string>(model.warningsAsMessages, StringComparer.OrdinalIgnoreCase)
++                    : null;
++            }
++        }
++#endif
+         /// <summary>
+         /// Factory for deserialization.
+         /// </summary>
+-        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        internal static INodePacket FactoryForDeserialization(ITranslatorBase translator)
+         {
+             TaskHostConfiguration configuration = new TaskHostConfiguration();
+-            configuration.Translate(translator);
+-
++            if (translator.Protocol == ProtocolType.Binary)
++            {
++                configuration.Translate((ITranslator)translator);
++            }
++#if !TASKHOST
++            else
++            {
++                configuration.Translate((IJsonTranslator)translator);
++            }
++#endif
+             return configuration;
+         }
++
++#if !TASKHOST
++
++        public static JsonSerializerOptions _jsonSerializerOptions = new JsonSerializerOptions
++        {
++            PropertyNameCaseInsensitive = true,
++            Converters =
++                {
++                    new JsonStringEnumConverter(),
++                    new CustomTaskParameterConverter()
++                },
++        };
++
++        private class TaskHostConfigurationModel
++        {
++            public int nodeId { get; set; }
++            public string startupDirectory { get; set; }
++            public Dictionary<string, string> buildProcessEnvironment { get; set; }
++            public string culture { get; set; }
++            public string uiCulture { get; set; }
++            public int lineNumberOfTask { get; set; }
++            public int columnNumberOfTask { get; set; }
++            public string projectFileOfTask { get; set; }
++            public bool continueOnError { get; set; }
++            public string taskName { get; set; }
++            public string taskLocation { get; set; }
++            public bool isTaskInputLoggingEnabled { get; set; }
++            public Dictionary<string, TaskParameter> taskParameters { get; set; }
++            public Dictionary<string, string> globalParameters { get; set; }
++            public string[] warningsAsErrors { get; set; }
++            public string[] warningsNotAsErrors { get; set; }
++            public string[] warningsAsMessages { get; set; }
++        }
++
++        private class CustomTaskParameterConverter : JsonConverter<TaskParameter>
++        {
++            public override TaskParameter Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
++            {
++                if (reader.TokenType == JsonTokenType.Null)
++                {
++                    return null;
++                }
++
++                using JsonDocument doc = JsonDocument.ParseValue(ref reader);
++                var element = doc.RootElement;
++
++                if (element.TryGetProperty("value", out JsonElement valueElement))
++                {
++                    object value = null;
++
++                    switch (valueElement.ValueKind)
++                    {
++                        case JsonValueKind.String:
++                            value = valueElement.GetString();
++                            break;
++                        case JsonValueKind.Number:
++                            if (valueElement.TryGetInt32(out int intValue))
++                            {
++                                value = intValue;
++                            }
++                            else if (valueElement.TryGetInt64(out long longValue))
++                            {
++                                value = longValue;
++                            }
++                            else
++                            {
++                                value = valueElement.GetDouble();
++                            }
++                            break;
++                        case JsonValueKind.True:
++                        case JsonValueKind.False:
++                            value = valueElement.GetBoolean();
++                            break;
++                        case JsonValueKind.Array:
++                            value = JsonSerializer.Deserialize<object[]>(valueElement.GetRawText(), options);
++                            break;
++                        case JsonValueKind.Object:
++                            value = JsonSerializer.Deserialize<Dictionary<string, object>>(valueElement.GetRawText(), options);
++                            break;
++                    }
++
++                    return new TaskParameter(value);
++                }
++
++                throw new JsonException("Invalid TaskParameter format");
++            }
++
++            public override void Write(Utf8JsonWriter writer, TaskParameter value, JsonSerializerOptions options)
++            {
++                if (value == null)
++                {
++                    writer.WriteNullValue();
++                    return;
++                }
++
++                writer.WriteStartObject();
++                writer.WritePropertyName("value");
++
++                object wrappedValue = value.WrappedParameter;
++                if (wrappedValue == null)
++                {
++                    writer.WriteNullValue();
++                }
++                else
++                {
++                    switch (wrappedValue)
++                    {
++                        case string strValue:
++                            writer.WriteStringValue(strValue);
++                            break;
++                        case int intValue:
++                            writer.WriteNumberValue(intValue);
++                            break;
++                        case long longValue:
++                            writer.WriteNumberValue(longValue);
++                            break;
++                        case double doubleValue:
++                            writer.WriteNumberValue(doubleValue);
++                            break;
++                        case float floatValue:
++                            writer.WriteNumberValue(floatValue);
++                            break;
++                        case decimal decimalValue:
++                            writer.WriteNumberValue(decimalValue);
++                            break;
++                        case bool boolValue:
++                            writer.WriteBooleanValue(boolValue);
++                            break;
++                        case DateTime dateValue:
++                            writer.WriteStringValue(dateValue);
++                            break;
++                        case ITaskItem taskItem:
++                            WriteTaskItem(writer, taskItem);
++                            break;
++                        case ITaskItem[] taskItems:
++                            WriteTaskItemArray(writer, taskItems);
++                            break;
++                        case IEnumerable enumerable:
++                            WriteEnumerable(writer, enumerable, options);
++                            break;
++                        default:
++                            JsonSerializer.Serialize(writer, wrappedValue, wrappedValue.GetType(), options);
++                            break;
++                    }
++                }
++
++                writer.WriteEndObject();
++            }
++
++            private static void WriteTaskItem(Utf8JsonWriter writer, ITaskItem taskItem)
++            {
++                writer.WriteStartObject();
++                writer.WritePropertyName("itemSpec");
++                writer.WriteStringValue(taskItem.ItemSpec);
++
++                if (taskItem.MetadataCount > 0)
++                {
++                    writer.WritePropertyName("metadata");
++                    writer.WriteStartObject();
++
++                    foreach (string name in taskItem.MetadataNames)
++                    {
++                        writer.WritePropertyName(name);
++                        writer.WriteStringValue(taskItem.GetMetadata(name));
++                    }
++
++                    writer.WriteEndObject();
++                }
++
++                writer.WriteEndObject();
++            }
++
++            private static void WriteTaskItemArray(Utf8JsonWriter writer, ITaskItem[] taskItems)
++            {
++                writer.WriteStartArray();
++
++                foreach (var item in taskItems)
++                {
++                    WriteTaskItem(writer, item);
++                }
++
++                writer.WriteEndArray();
++            }
++
++            private static void WriteEnumerable(Utf8JsonWriter writer, IEnumerable enumerable, JsonSerializerOptions options)
++            {
++                writer.WriteStartArray();
++
++                foreach (var item in enumerable)
++                {
++                    if (item == null)
++                    {
++                        writer.WriteNullValue();
++                    }
++                    else
++                    {
++                        JsonSerializer.Serialize(writer, item, item.GetType(), options);
++                    }
++                }
++
++                writer.WriteEndArray();
++            }
++        }
++#endif
+     }
+ }
+diff --git a/src/Shared/TaskHostTaskCancelled.cs b/src/Shared/TaskHostTaskCancelled.cs
+index f56e61a34d9..3f9104ac2e3 100644
+--- a/src/Shared/TaskHostTaskCancelled.cs
++++ b/src/Shared/TaskHostTaskCancelled.cs
+@@ -9,7 +9,12 @@ namespace Microsoft.Build.BackEnd
+     /// TaskHostTaskCancelled informs the task host that the task it is
+     /// currently executing has been canceled.
+     /// </summary>
+-    internal class TaskHostTaskCancelled : INodePacket
++    internal class TaskHostTaskCancelled :
++#if TASKHOST
++        INodePacket
++#else
++        INodePacket2
++#endif
+     {
+         /// <summary>
+         /// Constructor
+@@ -35,13 +40,21 @@ public void Translate(ITranslator translator)
+             // Do nothing -- this packet doesn't contain any parameters.
+         }
+ 
++#if !TASKHOST
++        public void Translate(IJsonTranslator translator)
++        {
++            // Do nothing -- this packet doesn't contain any parameters.
++        }
++#endif
++
+         /// <summary>
+         /// Factory for deserialization.
+         /// </summary>
+-        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        internal static INodePacket FactoryForDeserialization(ITranslatorBase translator)
+         {
+             TaskHostTaskCancelled taskCancelled = new TaskHostTaskCancelled();
+-            taskCancelled.Translate(translator);
++
++            // Do nothing -- this packet doesn't contain any parameters.
+             return taskCancelled;
+         }
+     }

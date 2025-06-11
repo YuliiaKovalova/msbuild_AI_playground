@@ -1,0 +1,333 @@
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index ccd837ef921..3d8897a3e20 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -530,6 +530,63 @@ public void BinaryLoggerShouldEmbedSymlinkFilesViaTaskOutput()
+                 customMessage: $"Embedded files: {string.Join(",", zipArchive.Entries)}");
+         }
+ 
++        [Fact]
++        public void EmbedsSourceFileFromRoslynCodeTaskFactoryInBinlog()
++        {
++            string taskName = "HelloTask";
++            string csprojFileName = "EmbedsSourceFileInTheBinlogTest.csproj";
++            string targetName = "SayHello";
++
++            TransientTestFolder folder = _env.CreateFolder(createFolder: true);
++            TransientTestFile taskClass = _env.CreateFile(folder, $"{taskName}.cs", $@"namespace InlineTask
++{{
++    using Microsoft.Build.Utilities;
++
++    public class {taskName} : Task
++    {{
++        public override bool Execute()
++        {{
++            Log.LogMessage(""Hello, world!"");
++            return !Log.HasLoggedErrors;
++        }}
++    }}
++}}
++");
++
++            TransientTestFile assemblyProj = _env.CreateFile(folder, csprojFileName, $@"
++<Project>
++
++  <UsingTask
++    TaskName=""{taskName}""
++    TaskFactory=""RoslynCodeTaskFactory""
++    AssemblyFile=""$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll"">
++    <Task>
++      <Code Type=""Class"" Language=""cs"" Source=""{taskClass.Path}"">
++      </Code>
++    </Task>
++  </UsingTask>
++
++    <Target Name=""{targetName}"">
++        <{taskName} />
++    </Target>
++
++</Project>
++                ");
++
++            string output = RunnerUtilities.ExecMSBuild($"{assemblyProj.Path} /t:{targetName} /bl:\"LogFile={_logFile};ProjectImports=ZipFile\"", out bool success);
++
++            success.ShouldBeTrue();
++
++            string projectImportsZipPath = Path.ChangeExtension(_logFile, ".ProjectImports.zip");
++            using var fileStream = new FileStream(projectImportsZipPath, FileMode.Open);
++            using var zipArchive = new ZipArchive(fileStream, ZipArchiveMode.Read);
++
++            // Can't just compare `Name` because `ZipArchive` does not handle unix directory separators well
++            // thus producing garbled fully qualified paths in the actual .ProjectImports.zip entries
++            zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith($"{taskName}.cs"),
++                "");
++        }
++
+         [Fact]
+         public void BinaryLoggerShouldNotThrowWhenMetadataCannotBeExpanded()
+         {
+diff --git a/src/Build/Instance/TaskRegistry.cs b/src/Build/Instance/TaskRegistry.cs
+index 5b65829e926..0f1c85086be 100644
+--- a/src/Build/Instance/TaskRegistry.cs
++++ b/src/Build/Instance/TaskRegistry.cs
+@@ -1492,6 +1492,14 @@ private bool GetTaskFactory(TargetLoggingContext targetLoggingContext, ElementLo
+                                         }
+                                     }
+ 
++                                    // Embed the source file
++                                    if (initialized && factory.TaskType != null &&
++                                        factory is IHasSourceFilePath factoryWithSourceFilePath &&
++                                        factoryWithSourceFilePath.SourceFilePath != null)
++                                    {
++                                        taskFactoryLoggingHost.LoggingContext.LogIncludeFile(factoryWithSourceFilePath.SourceFilePath);
++                                    }
++
+                                     // Throw an error if the ITaskFactory did not set the TaskType property.  If the property is null, it can cause NullReferenceExceptions in our code
+                                     if (initialized && factory.TaskType == null)
+                                     {
+diff --git a/src/Framework/IHasFilePath.cs b/src/Framework/IHasFilePath.cs
+new file mode 100644
+index 00000000000..50b8f831e58
+--- /dev/null
++++ b/src/Framework/IHasFilePath.cs
+@@ -0,0 +1,10 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Framework
++{
++    public interface IHasSourceFilePath
++    {
++        string SourceFilePath { get; }
++    }
++}
+diff --git a/src/Shared/UnitTests/ObjectModelHelpers.cs b/src/Shared/UnitTests/ObjectModelHelpers.cs
+index 5b6f8b43cec..7059609d2c3 100644
+--- a/src/Shared/UnitTests/ObjectModelHelpers.cs
++++ b/src/Shared/UnitTests/ObjectModelHelpers.cs
+@@ -1359,6 +1359,17 @@ private static void BuildProjectWithNewOM(string content, ref MockLogger logger,
+             result = project.Build(loggers);
+         }
+ 
++        public static void BuildProjectWithNewOMAndBinaryLogger(string content, BinaryLogger binaryLogger, out bool result)
++        {
++            // Replace the nonstandard quotes with real ones
++            content = ObjectModelHelpers.CleanupFileContents(content);
++
++            Project project = new Project(XmlReader.Create(new StringReader(content)), null, toolsVersion: null);
++            List<ILogger> loggers = new List<ILogger>();
++            loggers.Add(binaryLogger);
++            result = project.Build(loggers);
++        }
++
+         public static MockLogger BuildProjectContentUsingBuildManagerExpectResult(string content, BuildResultCode expectedResult)
+         {
+             var logger = new MockLogger();
+diff --git a/src/Tasks.UnitTests/CodeTaskFactoryTests.cs b/src/Tasks.UnitTests/CodeTaskFactoryTests.cs
+index f6d0b3a01ed..2daa78b9811 100644
+--- a/src/Tasks.UnitTests/CodeTaskFactoryTests.cs
++++ b/src/Tasks.UnitTests/CodeTaskFactoryTests.cs
+@@ -16,6 +16,9 @@ namespace Microsoft.Build.UnitTests
+ #if FEATURE_CODETASKFACTORY
+ 
+     using System.CodeDom.Compiler;
++    using System.IO.Compression;
++    using Microsoft.Build.Logging;
++    using Shouldly;
+ 
+     public sealed class CodeTaskFactoryTests
+     {
+@@ -1040,6 +1043,101 @@ public override bool Execute()
+             }
+         }
+ 
++        [Fact]
++        public void EmbedsSourceFileInBinlog()
++        {
++            string sourceFileContent = @"
++                                       using System;
++                    using System.Collections.Generic;
++                    using System.Text;
++                    using Microsoft.Build.Utilities;
++                    using Microsoft.Build.Framework;
++
++                    namespace Microsoft.Build.NonShippingTasks
++                    {
++                        public class LogNameValue_ClassSourcesTest : Task
++                        {
++                            private string variableName;
++                            private string variableValue;
++
++
++                            [Required]
++                            public string Name
++                            {
++                                get { return variableName; }
++                                set { variableName = value; }
++                            }
++
++
++                            public string Value
++                            {
++                                get { return variableValue; }
++                                set { variableValue = value; }
++                            }
++
++
++                            public override bool Execute()
++                            {
++                                // Set the process environment
++                                Log.LogMessage(""Setting {0}={1}"", this.variableName, this.variableValue);
++                                return true;
++                            }
++                        }
++                    }
++";
++
++            string tempFileDirectory = Path.GetTempPath();
++            string tempFileName = Guid.NewGuid().ToString() + ".cs";
++            string tempSourceFile = Path.Combine(tempFileDirectory, tempFileName);
++            File.WriteAllText(tempSourceFile, sourceFileContent);
++
++            try
++            {
++                string projectFileContents = @"
++                    <Project ToolsVersion='msbuilddefaulttoolsversion'>
++                        <UsingTask TaskName=`LogNameValue_ClassSourcesTest` TaskFactory=`CodeTaskFactory` AssemblyFile=`$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll`>
++                        <ParameterGroup>
++                            <Name ParameterType='System.String' />
++                            <Value ParameterType='System.String' />
++                        </ParameterGroup>
++                        <Task>
++                            <Code Source='" + tempSourceFile + @"'/>
++                         </Task>
++                         </UsingTask>
++                        <Target Name=`Build`>
++                            <LogNameValue_ClassSourcesTest Name='MyName' Value='MyValue'/>
++                        </Target>
++                    </Project>";
++
++                string binaryLogFile = Path.Combine(tempFileDirectory, "output.binlog");
++                var binaryLogger = new BinaryLogger()
++                {
++                    Parameters = $"LogFile={binaryLogFile}",
++                    CollectProjectImports = BinaryLogger.ProjectImportsCollectionMode.ZipFile,
++                };
++
++                Helpers.BuildProjectWithNewOMAndBinaryLogger(projectFileContents, binaryLogger, out bool result);
++
++                result.ShouldBeTrue();
++
++                string projectImportsZipPath = Path.ChangeExtension(binaryLogFile, ".ProjectImports.zip");
++                using var fileStream = new FileStream(projectImportsZipPath, FileMode.Open);
++                using var zipArchive = new ZipArchive(fileStream, ZipArchiveMode.Read);
++
++                // Can't just compare `Name` because `ZipArchive` does not handle unix directory separators well
++                // thus producing garbled fully qualified paths in the actual .ProjectImports.zip entries
++                zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith(tempFileName),
++                    "");
++            }
++            finally
++            {
++                if (File.Exists(tempSourceFile))
++                {
++                    File.Delete(tempSourceFile);
++                }
++            }
++        }
++
+         /// <summary>
+         /// Code factory test where the TMP directory does not exist.
+         /// See https://github.com/dotnet/msbuild/issues/328 for details.
+diff --git a/src/Tasks/CodeTaskFactory.cs b/src/Tasks/CodeTaskFactory.cs
+index 4c076939d98..fb2e2ee9c75 100644
+--- a/src/Tasks/CodeTaskFactory.cs
++++ b/src/Tasks/CodeTaskFactory.cs
+@@ -27,7 +27,7 @@ namespace Microsoft.Build.Tasks
+     /// <summary>
+     /// A task factory which can take code dom supported languages and create a task out of it
+     /// </summary>
+-    public class CodeTaskFactory : ITaskFactory
++    public class CodeTaskFactory : ITaskFactory, IHasSourceFilePath
+     {
+         /// <summary>
+         /// This dictionary keeps track of custom references to compiled assemblies.  The in-memory assembly is loaded from a byte
+@@ -161,6 +161,8 @@ private static Assembly CurrentDomainOnAssemblyResolve(object sender, ResolveEve
+         /// </summary>
+         public Type TaskType { get; private set; }
+ 
++        public string SourceFilePath { get; private set; }
++
+         /// <summary>
+         /// Get the type information for all task parameters.
+         /// </summary>
+@@ -302,6 +304,10 @@ public bool Initialize(string taskName, IDictionary<string, TaskPropertyInfo> ta
+                 {
+                     _log.LogErrorWithCodeFromResources("CodeTaskFactory.CouldNotFindTaskInAssembly", _nameOfTask);
+                 }
++                else
++                {
++                    SourceFilePath = _sourcePath;
++                }
+             }
+ 
+             return !_log.HasLoggedErrors;
+diff --git a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
+index 374fa50852d..6a6e2b57976 100644
+--- a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
++++ b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
+@@ -22,7 +22,7 @@
+ 
+ namespace Microsoft.Build.Tasks
+ {
+-    public sealed class RoslynCodeTaskFactory : ITaskFactory
++    public sealed class RoslynCodeTaskFactory : ITaskFactory, IHasSourceFilePath
+     {
+         /// <summary>
+         /// A set of default namespaces to add so that user does not have to include them.  Make sure that these are covered
+@@ -125,6 +125,8 @@ public sealed class RoslynCodeTaskFactory : ITaskFactory
+         /// </summary>
+         public Type TaskType { get; private set; }
+ 
++        public string SourceFilePath { get; private set; }
++
+         /// <inheritdoc cref="ITaskFactory.CleanupTask(ITask)"/>
+         public void CleanupTask(ITask task)
+         {
+@@ -201,6 +203,11 @@ public bool Initialize(string taskName, IDictionary<string, TaskPropertyInfo> pa
+                 }
+             }
+ 
++            if (TaskType != null)
++            {
++                SourceFilePath = taskInfo.Source;
++            }
++
+             // Initialization succeeded if we found a type matching the task name from the compiled assembly
+             return TaskType != null;
+         }
+@@ -446,6 +453,7 @@ internal static bool TryLoadTaskBody(TaskLoggingHelper log, string taskName, str
+ 
+                 // Instead of using the inner text of the <Code /> element, read the specified file as source code
+                 taskInfo.CodeType = RoslynCodeTaskFactoryCodeType.Class;
++                taskInfo.Source = sourceAttribute.Value;
+                 taskInfo.SourceCode = File.ReadAllText(sourceAttribute.Value.Trim());
+             }
+ 
+diff --git a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactoryTaskInfo.cs b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactoryTaskInfo.cs
+index 72993020895..e26ed183d05 100644
+--- a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactoryTaskInfo.cs
++++ b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactoryTaskInfo.cs
+@@ -35,6 +35,12 @@ internal sealed class RoslynCodeTaskFactoryTaskInfo : IEquatable<RoslynCodeTaskF
+         /// </summary>
+         public ISet<string> References { get; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+ 
++
++        /// <summary>
++        /// Gets or sets the source of the assembly.
++        /// </summary>
++        public string Source { get; set; }
++
+         /// <summary>
+         /// Gets or sets the source code of the assembly.
+         /// </summary>

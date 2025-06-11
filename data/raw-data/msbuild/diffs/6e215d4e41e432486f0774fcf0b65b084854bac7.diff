@@ -1,0 +1,844 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index fa6ae4bbbfd..a6c1f3db67c 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -560,6 +560,19 @@ public void BeginBuild(BuildParameters parameters)
+                     _buildParameters.OutputResultsCacheFile = FileUtilities.NormalizePath("msbuild-cache");
+                 }
+ 
++                // Launch the RAR node before the detoured launcher overrides the default node launcher.
++                if (_buildParameters.EnableRarNode)
++                {
++                    NodeLauncher nodeLauncher = ((IBuildComponentHost)this).GetComponent<NodeLauncher>(BuildComponentType.NodeLauncher);
++                    RarNodeLauncher rarNodeLauncher = new(nodeLauncher);
++
++                    // TODO: Evaluate making this fire-and-forget so we can continue with the build.
++                    if (!rarNodeLauncher.Start())
++                    {
++                        _buildParameters.EnableRarNode = false;
++                    }
++                }
++
+ #if FEATURE_REPORTFILEACCESSES
+                 if (_buildParameters.ReportFileAccesses)
+                 {
+diff --git a/src/Build/BackEnd/BuildManager/BuildParameters.cs b/src/Build/BackEnd/BuildManager/BuildParameters.cs
+index 1bfab1b0e52..9ae5c5f5bde 100644
+--- a/src/Build/BackEnd/BuildManager/BuildParameters.cs
++++ b/src/Build/BackEnd/BuildManager/BuildParameters.cs
+@@ -124,6 +124,8 @@ public class BuildParameters : ITranslatable
+         private bool _enableNodeReuse = false;
+ #endif
+ 
++        private bool _enableRarNode;
++
+         /// <summary>
+         /// The original process environment.
+         /// </summary>
+@@ -277,6 +279,7 @@ internal BuildParameters(BuildParameters other, bool resetEnvironment = false)
+             _culture = other._culture;
+             _defaultToolsVersion = other._defaultToolsVersion;
+             _enableNodeReuse = other._enableNodeReuse;
++            _enableRarNode = other._enableRarNode;
+             _buildProcessEnvironment = resetEnvironment
+                 ? CommunicationsUtilities.GetEnvironmentVariables()
+                 : other._buildProcessEnvironment != null
+@@ -424,6 +427,15 @@ public bool EnableNodeReuse
+             set => _enableNodeReuse = Environment.GetEnvironmentVariable("MSBUILDDISABLENODEREUSE") == "1" ? false : value;
+         }
+ 
++        /// <summary>
++        /// When true, the ResolveAssemblyReferences task executes in an out-of-proc node which persists across builds.
++        /// </summary>
++        public bool EnableRarNode
++        {
++            get => _enableRarNode;
++            set => _enableRarNode = value;
++        }
++
+         /// <summary>
+         /// Gets an immutable collection of environment properties.
+         /// </summary>
+@@ -915,6 +927,7 @@ void ITranslatable.Translate(ITranslator translator)
+             translator.Translate(ref _defaultToolsVersion);
+             translator.Translate(ref _disableInProcNode);
+             translator.Translate(ref _enableNodeReuse);
++            translator.Translate(ref _enableRarNode);
+             translator.TranslateProjectPropertyInstanceDictionary(ref _environmentProperties);
+             /* No forwarding logger information sent here - that goes with the node configuration */
+             translator.TranslateProjectPropertyInstanceDictionary(ref _globalProperties);
+diff --git a/src/Build/BackEnd/Components/Communications/RarNodeLauncher.cs b/src/Build/BackEnd/Components/Communications/RarNodeLauncher.cs
+new file mode 100644
+index 00000000000..6663595fa68
+--- /dev/null
++++ b/src/Build/BackEnd/Components/Communications/RarNodeLauncher.cs
+@@ -0,0 +1,82 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.IO;
++using System.IO.Pipes;
++using System.Linq;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++using Microsoft.Build.Shared.FileSystem;
++
++namespace Microsoft.Build.BackEnd
++{
++    internal sealed class RarNodeLauncher
++    {
++        private readonly INodeLauncher _nodeLauncher;
++
++        private readonly string _pipeName;
++
++        internal RarNodeLauncher(INodeLauncher nodeLauncher)
++        {
++            _nodeLauncher = nodeLauncher;
++            _pipeName = NamedPipeUtil.GetRarNodePipeName(new(HandshakeOptions.None));
++        }
++
++        /// <summary>
++        /// Creates a new MSBuild process with the RAR nodemode.
++        /// </summary>
++        public bool Start()
++        {
++            if (IsRarNodeRunning())
++            {
++                CommunicationsUtilities.Trace("Existing RAR node found.");
++                return true;
++            }
++
++            CommunicationsUtilities.Trace("Launching RAR node...");
++
++            try
++            {
++                LaunchNode();
++            }
++            catch (NodeFailedToLaunchException ex)
++            {
++                CommunicationsUtilities.Trace("Failed to launch RAR node: {0}", ex);
++                return false;
++            }
++
++            return true;
++        }
++
++        private bool IsRarNodeRunning()
++        {
++            // Determine if the node is running by checking if the expected named pipe exists.
++            if (NativeMethodsShared.IsWindows)
++            {
++                const string NamedPipeRoot = @"\\.\pipe\";
++
++                // File.Exists() will crash the pipe server, as the underlying Windows APIs have undefined behavior
++                // when used with pipe objects. Enumerating the pipe directory avoids this issue.
++                IEnumerable<string> pipeNames = FileSystems.Default.EnumerateFiles(NamedPipeRoot);
++
++                return pipeNames.Contains(Path.Combine(NamedPipeRoot, _pipeName));
++            }
++            else
++            {
++                // On Unix, named pipes are implemented via sockets, and the pipe name is simply the file path.
++                return FileSystems.Default.FileExists(_pipeName);
++            }
++        }
++
++        private void LaunchNode()
++        {
++            string msbuildLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
++            string commandLineArgs = string.Join(" ", ["/nologo", "/nodemode:3"]);
++            _ = _nodeLauncher.Start(msbuildLocation, commandLineArgs, nodeId: 0);
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index a262028f9f9..0cb83e34bed 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -940,6 +940,8 @@ public override bool LogsMessagesOfImportance(MessageImportance importance)
+             /// <inheritdoc/>
+             public override bool IsTaskInputLoggingEnabled => _taskHost._host.BuildParameters.LogTaskInputs;
+ 
++            public override bool IsOutOfProcRarNodeEnabled => _taskHost._host.BuildParameters.EnableRarNode;
++
+ #if FEATURE_REPORTFILEACCESSES
+             /// <summary>
+             /// Reports a file access from a task.
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index b28ac113cd2..144e09f128a 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -361,6 +361,7 @@
+     <Compile Include="BackEnd\Components\Communications\NodeInfo.cs" />
+     <Compile Include="BackEnd\Components\Communications\NodeLauncher.cs" />
+     <Compile Include="BackEnd\Components\Communications\NodeProviderInProc.cs" />
++    <Compile Include="BackEnd\Components\Communications\RarNodeLauncher.cs" />
+     <Compile Include="BackEnd\Components\IBuildComponent.cs" />
+     <Compile Include="BackEnd\Components\IBuildComponentHost.cs" />
+     <Compile Include="BackEnd\Components\Scheduler\IScheduler.cs" />
+diff --git a/src/Framework/EngineServices.cs b/src/Framework/EngineServices.cs
+index 491604c7827..8449a750230 100644
+--- a/src/Framework/EngineServices.cs
++++ b/src/Framework/EngineServices.cs
+@@ -48,5 +48,7 @@ public abstract class EngineServices
+         /// This is a performance optimization allowing tasks to skip expensive double-logging.
+         /// </remarks>
+         public virtual bool IsTaskInputLoggingEnabled => throw new NotImplementedException();
++
++        public virtual bool IsOutOfProcRarNodeEnabled => throw new NotImplementedException();
+     }
+ }
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index e355761d9fd..da8da210b3c 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -121,6 +121,12 @@ public Traits()
+         /// </summary>
+         public readonly int DictionaryBasedItemRemoveThreshold = ParseIntFromEnvironmentVariableOrDefault("MSBUILDDICTIONARYBASEDITEMREMOVETHRESHOLD", 100);
+ 
++        /// <summary>
++        /// Launches a persistent RAR process.
++        /// </summary>
++        /// TODO: Replace with command line flag when feature is completed. The environment variable is intented to avoid exposing the flag early.
++        public readonly bool EnableRarNode = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBuildRarNode"));
++
+         /// <summary>
+         /// Name of environment variables used to enable MSBuild server.
+         /// </summary>
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 276ee52c214..1f0b911667c 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -35,6 +35,7 @@
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Shared.Debugging;
+ using Microsoft.Build.Shared.FileSystem;
++using Microsoft.Build.Tasks.AssemblyDependency;
+ using BinaryLogger = Microsoft.Build.Logging.BinaryLogger;
+ using ConsoleLogger = Microsoft.Build.Logging.ConsoleLogger;
+ using FileLogger = Microsoft.Build.Logging.FileLogger;
+@@ -1529,6 +1530,11 @@ internal static bool BuildProject(
+                         }
+                     }
+ 
++                    if (Traits.Instance.EnableRarNode)
++                    {
++                        parameters.EnableRarNode = true;
++                    }
++
+                     List<BuildManager.DeferredBuildMessage> messagesToLogInBuildLoggers = new();
+ 
+                     BuildManager buildManager = BuildManager.DefaultBuildManager;
+@@ -3432,6 +3438,21 @@ private static void StartLocalNode(CommandLineSwitches commandLineSwitches, bool
+                     OutOfProcTaskHostNode node = new OutOfProcTaskHostNode();
+                     shutdownReason = node.Run(out nodeException);
+                 }
++                else if (nodeModeNumber == 3)
++                {
++                    // The RAR service persists between builds, and will continue to process requests until terminated.
++                    OutOfProcRarNode rarNode = new();
++                    RarNodeShutdownReason rarShutdownReason = rarNode.Run(out nodeException, s_buildCancellationSource.Token);
++
++                    shutdownReason = rarShutdownReason switch
++                    {
++                        RarNodeShutdownReason.Complete => NodeEngineShutdownReason.BuildComplete,
++                        RarNodeShutdownReason.Error => NodeEngineShutdownReason.Error,
++                        RarNodeShutdownReason.AlreadyRunning => NodeEngineShutdownReason.Error,
++                        RarNodeShutdownReason.ConnectionTimedOut => NodeEngineShutdownReason.ConnectionFailed,
++                        _ => throw new ArgumentOutOfRangeException(nameof(rarShutdownReason), $"Unexpected value: {rarShutdownReason}"),
++                    };
++                }
+                 else if (nodeModeNumber == 8)
+                 {
+                     // Since build function has to reuse code from *this* class and OutOfProcServerNode is in different assembly
+diff --git a/src/Shared/INodePacket.cs b/src/Shared/INodePacket.cs
+index 42b6a8d6ab6..b72e32efb4c 100644
+--- a/src/Shared/INodePacket.cs
++++ b/src/Shared/INodePacket.cs
+@@ -200,6 +200,16 @@ internal enum NodePacketType : byte
+         /// </summary>
+         ProcessReport,
+ 
++        /// <summary>
++        /// A request contains the inputs to the RAR task.
++        /// </summary>
++        RarNodeExecuteRequest,
++
++        /// <summary>
++        /// A request contains the outputs and log events of a completed RAR task.
++        /// </summary>
++        RarNodeExecuteResponse,
++
+         /// <summary>
+         /// Command in form of MSBuild command line for server node - MSBuild Server.
+         /// Keep this enum value constant intact as this is part of contract with dotnet CLI
+diff --git a/src/Shared/NamedPipeUtil.cs b/src/Shared/NamedPipeUtil.cs
+index 25094e59035..0b85b05bacd 100644
+--- a/src/Shared/NamedPipeUtil.cs
++++ b/src/Shared/NamedPipeUtil.cs
+@@ -2,6 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.IO;
++using Microsoft.Build.Internal;
+ 
+ namespace Microsoft.Build.Shared
+ {
+@@ -42,5 +43,11 @@ internal static string GetPlatformSpecificPipeName(string pipeName)
+                 return pipeName;
+             }
+         }
++
++        internal static string GetRarNodePipeName(ServerNodeHandshake handshake)
++            => GetPlatformSpecificPipeName($"MSBuildRarNode-{handshake.ComputeHash()}");
++
++        internal static string GetRarNodeEndpointPipeName(ServerNodeHandshake handshake)
++            => GetPlatformSpecificPipeName($"MSBuildRarNodeEndpoint-{handshake.ComputeHash()}");
+     }
+ }
+diff --git a/src/Shared/NodePipeServer.cs b/src/Shared/NodePipeServer.cs
+index eb932d973aa..79316ec9adc 100644
+--- a/src/Shared/NodePipeServer.cs
++++ b/src/Shared/NodePipeServer.cs
+@@ -47,7 +47,7 @@ internal NodePipeServer(string pipeName, Handshake handshake, int maxNumberOfSer
+             // SIDs or the client will reject this server.  This is used to avoid attacks where a
+             // hacked server creates a less restricted pipe in an attempt to lure us into using it and
+             // then sending build requests to the real pipe client (which is the MSBuild Build Manager.)
+-            PipeAccessRule rule = new(WindowsIdentity.GetCurrent().Owner, PipeAccessRights.ReadWrite, AccessControlType.Allow);
++            PipeAccessRule rule = new(WindowsIdentity.GetCurrent().Owner, PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance, AccessControlType.Allow);
+             PipeSecurity security = new();
+             security.AddAccessRule(rule);
+             security.SetOwner(rule.IdentityReference);
+diff --git a/src/Tasks/AssemblyDependency/Node/OutOfProcRarClient.cs b/src/Tasks/AssemblyDependency/Node/OutOfProcRarClient.cs
+new file mode 100644
+index 00000000000..7a1c9911b78
+--- /dev/null
++++ b/src/Tasks/AssemblyDependency/Node/OutOfProcRarClient.cs
+@@ -0,0 +1,39 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Tasks.AssemblyDependency
++{
++    internal class OutOfProcRarClient
++    {
++        private readonly NodePipeClient _pipeClient;
++
++        public OutOfProcRarClient()
++        {
++            ServerNodeHandshake handshake = new(HandshakeOptions.None);
++            _pipeClient = new NodePipeClient(NamedPipeUtil.GetRarNodeEndpointPipeName(handshake), handshake);
++
++            NodePacketFactory packetFactory = new();
++            packetFactory.RegisterPacketHandler(NodePacketType.RarNodeExecuteResponse, RarNodeExecuteRequest.FactoryForDeserialization, null);
++            _pipeClient.RegisterPacketFactory(packetFactory);
++        }
++
++        public bool Execute(ResolveAssemblyReference rarTask)
++        {
++            // Don't set a timeout since the build manager currently blocks until the server is running.
++            _pipeClient.ConnectToServer(0);
++
++            // TODO: Use RAR task to create the request packet.
++            _pipeClient.WritePacket(new RarNodeExecuteRequest());
++
++            // TODO: Use response packet to set RAR task outputs.
++            _ = (RarNodeExecuteResponse)_pipeClient.ReadPacket();
++
++            throw new NotImplementedException("RAR node communication succeeded, but task execution is unimplemented.");
++        }
++    }
++}
+diff --git a/src/Tasks/AssemblyDependency/Node/OutOfProcRarNode.cs b/src/Tasks/AssemblyDependency/Node/OutOfProcRarNode.cs
+new file mode 100644
+index 00000000000..4ae898ca870
+--- /dev/null
++++ b/src/Tasks/AssemblyDependency/Node/OutOfProcRarNode.cs
+@@ -0,0 +1,156 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Threading;
++using System.Threading.Tasks;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Tasks.AssemblyDependency
++{
++    /// <summary>
++    /// Implements a persistent node for the ResolveAssemblyReferences task.
++    /// </summary>
++    public class OutOfProcRarNode
++    {
++        private readonly ServerNodeHandshake _handshake = new(HandshakeOptions.None);
++
++        private readonly int _maxNumberOfConcurrentTasks;
++
++        public OutOfProcRarNode()
++            : this(Environment.ProcessorCount)
++        {
++        }
++
++        public OutOfProcRarNode(int maxNumberOfConcurrentTasks) => _maxNumberOfConcurrentTasks = maxNumberOfConcurrentTasks;
++
++        /// <summary>
++        /// Starts the node and begins processing RAR execution requests until cancelled.
++        /// </summary>
++        /// <param name="shutdownException">The exception which caused shutdown, if any.</param>
++        /// <param name="cancellationToken">A cancellation token to observe while running the node loop.</param>
++        /// <returns>The reason for the node shutdown.</returns>
++        public RarNodeShutdownReason Run(out Exception? shutdownException, CancellationToken cancellationToken = default)
++        {
++            RarNodeShutdownReason shutdownReason;
++            shutdownException = null;
++
++            try
++            {
++                shutdownReason = RunNodeAsync(cancellationToken).GetAwaiter().GetResult();
++            }
++            catch (OperationCanceledException)
++            {
++                // Consider cancellation as an intentional shutdown of the node.
++                shutdownReason = RarNodeShutdownReason.Complete;
++            }
++            catch (UnauthorizedAccessException)
++            {
++                // Access to the path is denied if the named pipe already exists.
++                shutdownException = new InvalidOperationException("RAR node is already running.");
++                shutdownReason = RarNodeShutdownReason.AlreadyRunning;
++            }
++            catch (Exception ex)
++            {
++                shutdownException = ex;
++                shutdownReason = RarNodeShutdownReason.Error;
++            }
++
++            if (shutdownException == null)
++            {
++                CommunicationsUtilities.Trace("Shutting down with reason: {0}");
++            }
++            else
++            {
++                CommunicationsUtilities.Trace("Shutting down with reason: {0}, and exception: {1}", shutdownReason, shutdownException);
++            }
++
++            return shutdownReason;
++        }
++
++        private async Task<RarNodeShutdownReason> RunNodeAsync(CancellationToken cancellationToken)
++        {
++            // The RAR node uses two sets of pipe servers:
++            // 1. A single instance pipe to manage the lifecycle of the node.
++            // 2. A multi-instance pipe to execute concurrent RAR requests.
++            // Because multi-instance pipes can live across multiple processes, we can't rely on the instance cap to preven
++            // multiple nodes from running in the event of a race condition.
++            // This also simplifies tearing down all active pipe servers when shutdown is requested.
++            using NodePipeServer pipeServer = new(NamedPipeUtil.GetRarNodePipeName(_handshake), _handshake);
++
++            NodePacketFactory packetFactory = new();
++            packetFactory.RegisterPacketHandler(NodePacketType.NodeBuildComplete, NodeBuildComplete.FactoryForDeserialization, null);
++            pipeServer.RegisterPacketFactory(packetFactory);
++
++            using CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
++
++            Task nodeEndpointTasks = Task.Run(() => RunNodeEndpointsAsync(linkedCts.Token), linkedCts.Token);
++
++            while (!cancellationToken.IsCancellationRequested)
++            {
++                LinkStatus linkStatus = await WaitForConnection(pipeServer, cancellationToken);
++
++                if (linkStatus == LinkStatus.Active)
++                {
++                    NodeBuildComplete buildComplete = (NodeBuildComplete)pipeServer.ReadPacket();
++
++                    if (!buildComplete.PrepareForReuse)
++                    {
++                        break;
++                    }
++                }
++
++                pipeServer.Disconnect();
++            }
++
++            // Gracefully shutdown the node endpoints.
++            linkedCts.Cancel();
++
++            try
++            {
++                await nodeEndpointTasks;
++            }
++            catch (OperationCanceledException)
++            {
++                // Ignore since cancellation is expected.
++            }
++
++            return RarNodeShutdownReason.Complete;
++
++            // WaitForConnection does not currently accept cancellation, so use Wait to watch for cancellation.
++            // Cancellation is only expected when MSBuild is gracefully shutting down the node or running in unit tests.
++            static async Task<LinkStatus> WaitForConnection(NodePipeServer pipeServer, CancellationToken cancellationToken)
++            {
++                Task<LinkStatus> linkStatusTask = Task.Run(pipeServer.WaitForConnection);
++                linkStatusTask.Wait(cancellationToken);
++                return await linkStatusTask;
++            }
++        }
++
++        private async Task RunNodeEndpointsAsync(CancellationToken cancellationToken)
++        {
++            OutOfProcRarNodeEndpoint[] endpoints = new OutOfProcRarNodeEndpoint[_maxNumberOfConcurrentTasks];
++            Task[] endpointTasks = new Task[endpoints.Length];
++
++            for (int i = 0; i < endpoints.Length; i++)
++            {
++                OutOfProcRarNodeEndpoint endpoint = new(endpointId: i + 1, _handshake, _maxNumberOfConcurrentTasks);
++                endpoints[i] = endpoint;
++                endpointTasks[i] = Task.Run(() => endpoint.Run(cancellationToken), cancellationToken);
++            }
++
++            CommunicationsUtilities.Trace("{0} RAR endpoints started.", _maxNumberOfConcurrentTasks);
++
++            await Task.WhenAll(endpointTasks);
++
++            foreach (OutOfProcRarNodeEndpoint endpoint in endpoints)
++            {
++                endpoint.Dispose();
++            }
++
++            CommunicationsUtilities.Trace("All endpoints successfully stopped. Exiting.");
++        }
++    }
++}
+diff --git a/src/Tasks/AssemblyDependency/Node/OutOfProcRarNodeEndpoint.cs b/src/Tasks/AssemblyDependency/Node/OutOfProcRarNodeEndpoint.cs
+new file mode 100644
+index 00000000000..97699d3bbbb
+--- /dev/null
++++ b/src/Tasks/AssemblyDependency/Node/OutOfProcRarNodeEndpoint.cs
+@@ -0,0 +1,83 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Threading;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Tasks.AssemblyDependency
++{
++    internal class OutOfProcRarNodeEndpoint : IDisposable
++    {
++        private readonly int _endpointId;
++
++        private readonly NodePipeServer _pipeServer;
++
++        internal OutOfProcRarNodeEndpoint(int endpointId, ServerNodeHandshake handshake, int maxNumberOfServerInstances)
++        {
++            _endpointId = endpointId;
++            _pipeServer = new NodePipeServer(NamedPipeUtil.GetRarNodeEndpointPipeName(handshake), handshake, maxNumberOfServerInstances);
++
++            NodePacketFactory packetFactory = new();
++            packetFactory.RegisterPacketHandler(NodePacketType.RarNodeExecuteRequest, RarNodeExecuteRequest.FactoryForDeserialization, null);
++            _pipeServer.RegisterPacketFactory(packetFactory);
++        }
++
++        public void Dispose() => _pipeServer.Dispose();
++
++        internal void Run(CancellationToken cancellationToken = default)
++        {
++            CommunicationsUtilities.Trace("({0}) Starting RAR endpoint.", _endpointId);
++
++            try
++            {
++                RunInternal(cancellationToken);
++            }
++            catch (OperationCanceledException)
++            {
++                // Swallow cancellation excpetions for now. We're using this as a simple way to gracefully shutdown the
++                // endpoint, instead of having to implement separate Start / Stop methods and deferring to the caller.
++                // Can reevaluate if we need more granular control over cancellation vs shutdown.
++            }
++        }
++
++        private void RunInternal(CancellationToken cancellationToken)
++        {
++            while (!cancellationToken.IsCancellationRequested)
++            {
++                LinkStatus linkStatus = _pipeServer.WaitForConnection();
++
++                if (linkStatus != LinkStatus.Active)
++                {
++                    // We either timed out or failed to connect to a client.
++                    // Just continue running since the RAR endpoint isn't tied to a specific client.
++                    continue;
++                }
++
++                CommunicationsUtilities.Trace("({0}) Connected to RAR client.", _endpointId);
++
++                try
++                {
++                    RarNodeExecuteRequest request = (RarNodeExecuteRequest)_pipeServer.ReadPacket();
++
++                    // TODO: Use request packet to set inputs on the RAR task.
++                    ResolveAssemblyReference rarTask = new();
++
++                    // TODO: bool success = rarTask.ExecuteInProcess();
++                    // TODO: Use RAR task outputs to create response packet.
++                    _pipeServer.WritePacket(new RarNodeExecuteResponse());
++
++                    CommunicationsUtilities.Trace("({0}) Completed RAR request.", _endpointId);
++                }
++                catch (Exception e) when (e is not OperationCanceledException)
++                {
++                    CommunicationsUtilities.Trace("({0}) Exception while executing RAR request: {1}", _endpointId, e);
++                }
++
++                _pipeServer.Disconnect();
++            }
++        }
++    }
++}
+diff --git a/src/Tasks/AssemblyDependency/Node/RarNodeExecuteRequest.cs b/src/Tasks/AssemblyDependency/Node/RarNodeExecuteRequest.cs
+new file mode 100644
+index 00000000000..cf1a6aa9bd0
+--- /dev/null
++++ b/src/Tasks/AssemblyDependency/Node/RarNodeExecuteRequest.cs
+@@ -0,0 +1,23 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using Microsoft.Build.BackEnd;
++
++namespace Microsoft.Build.Tasks.AssemblyDependency
++{
++    internal class RarNodeExecuteRequest : INodePacket
++    {
++        public NodePacketType Type => NodePacketType.RarNodeExecuteRequest;
++
++        public void Translate(ITranslator translator)
++        {
++        }
++
++        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        {
++            RarNodeExecuteRequest request = new();
++            request.Translate(translator);
++            return request;
++        }
++    }
++}
+diff --git a/src/Tasks/AssemblyDependency/Node/RarNodeExecuteResponse.cs b/src/Tasks/AssemblyDependency/Node/RarNodeExecuteResponse.cs
+new file mode 100644
+index 00000000000..c6a5cf9008a
+--- /dev/null
++++ b/src/Tasks/AssemblyDependency/Node/RarNodeExecuteResponse.cs
+@@ -0,0 +1,23 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using Microsoft.Build.BackEnd;
++
++namespace Microsoft.Build.Tasks.AssemblyDependency
++{
++    internal class RarNodeExecuteResponse : INodePacket
++    {
++        public NodePacketType Type => NodePacketType.RarNodeExecuteResponse;
++
++        public void Translate(ITranslator translator)
++        {
++        }
++
++        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        {
++            RarNodeExecuteResponse response = new();
++            response.Translate(translator);
++            return response;
++        }
++    }
++}
+diff --git a/src/Tasks/AssemblyDependency/Node/RarNodeShutdownReason.cs b/src/Tasks/AssemblyDependency/Node/RarNodeShutdownReason.cs
+new file mode 100644
+index 00000000000..67b37177e4a
+--- /dev/null
++++ b/src/Tasks/AssemblyDependency/Node/RarNodeShutdownReason.cs
+@@ -0,0 +1,31 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Tasks.AssemblyDependency
++{
++    /// <summary>
++    /// Reasons why the RAR node shutdown.
++    /// </summary>
++    public enum RarNodeShutdownReason
++    {
++        /// <summary>
++        /// The RAR node was instructed to terminate and gracefully shut down.
++        /// </summary>
++        Complete,
++
++        /// <summary>
++        /// The RAR node is already running.
++        /// </summary>
++        AlreadyRunning,
++
++        /// <summary>
++        /// The RAR node timed out waiting for a connection.
++        /// </summary>
++        ConnectionTimedOut,
++
++        /// <summary>
++        /// The RAR node encountered an unrecoverable error.
++        /// </summary>
++        Error,
++    }
++}
+diff --git a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+index 8a42269ce14..5f9caac3297 100644
+--- a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
++++ b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+@@ -16,6 +16,7 @@
+ 
+ using Microsoft.Build.Eventing;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Shared.FileSystem;
+ using Microsoft.Build.Tasks.AssemblyDependency;
+@@ -920,6 +921,11 @@ public string[] FullFrameworkFolders
+ 
+         public bool FailIfNotIncremental { get; set; }
+ 
++        /// <summary>
++        /// Executes the task in an out-of-proc RAR node if enabled by the BuildEngine.
++        /// </summary>
++        public bool ExecuteOutOfProcess { get; set; }
++
+         /// <summary>
+         /// This is a list of all primary references resolved to full paths.
+         ///     bool CopyLocal - whether the given reference should be copied to the output directory.
+@@ -3242,6 +3248,28 @@ private string GetAssemblyPathInGac(AssemblyNameExtension assemblyName, SystemPr
+         /// </summary>
+         /// <returns>True if there was success.</returns>
+         public override bool Execute()
++        {
++            if (ExecuteOutOfProcess
++                && BuildEngine is IBuildEngine10 buildEngine10
++                && buildEngine10.EngineServices.IsOutOfProcRarNodeEnabled)
++            {
++                OutOfProcRarClient rarClient = GetOutOfProcClient(buildEngine10);
++
++                try
++                {
++                    bool result = rarClient.Execute(this);
++                }
++                catch (Exception ex)
++                {
++                    // If the out-of-proc connection failed, fall back to in-proc.
++                    CommunicationsUtilities.Trace("RAR out-of-proc connection failed, failing back to in-proc. Exception: {0}", ex);
++                }
++            }
++
++            return ExecuteInProcess();
++        }
++
++        public bool ExecuteInProcess()
+         {
+             return Execute(
+                 p => FileUtilities.FileExistsNoThrow(p),
+@@ -3266,6 +3294,23 @@ public override bool Execute()
+                 p => ReferenceTable.ReadMachineTypeFromPEHeader(p));
+         }
+ 
++        private OutOfProcRarClient GetOutOfProcClient(IBuildEngine10 buildEngine)
++        {
++            // Create a single cached instance of the RAR out-of-proc client for this build node.
++            const string OutOfProcRarClientKey = "OutOfProcRarClient";
++
++            OutOfProcRarClient rarClient = (OutOfProcRarClient)buildEngine.GetRegisteredTaskObject(OutOfProcRarClientKey, RegisteredTaskObjectLifetime.Build);
++
++            if (rarClient == null)
++            {
++                rarClient = new OutOfProcRarClient();
++                buildEngine.RegisterTaskObject(OutOfProcRarClientKey, rarClient, RegisteredTaskObjectLifetime.Build, allowEarlyCollection: false);
++                CommunicationsUtilities.Trace("Initialized new RAR client.");
++            }
++
++            return rarClient;
++        }
++
+         #endregion
+     }
+ }
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index a518f22fe8b..d2c7c3c8815 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -34,6 +34,20 @@
+     <!-- Binary serialization by ITranslatable -->
+     <Compile Include="..\Shared\InterningBinaryReader.cs" />
+     <Compile Include="..\Shared\TranslatorHelpers.cs" />
++
++    <!-- Node communication -->
++    <Compile Include="..\Shared\CommunicationsUtilities.cs" />
++    <Compile Include="..\Shared\INodeEndpoint.cs" />
++    <Compile Include="..\Shared\INodePacket.cs" />
++    <Compile Include="..\Shared\INodePacketFactory.cs" />
++    <Compile Include="..\Shared\INodePacketHandler.cs" />
++    <Compile Include="..\Shared\NodeBuildComplete.cs" />
++    <Compile Include="..\Shared\NamedPipeUtil.cs" />
++    <Compile Include="..\Shared\NodePacketFactory.cs" />
++    <Compile Include="..\Shared\NodePipeBase.cs" />
++    <Compile Include="..\Shared\NodePipeClient.cs" />
++    <Compile Include="..\Shared\NodePipeServer.cs" />
++    <Compile Include="..\Shared\NodeShutdown.cs" />
+   </ItemGroup>
+   <ItemGroup>
+     <!-- Source Files -->
+@@ -183,6 +197,12 @@
+     <Compile Include="AssemblyDependency\UnificationVersion.cs" />
+     <Compile Include="AssemblyDependency\UnifiedAssemblyName.cs" />
+     <Compile Include="AssemblyDependency\WarnOrErrorOnTargetArchitectureMismatchBehavior.cs" />
++    <Compile Include="AssemblyDependency\Node\OutOfProcRarClient.cs" />
++    <Compile Include="AssemblyDependency\Node\OutOfProcRarNode.cs" />
++    <Compile Include="AssemblyDependency\Node\OutOfProcRarNodeEndpoint.cs" />
++    <Compile Include="AssemblyDependency\Node\RarNodeExecuteRequest.cs" />
++    <Compile Include="AssemblyDependency\Node\RarNodeExecuteResponse.cs" />
++    <Compile Include="AssemblyDependency\Node\RarNodeShutdownReason.cs" />
+     <Compile Include="AssemblyFolder.cs" />
+     <Compile Include="AssemblyInfo.cs" />
+     <Compile Include="AssemblyRemapping.cs" />
+diff --git a/src/Tasks/Microsoft.Common.CurrentVersion.targets b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+index 0c4ce55ad13..53eb4450511 100644
+--- a/src/Tasks/Microsoft.Common.CurrentVersion.targets
++++ b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+@@ -2385,6 +2385,10 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       <ResolveAssemblyReferencesStateFile Condition="'$(DisableRarCache)'!='true' and '$(ResolveAssemblyReferencesStateFile)' == ''">$(IntermediateOutputPath)$(MSBuildProjectFile).AssemblyReference.cache</ResolveAssemblyReferencesStateFile>
+     </PropertyGroup>
+ 
++    <PropertyGroup>
++      <ResolveAssemblyReferencesOutOfProcess Condition="'$(ResolveAssemblyReferencesOutOfProcess)' == ''">true</ResolveAssemblyReferencesOutOfProcess>
++    </PropertyGroup>
++
+     <!-- Make an App.Config item that exists when AutoUnify is false. -->
+     <ItemGroup>
+       <_ResolveAssemblyReferencesApplicationConfigFileForExes Include="@(AppConfigWithTargetPath)" Condition="'$(AutoGenerateBindingRedirects)'=='true' or '$(AutoUnifyAssemblyReferences)'=='false'"/>
+@@ -2476,6 +2480,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+         OutputUnresolvedAssemblyConflicts="$(ResolveAssemblyReferenceOutputUnresolvedAssemblyConflicts)"
+         NonCultureResourceDirectories="@(NonCultureResourceDirectory)"
+         EnableCustomCulture="$(EnableCustomCulture)"
++        ExecuteOutOfProcess="$(ResolveAssemblyReferencesOutOfProcess)"
+         Condition="'@(Reference)'!='' or '@(_ResolvedProjectReferencePaths)'!='' or '@(_ExplicitReference)' != ''"
+         >
+ 

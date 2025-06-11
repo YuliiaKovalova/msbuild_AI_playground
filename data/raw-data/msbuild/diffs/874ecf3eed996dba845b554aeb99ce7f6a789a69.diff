@@ -1,0 +1,596 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 60e92d7c2b6..30deca7f025 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -2189,9 +2189,9 @@ private void HandleResourceRequest(int node, ResourceRequest request)
+             {
+                 // Resource request requires a response and may be blocking. Our continuation is effectively a callback
+                 // to be called once at least one core becomes available.
+-                _scheduler.RequestCores(request.BlockedRequestId, request.NumCores, request.IsBlocking).ContinueWith((Task<int> task) =>
++                _scheduler.RequestCores(request.GlobalRequestId, request.NumCores, request.IsBlocking).ContinueWith((Task<int> task) =>
+                 {
+-                    var response = new ResourceResponse(request.BlockedRequestId, task.Result);
++                    var response = new ResourceResponse(request.GlobalRequestId, task.Result);
+                     _nodeManager.SendData(node, response);
+                 }, TaskContinuationOptions.ExecuteSynchronously);
+             }
+@@ -2199,7 +2199,7 @@ private void HandleResourceRequest(int node, ResourceRequest request)
+             {
+                 // Resource release is a one-way call, no response is expected. We release the cores as instructed
+                 // and kick the scheduler because there may be work waiting for cores to become available.
+-                IEnumerable<ScheduleResponse> response = _scheduler.ReleaseCores(request.BlockedRequestId, request.NumCores);
++                IEnumerable<ScheduleResponse> response = _scheduler.ReleaseCores(request.GlobalRequestId, request.NumCores);
+                 PerformSchedulingActions(response);
+             }
+         }
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+index f8d55075357..1038643d11f 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+@@ -468,7 +468,7 @@ public void GrantResources(ResourceResponse response)
+             QueueAction(
+                 () =>
+                 {
+-                    BuildRequestEntry entry = _requestsByGlobalRequestId[response.BlockedRequestId];
++                    BuildRequestEntry entry = _requestsByGlobalRequestId[response.GlobalRequestId];
+                     entry.Builder.ContinueRequestWithResources(response);
+                 },
+                 isLastTask: false);
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilderCallback.cs b/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilderCallback.cs
+index 323f046e040..d3629adec11 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilderCallback.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilderCallback.cs
+@@ -62,7 +62,7 @@ internal interface IRequestBuilderCallback
+         /// <param name="requestedCores">Number of logical cores being requested.</param>
+         /// <param name="waitForCores">True to make the request block and wait for at least one core.</param>
+         /// <returns>Number of logical cores actually granted. If <paramref name="waitForCores"/> is false, the call can return
+-        /// zero. Otherwise the return value is always positive.</returns>
++        /// zero. Otherwise the return value is positive.</returns>
+         int RequestCores(int requestedCores, bool waitForCores);
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index e9aadcd0adc..950091de93b 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -497,10 +497,7 @@ public int RequestCores(int requestedCores, bool waitForCores)
+             RaiseResourceRequest(new ResourceRequest(_requestEntry.Request.GlobalRequestId, requestedCores, waitForCores));
+ 
+             WaitHandle[] handles = new WaitHandle[] { _terminateEvent, _continueWithResourcesEvent };
+-
+-            int handle = WaitHandle.WaitAny(handles);
+-
+-            if (handle == 0)
++            if (WaitHandle.WaitAny(handles) == 0)
+             {
+                 // We've been aborted
+                 throw new BuildAbortedException();
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index e0b0f699686..8ceb6a72ece 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -680,17 +680,67 @@ public IReadOnlyDictionary<string, string> GetGlobalProperties()
+ 
+         #region IBuildEngine8 Members
+ 
+-        int runningTotal = 0;
+-        bool implicitCoreUsed = false;
++        private ICollection<string> _warningsAsErrors;
++
++        /// <summary>
++        /// Additional cores granted to the task by the scheduler. Does not include the one implicit core automatically granted to all tasks.
++        /// </summary>
++        private int _additionalAcquiredCores = 0;
++
++        /// <summary>
++        /// True if the one implicit core has been allocated by <see cref="RequestCores"/>, false otherwise.
++        /// </summary>
++        private bool _isImplicitCoreUsed = false;
++
++        /// <summary>
++        /// Contains all warnings that should be logged as errors.
++        /// Non-null empty set when all warnings should be treated as errors.
++        /// </summary>
++        private ICollection<string> WarningsAsErrors
++        {
++            get
++            {
++                // Test compatibility
++                if(_taskLoggingContext == null)
++                {
++                    return null;
++                }
++
++                return _warningsAsErrors ??= _taskLoggingContext.GetWarningsAsErrors();
++            }
++        }
++
++        /// <summary>
++        /// Determines if the given warning should be treated as an error.
++        /// </summary>
++        /// <param name="warningCode"></param>
++        /// <returns>True if WarningsAsErrors is an empty set or contains the given warning code.</returns>
++        public bool ShouldTreatWarningAsError(string warningCode)
++        {
++            if (WarningsAsErrors == null)
++            {
++                return false;
++            }
+ 
++            // An empty set means all warnings are errors.
++            return WarningsAsErrors.Count == 0 || WarningsAsErrors.Contains(warningCode);
++        }
++
++        /// <summary>
++        /// Allocates shared CPU resources. Called by a task when it's about to do potentially multi-threaded/multi-process work.
++        /// </summary>
++        /// <param name="requestedCores">The number of cores the task wants to use.</param>
++        /// <returns>The number of cores the task is allowed to use given the current state of the build. This number is always between
++        /// 1 and <paramref name="requestedCores"/>. If the task has allocated its one implicit core, this call may block, waiting for
++        /// at least one core to become available.</returns>
+         public int RequestCores(int requestedCores)
+         {
+             lock (_callbackMonitor)
+             {
+-                int coresAcquired = 0;
+-
+                 IRequestBuilderCallback builderCallback = _requestEntry.Builder as IRequestBuilderCallback;
+-                if (implicitCoreUsed)
++
++                int coresAcquired = 0;
++                if (_isImplicitCoreUsed)
+                 {
+                     coresAcquired = builderCallback.RequestCores(requestedCores, waitForCores: true);
+                 }
+@@ -698,87 +748,56 @@ public int RequestCores(int requestedCores)
+                 {
+                     coresAcquired = builderCallback.RequestCores(requestedCores - 1, waitForCores: false);
+                 }
+-                runningTotal += coresAcquired;
++                _additionalAcquiredCores += coresAcquired;
+ 
+-                if (!implicitCoreUsed)
++                if (!_isImplicitCoreUsed)
+                 {
+-                    // If we got nothing back from the actual system, pad it with the one implicit core
+-                    // you get just for running--that way the first call never blocks and always returns >= 1
+-                    implicitCoreUsed = true;
++                    // Pad the result with the one implicit core. This ensures that first call never blocks and always returns >= 1.
++                    _isImplicitCoreUsed = true;
+                     coresAcquired++;
+                 }
+ 
+                 Debug.Assert(coresAcquired >= 1);
+-
+                 return coresAcquired;
+             }
+         }
+ 
++        /// <summary>
++        /// Frees shared CPU resources. Called by a task when it's finished doing multi-threaded/multi-process work.
++        /// </summary>
++        /// <param name="coresToRelease">The number of cores the task wants to return. This number must be between 0 and the number of cores
++        /// granted and not yet released.</param>
+         public void ReleaseCores(int coresToRelease)
+         {
+             lock (_callbackMonitor)
+             {
+-                if (implicitCoreUsed && coresToRelease > runningTotal)
++                if (_isImplicitCoreUsed && coresToRelease > _additionalAcquiredCores)
+                 {
++                    // Release the implicit core last, i.e. only if we're asked to release everything.
+                     coresToRelease -= 1;
+-                    implicitCoreUsed = false;
++                    _isImplicitCoreUsed = false;
+                 }
+ 
+                 if (coresToRelease >= 1)
+                 {
+                     IRequestBuilderCallback builderCallback = _requestEntry.Builder as IRequestBuilderCallback;
+                     builderCallback.ReleaseCores(coresToRelease);
+-                    runningTotal -= coresToRelease;
++                    _additionalAcquiredCores -= coresToRelease;
+                 }
+             }
+         }
+ 
+-        internal void ReleaseAllCores()
+-        {
+-            ReleaseCores(runningTotal + (implicitCoreUsed ? 1 : 0));
+-
+-            runningTotal = 0;
+-            implicitCoreUsed = false;
+-        }
+-
+-        #endregion
+-
+-        #region IBuildEngine8 Members
+-        private ICollection<string> _warningsAsErrors;
+-
+         /// <summary>
+-        /// Contains all warnings that should be logged as errors.
+-        /// Non-null empty set when all warnings should be treated as errors.
++        /// Frees all CPU resources granted so far.
+         /// </summary>
+-        private ICollection<string> WarningsAsErrors
++        internal void ReleaseAllCores()
+         {
+-            get
+-            {
+-                // Test compatibility
+-                if(_taskLoggingContext == null)
+-                {
+-                    return null;
+-                }
++            ReleaseCores(_additionalAcquiredCores + (_isImplicitCoreUsed ? 1 : 0));
+ 
+-                return _warningsAsErrors ??= _taskLoggingContext.GetWarningsAsErrors();
+-            }
++            _additionalAcquiredCores = 0;
++            _isImplicitCoreUsed = false;
+         }
+ 
+-        /// <summary>
+-        /// Determines if the given warning should be treated as an error.
+-        /// </summary>
+-        /// <param name="warningCode"></param>
+-        /// <returns>True if WarningsAsErrors is an empty set or contains the given warning code.</returns>
+-        public bool ShouldTreatWarningAsError(string warningCode)
+-        {
+-            if (WarningsAsErrors == null)
+-            {
+-                return false;
+-            }
+-
+-            // An empty set means all warnings are errors.
+-            return WarningsAsErrors.Count == 0 || WarningsAsErrors.Contains(warningCode);
+-        }
+         #endregion
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs b/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
+index 2382a4bcc3b..b8541e89b1c 100644
+--- a/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
++++ b/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
+@@ -120,9 +120,9 @@ internal class SchedulableRequest
+         private Dictionary<SchedulableRequestState, ScheduleTimeRecord> _timeRecords;
+ 
+         /// <summary>
+-        /// Number of cores requested as part of running the build request.
++        /// Number of cores granted as part of running the build request.
+         /// </summary>
+-        private int _requestedCores;
++        private int _grantedCores;
+ 
+         /// <summary>
+         /// Constructor.
+@@ -295,10 +295,10 @@ public DateTime EndTime
+             }
+         }
+ 
+-        public int RequestedCores => _requestedCores;
++        public int GrantedCores => _grantedCores;
+ 
+-        public void AddRequestedCores(int cores) => _requestedCores += cores;
+-        public int RemoveRequestedCores(int cores) => _requestedCores = Math.Max(0, _requestedCores - cores);
++        public void AddGrantedCores(int cores) => _grantedCores += cores;
++        public void RemoveGrantedCores(int cores) => _grantedCores = Math.Max(0, _grantedCores - cores);
+ 
+         /// <summary>
+         /// Gets the amount of time we spent in the specified state.
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index 3f085ed3335..360cdcc5169 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -564,7 +564,7 @@ public Task<int> RequestCores(int requestId, int requestedCores, bool waitForCor
+                 if (grantedCores > 0)
+                 {
+                     SchedulableRequest request = _schedulingData.GetScheduledRequest(requestId);
+-                    request.AddRequestedCores(grantedCores);
++                    request.AddGrantedCores(grantedCores);
+                 }
+                 return grantedCores;
+             };
+@@ -589,7 +589,7 @@ public Task<int> RequestCores(int requestId, int requestedCores, bool waitForCor
+         public List<ScheduleResponse> ReleaseCores(int requestId, int coresToRelease)
+         {
+             SchedulableRequest request = _schedulingData.GetScheduledRequest(requestId);
+-            request.RemoveRequestedCores(coresToRelease);
++            request.RemoveGrantedCores(coresToRelease);
+ 
+             // Releasing cores means that we may be able to schedule more work.
+             List<ScheduleResponse> responses = new List<ScheduleResponse>();
+@@ -1364,13 +1364,13 @@ private int GetAvailableCoresForScheduling()
+                 _ => _componentHost.BuildParameters.MaxNodeCount + 2 + _nodeLimitOffset,
+             };
+ 
+-            return Math.Max(0, limit - (_schedulingData.ExecutingRequestsCount + _schedulingData.ExplicitlyRequestedCores + _schedulingData.YieldingRequestsCount));
++            return Math.Max(0, limit - (_schedulingData.ExecutingRequestsCount + _schedulingData.ExplicitlyGrantedCores + _schedulingData.YieldingRequestsCount));
+         }
+ 
+         private int GetAvailableCoresForExplicitRequests()
+         {
+             int implicitlyAllocatedCores = ((_schedulingData.ExecutingRequestsCount - 1) * _nodeCoreAllocationWeight) / 100;
+-            int explicitlyAllocatedCores = _schedulingData.ExplicitlyRequestedCores;
++            int explicitlyAllocatedCores = _schedulingData.ExplicitlyGrantedCores;
+             return Math.Max(0, _coreLimit - (implicitlyAllocatedCores + explicitlyAllocatedCores));
+         }
+ 
+diff --git a/src/Build/BackEnd/Components/Scheduler/SchedulingData.cs b/src/Build/BackEnd/Components/Scheduler/SchedulingData.cs
+index 99512373e62..f4592ac5b32 100644
+--- a/src/Build/BackEnd/Components/Scheduler/SchedulingData.cs
++++ b/src/Build/BackEnd/Components/Scheduler/SchedulingData.cs
+@@ -154,11 +154,11 @@ public int ReadyRequestsCount
+         }
+ 
+         /// <summary>
+-        /// Gets the total number of cores requested by executing and yielding build requests.
++        /// Gets the total number of cores granted to executing and yielding build requests.
+         /// </summary>
+-        public int ExplicitlyRequestedCores
++        public int ExplicitlyGrantedCores
+         {
+-            get { return _executingRequests.Sum(kvp => kvp.Value.RequestedCores) + _yieldingRequests.Sum(kvp => kvp.Value.RequestedCores); }
++            get { return _executingRequests.Sum(kvp => kvp.Value.GrantedCores) + _yieldingRequests.Sum(kvp => kvp.Value.GrantedCores); }
+         }
+ 
+         /// <summary>
+@@ -486,7 +486,7 @@ public SchedulableRequest GetReadyRequest(int globalRequestId)
+         }
+ 
+         /// <summary>
+-        /// Retrieves a request which has been assigned to a node and is in the executing, yielding, blocked, ready states.
++        /// Retrieves a request which has been assigned to a node and is in the executing, yielding, blocked, or ready states.
+         /// </summary>
+         public SchedulableRequest GetScheduledRequest(int globalRequestId)
+         {
+@@ -508,7 +508,7 @@ public bool IsNodeWorking(int nodeId)
+ 
+             foreach (KeyValuePair<int, SchedulableRequest> kvp in _yieldingRequests)
+             {
+-                if (kvp.Value.AssignedNode == nodeId && kvp.Value.RequestedCores > 0)
++                if (kvp.Value.AssignedNode == nodeId && kvp.Value.GrantedCores > 0)
+                 {
+                     // This node does not have an executing task on it. However, it does have a yielding task
+                     // that has explicitly asked for cores which makes it "working".
+diff --git a/src/Build/BackEnd/Node/InProcNode.cs b/src/Build/BackEnd/Node/InProcNode.cs
+index bfcecffd271..81b4ab63279 100644
+--- a/src/Build/BackEnd/Node/InProcNode.cs
++++ b/src/Build/BackEnd/Node/InProcNode.cs
+@@ -524,6 +524,9 @@ private void HandleNodeBuildComplete(NodeBuildComplete buildComplete)
+             _shutdownEvent.Set();
+         }
+ 
++        /// <summary>
++        /// Handles the ResourceResponse packet.
++        /// </summary>
+         private void HandleResourceResponse(ResourceResponse response)
+         {
+             _buildRequestEngine.GrantResources(response);
+diff --git a/src/Build/BackEnd/Shared/ResourceRequest.cs b/src/Build/BackEnd/Shared/ResourceRequest.cs
+index b3c3bd1f656..da5b5dc7b8a 100644
+--- a/src/Build/BackEnd/Shared/ResourceRequest.cs
++++ b/src/Build/BackEnd/Shared/ResourceRequest.cs
+@@ -1,8 +1,6 @@
+ ﻿// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+-using System.Diagnostics;
+-
+ namespace Microsoft.Build.BackEnd
+ {
+     /// <summary>
+@@ -13,12 +11,22 @@ internal class ResourceRequest : INodePacket
+         /// <summary>
+         /// The global request id of the request which is asking for resources.
+         /// </summary>
+-        private int _blockedGlobalRequestId;
++        private int _globalRequestId;
+ 
++        /// <summary>
++        /// True if this is a request to acquire resources, false if this is a request to release resources.
++        /// </summary>
+         private bool _isResourceAcquire;
+ 
++        /// <summary>
++        /// True if the request should be blocking until the resources become available. False if the request should
++        /// be responded to immediately even if the desired resources are not available.
++        /// </summary>
+         private bool _isBlocking;
+ 
++        /// <summary>
++        /// Number of CPU cores being requested or released.
++        /// </summary>
+         private int _numCores;
+ 
+         /// <summary>
+@@ -32,78 +40,48 @@ internal ResourceRequest(ITranslator translator)
+         /// <summary>
+         /// Constructor for acquiring.
+         /// </summary>
+-        internal ResourceRequest(int blockedGlobalRequestId, int numCores, bool isBlocking)
++        internal ResourceRequest(int globalRequestId, int numCores, bool isBlocking)
+         {
+             _isResourceAcquire = true;
+             _isBlocking = isBlocking;
+-            _blockedGlobalRequestId = blockedGlobalRequestId;
++            _globalRequestId = globalRequestId;
+             _numCores = numCores;
+         }
+ 
+         /// <summary>
+         /// Constructor for releasing.
+         /// </summary>
+-        internal ResourceRequest(int blockedGlobalRequestId, int numCores)
++        internal ResourceRequest(int globalRequestId, int numCores)
+         {
+             _isResourceAcquire = false;
+-            _blockedGlobalRequestId = blockedGlobalRequestId;
++            _globalRequestId = globalRequestId;
+             _numCores = numCores;
+         }
+ 
+         /// <summary>
+         /// Returns the type of packet.
+         /// </summary>
+-        public NodePacketType Type
+-        {
+-            [DebuggerStepThrough]
+-            get
+-            { return NodePacketType.ResourceRequest; }
+-        }
++        public NodePacketType Type => NodePacketType.ResourceRequest;
+ 
+         /// <summary>
+-        /// Accessor for the blocked request id.
++        /// Accessor for the global request id.
+         /// </summary>
+-        public int BlockedRequestId
+-        {
+-            [DebuggerStepThrough]
+-            get
+-            {
+-                return _blockedGlobalRequestId;
+-            }
+-        }
++        public int GlobalRequestId => _globalRequestId;
+ 
+         /// <summary>
++        /// Accessor for _isResourceAcquire.
+         /// </summary>
+-        public bool IsResourceAcquire
+-        {
+-            [DebuggerStepThrough]
+-            get
+-            {
+-                return _isResourceAcquire;
+-            }
+-        }
++        public bool IsResourceAcquire => _isResourceAcquire;
+ 
+         /// <summary>
++        /// Accessor fro _isBlocking.
+         /// </summary>
+-        public bool IsBlocking
+-        {
+-            [DebuggerStepThrough]
+-            get
+-            {
+-                return _isBlocking;
+-            }
+-        }
++        public bool IsBlocking => _isBlocking;
+ 
+         /// <summary>
++        /// Accessor for _numCores.
+         /// </summary>
+-        public int NumCores
+-        {
+-            [DebuggerStepThrough]
+-            get
+-            {
+-                return _numCores;
+-            }
+-        }
++        public int NumCores => _numCores;
+ 
+         #region INodePacketTranslatable Members
+ 
+@@ -112,7 +90,7 @@ public int NumCores
+         /// </summary>
+         public void Translate(ITranslator translator)
+         {
+-            translator.Translate(ref _blockedGlobalRequestId);
++            translator.Translate(ref _globalRequestId);
+             translator.Translate(ref _isResourceAcquire);
+             translator.Translate(ref _isBlocking);
+             translator.Translate(ref _numCores);
+diff --git a/src/Build/BackEnd/Shared/ResourceResponse.cs b/src/Build/BackEnd/Shared/ResourceResponse.cs
+index fddc805598b..e603307d7c3 100644
+--- a/src/Build/BackEnd/Shared/ResourceResponse.cs
++++ b/src/Build/BackEnd/Shared/ResourceResponse.cs
+@@ -1,8 +1,6 @@
+ ﻿// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+-using System.Diagnostics;
+-
+ namespace Microsoft.Build.BackEnd
+ {
+     /// <summary>
+@@ -12,8 +10,11 @@ internal class ResourceResponse : INodePacket
+         /// <summary>
+         /// The global request id of the request which is being responded to.
+         /// </summary>
+-        private int _blockedGlobalRequestId;
++        private int _globalRequestId;
+ 
++        /// <summary>
++        /// Number of CPU cores being granted.
++        /// </summary>
+         private int _numCores;
+ 
+         /// <summary>
+@@ -25,45 +26,28 @@ internal ResourceResponse(ITranslator translator)
+         }
+ 
+         /// <summary>
++        /// Constructor for granting cores.
+         /// </summary>
+-        internal ResourceResponse(int blockedGlobalRequestId, int numCores)
++        internal ResourceResponse(int globalRequestId, int numCores)
+         {
+-            _blockedGlobalRequestId = blockedGlobalRequestId;
++            _globalRequestId = globalRequestId;
+             _numCores = numCores;
+         }
+ 
+         /// <summary>
+         /// Returns the type of packet.
+         /// </summary>
+-        public NodePacketType Type
+-        {
+-            [DebuggerStepThrough]
+-            get
+-            { return NodePacketType.ResourceResponse; }
+-        }
++        public NodePacketType Type => NodePacketType.ResourceResponse;
+ 
+         /// <summary>
+-        /// Accessor for the blocked request id.
++        /// Accessor for the global request id.
+         /// </summary>
+-        public int BlockedRequestId
+-        {
+-            [DebuggerStepThrough]
+-            get
+-            {
+-                return _blockedGlobalRequestId;
+-            }
+-        }
++        public int GlobalRequestId => _globalRequestId;
+ 
+         /// <summary>
++        /// Accessor for _numCores.
+         /// </summary>
+-        public int NumCores
+-        {
+-            [DebuggerStepThrough]
+-            get
+-            {
+-                return _numCores;
+-            }
+-        }
++        public int NumCores => _numCores;
+ 
+         #region INodePacketTranslatable Members
+ 
+@@ -72,7 +56,7 @@ public int NumCores
+         /// </summary>
+         public void Translate(ITranslator translator)
+         {
+-            translator.Translate(ref _blockedGlobalRequestId);
++            translator.Translate(ref _globalRequestId);
+             translator.Translate(ref _numCores);
+         }
+ 

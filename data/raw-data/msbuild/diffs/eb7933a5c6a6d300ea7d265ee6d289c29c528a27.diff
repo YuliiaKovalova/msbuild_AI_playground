@@ -1,0 +1,322 @@
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+index 0ea5f88df34..2bb1dcd51a5 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+@@ -30,6 +30,16 @@ internal interface IRawLogEventsSource
+         void DeferredInitialize(
+             Action onRawReadingPossible,
+             Action onStructuredReadingOnly);
++
++        /// <summary>
++        /// File format version of the binary log file.
++        /// </summary>
++        int FileFormatVersion { get; }
++
++        /// <summary>
++        /// The minimum reader version for the binary log file.
++        /// </summary>
++        int MinimumReaderVersion { get; }
+     }
+ 
+     /// <summary>
+@@ -157,6 +167,7 @@ public static BuildEventArgsReader OpenBuildEventsReader(
+             return new BuildEventArgsReader(binaryReader, fileFormatVersion)
+             {
+                 CloseInput = closeInput,
++                MinimumReaderVersion = minimumReaderVersion
+             };
+         }
+ 
+@@ -208,6 +219,8 @@ public void Replay(BinaryReader binaryReader, bool closeInput, CancellationToken
+         /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
+         public void Replay(BuildEventArgsReader reader, CancellationToken cancellationToken)
+         {
++            _fileFormatVersion = reader.FileFormatVersion;
++            _minimumReaderVersion = reader.MinimumReaderVersion;
+             bool supportsForwardCompatibility = reader.FileFormatVersion >= BinaryLogger.ForwardCompatibilityMinimalVersion;
+ 
+             // Allow any possible deferred subscriptions to be registered
+@@ -276,6 +289,11 @@ void IRawLogEventsSource.DeferredInitialize(
+             this._onStructuredReadingOnly += onStructuredReadingOnly;
+         }
+ 
++        public int FileFormatVersion => _fileFormatVersion ?? throw new InvalidOperationException(ResourceUtilities.GetResourceString("Binlog_Source_VersionUninitialized"));
++        public int MinimumReaderVersion => _minimumReaderVersion ?? throw new InvalidOperationException(ResourceUtilities.GetResourceString("Binlog_Source_VersionUninitialized"));
++
++        private int? _fileFormatVersion;
++        private int? _minimumReaderVersion;
+         private Action? _onRawReadingPossible;
+         private Action? _onStructuredReadingOnly;
+         private Action<EmbeddedContentEventArgs>? _embeddedContentRead;
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogger.cs b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+index bb0a03a019c..9f4cd60f50a 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogger.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+@@ -206,9 +206,6 @@ public void Initialize(IEventSource eventSource)
+                 eventArgsWriter.EmbedFile += EventArgsWriter_EmbedFile;
+             }
+ 
+-            binaryWriter.Write(FileFormatVersion);
+-            binaryWriter.Write(MinimumReaderVersion);
+-
+             if (replayEventsSource != null)
+             {
+                 if (CollectProjectImports == ProjectImportsCollectionMode.Embed)
+@@ -228,8 +225,11 @@ public void Initialize(IEventSource eventSource)
+                 replayEventsSource.DeferredInitialize(
+                     // For raw events we cannot write the initial info - as we cannot write
+                     //  at the same time as raw events are being written - this would break the deduplicated strings store.
++                    // But we need to write the version info - but since we read/write raw - let's not change the version info.
+                     () =>
+                     {
++                        binaryWriter.Write(replayEventsSource.FileFormatVersion);
++                        binaryWriter.Write(replayEventsSource.MinimumReaderVersion);
+                         replayEventsSource.RawLogRecordReceived += RawEvents_LogDataSliceReceived;
+                         // Replay separated strings here as well (and do not deduplicate! It would skew string indexes)
+                         replayEventsSource.StringReadDone += strArg => eventArgsWriter.WriteStringRecord(strArg.StringToBeUsed);
+@@ -245,6 +245,11 @@ public void Initialize(IEventSource eventSource)
+ 
+             void SubscribeToStructuredEvents()
+             {
++                // Write the version info - the latest version is written only for structured events replaying
++                //  as raw events do not change structure - hence the version is the same as the one they were written with.
++                binaryWriter.Write(FileFormatVersion);
++                binaryWriter.Write(MinimumReaderVersion);
++
+                 if (!omitInitialInfo)
+                 {
+                     LogInitialInfo();
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index 04a459b7571..9e5bee6d8c0 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -143,6 +143,7 @@ public void Dispose()
+         public event Action<StringReadEventArgs>? StringReadDone;
+ 
+         internal int FileFormatVersion => _fileFormatVersion;
++        internal int MinimumReaderVersion { get; set; } = BinaryLogger.ForwardCompatibilityMinimalVersion;
+ 
+         /// <inheritdoc cref="IEmbeddedContentSource.EmbeddedContentRead"/>
+         internal event Action<EmbeddedContentEventArgs>? EmbeddedContentRead;
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 52477838f97..aab80835e99 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -2016,6 +2016,9 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+   <data name="Binlog_Source_MissingSubscribeError" xml:space="preserve">
+     <value>No subscribers for any events.</value>
+   </data>
++  <data name="Binlog_Source_VersionUninitialized" xml:space="preserve">
++    <value>Version info not yet initialized. Replay must be called first.</value>
++  </data>
+   <data name="Binlog_MissingRecoverableErrorSubscribeError" xml:space="preserve">
+     <value>Subscription to RecoverableReadError is mandatory during forward compatible reading.</value>
+   </data>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 4eb4f1b3959..a9c52fed296 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index be14de48f54..1eb79228ae4 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 098079384e5..18f768dbcab 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 502103dff6c..3bad0fad7e3 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index fba6fc8ea6e..5cbd3aa833f 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index e87a7fa646d..458e98f4025 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 541a5d4e662..3d59626edc2 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 18a64eb5d12..beca14a7343 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 35a450c1578..7180455a252 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 2c43ea7fa72..7220bfe702f 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 0102cea8785..636c733aaf9 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index f55ff3cc279..0695918b4d4 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 51e9939ee21..151c31bb5bb 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -94,6 +94,11 @@
+         <target state="new">Structured events and raw events cannot be replayed at the same time.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="Binlog_Source_VersionUninitialized">
++        <source>Version info not yet initialized. Replay must be called first.</source>
++        <target state="new">Version info not yet initialized. Replay must be called first.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="Binlog_StreamUtils_MustBeReadable">
+         <source>Stream must be readable.</source>
+         <target state="new">Stream must be readable.</target>

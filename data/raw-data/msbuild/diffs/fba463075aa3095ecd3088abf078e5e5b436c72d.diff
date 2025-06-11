@@ -1,0 +1,133 @@
+diff --git a/src/Build/BackEnd/Components/Communications/NodeEndpointInProc.cs b/src/Build/BackEnd/Components/Communications/NodeEndpointInProc.cs
+index fe81fa4298d..35dcda21565 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeEndpointInProc.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeEndpointInProc.cs
+@@ -221,6 +221,12 @@ public void SendData(INodePacket packet)
+                 EnqueuePacket(packet);
+             }
+         }
++
++        public void ClientWillDisconnect()
++        {
++            // We do not need to do anything here for InProc node.
++        }
++
+         #endregion
+ 
+         #region Internal Methods
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index f795a3eceae..19342b4ef57 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -219,13 +219,13 @@ private NodeEngineShutdownReason HandleShutdown(out Exception? exception)
+         {
+             CommunicationsUtilities.Trace("Shutting down with reason: {0}, and exception: {1}.", _shutdownReason, _shutdownException);
+ 
+-            exception = _shutdownException;
++            // On Windows, a process holds a handle to the current directory,
++            // so reset it away from a user-requested folder that may get deleted.
++            NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);
+ 
+-            if (_nodeEndpoint.LinkStatus == LinkStatus.Active)
+-            {
+-                _nodeEndpoint.OnLinkStatusChanged -= OnLinkStatusChanged;
+-            }
++            exception = _shutdownException;
+ 
++            _nodeEndpoint.OnLinkStatusChanged -= OnLinkStatusChanged;
+             _nodeEndpoint.Disconnect();
+ 
+             CommunicationsUtilities.Trace("Shut down complete.");
+@@ -348,6 +348,7 @@ private void HandleServerNodeBuildCommand(ServerNodeBuildCommand command)
+             // so reset it away from a user-requested folder that may get deleted.
+             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);
+ 
++            _nodeEndpoint.ClientWillDisconnect();
+             var response = new ServerNodeBuildResult(buildResult.exitCode, buildResult.exitType);
+             SendPacket(response);
+ 
+diff --git a/src/Shared/INodeEndpoint.cs b/src/Shared/INodeEndpoint.cs
+index cb8ce4a4c0a..ef2f319f023 100644
+--- a/src/Shared/INodeEndpoint.cs
++++ b/src/Shared/INodeEndpoint.cs
+@@ -103,5 +103,11 @@ LinkStatus LinkStatus
+         /// <param name="packet">The packet to be sent.</param>
+         void SendData(INodePacket packet);
+         #endregion
++
++        /// <summary>
++        /// Called when we are about to send last packet to finalize graceful disconnection with client.
++        /// This is needed to handle race condition when both client and server is gracefully about to close connection.
++        /// </summary>
++        void ClientWillDisconnect();
+     }
+ }
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index 6477869dc05..0be21ce32c0 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -73,6 +73,13 @@ internal abstract class NodeEndpointOutOfProcBase : INodeEndpoint
+         /// </summary>
+         private AutoResetEvent _terminatePacketPump;
+ 
++        /// <summary>
++        /// True if this side is gracefully disconnecting.
++        /// In such case we have sent last packet to client side and we expect
++        /// client will soon broke pipe connection - unless server do it first.
++        /// </summary>
++        private bool _isClientDisconnecting;
++
+         /// <summary>
+         /// The thread which runs the asynchronous packet pump
+         /// </summary>
+@@ -179,6 +186,14 @@ public void SendData(INodePacket packet)
+             }
+         }
+ 
++        /// <summary>
++        /// Called when we are about to send last packet to finalize graceful disconnection with client.
++        /// </summary>
++        public void ClientWillDisconnect()
++        {
++            _isClientDisconnecting = true;
++        }
++
+ #endregion
+ 
+ #region Construction
+@@ -312,6 +327,7 @@ private void InitializeAsyncPacketThread()
+         {
+             lock (_asyncDataMonitor)
+             {
++                _isClientDisconnecting = false;
+                 _packetPump = new Thread(PacketPumpProc);
+                 _packetPump.IsBackground = true;
+                 _packetPump.Name = "OutOfProc Endpoint Packet Pump";
+@@ -548,14 +564,25 @@ private void RunReadLoop(Stream localReadPipe, Stream localWritePipe,
+                                 // Incomplete read.  Abort.
+                                 if (bytesRead == 0)
+                                 {
+-                                    CommunicationsUtilities.Trace("Parent disconnected abruptly");
++                                    if (_isClientDisconnecting)
++                                    {
++                                        CommunicationsUtilities.Trace("Parent disconnected gracefully.");
++                                        // Do not change link status to failed as this could make node think connection has failed
++                                        // and recycle node, while this is perfectly expected and handled race condition
++                                        // (both client and node is about to close pipe and client can be faster).
++                                    }
++                                    else
++                                    {
++                                        CommunicationsUtilities.Trace("Parent disconnected abruptly.");
++                                        ChangeLinkStatus(LinkStatus.Failed);
++                                    }
+                                 }
+                                 else
+                                 {
+                                     CommunicationsUtilities.Trace("Incomplete header read from server.  {0} of {1} bytes read", bytesRead, headerByte.Length);
++                                    ChangeLinkStatus(LinkStatus.Failed);
+                                 }
+ 
+-                                ChangeLinkStatus(LinkStatus.Failed);
+                                 exitLoop = true;
+                                 break;
+                             }

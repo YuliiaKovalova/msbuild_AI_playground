@@ -1,0 +1,210 @@
+diff --git a/src/Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs b/src/Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs
+index 2a7f57ece4e..a96db036786 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs
+@@ -1,6 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+ 
+@@ -18,9 +19,11 @@ internal sealed class NodeEndpointOutOfProc : NodeEndpointOutOfProcBase
+         /// <summary>
+         /// Instantiates an endpoint to act as a client.
+         /// </summary>
++        /// <param name="nodeHostStartTime">The time when a node in this process first started.</param>
+         /// <param name="enableReuse">Whether this node may be reused for a later build.</param>
+         /// <param name="lowPriority">Whether this node is low priority.</param>
+-        internal NodeEndpointOutOfProc(bool enableReuse, bool lowPriority)
++        internal NodeEndpointOutOfProc(DateTime nodeHostStartTime, bool enableReuse, bool lowPriority)
++            : base(nodeHostStartTime)
+         {
+             _enableReuse = enableReuse;
+             LowPriority = lowPriority;
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderInProc.cs b/src/Build/BackEnd/Components/Communications/NodeProviderInProc.cs
+index 26cf8ed28f3..07c8f6717b7 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderInProc.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderInProc.cs
+@@ -392,7 +392,7 @@ private bool InstantiateNode(INodePacketFactory factory)
+ 
+             _inProcNodeEndpoint.Connect(this);
+ 
+-            int connectionTimeout = CommunicationsUtilities.NodeConnectionTimeout;
++            int connectionTimeout = CommunicationsUtilities.MaximumNodeConnectionTimeout;
+             bool connected = _endpointConnectedEvent.WaitOne(connectionTimeout);
+             ErrorUtilities.VerifyThrow(connected, "In-proc node failed to start up within {0}ms", connectionTimeout);
+             return true;
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index 51ac31c32dd..f91de3a2d52 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -222,7 +222,7 @@ public OutOfProcNode()
+         /// <returns>The reason for shutting down.</returns>
+         public NodeEngineShutdownReason Run(out Exception shutdownException)
+         {
+-            return Run(false, false, out shutdownException);
++            return Run(DateTime.UtcNow, false, false, out shutdownException);
+         }
+ 
+         /// <summary>
+@@ -234,19 +234,20 @@ public NodeEngineShutdownReason Run(out Exception shutdownException)
+         /// <returns>The reason for shutting down.</returns>
+         public NodeEngineShutdownReason Run(bool enableReuse, out Exception shutdownException)
+         {
+-            return Run(enableReuse, false, out shutdownException);
++            return Run(DateTime.UtcNow, enableReuse, false, out shutdownException);
+         }
+ 
+         /// <summary>
+         /// Starts up the node and processes messages until the node is requested to shut down.
+         /// </summary>
++        /// <param name="nodeHostStartTime">The time when a node in this process first started.</param>
+         /// <param name="enableReuse">Whether this node is eligible for reuse later.</param>
+         /// <param name="lowPriority">Whether this node should be running with low priority.</param>
+         /// <param name="shutdownException">The exception which caused shutdown, if any.</param>
+         /// <returns>The reason for shutting down.</returns>
+-        public NodeEngineShutdownReason Run(bool enableReuse, bool lowPriority, out Exception shutdownException)
++        public NodeEngineShutdownReason Run(DateTime nodeHostStartTime, bool enableReuse, bool lowPriority, out Exception shutdownException)
+         {
+-            _nodeEndpoint = new NodeEndpointOutOfProc(enableReuse, lowPriority);
++            _nodeEndpoint = new NodeEndpointOutOfProc(nodeHostStartTime, enableReuse, lowPriority);
+             _nodeEndpoint.OnLinkStatusChanged += OnLinkStatusChanged;
+             _nodeEndpoint.Listen(this);
+ 
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 088d2c00179..f144943aa43 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -3356,6 +3356,8 @@ private static void StartLocalNode(CommandLineSwitches commandLineSwitches, bool
+                 CommandLineSwitchException.VerifyThrow(nodeModeNumber >= 0, "InvalidNodeNumberValueIsNegative", input[0]);
+             }
+ 
++            DateTime startTime = DateTime.UtcNow;
++
+             bool restart = true;
+             while (restart)
+             {
+@@ -3368,7 +3370,7 @@ private static void StartLocalNode(CommandLineSwitches commandLineSwitches, bool
+                     // If FEATURE_NODE_REUSE is OFF, just validates that the switch is OK, and always returns False
+                     bool nodeReuse = ProcessNodeReuseSwitch(commandLineSwitches[CommandLineSwitches.ParameterizedSwitch.NodeReuse]);
+                     OutOfProcNode node = new OutOfProcNode();
+-                    shutdownReason = node.Run(nodeReuse, lowpriority, out nodeException);
++                    shutdownReason = node.Run(startTime, nodeReuse, lowpriority, out nodeException);
+ 
+                     FileUtilities.ClearCacheDirectory();
+                 }
+diff --git a/src/Shared/CommunicationsUtilities.cs b/src/Shared/CommunicationsUtilities.cs
+index 314301eec05..7b87f1e9e72 100644
+--- a/src/Shared/CommunicationsUtilities.cs
++++ b/src/Shared/CommunicationsUtilities.cs
+@@ -203,9 +203,14 @@ internal static class CommunicationsUtilities
+         internal const byte handshakeVersion = 0x01;
+ 
+         /// <summary>
+-        /// The timeout to connect to a node.
++        /// The timeout to connect to a node. Also the timeout to wait before shutting down an idle node (upper bound).
+         /// </summary>
+-        private const int DefaultNodeConnectionTimeout = 900 * 1000; // 15 minutes; enough time that a dev will typically do another build in this time
++        private const int DefaultMaximumNodeConnectionTimeout = 900 * 1000; // 15 minutes; enough time that a dev will typically do another build in this time
++
++        /// <summary>
++        /// The timeout to wait before shutting down an idle node (lower bound).
++        /// </summary>
++        private const int DefaultMinimumNodeConnectionTimeout = 60 * 1000; // 1 minute; to not make the process linger for too long after an isolated build
+ 
+         /// <summary>
+         /// Whether to trace communications
+@@ -233,11 +238,19 @@ internal static class CommunicationsUtilities
+         internal delegate void LogDebugCommunications(string format, params object[] stuff);
+ 
+         /// <summary>
+-        /// Gets or sets the node connection timeout.
++        /// Gets the maximum node connection timeout.
++        /// </summary>
++        internal static int MaximumNodeConnectionTimeout
++        {
++            get { return GetIntegerVariableOrDefault("MSBUILDNODECONNECTIONTIMEOUT", DefaultMaximumNodeConnectionTimeout); }
++        }
++
++        /// <summary>
++        /// Gets the minimum node connection timeout.
+         /// </summary>
+-        internal static int NodeConnectionTimeout
++        internal static int MinimumNodeConnectionTimeout
+         {
+-            get { return GetIntegerVariableOrDefault("MSBUILDNODECONNECTIONTIMEOUT", DefaultNodeConnectionTimeout); }
++            get { return GetIntegerVariableOrDefault("MSBUILDMINNODECONNECTIONTIMEOUT", DefaultMinimumNodeConnectionTimeout); }
+         }
+ 
+ #if NETFRAMEWORK
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index 8783318b2e5..f413029a023 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -116,6 +116,11 @@ internal abstract class NodeEndpointOutOfProcBase : INodeEndpoint
+         /// </summary>
+         private BinaryWriter _binaryWriter;
+ 
++        /// <summary>
++        /// The time when a node in this process was first created.
++        /// </summary>
++        private readonly DateTime _nodeHostStartTime;
++
+         #endregion
+ 
+         #region INodeEndpoint Events
+@@ -143,6 +148,20 @@ public LinkStatus LinkStatus
+ 
+         #endregion
+ 
++        #region Constructors
++
++        protected NodeEndpointOutOfProcBase()
++            : this(DateTime.UtcNow)
++        {
++        }
++
++        protected NodeEndpointOutOfProcBase(DateTime nodeHostStartTime)
++        {
++            _nodeHostStartTime = nodeHostStartTime;
++        }
++
++        #endregion
++
+         #region INodeEndpoint Methods
+ 
+         /// <summary>
+@@ -339,6 +358,18 @@ private void InitializeAsyncPacketThread()
+             }
+         }
+ 
++        private int GetConnectionTimeout(DateTime currentTime)
++        {
++            // Use the current node process up time to estimate for how long it should be kept alive. E.g. if the node process
++            // was started 5 minutes ago, then wait 5 more minutes for new connections before shutting down.
++            int upTimeMs = (int)(currentTime - _nodeHostStartTime).TotalMilliseconds;
++
++            // Clamp to [MinimumNodeConnectionTimeout, MaximumNodeConnectionTimeout].
++            upTimeMs = Math.Max(upTimeMs, CommunicationsUtilities.MinimumNodeConnectionTimeout);
++            upTimeMs = Math.Min(upTimeMs, CommunicationsUtilities.MaximumNodeConnectionTimeout);
++            return upTimeMs;
++        }
++
+         /// <summary>
+         /// This method handles the asynchronous message pump.  It waits for messages to show up on the queue
+         /// and calls FireDataAvailable for each such packet.  It will terminate when the terminate event is
+@@ -359,10 +390,10 @@ private void PacketPumpProc()
+                 gotValidConnection = true;
+                 DateTime restartWaitTime = DateTime.UtcNow;
+ 
+-                // We only wait to wait the difference between now and the last original start time, in case we have multiple hosts attempting
++                // We only want to wait the difference between now and the last original start time, in case we have multiple hosts attempting
+                 // to attach.  This prevents each attempt from resetting the timer.
+                 TimeSpan usedWaitTime = restartWaitTime - originalWaitStartTime;
+-                int waitTimeRemaining = Math.Max(0, CommunicationsUtilities.NodeConnectionTimeout - (int)usedWaitTime.TotalMilliseconds);
++                int waitTimeRemaining = Math.Max(0, GetConnectionTimeout(originalWaitStartTime) - (int)usedWaitTime.TotalMilliseconds);
+ 
+                 try
+                 {

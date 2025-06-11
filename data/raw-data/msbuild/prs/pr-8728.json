@@ -1,0 +1,268 @@
+{
+  "number": 8728,
+  "title": "Optimize locking in ProjectCollection",
+  "body": "Fixes [AB#1811627](https://devdiv.visualstudio.com/0bdbc590-a062-4c3f-b0f6-9383f67865ee/_workitems/edit/1811627) (@davkean will likely file a GH issue)\r\n\r\n### Context\r\n\r\n`ProjectCollection` runs everything under one big lock which results in excessive contention. The problematic scenarios involve one thread in a long-running call such as `LoadProject` and another one trying to read a simple property like `LoggingService` or `ToolsetVersion`.\r\n\r\n### Changes Made\r\n\r\n- Split the lock into three for finer locking: one for loaded projects, on for global properties, and one for toolsets.\r\n- Made the code lock-free where practical.\r\n\r\n### Testing\r\n\r\nExisting unit tests and careful code review. I'll do a self-review and add inline comments to justify individual changes.\r\n\r\n### Notes\r\n",
+  "state": "CLOSED",
+  "createdAt": "2023-05-03T14:53:29Z",
+  "updatedAt": "2023-05-04T14:02:59Z",
+  "closedAt": "2023-05-04T14:02:58Z",
+  "mergedAt": null,
+  "additions": 110,
+  "deletions": 198,
+  "changedFiles": 1,
+  "headRefName": "projectcollection-locking",
+  "isDraft": true,
+  "author": {
+    "login": "ladipro"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": []
+  },
+  "labels": [],
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "oid": "fbe2f928abfabed91613a3a86ca29acbd16aca26",
+          "message": "Optimize locking in ProjectCollection",
+          "committedDate": "2023-05-03T14:50:59Z",
+          "author": {
+            "name": "Ladi Prosek",
+            "email": "laprosek@microsoft.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "f92b05e0b5350b523a66afe74f6d93cb9a50e7cf",
+          "message": "Fix assert",
+          "committedDate": "2023-05-03T15:35:25Z",
+          "author": {
+            "name": "Ladi Prosek",
+            "email": "laprosek@microsoft.com"
+          }
+        }
+      }
+    ]
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "I think I would have approached this differently; the contention is caused by two read threads entering an upgradeable read lock at the same time. Those upgradeable read locks aren't actually writing in a lot of the properties, so they should be switched to ReadLocks and most of the contention should be gone? ",
+        "createdAt": "2023-05-04T00:31:28Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "> I think I would have approached this differently; the contention is caused by two read threads entering an upgradeable read lock at the same time. Those upgradeable read locks aren't actually writing in a lot of the properties, so they should be switched to ReadLocks and most of the contention should be gone?\r\n\r\nYes, taking the lock in upgradable mode with no intention to upgrade is clearly a misuse. Switching to pure read mode would fix contention between those prop getters but it still doesn't solve the problem of one thread calling `LoadProject`, which can be very long running, and others blocked on the simple getters for the entire duration of a project load/evaluation.\r\n\r\nI've looked at the problematic trace you've shared and I don't see any `LoadProject` there. Is it safe to assume that this method is not called in any relevant VS scenario?",
+        "createdAt": "2023-05-04T12:33:09Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "We don't call LoadProject. The trace from the scenario is a branch switch that touches common targets file, which results in a ProjectRootElement.ReloadFrom and project reevaluation.",
+        "createdAt": "2023-05-04T13:52:36Z",
+        "author": {
+          "login": "davkean"
+        }
+      },
+      {
+        "body": "Thank you. Then I agree that a different approach would be better. This PR is an overkill for what we're fixing. I'll open another one.",
+        "createdAt": "2023-05-04T14:02:58Z",
+        "author": {
+          "login": "ladipro"
+        }
+      }
+    ]
+  },
+  "reviewThreads": {
+    "nodes": [
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "This is OK to do lock-free. The field is initialized as part of construction and then the only source of mutation is this property.",
+              "createdAt": "2023-05-03T14:56:29Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -508,29 +524,27 @@ public string DefaultToolsVersion\n         {\n             get\n             {\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n-                {\n-                    ErrorUtilities.VerifyThrow(_defaultToolsVersion != null, \"Should have a default\");\n-                    return _defaultToolsVersion;\n-                }\n+                string defaultToolsVersion = Volatile.Read(ref _defaultToolsVersion);\n+\n+                ErrorUtilities.VerifyThrow(defaultToolsVersion != null, \"Should have a default\");\n+                return defaultToolsVersion;",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "`_loggingService` is mutated only as part of `Dispose` so no need to synchronize on that. `Loggers` exposes an unprotected list though, so this needs to be fixed to happen under the `LoggingService`-internal lock.",
+              "createdAt": "2023-05-03T15:04:59Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -609,12 +623,9 @@ public ICollection<ILogger> Loggers\n             [DebuggerStepThrough]\n             get\n             {\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n-                {\n-                    return _loggingService.Loggers == null\n-                        ? (ICollection<ILogger>)ReadOnlyEmptyCollection<ILogger>.Instance\n-                        : new List<ILogger>(_loggingService.Loggers);\n-                }\n+                return _loggingService.Loggers == null",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Playing it safe with the flags to guarantee that `OnProjectCollectionChanged` is delivered only once if multiple threads get here.",
+              "createdAt": "2023-05-03T15:06:43Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -650,26 +661,14 @@ public bool IsBuildEnabled\n             [DebuggerStepThrough]\n             get\n             {\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n-                {\n-                    return _isBuildEnabled;\n-                }\n+                return _isBuildEnabled != 0;\n             }\n \n             [DebuggerStepThrough]\n             set\n             {\n-                bool sendEvent = false;\n-                using (_locker.EnterDisposableWriteLock())\n-                {\n-                    if (_isBuildEnabled != value)\n-                    {\n-                        _isBuildEnabled = value;\n-                        sendEvent = true;\n-                    }\n-                }\n-\n-                if (sendEvent)\n+                int intValue = value ? 1 : 0;\n+                if (Interlocked.Exchange(ref _isBuildEnabled, intValue) != intValue)",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Constructing a new `HostServices` has no side-effects. Using `CompareExchange` to make sure that only one instance wins and becomes `_hostServices`.",
+              "createdAt": "2023-05-03T15:09:56Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -719,34 +706,18 @@ public HostServices HostServices\n         {\n             get\n             {\n-                // Avoid write lock if possible, this getter is called a lot during Project construction.\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n+                HostServices hostServices = Volatile.Read(ref _hostServices);\n+                if (hostServices != null)\n                 {\n-                    if (_hostServices != null)\n-                    {\n-                        return _hostServices;\n-                    }\n-\n-                    using (_locker.EnterDisposableWriteLock())\n-                    {\n-                        return _hostServices ?? (_hostServices = new HostServices());\n-                    }\n+                    return hostServices;\n                 }\n+                hostServices = new HostServices();\n+                return Interlocked.CompareExchange(ref _hostServices, hostServices, null) ?? hostServices;",
+              "author": {
+                "login": "ladipro"
+              }
+            },
+            {
+              "body": "That does not seem correct, HostServices stores affinities & host services for projects - if two threads race here, we can have situations where affinities/host objects aren't set correct for the right projects.",
+              "createdAt": "2023-05-04T00:29:25Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -719,34 +706,18 @@ public HostServices HostServices\n         {\n             get\n             {\n-                // Avoid write lock if possible, this getter is called a lot during Project construction.\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n+                HostServices hostServices = Volatile.Read(ref _hostServices);\n+                if (hostServices != null)\n                 {\n-                    if (_hostServices != null)\n-                    {\n-                        return _hostServices;\n-                    }\n-\n-                    using (_locker.EnterDisposableWriteLock())\n-                    {\n-                        return _hostServices ?? (_hostServices = new HostServices());\n-                    }\n+                    return hostServices;\n                 }\n+                hostServices = new HostServices();\n+                return Interlocked.CompareExchange(ref _hostServices, hostServices, null) ?? hostServices;",
+              "author": {
+                "login": "davkean"
+              }
+            },
+            {
+              "body": "The logic is the same as it was before, as far as I can tell. The only difference is that the new lock-free code can create an instance of `HostServices` that ends up being thrown away.\r\n\r\nBefore:\r\n1. Check if `_hostServices` is non-null. If so, return it.\r\n2. Otherwise, check again under a lock, if still null create a new `HostServices`, assign it to `_hostServices` and return it.\r\n\r\nAfter:\r\n1. Check if `_hostServices` is non-null. If so, return it.\r\n2. Create a new instance and assign it to `_hostServices` only if `_hostServices` is still null (via `CompareExchange`). If two threads race here, only one will set the field, the other one will return the result of `CompareExchange` which is the current value of the field.",
+              "createdAt": "2023-05-04T06:24:48Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -719,34 +706,18 @@ public HostServices HostServices\n         {\n             get\n             {\n-                // Avoid write lock if possible, this getter is called a lot during Project construction.\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n+                HostServices hostServices = Volatile.Read(ref _hostServices);\n+                if (hostServices != null)\n                 {\n-                    if (_hostServices != null)\n-                    {\n-                        return _hostServices;\n-                    }\n-\n-                    using (_locker.EnterDisposableWriteLock())\n-                    {\n-                        return _hostServices ?? (_hostServices = new HostServices());\n-                    }\n+                    return hostServices;\n                 }\n+                hostServices = new HostServices();\n+                return Interlocked.CompareExchange(ref _hostServices, hostServices, null) ?? hostServices;",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Calling `Interlocked.Exchange` to avoid multiple `OnProjectCollectionChanged` callbacks if this is run concurrently.",
+              "createdAt": "2023-05-03T15:12:48Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -719,34 +706,18 @@ public HostServices HostServices\n         {\n             get\n             {\n-                // Avoid write lock if possible, this getter is called a lot during Project construction.\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n+                HostServices hostServices = Volatile.Read(ref _hostServices);\n+                if (hostServices != null)\n                 {\n-                    if (_hostServices != null)\n-                    {\n-                        return _hostServices;\n-                    }\n-\n-                    using (_locker.EnterDisposableWriteLock())\n-                    {\n-                        return _hostServices ?? (_hostServices = new HostServices());\n-                    }\n+                    return hostServices;\n                 }\n+                hostServices = new HostServices();\n+                return Interlocked.CompareExchange(ref _hostServices, hostServices, null) ?? hostServices;\n             }\n \n             set\n             {\n-                bool sendEvent = false;\n-                using (_locker.EnterDisposableWriteLock())\n-                {\n-                    if (_hostServices != value)\n-                    {\n-                        _hostServices = value;\n-                        sendEvent = true;\n-                    }\n-                }\n-\n-                if (sendEvent)\n+                if (Interlocked.Exchange(ref _hostServices, value) != value)",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "The field is assigned to only during construction and disposal.",
+              "createdAt": "2023-05-03T15:13:48Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -849,10 +796,7 @@ internal ILoggingService LoggingService\n             [DebuggerStepThrough]\n             get\n             {\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n-                {\n-                    return _loggingService;\n-                }\n+                return _loggingService;",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "`Utilities.GetEnvironmentProperties` has no side-effects but is not cheap. Maybe I should use `Lazy<T>` instead of manually implementing this pattern.",
+              "createdAt": "2023-05-03T15:17:34Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -886,25 +830,17 @@ internal PropertyDictionary<ProjectPropertyInstance> EnvironmentProperties\n         {\n             get\n             {\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n+                // Retrieves the environment properties.\n+                // This is only done once, when the project collection is created. Any subsequent\n+                // environment changes will be ignored. Child nodes will be passed this set\n+                // of properties in their build parameters.\n+                PropertyDictionary<ProjectPropertyInstance> environmentProperties = Volatile.Read(ref _environmentProperties);\n+                if (environmentProperties == null)\n                 {\n-                    // Retrieves the environment properties.\n-                    // This is only done once, when the project collection is created. Any subsequent\n-                    // environment changes will be ignored. Child nodes will be passed this set\n-                    // of properties in their build parameters.\n-                    if (_environmentProperties == null)\n-                    {\n-                        using (_locker.EnterDisposableWriteLock())\n-                        {\n-                            if (_environmentProperties == null)\n-                            {\n-                                _environmentProperties = Utilities.GetEnvironmentProperties();\n-                            }\n-                        }\n-                    }\n-\n-                    return new PropertyDictionary<ProjectPropertyInstance>(_environmentProperties);\n+                    environmentProperties = Utilities.GetEnvironmentProperties();",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Just an integer, no need to protect the read.",
+              "createdAt": "2023-05-03T15:18:23Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -917,10 +853,7 @@ internal int ToolsetsVersion\n             [DebuggerStepThrough]\n             get\n             {\n-                using (_locker.EnterDisposableUpgradeableReadLock())\n-                {\n-                    return _toolsetsVersion;\n-                }\n+                return _toolsetsVersion;",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "This is just calling `LoggingService.RegisterLogger` which has its own locking. No need to protect it here.",
+              "createdAt": "2023-05-03T15:20:17Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -1241,10 +1168,7 @@ public Project LoadProject(XmlReader xmlReader, IDictionary<string, string> glob\n         /// </summary>\n         public void RegisterLogger(ILogger logger)\n         {\n-            using (_locker.EnterDisposableWriteLock())\n-            {\n-                RegisterLoggerInternal(logger);\n-            }\n+            RegisterLoggerInternal(logger);",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Oops, this is a public API. I'll fix this so it doesn't expose an uninitialized `_loggingService`.",
+              "createdAt": "2023-05-03T15:24:10Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -1300,14 +1218,11 @@ public void RegisterForwardingLoggers(IEnumerable<ForwardingLoggerRecord> remote\n         /// </summary>\n         public void UnregisterAllLoggers()\n         {\n-            using (_locker.EnterDisposableWriteLock())\n-            {\n-                _loggingService.UnregisterAllLoggers();\n+            _loggingService.UnregisterAllLoggers();\n \n-                // UNDONE: Logging service should not shut down when all loggers are unregistered.\n-                // VS unregisters all loggers on the same project collection often. To workaround this, we have to create it again now!\n-                CreateLoggingService(MaxNodeCount, OnlyLogCriticalEvents);\n-            }\n+            // UNDONE: Logging service should not shut down when all loggers are unregistered.\n+            // VS unregisters all loggers on the same project collection often. To workaround this, we have to create it again now!\n+            CreateLoggingService(MaxNodeCount, OnlyLogCriticalEvents);",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "`_globalProperties` is thread-safe so it doesn't look like a single access like this has to run under `_lockerGlobalProperties`. It would be less fragile to do it, though. Will fix.",
+              "createdAt": "2023-05-03T15:27:15Z",
+              "path": "src/Build/Definition/ProjectCollection.cs",
+              "diffHunk": "@@ -1419,10 +1336,7 @@ public void UnloadAllProjects()\n         /// </summary>\n         public ProjectPropertyInstance GetGlobalProperty(string name)\n         {\n-            using (_locker.EnterDisposableUpgradeableReadLock())\n-            {\n-                return _globalProperties[name];\n-            }\n+            return _globalProperties[name];",
+              "author": {
+                "login": "ladipro"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

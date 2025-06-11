@@ -1,0 +1,138 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 40d303360c4..fd1f6024f3d 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1159,6 +1159,9 @@ public void EndBuild()
+                 }
+             }
+ 
++            // clean up inline tasks
++            FileUtilities.DeleteDirectoryNoThrow(Path.Combine(FileUtilities.TempFileDirectory, MSBuildConstants.InlineTaskTempDllSubPath), recursive: true);
++
+             void SerializeCaches()
+             {
+                 string errorMessage = CacheSerialization.SerializeCaches(
+diff --git a/src/Shared/AssemblyLoadInfo.cs b/src/Shared/AssemblyLoadInfo.cs
+index be467ff2a20..a17f3204fd5 100644
+--- a/src/Shared/AssemblyLoadInfo.cs
++++ b/src/Shared/AssemblyLoadInfo.cs
+@@ -26,8 +26,6 @@ internal static AssemblyLoadInfo Create(string assemblyName, string assemblyFile
+         {
+             ErrorUtilities.VerifyThrow((!string.IsNullOrEmpty(assemblyName)) || (!string.IsNullOrEmpty(assemblyFile)),
+                 "We must have either the assembly name or the assembly file/path.");
+-            ErrorUtilities.VerifyThrow((assemblyName == null) || (assemblyFile == null),
+-                "We must not have both the assembly name and the assembly file/path.");
+ 
+             if (assemblyName != null)
+             {
+diff --git a/src/Shared/Constants.cs b/src/Shared/Constants.cs
+index 4aa800ef2d2..f7a131836bd 100644
+--- a/src/Shared/Constants.cs
++++ b/src/Shared/Constants.cs
+@@ -114,6 +114,11 @@ internal static class MSBuildConstants
+         /// </summary>
+         internal const string ProjectReferenceTargetsOrDefaultTargetsMarker = ".projectReferenceTargetsOrDefaultTargets";
+ 
++        /// <summary>
++        /// The sub-path within the temporary directory where compiled inline tasks are located.
++        /// </summary>
++        internal const string InlineTaskTempDllSubPath = nameof(InlineTaskTempDllSubPath);
++
+         // One-time allocations to avoid implicit allocations for Split(), Trim().
+         internal static readonly char[] SemicolonChar = [';'];
+         internal static readonly char[] SpaceChar = [' '];
+diff --git a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
+index d5d9ebda785..c37239666af 100644
+--- a/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
++++ b/src/Tasks/RoslynCodeTaskFactory/RoslynCodeTaskFactory.cs
+@@ -84,7 +84,7 @@ public sealed class RoslynCodeTaskFactory : ITaskFactory
+         /// A cache of <see cref="RoslynCodeTaskFactoryTaskInfo"/> objects and their corresponding compiled assembly.  This cache ensures that two of the exact same code task
+         /// declarations are not compiled multiple times.
+         /// </summary>
+-        private static readonly ConcurrentDictionary<RoslynCodeTaskFactoryTaskInfo, Assembly> CompiledAssemblyCache = new ConcurrentDictionary<RoslynCodeTaskFactoryTaskInfo, Assembly>();
++        private static readonly ConcurrentDictionary<RoslynCodeTaskFactoryTaskInfo, (string Path, Assembly Assembly)> CompiledAssemblyCache = new ConcurrentDictionary<RoslynCodeTaskFactoryTaskInfo, (string, Assembly)>();
+ 
+         /// <summary>
+         /// Stores the path to the directory that this assembly is located in.
+@@ -162,7 +162,7 @@ public bool Initialize(string taskName, IDictionary<string, TaskPropertyInfo> pa
+             }
+ 
+             // Attempt to compile an assembly (or get one from the cache)
+-            if (!TryCompileInMemoryAssembly(taskFactoryLoggingHost, taskInfo, out Assembly assembly))
++            if (!TryCompileAssembly(taskFactoryLoggingHost, taskInfo, out string assemblyPath, out Assembly assembly))
+             {
+                 return false;
+             }
+@@ -655,17 +655,23 @@ private static CodeMemberProperty CreateProperty(CodeTypeDeclaration codeTypeDec
+         }
+ 
+         /// <summary>
+-        /// Attempts to compile the current source code and load the assembly into memory.
++        /// Attempts to compile the current source code.
+         /// </summary>
+         /// <param name="buildEngine">An <see cref="IBuildEngine"/> to use give to the compiler task so that messages can be logged.</param>
+         /// <param name="taskInfo">A <see cref="RoslynCodeTaskFactoryTaskInfo"/> object containing details about the task.</param>
+-        /// <param name="assembly">The <see cref="Assembly"/> if the source code be compiled and loaded, otherwise <code>null</code>.</param>
+-        /// <returns><code>true</code> if the source code could be compiled and loaded, otherwise <code>null</code>.</returns>
+-        private bool TryCompileInMemoryAssembly(IBuildEngine buildEngine, RoslynCodeTaskFactoryTaskInfo taskInfo, out Assembly assembly)
++        /// <param name="assemblyPath">The path to a dll if the source code be compiled, otherwise <code>null</code>.</param>
++        /// <param name="assembly">The loaded assembly if compilation and loading succeeded, otherwise <code>null</code>.</param>
++        /// <returns><code>true</code> if the source code could be compiled and loaded, otherwise <code>false</code>.</returns>
++        private bool TryCompileAssembly(IBuildEngine buildEngine, RoslynCodeTaskFactoryTaskInfo taskInfo, out string assemblyPath, out Assembly assembly)
+         {
++            assembly = null;
++            assemblyPath = null;
++
+             // First attempt to get a compiled assembly from the cache
+-            if (CompiledAssemblyCache.TryGetValue(taskInfo, out assembly))
++            if (CompiledAssemblyCache.TryGetValue(taskInfo, out var cachedEntry))
+             {
++                assemblyPath = cachedEntry.Path;
++                assembly = cachedEntry.Assembly;
+                 return true;
+             }
+ 
+@@ -675,9 +681,9 @@ private bool TryCompileInMemoryAssembly(IBuildEngine buildEngine, RoslynCodeTask
+             }
+ 
+             // The source code cannot actually be compiled "in memory" so instead the source code is written to disk in
+-            // the temp folder as well as the assembly.  After compilation, the source code and assembly are deleted.
++            // the temp folder as well as the assembly. After build, the source code and assembly are deleted.
+             string sourceCodePath = FileUtilities.GetTemporaryFileName(".tmp");
+-            string assemblyPath = FileUtilities.GetTemporaryFileName(".dll");
++            assemblyPath = FileUtilities.GetTemporaryFile(Path.Combine(FileUtilities.TempFileDirectory, MSBuildConstants.InlineTaskTempDllSubPath), null, ".dll", false);
+ 
+             // Delete the code file unless compilation failed or the environment variable MSBUILDLOGCODETASKFACTORYOUTPUT
+             // is set (which allows for debugging problems)
+@@ -759,12 +765,14 @@ private bool TryCompileInMemoryAssembly(IBuildEngine buildEngine, RoslynCodeTask
+                     }
+                 }
+ 
+-                // Return the assembly which is loaded into memory
+-                assembly = Assembly.Load(File.ReadAllBytes(assemblyPath));
+-
+-                // Attempt to cache the compiled assembly
+-                CompiledAssemblyCache.TryAdd(taskInfo, assembly);
++                // Load the compiled assembly
++                assembly = Assembly.LoadFrom(assemblyPath);
++                if (assembly == null)
++                {
++                    return false;
++                }
+ 
++                CompiledAssemblyCache.TryAdd(taskInfo, (assemblyPath, assembly));
+                 return true;
+             }
+             catch (Exception e)
+@@ -774,11 +782,6 @@ private bool TryCompileInMemoryAssembly(IBuildEngine buildEngine, RoslynCodeTask
+             }
+             finally
+             {
+-                if (FileSystems.Default.FileExists(assemblyPath))
+-                {
+-                    File.Delete(assemblyPath);
+-                }
+-
+                 if (deleteSourceCodeFile && FileSystems.Default.FileExists(sourceCodePath))
+                 {
+                     File.Delete(sourceCodePath);

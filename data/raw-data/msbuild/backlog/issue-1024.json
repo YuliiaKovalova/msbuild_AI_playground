@@ -1,0 +1,82 @@
+{
+  "number": 1024,
+  "title": "Crossplat MSBuild and path representation",
+  "body": "This is a part of #781 but focused on path separators and how path values flow through msbuild.\n\nPath values get introduced in MSBuild's data flow from:\n- user input (command line properties, properties, items, metadata, task arguments, imports, using tasks, conditions)\n- glob expansions (discussed in #1026 )\n- task outputs\n- well known item metadata pertaining to paths (FullPath, RootDir, etc)\n\nPaths values are consumed in:\n- Conditions (path comparisons, etc)\n- Tasks\n- Exec task\n\nPath consumers can access paths via:\n- direct property / item reference (`@(Compile)`, `$(MyFile)`)\n- item file metadata (FullPath, Identity, etc)\n\nObservations:\n- There is no distinction between strings and paths\n- Path value consumers can interpret the values either as plain strings (and MSBuild should not massage the value thinking it's a path), or as actual paths and thus do IO operations on them (when MSBuild is OK to normalize paths, etc)\n\nProblems:\n- crossplatform MSBuild may break if path producers do not agree with path consumers. For example if producers and consumers use different slashes, trailing slashes, absolute vs relative paths, etc\n\nPotential solutions:\n- msbuild could normalize all or some path producers in regards to separators to:\n  - only use forward or backward slashes\n  - use the file system specific path separator\n",
+  "state": "CLOSED",
+  "createdAt": "2016-09-14T19:47:24Z",
+  "updatedAt": "2024-02-21T17:25:59Z",
+  "closedAt": "2019-11-04T21:53:18Z",
+  "author": {
+    "login": "cdmihai"
+  },
+  "labels": [
+    "needs-design",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": {
+    "title": "Backlog"
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "> use the file system specific path separator\n\nThat can't work as your typical .NET Core OSS project should be buildable on any system.\n\nWhat's the objection against making them interchangeable? I get that it could break some existing tasks, but do we know exactly how bad that would be?\n",
+        "createdAt": "2016-09-14T21:46:36Z",
+        "updatedAt": "2016-09-14T21:46:36Z",
+        "author": {
+          "login": "bleroy"
+        }
+      },
+      {
+        "body": "Currently Mono's xbuild normalizes paths to work on the current platform. Will msbuild do the same or will there be an agreed standard for the path separator in the xml files?\n",
+        "createdAt": "2016-09-17T10:48:35Z",
+        "updatedAt": "2016-09-17T10:48:35Z",
+        "author": {
+          "login": "borgdylan"
+        }
+      },
+      {
+        "body": "My two cents: MSBuild should follow _idealized_ xbuild behavior, by which I mean:\n1. Strings and paths are interchangeable. There is no difference.\n2. _Whenever_ strings are compared, `\\` and `/` compare as the same value, and thus `\"Foo\\Bar\" == \"Foo/Bar\"` is True.\n3. When reading from/writing to a file, MSBuild will replace `\\` and `/` with the correct OS-native directory separator character.\n   \n   ```\n   <ItemGroup>\n     <Foo Include=\"Something\\File1.txt\" />\n     <Foo Include=\"Something\\File2.txt\" />\n   </ItemGroup>\n   <WriteLinesToFile File=\"Some\\Path.txt\" Lines=\"@(Foo)\" />\n   ```\n   \n   On Unix, the `<WriteLinesToFile/>` task should write to the file `Some/Path.txt`, and the `Lines` property should likewise contain `Something/File1.txt` and `Something/File2.txt`.\n4. In the (hopefully rare) instances in which a `\\` is actually required, e.g. to use the `<Exec/>` with the **grep**(1) Unix command utility, which uses `\\` as an escape character, `\\` should be _escaped_ and instead entered as `%5c`.\n\n**Rationale**\n\nMost existing MSBuild projects use `\\` within filesystem paths, e.g.:\n\n```\n  <Import Project=\"$(MSBuildExtensionsPath)\\Xamarin\\Android\\Xamarin.Android.CSharp.targets\" />\n```\n\nThus, on Unix platforms, `\\` _must_ be treated as `/` most of the time, or the above import _won't work_. That's Bad\u2122.\n\n(2) is the natural fallout of this: if most project files will be written originally on Windows, if they have _any_ use of `Condition` which may compare a filesystem path against anything else, then `\\` and `/` need to be normalized so that they're treated the same. For example:\n\n```\n<Import\n  Condition=\"'$(Language)' != 'F#' And Exists('$(MSBuildExtensionsPath32)\\Microsoft\\VisualStudio\\v$(VisualStudioVersion)\\FSharp\\Microsoft.FSharp.Targets')\"\n  Project=\"$(MSBuildExtensionsPath32)\\Microsoft\\VisualStudio\\v$(VisualStudioVersion)\\FSharp\\Microsoft.FSharp.Targets\" />\n```\n\nWe could argue that only `Exists()` within a Conditional needs escaping, but I believe that the mental model is easier to reason about if we say that _all_ strings are treated the same, not just \"substrings\" within certain contexts.\n\n(3) Shows why this needs to be done consistently _everywhere_. Filesystem paths can be stored in anything, e.g. `%(Reference.HintPath)`, and that \"anything\" can in turn be passed on to other tasks which will read or write those values. Since any string may potentially contain a path value, _all_ strings need to be similarly munged so that `\\` or `/` will contain the OS-native directory separator character.\n\n(4) is the escape hatch: sometimes you need an actual `\\` or an actual `/`, for  any number of reasons. In such situations, we should require using the existing `%xx` literal syntax to enter the desired character.\n\n---\n\nNote that I said that this is the _idealized_ xbuild behavior. I have observed scenarios where I would write Item Metadata which contains a `\\`, then invoke the `<Copy/>` task, the `\\` would be used as part of the copy output. This...is maddening.\n\n```\n<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!-- b.targets -->\n<Project DefaultTargets=\"Default\" ToolsVersion=\"4.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">\n  <PropertyGroup>\n    <Dir>Foo</Dir>\n  </PropertyGroup>\n  <ItemGroup>\n    <F Include=\"b.targets\">\n      <MD>Foo\\Example</MD>\n    </F>\n  </ItemGroup>\n  <Target Name=\"Default\">\n    <Message Text=\"foo\\bar\" />\n    <MakeDir Directories=\"$(Dir)\" />\n    <Copy SourceFiles=\"@(F)\" DestinationFiles=\"%(F.MD)\" />\n  </Target>\n</Project>\n```\n\nWhen running on xbuild:\n\n```\n$ xbuild b.targest\n...\n    Target Default:\n        foo/bar\n        Copying file from '/Users/jon/tmp/b.targets' to '/Users/jon/tmp/Foo\\Example'\n```\n\nJust...wat.\n\nMSBuild actually behaves reasonably here.\n",
+        "createdAt": "2016-09-21T16:39:36Z",
+        "updatedAt": "2016-09-21T16:39:36Z",
+        "author": {
+          "login": "jonpryor"
+        }
+      },
+      {
+        "body": "My two cents about xBuild: xBuild just replace char `'\\'` to Path.DirectorySeparatorChar in all sub items: https://github.com/mono/mono/blob/master/mcs/class/Microsoft.Build.Engine/Microsoft.Build.BuildEngine/Expression.cs#L103 \r\n",
+        "createdAt": "2016-09-22T07:56:21Z",
+        "updatedAt": "2017-01-30T22:45:27Z",
+        "author": {
+          "login": "mfilippov"
+        }
+      },
+      {
+        "body": "Addendum/elaboration: the original comment wrote:\r\n\r\n> Paths values are consumed in:\r\n> \r\n> * Exec task\r\n\r\nA related concern is that path values aren't *just* \"consumed\" in the `<Exec/>` task. They are also *generated* in the `<Exec/>` task. [Consider the `xamarin-android` repo](https://github.com/xamarin/xamarin-android/search?utf8=\u2713&q=Command+language%3Axml&type=Code), which contains `<Exec/>`s such as:\r\n\r\n```xml\r\n<Exec Command=\"%(_LlvmRuntime.ConfigureEnvironment) $(LlvmSourceFullPath)\\configure %(_LlvmRuntime.ConfigureFlags)\" />\r\n<Exec Command=\"&quot;%(_MonoRuntime.Strip)&quot; %(_MonoRuntime.StripFlags) &quot;$(OutputPath)\\lib\\xbuild\\Xamarin\\Android\\lib\\%(_MonoRuntime.Identity)\\%(_MonoRuntime.OutputRuntimeFilename).%(_MonoRuntime.NativeLibraryExtens\r\nion)&quot;\" />\r\n<Exec Command=\"$(ManagedRuntime) ..\\..\\bin\\Build$(Configuration)\\jnienv-gen.exe -o Android.Runtime\\JNIEnv.g.cs --use-java-interop\" />\r\n<Exec Command=\"&quot;$(AndroidNdkDirectory)\\ndk-build&quot;\" /\r\n<Exec Command=\"$(AndroidToolchainDirectory)\\ndk\\ndk-build $(_NdkBuildArgs) NDK_LIBS_OUT=./libs/Debug NDK_OUT=./obj/Debug V=1\" />\r\n<Exec Command=\"&quot;$(JavaSdkDirectory)\\bin\\javac&quot; -source 1.5 -target 1.6 -d &quot;Jars\\classes&quot; @(InputJarSource -&gt; '%(Identity)', ' ')\" />\r\n...\r\n```\r\n\r\nMy (incorrect?) understanding is that, at present, MSBuild/master will replace `\\` with `/` when accessed from Item metadata and properties. This is insufficient. *Many* of the above commands *should* work in a cross-platform manner, but if `\\` replacement only happens for properties and item groups, *none* of the above will be \"fixed\" to execute properly on Unix.\r\n\r\nAll of those execute on Unix, *today*, using `xbuild` and the `msbuild` included with Mono 4.8.",
+        "createdAt": "2017-03-08T17:33:53Z",
+        "updatedAt": "2017-03-08T17:33:53Z",
+        "author": {
+          "login": "jonpryor"
+        }
+      },
+      {
+        "body": "Any update on this? I'm in favor of treating `\\` equal to `/`, for example when using `Include=\"%2A%2A\"` with `Exclude=a/b/c` at the same time, should I use forward or backslashes in exclude?",
+        "createdAt": "2018-05-07T20:50:03Z",
+        "updatedAt": "2018-05-07T20:50:03Z",
+        "author": {
+          "login": "jeremyVignelles"
+        }
+      },
+      {
+        "body": "We have chosen to keep the current behavior. At this point, changing this would be a big breaking change for what does not look like a fantastic improvement.",
+        "createdAt": "2019-11-04T21:53:18Z",
+        "updatedAt": "2019-11-04T21:53:18Z",
+        "author": {
+          "login": "livarcocc"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,836 @@
+diff --git a/scripts/Deploy-MSBuild.ps1 b/scripts/Deploy-MSBuild.ps1
+index b7bf08ced01..c9bc90217fe 100644
+--- a/scripts/Deploy-MSBuild.ps1
++++ b/scripts/Deploy-MSBuild.ps1
+@@ -74,11 +74,11 @@ $filesToCopyToBin = @(
+     FileToCopy "$bootstrapBinDirectory\Microsoft.Managed.targets"
+     FileToCopy "$bootstrapBinDirectory\Microsoft.Managed.Before.targets"
+     FileToCopy "$bootstrapBinDirectory\Microsoft.Managed.After.targets"
+-    FileToCopy "$bootstrapBinDirectory\Microsoft.Net.props"
+-    FileToCopy "$bootstrapBinDirectory\Microsoft.NetFramework.CurrentVersion.props"
+-    FileToCopy "$bootstrapBinDirectory\Microsoft.NetFramework.CurrentVersion.targets"
+-    FileToCopy "$bootstrapBinDirectory\Microsoft.NetFramework.props"
+-    FileToCopy "$bootstrapBinDirectory\Microsoft.NetFramework.targets"
++    FileToCopy "$bootstrapBinDirectory\Microsoft.NET.props"
++    FileToCopy "$bootstrapBinDirectory\Microsoft.NETFramework.CurrentVersion.props"
++    FileToCopy "$bootstrapBinDirectory\Microsoft.NETFramework.CurrentVersion.targets"
++    FileToCopy "$bootstrapBinDirectory\Microsoft.NETFramework.props"
++    FileToCopy "$bootstrapBinDirectory\Microsoft.NETFramework.targets"
+     FileToCopy "$bootstrapBinDirectory\Microsoft.VisualBasic.CrossTargeting.targets"
+     FileToCopy "$bootstrapBinDirectory\Microsoft.VisualBasic.CurrentVersion.targets"
+     FileToCopy "$bootstrapBinDirectory\Microsoft.VisualBasic.targets"
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index e071160c912..271454fb2a9 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -629,7 +629,7 @@ void Callback(object state)
+                         }
+                     }
+ 
+-                    ShutdownConnectedNodesAsync(true /* abort */);
++                    ShutdownConnectedNodes(true /* abort */);
+                     CheckForActiveNodesAndCleanUpSubmissions();
+                 }
+             }
+@@ -774,7 +774,7 @@ public void EndBuild()
+             try
+             {
+                 _noActiveSubmissionsEvent.WaitOne();
+-                ShutdownConnectedNodesAsync(false /* normal termination */);
++                ShutdownConnectedNodes(false /* normal termination */);
+                 _noNodesActiveEvent.WaitOne();
+ 
+                 // Wait for all of the actions in the work queue to drain.  Wait() could throw here if there was an unhandled exception
+@@ -1955,7 +1955,7 @@ public void Dispose()
+         /// Asks the nodeManager to tell the currently connected nodes to shut down and sets a flag preventing all non-shutdown-related packets from
+         /// being processed.
+         /// </summary>
+-        private void ShutdownConnectedNodesAsync(bool abort)
++        private void ShutdownConnectedNodes(bool abort)
+         {
+             _shuttingDown = true;
+ 
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index 501d9ddbbc8..0889994b493 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -25,6 +25,10 @@
+ using Microsoft.Build.Utilities;
+ 
+ using BackendNativeMethods = Microsoft.Build.BackEnd.NativeMethods;
++using Task = System.Threading.Tasks.Task;
++using DotNetFrameworkArchitecture = Microsoft.Build.Shared.DotNetFrameworkArchitecture;
++using Microsoft.Build.Framework;
++using Microsoft.Build.BackEnd.Logging;
+ 
+ namespace Microsoft.Build.BackEnd
+ {
+@@ -49,6 +53,11 @@ internal abstract class NodeProviderOutOfProcBase
+         /// </summary>
+         private const int TimeoutForNewNodeCreation = 30000;
+ 
++        /// <summary>
++        /// The amount of time to wait for an out-of-proc node to exit.
++        /// </summary>
++        private const int TimeoutForWaitForExit = 30000;
++
+         /// <summary>
+         /// The build component host.
+         /// </summary>
+@@ -95,9 +104,30 @@ protected void ShutdownConnectedNodes(List<NodeContext> contextsToShutDown, bool
+             // Send the build completion message to the nodes, causing them to shutdown or reset.
+             _processesToIgnore.Clear();
+ 
++            // We wait for child nodes to exit to avoid them changing the terminal
++            // after this process terminates.
++            bool waitForExit =  !enableReuse &&
++                                !Console.IsInputRedirected &&
++                                Traits.Instance.EscapeHatches.EnsureStdOutForChildNodesIsPrimaryStdout;
++
++            Task[] waitForExitTasks = waitForExit && contextsToShutDown.Count > 0 ? new Task[contextsToShutDown.Count] : null;
++            int i = 0;
++            var loggingService = _componentHost.LoggingService;
+             foreach (NodeContext nodeContext in contextsToShutDown)
+             {
+-                nodeContext?.SendData(new NodeBuildComplete(enableReuse));
++                if (nodeContext is null)
++                {
++                    continue;
++                }
++                nodeContext.SendData(new NodeBuildComplete(enableReuse));
++                if (waitForExit)
++                {
++                    waitForExitTasks[i++] = nodeContext.WaitForExitAsync(loggingService);
++                }
++            }
++            if (waitForExitTasks != null)
++            {
++                Task.WaitAll(waitForExitTasks);
+             }
+         }
+ 
+@@ -138,7 +168,7 @@ protected void ShutdownAllNodes(bool nodeReuse, NodeContextTerminateDelegate ter
+                 {
+                     // If we're able to connect to such a process, send a packet requesting its termination
+                     CommunicationsUtilities.Trace("Shutting down node with pid = {0}", nodeProcess.Id);
+-                    NodeContext nodeContext = new NodeContext(0, nodeProcess.Id, nodeStream, factory, terminateNode);
++                    NodeContext nodeContext = new NodeContext(0, nodeProcess, nodeStream, factory, terminateNode);
+                     nodeContext.SendData(new NodeBuildComplete(false /* no node reuse */));
+                     nodeStream.Dispose();
+                 }
+@@ -204,7 +234,7 @@ protected NodeContext GetNode(string msbuildLocation, string commandLineArgs, in
+                     {
+                         // Connection successful, use this node.
+                         CommunicationsUtilities.Trace("Successfully connected to existed node {0} which is PID {1}", nodeId, nodeProcess.Id);
+-                        return new NodeContext(nodeId, nodeProcess.Id, nodeStream, factory, terminateNode);
++                        return new NodeContext(nodeId, nodeProcess, nodeStream, factory, terminateNode);
+                     }
+                 }
+             }
+@@ -242,20 +272,20 @@ protected NodeContext GetNode(string msbuildLocation, string commandLineArgs, in
+ #endif
+ 
+                 // Create the node process
+-                int msbuildProcessId = LaunchNode(msbuildLocation, commandLineArgs);
+-                _processesToIgnore.Add(GetProcessesToIgnoreKey(hostHandshake, msbuildProcessId));
++                Process msbuildProcess = LaunchNode(msbuildLocation, commandLineArgs);
++                _processesToIgnore.Add(GetProcessesToIgnoreKey(hostHandshake, msbuildProcess.Id));
+ 
+                 // Note, when running under IMAGEFILEEXECUTIONOPTIONS registry key to debug, the process ID
+                 // gotten back from CreateProcess is that of the debugger, which causes this to try to connect
+                 // to the debugger process. Instead, use MSBUILDDEBUGONSTART=1
+ 
+                 // Now try to connect to it.
+-                Stream nodeStream = TryConnectToProcess(msbuildProcessId, TimeoutForNewNodeCreation, hostHandshake);
++                Stream nodeStream = TryConnectToProcess(msbuildProcess.Id, TimeoutForNewNodeCreation, hostHandshake);
+                 if (nodeStream != null)
+                 {
+                     // Connection successful, use this node.
+-                    CommunicationsUtilities.Trace("Successfully connected to created node {0} which is PID {1}", nodeId, msbuildProcessId);
+-                    return new NodeContext(nodeId, msbuildProcessId, nodeStream, factory, terminateNode);
++                    CommunicationsUtilities.Trace("Successfully connected to created node {0} which is PID {1}", nodeId, msbuildProcess.Id);
++                    return new NodeContext(nodeId, msbuildProcess, nodeStream, factory, terminateNode);
+                 }
+             }
+ 
+@@ -391,7 +421,7 @@ private Stream TryConnectToProcess(int nodeProcessId, int timeout, Handshake han
+         /// <summary>
+         /// Creates a new MSBuild process
+         /// </summary>
+-        private int LaunchNode(string msbuildLocation, string commandLineArgs)
++        private Process LaunchNode(string msbuildLocation, string commandLineArgs)
+         {
+             // Should always have been set already.
+             ErrorUtilities.VerifyThrowInternalLength(msbuildLocation, nameof(msbuildLocation));
+@@ -490,7 +520,7 @@ private int LaunchNode(string msbuildLocation, string commandLineArgs)
+                 }
+ 
+                 CommunicationsUtilities.Trace("Successfully launched {1} node with PID {0}", process.Id, exeName);
+-                return process.Id;
++                return process;
+             }
+             else
+             {
+@@ -548,7 +578,7 @@ out processInfo
+                 }
+ 
+                 CommunicationsUtilities.Trace("Successfully launched {1} node with PID {0}", childProcessId, exeName);
+-                return childProcessId;
++                return Process.GetProcessById(childProcessId);
+             }
+         }
+ 
+@@ -582,6 +612,13 @@ private static string GetCurrentHost()
+         /// </summary>
+         internal class NodeContext
+         {
++            enum ExitPacketState
++            {
++                None,
++                ExitPacketQueued,
++                ExitPacketSent
++            }
++
+             // The pipe(s) used to communicate with the node.
+             private Stream _clientToServerStream;
+             private Stream _serverToClientStream;
+@@ -597,9 +634,9 @@ internal class NodeContext
+             private int _nodeId;
+ 
+             /// <summary>
+-            /// The process id
++            /// The node process.
+             /// </summary>
+-            private int _processId;
++            private readonly Process _process;
+ 
+             /// <summary>
+             /// An array used to store the header byte for each packet when read.
+@@ -631,14 +668,14 @@ internal class NodeContext
+             private Task _packetWriteDrainTask = Task.CompletedTask;
+ 
+             /// <summary>
+-            /// Event indicating the node has terminated.
++            /// Delegate called when the context terminates.
+             /// </summary>
+-            private ManualResetEvent _nodeTerminated;
++            private NodeContextTerminateDelegate _terminateDelegate;
+ 
+             /// <summary>
+-            /// Delegate called when the context terminates.
++            /// Tracks the state of the packet sent to terminate the node.
+             /// </summary>
+-            private NodeContextTerminateDelegate _terminateDelegate;
++            private ExitPacketState _exitPacketState;
+ 
+             /// <summary>
+             /// Per node read buffers
+@@ -648,20 +685,18 @@ internal class NodeContext
+             /// <summary>
+             /// Constructor.
+             /// </summary>
+-            public NodeContext(int nodeId, int processId,
++            public NodeContext(int nodeId, Process process,
+                 Stream nodePipe,
+                 INodePacketFactory factory, NodeContextTerminateDelegate terminateDelegate)
+             {
+                 _nodeId = nodeId;
+-                _processId = processId;
++                _process = process;
+                 _clientToServerStream = nodePipe;
+                 _serverToClientStream = nodePipe;
+                 _packetFactory = factory;
+                 _headerByte = new byte[5]; // 1 for the packet type, 4 for the body length
+-
+                 _readBufferMemoryStream = new MemoryStream();
+                 _writeBufferMemoryStream = new MemoryStream();
+-                _nodeTerminated = new ManualResetEvent(false);
+                 _terminateDelegate = terminateDelegate;
+                 _sharedReadBuffer = InterningBinaryReader.CreateSharedBuffer();
+             }
+@@ -749,6 +784,10 @@ public async Task RunPacketReadLoopAsync()
+             /// <param name="packet">The packet to send.</param>
+             public void SendData(INodePacket packet)
+             {
++                if (IsExitPacket(packet))
++                {
++                    _exitPacketState = ExitPacketState.ExitPacketQueued;
++                }
+                 _packetWriteQueue.Add(packet);
+                 DrainPacketQueue();
+             }
+@@ -816,6 +855,10 @@ private void SendDataCore(INodePacket packet)
+                         int lengthToWrite = Math.Min(writeStreamLength - i, MaxPacketWriteSize);
+                         _serverToClientStream.Write(writeStreamBuffer, i, lengthToWrite);
+                     }
++                    if (IsExitPacket(packet))
++                    {
++                        _exitPacketState = ExitPacketState.ExitPacketSent;
++                    }
+                 }
+                 catch (IOException e)
+                 {
+@@ -828,6 +871,11 @@ private void SendDataCore(INodePacket packet)
+                 }
+             }
+ 
++            private static bool IsExitPacket(INodePacket packet)
++            {
++                return packet is NodeBuildComplete buildCompletePacket && !buildCompletePacket.PrepareForReuse;
++            }
++
+             /// <summary>
+             /// Avoid having a BinaryWriter just to write a 4-byte int
+             /// </summary>
+@@ -842,7 +890,7 @@ private void WriteInt32(MemoryStream stream, int value)
+             /// <summary>
+             /// Closes the node's context, disconnecting it from the node.
+             /// </summary>
+-            public void Close()
++            private void Close()
+             {
+                 _clientToServerStream.Dispose();
+                 if (!object.ReferenceEquals(_clientToServerStream, _serverToClientStream))
+@@ -852,6 +900,52 @@ public void Close()
+                 _terminateDelegate(_nodeId);
+             }
+ 
++            /// <summary>
++            /// Waits for the child node process to exit.
++            /// </summary>
++            public async Task WaitForExitAsync(ILoggingService loggingService)
++            {
++                if (_exitPacketState == ExitPacketState.ExitPacketQueued)
++                {
++                    // Wait up to 100ms until all remaining packets are sent.
++                    // We don't need to wait long, just long enough for the Task to start running on the ThreadPool.
++                    await Task.WhenAny(_packetWriteDrainTask, Task.Delay(100));
++                }
++                if (_exitPacketState == ExitPacketState.ExitPacketSent)
++                {
++                    CommunicationsUtilities.Trace("Waiting for node with pid = {0} to exit", _process.Id);
++
++                    // .NET 5 introduces a real WaitForExitAsyc.
++                    // This is a poor man's implementation that uses polling.
++                    int timeout = TimeoutForWaitForExit;
++                    int delay = 5;
++                    while (timeout > 0)
++                    {
++                        bool exited = _process.WaitForExit(milliseconds: 0);
++                        if (exited)
++                        {
++                            return;
++                        }
++                        timeout -= delay;
++                        await Task.Delay(delay).ConfigureAwait(false);
++
++                        // Double delay up to 500ms.
++                        delay = Math.Min(delay * 2, 500);
++                    }
++                }
++
++                // Kill the child and do a blocking wait.
++                loggingService?.LogWarning(
++                    BuildEventContext.Invalid,
++                    null,
++                    BuildEventFileInfo.Empty,
++                    "KillingProcessWithPid",
++                    _process.Id);
++                CommunicationsUtilities.Trace("Killing node with pid = {0}", _process.Id);
++
++                _process.KillTree(timeout: 5000);
++            }
++
+ #if FEATURE_APM
+             /// <summary>
+             /// Completes the asynchronous packet write to the node.
+@@ -873,17 +967,16 @@ private bool ProcessHeaderBytesRead(int bytesRead)
+             {
+                 if (bytesRead != _headerByte.Length)
+                 {
+-                    CommunicationsUtilities.Trace(_nodeId, "COMMUNICATIONS ERROR (HRC) Node: {0} Process: {1} Bytes Read: {2} Expected: {3}", _nodeId, _processId, bytesRead, _headerByte.Length);
++                    CommunicationsUtilities.Trace(_nodeId, "COMMUNICATIONS ERROR (HRC) Node: {0} Process: {1} Bytes Read: {2} Expected: {3}", _nodeId, _process.Id, bytesRead, _headerByte.Length);
+                     try
+                     {
+-                        Process childProcess = Process.GetProcessById(_processId);
+-                        if (childProcess?.HasExited != false)
++                        if (_process.HasExited)
+                         {
+-                            CommunicationsUtilities.Trace(_nodeId, "   Child Process {0} has exited.", _processId);
++                            CommunicationsUtilities.Trace(_nodeId, "   Child Process {0} has exited.", _process.Id);
+                         }
+                         else
+                         {
+-                            CommunicationsUtilities.Trace(_nodeId, "   Child Process {0} is still running.", _processId);
++                            CommunicationsUtilities.Trace(_nodeId, "   Child Process {0} is still running.", _process.Id);
+                         }
+                     }
+                     catch (Exception e) when (!ExceptionHandling.IsCriticalException(e))
+diff --git a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+index 9a329a707b5..7bf9a69aebc 100644
+--- a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
++++ b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+@@ -24,6 +24,7 @@
+ using Microsoft.Build.Utilities;
+ 
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
++using Task = System.Threading.Tasks.Task;
+ 
+ namespace Microsoft.Build.BackEnd
+ {
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 122fafbe597..01a5fd018d2 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -127,6 +127,7 @@
+     <Compile Include="..\Shared\NodeBuildComplete.cs" />
+     <Compile Include="..\Shared\NodeShutdown.cs" />
+     <Compile Include="..\Shared\NamedPipeUtil.cs" />
++    <Compile Include="..\Shared\ProcessExtensions.cs" />
+     <Compile Include="..\Shared\TaskLoggingHelper.cs">
+       <Link>BackEnd\Components\RequestBuilder\IntrinsicTasks\TaskLoggingHelper.cs</Link>
+       <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index f952aa2fde1..5c71c76765a 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1876,4 +1876,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+   <data name="NoProjectCachePluginFoundInAssembly" xml:space="preserve">
+     <value>MSB4270: No project cache plugins found in assembly "{0}". Expected one.</value>
+   </data>
++  <data name="KillingProcessWithPid" xml:space="preserve">
++    <value>Killing process with pid = {0}.</value>
++  </data>
+ </root>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index bf510a79af5..97c6ae7d7fe 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">Objekty EvaluationContext vytvořené pomocí SharingPolicy.Isolated nepodporují předávání souborového systému MSBuildFileSystemBase.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 16d5a0150ac..0d28f1e35f5 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"Die Übergabe eines MSBuildFileSystemBase-Dateisystems wird von EvaluationContext-Objekten, die mit SharingPolicy.Isolated erstellt wurden, nicht unterstützt."</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.en.xlf b/src/Build/Resources/xlf/Strings.en.xlf
+index de8f087e73c..ba6514d2b02 100644
+--- a/src/Build/Resources/xlf/Strings.en.xlf
++++ b/src/Build/Resources/xlf/Strings.en.xlf
+@@ -132,6 +132,11 @@
+         <target state="new">EvaluationContext objects created with SharingPolicy.Isolated do not support being passed an MSBuildFileSystemBase file system.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 8ccf739bc72..fee1eccec2b 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"Los objetos EvaluationContext creados con SharingPolicy.Isolated no admiten que se les pase un sistema de archivos MSBuildFileSystemBase".</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 64457b6af8f..039fc62e433 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"Les objets EvaluationContext créés avec SharingPolicy.Isolated ne prennent pas en charge le passage d'un système de fichiers MSBuildFileSystemBase."</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 9a5ec86d692..9fe35b095d5 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"Agli oggetti EvaluationContext creati con SharingPolicy.Isolated non è possibile passare un file system MSBuildFileSystemBase."</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 3306b529d97..53381475528 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"SharingPolicy.Isolated を指定して作成された EvaluationContext オブジェクトに MSBuildFileSystemBase ファイル システムを渡すことはサポートされていません。"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index f293d489173..0c24346a7b3 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"SharingPolicy.Isolated로 만든 EvaluationContext 개체는 MSBuildFileSystemBase 파일 시스템 전달을 지원하지 않습니다."</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 1c71a6845ba..aa5266f9494 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">„Obiekty EvaluationContext utworzone za pomocą elementu SharingPolicy.Isolated nie obsługują przekazywania za pomocą systemu plików MSBuildFileSystemBase.”</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 75e73602273..6a68c83bc50 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"Os objetos EvaluationContext criados com SharingPolicy.Isolable não são compatíveis com o recebimento de um sistema de arquivos MSBuildFileSystemBase."</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index e977086f6a3..1b96d782976 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"Объекты EvaluationContext, созданные с помощью SharingPolicy.Isolated, не поддерживают передачу в файловую систему MSBuildFileSystemBase."</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 7f68a7c7e38..6881e585760 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"SharingPolicy.Isolated ile oluşturulan EvaluationContext nesneleri bir MSBuildFileSystemBase dosya sisteminin geçirilmesini desteklemez."</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 4c5c31147ad..2c5d49b27bd 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">“使用 SharingPolicy.Isolated 创建的 EvaluationContext 对象不支持通过 MSBuildFileSystemBase 文件系统传递。”</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 13dbb6ee048..bc1a6b8f5be 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -132,6 +132,11 @@
+         <target state="needs-review-translation">"使用 SharingPolicy.Isolated 建立的 EvaluationContext 物件不支援以 MSBuildFileSystemBase 檔案系統傳遞。"</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="KillingProcessWithPid">
++        <source>Killing process with pid = {0}.</source>
++        <target state="new">Killing process with pid = {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>"Loading the following project cache plugin:
+     {0}"</source>
+diff --git a/src/Shared/NativeMethodsShared.cs b/src/Shared/NativeMethodsShared.cs
+index 4818d7eda9c..42e8a3ead07 100644
+--- a/src/Shared/NativeMethodsShared.cs
++++ b/src/Shared/NativeMethodsShared.cs
+@@ -465,10 +465,8 @@ public SystemInformationData()
+                                 string arch = null;
+                                 if (proc != null)
+                                 {
+-                                    // Since uname -m simply returns kernel property, it should be quick.
+-                                    // 1 second is the best guess for a safe timeout.
+-                                    proc.WaitForExit(1000);
+                                     arch = proc.StandardOutput.ReadLine();
++                                    proc.WaitForExit();
+                                 }
+ 
+                                 if (!string.IsNullOrEmpty(arch))
+diff --git a/src/Utilities/ProcessExtensions.cs b/src/Shared/ProcessExtensions.cs
+similarity index 78%
+rename from src/Utilities/ProcessExtensions.cs
+rename to src/Shared/ProcessExtensions.cs
+index 04d6afb3f36..9504440d124 100644
+--- a/src/Utilities/ProcessExtensions.cs
++++ b/src/Shared/ProcessExtensions.cs
+@@ -7,7 +7,7 @@
+ using System.IO;
+ using Microsoft.Build.Shared;
+ 
+-namespace Microsoft.Build.Utilities
++namespace Microsoft.Build.Shared
+ {
+     internal static class ProcessExtensions
+     {
+@@ -46,12 +46,12 @@ public static void KillTree(this Process process, int timeout)
+ 
+         private static void GetAllChildIdsUnix(int parentId, ISet<int> children)
+         {
+-            var exitCode = RunProcessAndWaitForExit(
++            RunProcessAndWaitForExit(
+                 "pgrep",
+                 $"-P {parentId}",
+                 out string stdout);
+ 
+-            if (exitCode == 0 && !string.IsNullOrEmpty(stdout))
++            if (!string.IsNullOrEmpty(stdout))
+             {
+                 using (var reader = new StringReader(stdout))
+                 {
+@@ -77,13 +77,24 @@ private static void GetAllChildIdsUnix(int parentId, ISet<int> children)
+ 
+         private static void KillProcessUnix(int processId)
+         {
+-            RunProcessAndWaitForExit(
+-                "kill",
+-                $"-TERM {processId}",
+-                out string _);
++            try
++            {
++                using Process process = Process.GetProcessById(processId);
++                process.Kill();
++            }
++            catch (ArgumentException)
++            {
++                // Process already terminated.
++                return;
++            }
++            catch (InvalidOperationException)
++            {
++                // Process already terminated.
++                return;
++            }
+         }
+ 
+-        private static int RunProcessAndWaitForExit(string fileName, string arguments, out string stdout)
++        private static void RunProcessAndWaitForExit(string fileName, string arguments, out string stdout)
+         {
+             var startInfo = new ProcessStartInfo
+             {
+@@ -94,22 +105,8 @@ private static int RunProcessAndWaitForExit(string fileName, string arguments, o
+             };
+ 
+             var process = Process.Start(startInfo);
+-
+-            stdout = null;
+-            if (process.WaitForExit((int) TimeSpan.FromSeconds(30).TotalMilliseconds))
+-            {
+-                stdout = process.StandardOutput.ReadToEnd();
+-            }
+-            else
+-            {
+-                process.Kill();
+-                
+-                // Kill is asynchronous so we should still wait a little
+-                //
+-                process.WaitForExit((int) TimeSpan.FromSeconds(1).TotalMilliseconds);
+-            }
+-
+-            return process.HasExited ? process.ExitCode : -1;
++            stdout = process.StandardOutput.ReadToEnd();
++            process.WaitForExit();
+         }
+     }
+ }
+diff --git a/src/Tasks.UnitTests/Exec_Tests.cs b/src/Tasks.UnitTests/Exec_Tests.cs
+index df8ac22edce..3bc0657cab2 100644
+--- a/src/Tasks.UnitTests/Exec_Tests.cs
++++ b/src/Tasks.UnitTests/Exec_Tests.cs
+@@ -103,8 +103,8 @@ public void ExitCodeCausesFailure()
+         [Fact]
+         public void Timeout()
+         {
+-            // On non-Windows the exit code of a killed process is SIGTERM (143)
+-            int expectedExitCode = NativeMethodsShared.IsWindows ? -1 : 143;
++            // On non-Windows the exit code of a killed process is SIGKILL (137)
++            int expectedExitCode = NativeMethodsShared.IsWindows ? -1 : 137;
+ 
+             Exec exec = PrepareExec(NativeMethodsShared.IsWindows ? ":foo \n goto foo" : "while true; do sleep 1; done");
+             exec.Timeout = 5;
+@@ -122,7 +122,6 @@ public void Timeout()
+         [Fact]
+         public void TimeoutFailsEvenWhenExitCodeIsIgnored()
+         {
+-
+             Exec exec = PrepareExec(NativeMethodsShared.IsWindows ? ":foo \n goto foo" : "while true; do sleep 1; done");
+             exec.Timeout = 5;
+             exec.IgnoreExitCode = true;
+@@ -138,16 +137,13 @@ public void TimeoutFailsEvenWhenExitCodeIsIgnored()
+ 
+             if (NativeMethodsShared.IsMono)
+             {
+-                // The standard check for SIGTERM fails intermittently on macOS Mono
+-                // https://github.com/dotnet/msbuild/issues/5506
+-                // To avoid test flakiness, allow 259 even though I can't justify it.
+-                exec.ExitCode.ShouldBeOneOf(143, 259);
++                const int STILL_ACTIVE = 259; // When Process.WaitForExit times out.
++                exec.ExitCode.ShouldBeOneOf(137, STILL_ACTIVE);
+             }
+             else
+             {
+-                // On non-Windows the exit code of a killed process is generally 128 + SIGTERM = 143
+-                // though this isn't 100% guaranteed, see https://unix.stackexchange.com/a/99134
+-                exec.ExitCode.ShouldBe(NativeMethodsShared.IsWindows ? -1 : 143);
++                // On non-Windows the exit code of a killed process is 128 + SIGKILL = 137
++                exec.ExitCode.ShouldBe(NativeMethodsShared.IsWindows ? -1 : 137);
+             }
+         }
+ 
+diff --git a/src/Utilities.UnitTests/ProcessExtensions_Tests.cs b/src/Utilities.UnitTests/ProcessExtensions_Tests.cs
+new file mode 100644
+index 00000000000..e24dca74ec4
+--- /dev/null
++++ b/src/Utilities.UnitTests/ProcessExtensions_Tests.cs
+@@ -0,0 +1,30 @@
++// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using Shouldly;
++using Xunit;
++
++using Microsoft.Build.Shared;
++using System.Diagnostics;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.UnitTests
++{
++    public class ProcessExtensions_Tests
++    {
++        [Fact]
++        public async Task KillTree()
++        {
++            Process p = Process.Start("sleep", "600"); // sleep 10m.
++
++            // Verify the process is running.
++            await Task.Delay(500);
++            p.HasExited.ShouldBe(false);
++
++            // Kill the process.
++            p.KillTree(timeout: 5000);
++            p.HasExited.ShouldBe(true);
++            p.ExitCode.ShouldNotBe(0);
++        }
++    }
++}
+diff --git a/src/Utilities/Microsoft.Build.Utilities.csproj b/src/Utilities/Microsoft.Build.Utilities.csproj
+index ad57c67a789..8c4526c39b6 100644
+--- a/src/Utilities/Microsoft.Build.Utilities.csproj
++++ b/src/Utilities/Microsoft.Build.Utilities.csproj
+@@ -125,6 +125,9 @@
+     <Compile Include="..\Shared\InprocTrackingNativeMethods.cs">
+       <Link>Shared\InprocTrackingNativeMethods.cs</Link>
+     </Compile>
++    <Compile Include="..\Shared\ProcessExtensions.cs">
++      <Link>Shared\ProcessExtensions.cs</Link>
++    </Compile>
+     <Compile Include="..\Shared\ReadOnlyEmptyCollection.cs">
+       <Link>Shared\ReadOnlyEmptyCollection.cs</Link>
+     </Compile>
+diff --git a/src/Utilities/ToolTask.cs b/src/Utilities/ToolTask.cs
+index 23f7abc7e67..5ccd30763e2 100644
+--- a/src/Utilities/ToolTask.cs
++++ b/src/Utilities/ToolTask.cs
+@@ -949,7 +949,6 @@ private void KillToolProcessOnTimeout(Process proc, bool isBeingCancelled)
+                         timeout = result;
+                     }
+                 }
+-
+                 proc.KillTree(timeout);
+             }
+         }

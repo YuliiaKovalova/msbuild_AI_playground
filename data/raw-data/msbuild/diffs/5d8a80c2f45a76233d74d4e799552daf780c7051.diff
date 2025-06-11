@@ -1,0 +1,206 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 51606ec9385..6546f1529be 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -634,8 +634,7 @@ ILoggingService InitializeLoggingService()
+                     _buildParameters.ForwardingLoggers,
+                     _buildParameters.WarningsAsErrors,
+                     _buildParameters.WarningsNotAsErrors,
+-                    _buildParameters.WarningsAsMessages,
+-                    out ILogger buildCheckLogger);
++                    _buildParameters.WarningsAsMessages);
+ 
+                 _nodeManager.RegisterPacketHandler(NodePacketType.LogMessage, LogMessagePacket.FactoryForDeserialization, loggingService as INodePacketHandler);
+ 
+@@ -2953,30 +2952,37 @@ private void OnProjectStarted(object sender, ProjectStartedEventArgs e)
+         }
+ 
+         public void AttachBuildCheckForReplay(
++            BinaryLogReplayEventSource replayEventSource,
+             IEnumerable<ILogger> loggers,
+             IEnumerable<ForwardingLoggerRecord> forwardingLoggers,
+             ISet<string> warningsAsErrors,
+             ISet<string> warningsNotAsErrors,
+-            ISet<string> warningsAsMessages,
+-            out ILogger buildCheckLogger)
++            ISet<string> warningsAsMessages)
+         {
+             _buildParameters = new BuildParameters
+             {
+                 MaxNodeCount = 1,
+-                IsBuildCheckEnabled = true
++                IsBuildCheckEnabled = true,
++                UseSynchronousLogging = true
+             };
+ 
++            if (_workQueue == null)
++            {
++                _workQueue = new ActionBlock<Action>(action => ProcessWorkQueue(action));
++            }
++
+             lock (_syncLock)
+             {
+                 AttachDebugger();
+ 
+-                CreateLoggingService(
++                var loggingService = CreateLoggingService(
+                 loggers,
+                 forwardingLoggers,
+                 warningsAsErrors,
+                 warningsNotAsErrors,
+-                warningsAsMessages,
+-                out buildCheckLogger);
++                warningsAsMessages);
++
++                replayEventSource.AttachLoggingService(loggingService as LoggingService);
+             }
+         }
+ 
+@@ -2988,8 +2994,7 @@ private ILoggingService CreateLoggingService(
+             IEnumerable<ForwardingLoggerRecord> forwardingLoggers,
+             ISet<string> warningsAsErrors,
+             ISet<string> warningsNotAsErrors,
+-            ISet<string> warningsAsMessages,
+-            out ILogger buildCheckLogger)
++            ISet<string> warningsAsMessages)
+         {
+             Debug.Assert(Monitor.IsEntered(_syncLock));
+ 
+@@ -3028,7 +3033,7 @@ private ILoggingService CreateLoggingService(
+                     loggerSwitchParameters: null,
+                     verbosity: LoggerVerbosity.Quiet);
+ 
+-                buildCheckLogger =
++                ILogger buildCheckLogger =
+                     new BuildCheckConnectorLogger(new AnalyzerLoggingContextFactory(loggingService),
+                         buildCheckManagerProvider.Instance);
+ 
+@@ -3036,10 +3041,6 @@ private ILoggingService CreateLoggingService(
+ 
+                 forwardingLoggers = forwardingLoggers?.Concat(forwardingLogger) ?? forwardingLogger;
+             }
+-            else
+-            {
+-                buildCheckLogger = null;
+-            }
+ 
+             try
+             {
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+index abf9e4e80c9..4ddff252e78 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+@@ -6,6 +6,7 @@
+ using System.IO.Compression;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
++using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+@@ -65,6 +66,8 @@ public sealed class BinaryLogReplayEventSource : EventArgsDispatcher,
+         private int? _fileFormatVersion;
+         private int? _minimumReaderVersion;
+ 
++        private LoggingService? _loggingService;
++
+         public int FileFormatVersion => _fileFormatVersion ?? throw new InvalidOperationException(ResourceUtilities.GetResourceString("Binlog_Source_VersionUninitialized"));
+         public int MinimumReaderVersion => _minimumReaderVersion ?? throw new InvalidOperationException(ResourceUtilities.GetResourceString("Binlog_Source_VersionUninitialized"));
+ 
+@@ -93,6 +96,11 @@ public void Replay(string sourceFilePath)
+             Replay(sourceFilePath, CancellationToken.None);
+         }
+ 
++        internal void AttachLoggingService(LoggingService loggingService)
++        {
++            _loggingService = loggingService;
++        }
++
+         /// <summary>
+         /// Read the provided binary log file opened as a stream and raise corresponding events for each BuildEventArgs
+         /// </summary>
+@@ -245,7 +253,7 @@ public void Replay(BuildEventArgsReader reader, CancellationToken cancellationTo
+             reader.ArchiveFileEncountered += _archiveFileEncountered;
+             reader.StringReadDone += _stringReadDone;
+ 
+-            if (HasStructuredEventsSubscribers || !supportsForwardCompatibility)
++            if (HasStructuredEventsSubscribers || !supportsForwardCompatibility || _loggingService != null)
+             {
+                 if (this._rawLogRecordReceived != null)
+                 {
+@@ -258,10 +266,20 @@ public void Replay(BuildEventArgsReader reader, CancellationToken cancellationTo
+                 reader.SkipUnknownEventParts = supportsForwardCompatibility && AllowForwardCompatibility;
+                 reader.RecoverableReadError += RecoverableReadError;
+ 
+-                while (!cancellationToken.IsCancellationRequested && reader.Read() is { } instance)
++                if (_loggingService != null)
+                 {
+-                    Dispatch(instance);
++                    while (!cancellationToken.IsCancellationRequested && reader.Read() is { } instance)
++                    {
++                        _loggingService.ProcessLoggingEvent(instance);
++                    }
+                 }
++                else
++                {
++                    while (!cancellationToken.IsCancellationRequested && reader.Read() is { } instance)
++                    {
++                        Dispatch(instance);
++                    }
++                }           
+             }
+             else
+             {
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 1499e87f9ea..7c2c416d00a 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -4422,25 +4422,33 @@ private static void ReplayBinaryLog(
+         {
+             var replayEventSource = new BinaryLogReplayEventSource();
+ 
+-            ILogger buildCheckLogger = null;
+-
+             if (isBuildCheckEnabled)
+             {
+-                List<ForwardingLoggerRecord> remoteLoggerRecords = new List<ForwardingLoggerRecord>();
++                List<ForwardingLoggerRecord> remoteLoggerRecords = [];
+                 foreach (DistributedLoggerRecord distRecord in distributedLoggerRecords)
+                 {
+                     remoteLoggerRecords.Add(new ForwardingLoggerRecord(distRecord.CentralLogger, distRecord.ForwardingLoggerDescription));
+                 }
+ 
+                 BuildManager.DefaultBuildManager.AttachBuildCheckForReplay(
++                    replayEventSource,
+                     loggers,
+                     remoteLoggerRecords,
+                     warningsAsErrors,
+                     warningsNotAsErrors,
+-                    warningsAsMessages,
+-                    out buildCheckLogger);
++                    warningsAsMessages);
++
++                try
++                {
++                    replayEventSource.Replay(binaryLogFilePath, s_buildCancellationSource.Token);
++                }
++                catch (Exception ex)
++                {
++                    var message = ResourceUtilities.FormatResourceStringStripCodeAndKeyword("InvalidLogFileFormat", ex.Message);
++                    Console.WriteLine(message);
++                }
+ 
+-                buildCheckLogger.Initialize(replayEventSource);
++                return;
+             }
+ 
+             foreach (var distributedLoggerRecord in distributedLoggerRecords)
+@@ -4487,8 +4495,6 @@ private static void ReplayBinaryLog(
+             {
+                 distributedLoggerRecord.CentralLogger?.Shutdown();
+             }
+-
+-            buildCheckLogger?.Shutdown();
+         }
+ 
+         /// <summary>

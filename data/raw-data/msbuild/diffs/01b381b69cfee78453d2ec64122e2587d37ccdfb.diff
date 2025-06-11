@@ -1,0 +1,189 @@
+diff --git a/src/Build/Utilities/AutomaticEncodingRestorer.cs b/src/Build/Utilities/AutomaticEncodingRestorer.cs
+new file mode 100644
+index 00000000000..ed22352cff3
+--- /dev/null
++++ b/src/Build/Utilities/AutomaticEncodingRestorer.cs
+@@ -0,0 +1,75 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++using System.Security;
++using System.Text;
++
++namespace Microsoft.Build.Utilities
++{
++    /// <summary>
++    /// Ported from https://github.com/dotnet/sdk/blob/bcea1face15458814b8e53e8785b52ba464f6538/src/Cli/dotnet/AutomaticEncodingRestorer.cs.
++    /// A program can change the encoding of the console which would affect other programs.
++    /// We would prefer to have a pattern where the program does not affect encoding of other programs.
++    /// Create this class in a function akin to Main and let it manage the console encoding resources to return it to the state before execution upon destruction.
++    /// </summary>
++    public class AutomaticEncodingRestorer : IDisposable
++    {
++        private Encoding? _originalOutputEncoding = null;
++        private Encoding? _originalInputEncoding = null;
++
++        private bool outputEncodingAccessible = false;
++        private bool inputEncodingAccessible = false;
++
++        public AutomaticEncodingRestorer()
++        {
++            try
++            {
++                if (
++#if NET7_0_OR_GREATER
++                        !OperatingSystem.IsIOS() && !OperatingSystem.IsAndroid() && !OperatingSystem.IsTvOS()) // Output + Input Encoding are unavailable on these platforms per docs.
++#else
++                        RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) // Windows is the only platform where we need to change the encoding as other platforms are UTF 8 by default.
++#endif
++                {
++                    _originalOutputEncoding = Console.OutputEncoding;
++                    outputEncodingAccessible = true;
++                    if (
++#if NET7_0_OR_GREATER
++                        !OperatingSystem.IsBrowser()) // Input Encoding is also unavailable in this platform.
++#else
++                        RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
++#endif
++                    {
++                        _originalInputEncoding = Console.InputEncoding;
++                        inputEncodingAccessible = true;
++                    }
++                }
++            }
++            catch (Exception ex) when (ex is IOException || ex is SecurityException)
++            {
++                // The encoding is unavailable. Do nothing.
++            }
++        }
++
++        public void Dispose()
++        {
++            try
++            {
++                if (outputEncodingAccessible && _originalOutputEncoding != null)
++                {
++                    Console.OutputEncoding = _originalOutputEncoding;
++                }
++                if (inputEncodingAccessible && _originalInputEncoding != null)
++                {
++                    Console.InputEncoding = _originalInputEncoding;
++                }
++            }
++            catch (Exception ex) when (ex is IOException || ex is SecurityException)
++            {
++                // The encoding is unavailable. Do nothing.
++            }
++        }
++    }
++}
+diff --git a/src/MSBuild.UnitTests/XMake_Tests.cs b/src/MSBuild.UnitTests/XMake_Tests.cs
+index 4105f40bb96..34a6f26386d 100644
+--- a/src/MSBuild.UnitTests/XMake_Tests.cs
++++ b/src/MSBuild.UnitTests/XMake_Tests.cs
+@@ -9,8 +9,8 @@
+ using System.IO.Compression;
+ using System.Linq;
+ using System.Reflection;
+-using System.Text;
+ using System.Threading;
++using Newtonsoft.Json.Linq;
+ using Microsoft.Build.CommandLine;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Logging;
+@@ -652,8 +652,8 @@ public void ConsoleUIRespectsSDKLanguage()
+             // Save the current environment info so it can be restored.
+             var originalUILanguage = Environment.GetEnvironmentVariable(DOTNET_CLI_UI_LANGUAGE);
+ 
+-            Encoding originalOutputEncoding = Console.OutputEncoding;
+-            Encoding originalInputEncoding = Console.InputEncoding;
++            var originalOutputEncoding = Console.OutputEncoding;
++            var originalInputEncoding = Console.InputEncoding;
+             Thread thisThread = Thread.CurrentThread;
+             CultureInfo originalUICulture = thisThread.CurrentUICulture;
+ 
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index ec9f2c17386..609d7058795 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -41,6 +41,8 @@
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Logging.LiveLogger;
+ using System.Runtime.InteropServices;
++using Microsoft.Win32;
++using Microsoft.Build.Utilities;
+ 
+ #nullable disable
+ 
+@@ -666,8 +668,7 @@ public static ExitType Execute(
+                 VerifyThrowSupportedOS();
+ 
+                 // Setup the console UI.
+-                Encoding originalOutputEncoding = Console.OutputEncoding;
+-                Encoding originalInputEncoding = Console.InputEncoding;
++                using AutomaticEncodingRestorer _ = new();
+                 CultureInfo originalThreadCulture = Thread.CurrentThread.CurrentUICulture;
+                 SetConsoleUI();
+ 
+@@ -838,8 +839,8 @@ public static ExitType Execute(
+                 }
+ 
+                 // The encoding may be changed to support non-en characters for environment variables set by external tools. We don't want to impact other programs on the console.
+-                Console.OutputEncoding = originalOutputEncoding;
+-                Console.InputEncoding = originalInputEncoding;
++                //Console.OutputEncoding = originalOutputEncoding;
++                //Console.InputEncoding = originalInputEncoding;
+             }
+             /**********************************************************************************************************************
+              * WARNING: Do NOT add any more catch blocks below! Exceptions should be caught as close to their point of origin as
+@@ -1691,9 +1692,8 @@ private static CultureInfo GetExternalOverridenUILanguageIfSupportableWithEncodi
+             if (externalLanguageSetting != null)
+             {
+                 if (
+-                    RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && // Encoding is only an issue on Windows
+                     !externalLanguageSetting.TwoLetterISOLanguageName.Equals("en", StringComparison.InvariantCultureIgnoreCase) &&
+-                    Environment.OSVersion.Version.Major >= 10 // UTF-8 is only officially supported on 10+.
++                    CurrentPlatformIsWindowsAndOfficiallySupportsUTF8Encoding()
+                     )
+                 {
+                     // Setting both encodings causes a change in the CHCP, making it so we dont need to P-Invoke ourselves.
+@@ -1710,10 +1710,36 @@ private static CultureInfo GetExternalOverridenUILanguageIfSupportableWithEncodi
+             return null;
+         }
+ 
++        private static bool CurrentPlatformIsWindowsAndOfficiallySupportsUTF8Encoding()
++        {
++            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && Environment.OSVersion.Version.Major >= 10) // UTF-8 is only officially supported on 10+.
++            {
++                try
++                {
++                    using RegistryKey windowsVersionRegistry = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
++                    var buildNumber = windowsVersionRegistry.GetValue("CurrentBuildNumber").ToString();
++                    const int buildNumberThatOfficialySupportsUTF8 = 18363;
++                    return int.Parse(buildNumber) >= buildNumberThatOfficialySupportsUTF8 || ForceUniversalEncodingOptInEnabled();
++                }
++                catch (Exception ex) when (ex is SecurityException || ex is ObjectDisposedException)
++                {
++                    // We don't want to break those in VS on older versions of Windows with a non-en language.
++                    // Allow those without registry permissions to force the encoding, however.
++                    return ForceUniversalEncodingOptInEnabled();
++                }
++            }
++            return false;
++        }
++
++        private static bool ForceUniversalEncodingOptInEnabled()
++        {
++            return String.Equals(Environment.GetEnvironmentVariable("DOTNET_CLI_FORCE_UTF8_ENCODING"), "true", StringComparison.OrdinalIgnoreCase);
++        }
++
+         /// <summary>
+         /// Look at UI language overrides that can be set by known external invokers. (DOTNET_CLI_UI_LANGUAGE and VSLANG).
+         /// Does NOT check System Locale or OS Display Language.
+-        /// Ported from the .NET SDK: https://github.com/dotnet/sdk/blob/4846f59fe168a343acfb84841f323fd47dd0e72c/src/Cli/Microsoft.DotNet.Cli.Utils/UILanguageOverride.cs#L53.
++        /// Ported from the .NET SDK: https://github.com/dotnet/sdk/blob/bcea1face15458814b8e53e8785b52ba464f6538/src/Cli/Microsoft.DotNet.Cli.Utils/UILanguageOverride.cs
+         /// </summary>
+         /// <returns>The custom language that was set by the user for an 'external' tool besides MSBuild.
+         /// DOTNET_CLI_UI_LANGUAGE > VSLANG. Returns null if none are set.</returns>

@@ -1,0 +1,359 @@
+diff --git a/MSBuild.Dev.slnf b/MSBuild.Dev.slnf
+index 39e25ebb5a8..79c1a4edfdf 100644
+--- a/MSBuild.Dev.slnf
++++ b/MSBuild.Dev.slnf
+@@ -9,13 +9,13 @@
+       "src\\Framework\\Microsoft.Build.Framework.csproj",
+       "src\\MSBuild.UnitTests\\Microsoft.Build.CommandLine.UnitTests.csproj",
+       "src\\MSBuild\\MSBuild.csproj",
++      "src\\StringTools\\StringTools.csproj",
+       "src\\Tasks.UnitTests\\Microsoft.Build.Tasks.UnitTests.csproj",
+       "src\\Tasks\\Microsoft.Build.Tasks.csproj",
++      "src\\UnitTests.Shared\\Microsoft.Build.UnitTests.Shared.csproj",
+       "src\\Utilities.UnitTests\\Microsoft.Build.Utilities.UnitTests.csproj",
+       "src\\Utilities\\Microsoft.Build.Utilities.csproj",
+-      "src\\Xunit.NetCore.Extensions\\Xunit.NetCore.Extensions.csproj",
+-      "src\\StringTools\\StringTools.csproj",
+-      "src\\UnitTests.Shared\\Microsoft.Build.UnitTests.Shared.csproj"
++      "src\\Xunit.NetCore.Extensions\\Xunit.NetCore.Extensions.csproj"
+     ]
+   }
+ }
+\ No newline at end of file
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
+index 361c30c4200..14f16e691f0 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckConnectorLogger.cs
+@@ -6,6 +6,7 @@
+ using System.Linq;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.BuildCheck.Acquisition;
++using Microsoft.Build.BuildCheck.Utilities;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Framework;
+ using static Microsoft.Build.BuildCheck.Infrastructure.BuildCheckManagerProvider;
+@@ -80,9 +81,6 @@ private void EventSource_AnyEventRaised(object sender, BuildEventArgs e)
+ 
+     private void EventSource_BuildFinished(object sender, BuildFinishedEventArgs e)
+     {
+-        _stats.Merge(_buildCheckManager.CreateTracingStats(), (span1, span2) => span1 + span2);
+-        string msg = string.Join(Environment.NewLine, _stats.Select(a => a.Key + ": " + a.Value));
+-
+         BuildEventContext buildEventContext = e.BuildEventContext
+             ?? new BuildEventContext(
+                 BuildEventContext.InvalidNodeId,
+@@ -92,8 +90,43 @@ private void EventSource_BuildFinished(object sender, BuildFinishedEventArgs e)
+ 
+         LoggingContext loggingContext = _loggingContextFactory.CreateLoggingContext(buildEventContext);
+ 
+-        // Tracing: https://github.com/dotnet/msbuild/issues/9629
+-        loggingContext.LogCommentFromText(MessageImportance.High, msg);
++        _stats.Merge(_buildCheckManager.CreateAnalyzerTracingStats(), (span1, span2) => span1 + span2);
++        LogAnalyzerStats(loggingContext);
++    }
++    
++    private void LogAnalyzerStats(LoggingContext loggingContext)
++    {
++        Dictionary<string, TimeSpan> infraStats = new Dictionary<string, TimeSpan>();
++        Dictionary<string, TimeSpan> analyzerStats = new Dictionary<string, TimeSpan>();
++
++        foreach (var stat in _stats)
++        {
++            if (stat.Key.StartsWith(BuildCheckConstants.infraStatPrefix))
++            {
++                string newKey = stat.Key.Substring(BuildCheckConstants.infraStatPrefix.Length);
++                infraStats[newKey] = stat.Value;
++            }
++            else
++            {
++                analyzerStats[stat.Key] = stat.Value;
++            }
++        }
++
++        BuildCheckTracingEventArgs statEvent = new BuildCheckTracingEventArgs(_stats, true)
++        { BuildEventContext = loggingContext.BuildEventContext };
++
++        loggingContext.LogBuildEvent(statEvent);
++
++        loggingContext.LogCommentFromText(MessageImportance.Low, $"BuildCheck run times{Environment.NewLine}");
++        string infraData = BuildCsvString("Infrastructure run times", infraStats);
++        loggingContext.LogCommentFromText(MessageImportance.Low, infraData);
++        string analyzerData = BuildCsvString("Analyzer run times", analyzerStats);
++        loggingContext.LogCommentFromText(MessageImportance.Low, analyzerData);
++    }
++
++    private string BuildCsvString(string title, Dictionary<string, TimeSpan> rowData)
++    {
++        return title + Environment.NewLine + String.Join(Environment.NewLine, rowData.Select(a => $"{a.Key},{a.Value}")) + Environment.NewLine;
+     }
+ 
+     private Dictionary<Type, Action<BuildEventArgs>> GetBuildEventHandlers() => new()
+@@ -102,7 +135,14 @@ private void EventSource_BuildFinished(object sender, BuildFinishedEventArgs e)
+         { typeof(ProjectEvaluationStartedEventArgs), (BuildEventArgs e) => HandleProjectEvaluationStartedEvent((ProjectEvaluationStartedEventArgs) e) },
+         { typeof(ProjectStartedEventArgs), (BuildEventArgs e) => _buildCheckManager.StartProjectRequest(BuildCheckDataSource.EventArgs, e.BuildEventContext!) },
+         { typeof(ProjectFinishedEventArgs), (BuildEventArgs e) => _buildCheckManager.EndProjectRequest(BuildCheckDataSource.EventArgs, e.BuildEventContext!) },
+-        { typeof(BuildCheckTracingEventArgs), (BuildEventArgs e) => _stats.Merge(((BuildCheckTracingEventArgs)e).TracingData, (span1, span2) => span1 + span2) },
++        { typeof(BuildCheckTracingEventArgs), (BuildEventArgs e) => 
++        {
++            if(!((BuildCheckTracingEventArgs)e).IsAggregatedGlobalReport)
++            {
++                _stats.Merge(((BuildCheckTracingEventArgs)e).TracingData, (span1, span2) => span1 + span2);
++            }
++        }
++        },
+         { typeof(BuildCheckAcquisitionEventArgs), (BuildEventArgs e) => _buildCheckManager.ProcessAnalyzerAcquisition(((BuildCheckAcquisitionEventArgs)e).ToAnalyzerAcquisitionData(), e.BuildEventContext!) },
+     };
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 33985a81707..3fadcac86b1 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Linq;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+@@ -88,15 +89,19 @@ internal BuildCheckManager(ILoggingService loggingService)
+         /// <param name="buildCheckDataSource"></param>
+         public void SetDataSource(BuildCheckDataSource buildCheckDataSource)
+         {
++            Stopwatch stopwatch = Stopwatch.StartNew();
+             if (!_enabledDataSources[(int)buildCheckDataSource])
+             {
+                 _enabledDataSources[(int)buildCheckDataSource] = true;
+                 RegisterBuiltInAnalyzers(buildCheckDataSource);
+             }
++            stopwatch.Stop();
++            _tracingReporter.AddSetDataSourceStats(stopwatch.Elapsed);
+         }
+ 
+         public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData, BuildEventContext buildEventContext)
+         {
++            Stopwatch stopwatch = Stopwatch.StartNew();
+             if (IsInProcNode)
+             {
+                 var analyzersFactories = _acquisitionModule.CreateBuildAnalyzerFactories(acquisitionData, buildEventContext);
+@@ -116,6 +121,8 @@ public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData,
+ 
+                 _loggingService.LogBuildEvent(eventArgs);
+             }
++            stopwatch.Stop();
++            _tracingReporter.AddAcquisitionStats(stopwatch.Elapsed);
+         }
+ 
+         private static T Construct<T>() where T : new() => new();
+@@ -266,7 +273,7 @@ private void SetupAnalyzersForNewProject(string projectFullPath, BuildEventConte
+             // On an execution node - we might remove and dispose the analyzers once project is done
+ 
+             // If it's already constructed - just control the custom settings do not differ
+-
++            Stopwatch stopwatch = Stopwatch.StartNew();
+             List<BuildAnalyzerFactoryContext> analyzersToRemove = new();
+             foreach (BuildAnalyzerFactoryContext analyzerFactoryContext in _analyzersRegistry)
+             {
+@@ -291,9 +298,12 @@ private void SetupAnalyzersForNewProject(string projectFullPath, BuildEventConte
+             foreach (var analyzerToRemove in analyzersToRemove.Select(a => a.MaterializedAnalyzer).Where(a => a != null))
+             {
+                 _buildCheckCentralContext.DeregisterAnalyzer(analyzerToRemove!);
+-                _tracingReporter.AddStats(analyzerToRemove!.BuildAnalyzer.FriendlyName, analyzerToRemove.Elapsed);
++                _tracingReporter.AddAnalyzerStats(analyzerToRemove!.BuildAnalyzer.FriendlyName, analyzerToRemove.Elapsed);
+                 analyzerToRemove.BuildAnalyzer.Dispose();
+             }
++
++            stopwatch.Stop();
++            _tracingReporter.AddNewProjectStats(stopwatch.Elapsed);
+         }
+ 
+         public void ProcessEvaluationFinishedEventArgs(
+@@ -302,19 +312,19 @@ public void ProcessEvaluationFinishedEventArgs(
+             => _buildEventsProcessor
+                 .ProcessEvaluationFinishedEventArgs(buildAnalysisContext, evaluationFinishedEventArgs);
+ 
+-        // Tracing: https://github.com/dotnet/msbuild/issues/9629
+-        public Dictionary<string, TimeSpan> CreateTracingStats()
++        public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats()
+         {
+             foreach (BuildAnalyzerFactoryContext analyzerFactoryContext in _analyzersRegistry)
+             {
+                 if (analyzerFactoryContext.MaterializedAnalyzer != null)
+                 {
+-                    _tracingReporter.AddStats(analyzerFactoryContext.FriendlyName,
++                    _tracingReporter.AddAnalyzerStats(analyzerFactoryContext.FriendlyName,
+                         analyzerFactoryContext.MaterializedAnalyzer.Elapsed);
+                     analyzerFactoryContext.MaterializedAnalyzer.ClearStats();
+                 }
+             }
+ 
++            _tracingReporter.AddAnalyzerInfraStats();
+             return _tracingReporter.TracingStats;
+         }
+ 
+@@ -326,9 +336,11 @@ public void FinalizeProcessing(LoggingContext loggingContext)
+                 return;
+             }
+ 
+-            BuildCheckTracingEventArgs eventArgs =
+-                new(CreateTracingStats()) { BuildEventContext = loggingContext.BuildEventContext };
+-            loggingContext.LogBuildEvent(eventArgs);
++            var analyzerEventStats = CreateAnalyzerTracingStats();
++
++            BuildCheckTracingEventArgs analyzerEventArg =
++                new(analyzerEventStats) { BuildEventContext = loggingContext.BuildEventContext };
++            loggingContext.LogBuildEvent(analyzerEventArg);
+         }
+ 
+         public void StartProjectEvaluation(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext,
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+index 331502e95e0..ca8803b99af 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+@@ -44,7 +44,7 @@ void ProcessEvaluationFinishedEventArgs(
+ 
+     void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData, BuildEventContext buildEventContext);
+ 
+-    Dictionary<string, TimeSpan> CreateTracingStats();
++    Dictionary<string, TimeSpan> CreateAnalyzerTracingStats();
+ 
+     void FinalizeProcessing(LoggingContext loggingContext);
+ 
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+index 45ed260d425..4ba7579c0ba 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+@@ -31,8 +31,6 @@ public void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData,
+     {
+     }
+ 
+-    public Dictionary<string, TimeSpan> CreateTracingStats() => throw new NotImplementedException();
+-
+     public void FinalizeProcessing(LoggingContext loggingContext)
+     {
+     }
+@@ -60,4 +58,6 @@ public void YieldProject(BuildCheckDataSource buildCheckDataSource, BuildEventCo
+     public void ResumeProject(BuildCheckDataSource buildCheckDataSource, BuildEventContext buildEventContext)
+     {
+     }
++
++    public Dictionary<string, TimeSpan> CreateAnalyzerTracingStats() => new Dictionary<string, TimeSpan>();
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/TracingReporter.cs b/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
+index 2d6d850737b..eb41e3d1214 100644
+--- a/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
++++ b/src/Build/BuildCheck/Infrastructure/TracingReporter.cs
+@@ -6,6 +6,8 @@
+ using System.Linq;
+ using System.Text;
+ using System.Threading.Tasks;
++using Microsoft.Build.BuildCheck.Utilities;
++using Microsoft.Build.Experimental.BuildCheck;
+ 
+ namespace Microsoft.Build.BuildCheck.Infrastructure;
+ 
+@@ -13,7 +15,13 @@ internal class TracingReporter
+ {
+     internal Dictionary<string, TimeSpan> TracingStats { get; } = new();
+ 
+-    public void AddStats(string name, TimeSpan subtotal)
++    // Infrastructure time keepers
++    // TODO: add more timers throughout BuildCheck run
++    private TimeSpan analyzerAcquisitionTime;
++    private TimeSpan analyzerSetDataSourceTime;
++    private TimeSpan newProjectAnalyzersTime;
++
++    public void AddAnalyzerStats(string name, TimeSpan subtotal)
+     {
+         if (TracingStats.TryGetValue(name, out TimeSpan existing))
+         {
+@@ -24,4 +32,30 @@ public void AddStats(string name, TimeSpan subtotal)
+             TracingStats[name] = subtotal;
+         }
+     }
++
++    public void AddAcquisitionStats(TimeSpan subtotal)
++    {
++        analyzerAcquisitionTime += subtotal;
++    }
++
++    public void AddSetDataSourceStats(TimeSpan subtotal)
++    {
++        analyzerSetDataSourceTime += subtotal;
++    }
++
++    public void AddNewProjectStats(TimeSpan subtotal)
++    {
++        newProjectAnalyzersTime += subtotal;
++    }
++
++    public void AddAnalyzerInfraStats()
++    {
++        var infraStats = new Dictionary<string, TimeSpan>() {
++                { $"{BuildCheckConstants.infraStatPrefix}analyzerAcquisitionTime", analyzerAcquisitionTime },
++                { $"{BuildCheckConstants.infraStatPrefix}analyzerSetDataSourceTime", analyzerSetDataSourceTime },
++                { $"{BuildCheckConstants.infraStatPrefix}newProjectAnalyzersTime", newProjectAnalyzersTime }
++            };
++
++        TracingStats.Merge(infraStats, (span1, span2) => span1 + span2);
++    }
+ }
+diff --git a/src/Build/BuildCheck/Utilities/Constants.cs b/src/Build/BuildCheck/Utilities/Constants.cs
+new file mode 100644
+index 00000000000..9ba6b58a1e6
+--- /dev/null
++++ b/src/Build/BuildCheck/Utilities/Constants.cs
+@@ -0,0 +1,19 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.BuildCheck.Utilities
++{
++    /// <summary>
++    /// Constants to be shared within BuildCheck infrastructure
++    /// </summary>
++    internal static class BuildCheckConstants
++    {
++        internal const string infraStatPrefix = "infrastructureStat_";
++    }
++}
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 1a1eedbf750..f9528b3b6d8 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -188,6 +188,7 @@
+     <Compile Include="BuildCheck\Logging\IBuildAnalysisLoggingContextFactory.cs" />
+     <Compile Include="BuildCheck\OM\EvaluatedPropertiesAnalysisData.cs" />
+     <Compile Include="BuildCheck\OM\ParsedItemsAnalysisData.cs" />
++    <Compile Include="BuildCheck\Utilities\Constants.cs" />
+     <Compile Include="BuildCheck\Utilities\EnumerableExtensions.cs" />
+     <Compile Include="Evaluation\IItemTypeDefinition.cs" />
+     <Compile Include="FileAccess\DesiredAccess.cs" />
+diff --git a/src/Framework/BuildCheck/BuildCheckEventArgs.cs b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+index b7edcb5161a..7789ba37d18 100644
+--- a/src/Framework/BuildCheck/BuildCheckEventArgs.cs
++++ b/src/Framework/BuildCheck/BuildCheckEventArgs.cs
+@@ -30,6 +30,17 @@ internal BuildCheckTracingEventArgs()
+     {
+     }
+ 
++    internal BuildCheckTracingEventArgs(Dictionary<string, TimeSpan> data, bool isAggregatedGlobalReport) : this(data)
++    {
++        IsAggregatedGlobalReport = isAggregatedGlobalReport;
++    }
++
++    /// <summary>
++    /// When true, the tracing information is from the whole build for logging purposes
++    /// When false, the tracing is being used for communication between nodes and central process
++    /// </summary>
++    public bool IsAggregatedGlobalReport { get; private set; } = false;
++
+     public Dictionary<string, TimeSpan> TracingData { get; private set; } = tracingData;
+ 
+     internal override void WriteToStream(BinaryWriter writer)

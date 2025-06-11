@@ -1,0 +1,189 @@
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 8f2d33a8d56..6ad55123bc3 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -115,8 +115,8 @@ public MSBuildClient(string exeLocation, string dllLocation)
+         /// or the manner in which it failed.</returns>
+         public MSBuildClientExitResult Execute(string commandLine, CancellationToken cancellationToken)
+         {
+-            string serverRunningMutexName = $@"{ServerNamedMutex.RunningServerMutexNamePrefix}{_pipeName}";
+-            string serverBusyMutexName = $@"{ServerNamedMutex.BusyServerMutexNamePrefix}{_pipeName}";
++            string serverRunningMutexName = OutOfProcServerNode.GetRunningServerMutexName(_handshake);
++            string serverBusyMutexName = OutOfProcServerNode.GetBusyServerMutexName(_handshake);
+ 
+             // Start server it if is not running.
+             bool serverIsAlreadyRunning = ServerNamedMutex.WasOpen(serverRunningMutexName);
+@@ -213,7 +213,7 @@ public MSBuildClientExitResult Execute(string commandLine, CancellationToken can
+         /// <returns> Whether MSBuild server was started successfully.</returns>
+         private bool TryLaunchServer()
+         {
+-            string serverLaunchMutexName = $@"Global\server-launch-{_pipeName}";
++            string serverLaunchMutexName = $@"Global\server-launch-{_handshake.ComputeHash()}";
+             using var serverLaunchMutex = ServerNamedMutex.OpenOrCreateMutex(serverLaunchMutexName, out bool mutexCreatedNew);
+             if (!mutexCreatedNew)
+             {
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index ec334e698b5..b667e7a60f2 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -378,7 +378,7 @@ private void ValidateRemotePipeSecurityOnWindows(NamedPipeClientStream nodeStrea
+         private Stream TryConnectToProcess(int nodeProcessId, int timeout, Handshake handshake)
+         {
+             // Try and connect to the process.
+-            string pipeName = NamedPipeUtil.GetPipeNameOrPath(nodeProcessId);
++            string pipeName = NamedPipeUtil.GetPlatformSpecificPipeName(nodeProcessId);
+ 
+             NamedPipeClientStream nodeStream = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous
+ #if FEATURE_PIPEOPTIONS_CURRENTUSERONLY
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index eb8edeec7dc..25b39f379be 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -77,32 +77,29 @@ public OutOfProcServerNode(Func<string, (int exitCode, string exitType)> buildFu
+         }
+ 
+         #region INode Members
+-
++        
+         /// <summary>
+         /// Starts up the node and processes messages until the node is requested to shut down.
+         /// </summary>
+-        /// <param name="shutdownException">The exception which caused shutdown, if any.</param>
++        /// <param name="shutdownException">The exception which caused shutdown, if any.</param> 
+         /// <returns>The reason for shutting down.</returns>
+         public NodeEngineShutdownReason Run(out Exception? shutdownException)
+         {
+             var handshake = new ServerNodeHandshake(
+                 CommunicationsUtilities.GetHandshakeOptions(taskHost: false, architectureFlagToSet: XMakeAttributes.GetCurrentMSBuildArchitecture()));
+ 
+-            string pipeName = GetPipeName(handshake);
+-
+-            string serverRunningMutexName = $@"{ServerNamedMutex.RunningServerMutexNamePrefix}{pipeName}";
+-            _serverBusyMutexName = $@"{ServerNamedMutex.BusyServerMutexNamePrefix}{pipeName}";
++            _serverBusyMutexName = GetBusyServerMutexName(handshake);
+ 
+-            // TODO: shall we address possible race condition. It is harmless as it, with acceptable probability, just cause unnecessary process spawning
+-            // and of two processes will become victim and fails, build will not be affected
+-            using var serverRunningMutex = ServerNamedMutex.OpenOrCreateMutex(serverRunningMutexName, out bool mutexCreatedNew);
++            // Handled race condition. If two processes spawn to start build Server one will die while
++            // one Server client connects to the other one and run build on it.
++            using var serverRunningMutex = ServerNamedMutex.OpenOrCreateMutex(GetRunningServerMutexName(handshake), out bool mutexCreatedNew);
+             if (!mutexCreatedNew)
+             {
+                 shutdownException = new InvalidOperationException("MSBuild server is already running!");
+                 return NodeEngineShutdownReason.Error;
+             }
+ 
+-            _nodeEndpoint = new ServerNodeEndpointOutOfProc(pipeName, handshake);
++            _nodeEndpoint = new ServerNodeEndpointOutOfProc(GetPipeName(handshake), handshake);
+             _nodeEndpoint.OnLinkStatusChanged += OnLinkStatusChanged;
+             _nodeEndpoint.Listen(this);
+ 
+@@ -137,7 +134,14 @@ public NodeEngineShutdownReason Run(out Exception? shutdownException)
+ 
+         #endregion
+ 
+-        internal static string GetPipeName(ServerNodeHandshake handshake) => NamedPipeUtil.GetPipeNameOrPath("MSBuildServer-" + handshake.ComputeHash());
++        internal static string GetPipeName(ServerNodeHandshake handshake)
++            => NamedPipeUtil.GetPlatformSpecificPipeName($"MSBuildServer-{handshake.ComputeHash()}");
++
++        internal static string GetRunningServerMutexName(ServerNodeHandshake handshake)
++            => $@"Global\server-running-{handshake.ComputeHash()}";
++
++        internal static string GetBusyServerMutexName(ServerNodeHandshake handshake)
++            => $@"Global\server-busy-{handshake.ComputeHash()}";
+ 
+         #region INodePacketFactory Members
+ 
+diff --git a/src/Build/BackEnd/Node/ServerNamedMutex.cs b/src/Build/BackEnd/Node/ServerNamedMutex.cs
+index e149cda704b..2d6ab100d10 100644
+--- a/src/Build/BackEnd/Node/ServerNamedMutex.cs
++++ b/src/Build/BackEnd/Node/ServerNamedMutex.cs
+@@ -8,9 +8,6 @@ namespace Microsoft.Build.Execution
+ {
+     internal sealed class ServerNamedMutex : IDisposable
+     {
+-        public const string RunningServerMutexNamePrefix = @"Global\server-running-";
+-        public const string BusyServerMutexNamePrefix = @"Global\server-busy-";
+-
+         private readonly Mutex _serverMutex;
+ 
+         public bool IsDisposed { get; private set; }
+diff --git a/src/Shared/CommunicationsUtilities.cs b/src/Shared/CommunicationsUtilities.cs
+index 131a64a0786..50e34e2bc2a 100644
+--- a/src/Shared/CommunicationsUtilities.cs
++++ b/src/Shared/CommunicationsUtilities.cs
+@@ -136,6 +136,11 @@ public virtual int[] RetrieveHandshakeComponents()
+ 
+     internal sealed class ServerNodeHandshake : Handshake
+     {
++        /// <summary>
++        /// Caching computed hash.
++        /// </summary>
++        private string _computedHash = null;
++
+         public override byte? ExpectedVersionInFirstByte => null;
+ 
+         internal ServerNodeHandshake(HandshakeOptions nodeType)
+@@ -178,12 +183,16 @@ public override string GetKey()
+         /// </summary>
+         public string ComputeHash()
+         {
+-            var input = GetKey();
+-            using var sha = SHA256.Create();
+-            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
+-            return Convert.ToBase64String(bytes)
+-                .Replace("/", "_")
+-                .Replace("=", string.Empty);
++            if (_computedHash == null)
++            {
++                var input = GetKey();
++                using var sha = SHA256.Create();
++                var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
++                _computedHash = Convert.ToBase64String(bytes)
++                    .Replace("/", "_")
++                    .Replace("=", string.Empty);
++            }
++            return _computedHash;
+         }
+     }
+ 
+diff --git a/src/Shared/NamedPipeUtil.cs b/src/Shared/NamedPipeUtil.cs
+index 9db07e16722..dfc76317e84 100644
+--- a/src/Shared/NamedPipeUtil.cs
++++ b/src/Shared/NamedPipeUtil.cs
+@@ -8,7 +8,7 @@ namespace Microsoft.Build.Shared
+ {
+     internal static class NamedPipeUtil
+     {
+-        internal static string GetPipeNameOrPath(int? processId = null)
++        internal static string GetPlatformSpecificPipeName(int? processId = null)
+         {
+             if (processId is null)
+             {
+@@ -17,10 +17,10 @@ internal static string GetPipeNameOrPath(int? processId = null)
+ 
+             string pipeName = $"MSBuild{processId}";
+ 
+-            return GetPipeNameOrPath(pipeName);
++            return GetPlatformSpecificPipeName(pipeName);
+         }
+ 
+-        internal static string GetPipeNameOrPath(string pipeName)
++        internal static string GetPlatformSpecificPipeName(string pipeName)
+         {
+             if (NativeMethodsShared.IsUnixLike)
+             {
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index 9b15f5baf2f..6477869dc05 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -195,7 +195,7 @@ internal void InternalConstruct(string pipeName = null)
+             _packetStream = new MemoryStream();
+             _binaryWriter = new BinaryWriter(_packetStream);
+ 
+-            pipeName ??= NamedPipeUtil.GetPipeNameOrPath();
++            pipeName ??= NamedPipeUtil.GetPlatformSpecificPipeName();
+ 
+ #if FEATURE_PIPE_SECURITY && FEATURE_NAMED_PIPE_SECURITY_CONSTRUCTOR
+             if (!NativeMethodsShared.IsMono)

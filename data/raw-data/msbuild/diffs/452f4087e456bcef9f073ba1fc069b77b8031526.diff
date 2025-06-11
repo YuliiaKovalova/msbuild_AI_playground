@@ -1,0 +1,1071 @@
+diff --git a/documentation/wiki/ChangeWaves.md b/documentation/wiki/ChangeWaves.md
+index 16823e9cd00..b7508160ef6 100644
+--- a/documentation/wiki/ChangeWaves.md
++++ b/documentation/wiki/ChangeWaves.md
+@@ -33,6 +33,7 @@ A wave of features is set to "rotate out" (i.e. become standard functionality) t
+ - [Load Microsoft.DotNet.MSBuildSdkResolver into default load context (MSBuild.exe only)](https://github.com/dotnet/msbuild/pull/9439)
+ - [Load NuGet.Frameworks into secondary AppDomain (MSBuild.exe only)](https://github.com/dotnet/msbuild/pull/9446)
+ - [Update Traits when environment has been changed](https://github.com/dotnet/msbuild/pull/9655)
++- [Exec task does not trim leading whitespaces for ConsoleOutput](https://github.com/dotnet/msbuild/pull/9722)
+ 
+ 
+ ### 17.8
+diff --git a/src/Build.UnitTests/BackEnd/SdkResolverService_Tests.cs b/src/Build.UnitTests/BackEnd/SdkResolverService_Tests.cs
+index 831ec4a4091..d15bd7d203d 100644
+--- a/src/Build.UnitTests/BackEnd/SdkResolverService_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/SdkResolverService_Tests.cs
+@@ -24,7 +24,7 @@
+ 
+ namespace Microsoft.Build.Engine.UnitTests.BackEnd
+ {
+-    public class SdkResolverService_Tests
++    public class SdkResolverService_Tests : IDisposable
+     {
+         private readonly MockLogger _logger;
+         private readonly LoggingContext _loggingContext;
+@@ -40,6 +40,11 @@ public SdkResolverService_Tests()
+                 new BuildEventContext(0, 0, BuildEventContext.InvalidProjectContextId, 0, 0));
+         }
+ 
++        public void Dispose()
++        {
++            SdkResolverService.Instance.InitializeForTests();
++        }
++
+         [Fact]
+         // Scenario: Sdk is not resolved.
+         public void AssertAllResolverErrorsLoggedWhenSdkNotResolved()
+@@ -252,6 +257,29 @@ public void AssertResolverStateNotPreserved()
+             SdkResolverService.Instance.ResolveSdk(submissionId, sdk, _loggingContext, new MockElementLocation("file"), "sln", "projectPath", interactive: false, isRunningInVisualStudio: false, failOnUnresolvedSdk: true).Path.ShouldBe("resolverpath");
+         }
+ 
++        [Fact]
++        public void AssertResolversLoadedIfDefaultResolverSucceeds()
++        {
++            const int submissionId = BuildEventContext.InvalidSubmissionId;
++
++            MockLoaderStrategy mockLoaderStrategy = new MockLoaderStrategy(includeDefaultResolver: true);
++            SdkResolverService.Instance.InitializeForTests(mockLoaderStrategy);
++
++            SdkReference sdk = new SdkReference("notfound", "1.0", "minimumVersion");
++
++            SdkResolverService.Instance.ResolveSdk(submissionId, sdk, _loggingContext, new MockElementLocation("file"), "sln", "projectPath", interactive: false, isRunningInVisualStudio: false, failOnUnresolvedSdk: true).Path.ShouldBe("defaultpath");
++
++#if NETCOREAPP
++            // On Core, we check the default resolver *first*, so regular resolvers are not loaded.
++            mockLoaderStrategy.ResolversHaveBeenLoaded.ShouldBeFalse();
++            mockLoaderStrategy.ManifestsHaveBeenLoaded.ShouldBeFalse();
++#else
++            // On Framework, the default resolver is a fallback, so regular resolvers will have been loaded.
++            mockLoaderStrategy.ResolversHaveBeenLoaded.ShouldBeTrue();
++            mockLoaderStrategy.ManifestsHaveBeenLoaded.ShouldBeTrue();
++#endif
++        }
++
+         [Theory]
+         [InlineData(null, "1.0", true)]
+         [InlineData("1.0", "1.0", true)]
+@@ -622,10 +650,13 @@ public void IsRunningInVisualStudioIsSetForResolverContext()
+         private sealed class MockLoaderStrategy : SdkResolverLoader
+         {
+             private List<SdkResolver> _resolvers;
++            private List<SdkResolver> _defaultResolvers;
+             private List<(string ResolvableSdkPattern, SdkResolver Resolver)> _resolversWithPatterns;
+ 
++            public bool ResolversHaveBeenLoaded { get; private set; } = false;
++            public bool ManifestsHaveBeenLoaded { get; private set; } = false;
+ 
+-            public MockLoaderStrategy(bool includeErrorResolver = false, bool includeResolversWithPatterns = false) : this()
++            public MockLoaderStrategy(bool includeErrorResolver = false, bool includeResolversWithPatterns = false, bool includeDefaultResolver = false) : this()
+             {
+                 if (includeErrorResolver)
+                 {
+@@ -637,6 +668,11 @@ public MockLoaderStrategy(bool includeErrorResolver = false, bool includeResolve
+                     _resolversWithPatterns.Add(("1.*", new MockSdkResolverWithResolvableSdkPattern1()));
+                     _resolversWithPatterns.Add((".*", new MockSdkResolverWithResolvableSdkPattern2()));
+                 }
++
++                if (includeDefaultResolver)
++                {
++                    _defaultResolvers.Add(new MockSdkResolverDefault());
++                }
+             }
+ 
+             private MockLoaderStrategy()
+@@ -649,16 +685,22 @@ private MockLoaderStrategy()
+                     new MockSdkResolverWithState()
+                 };
+ 
++                _defaultResolvers = new List<SdkResolver>();
++
+                 _resolversWithPatterns = new List<(string ResolvableSdkPattern, SdkResolver Resolver)>();
+             }
+ 
+             internal override IReadOnlyList<SdkResolver> LoadAllResolvers(ElementLocation location)
+             {
++                ResolversHaveBeenLoaded = true;
++
+                 return _resolvers.OrderBy(i => i.Priority).ToList();
+             }
+ 
+             internal override IReadOnlyList<SdkResolverManifest> GetResolversManifests(ElementLocation location)
+             {
++                ManifestsHaveBeenLoaded = true;
++
+                 var manifests = new List<SdkResolverManifest>();
+                 foreach (SdkResolver resolver in _resolvers)
+                 {
+@@ -678,6 +720,8 @@ internal override IReadOnlyList<SdkResolverManifest> GetResolversManifests(Eleme
+ 
+             protected internal override IReadOnlyList<SdkResolver> LoadResolversFromManifest(SdkResolverManifest manifest, ElementLocation location)
+             {
++                ResolversHaveBeenLoaded = true;
++
+                 var resolvers = new List<SdkResolver>();
+                 foreach (var resolver in _resolvers)
+                 {
+@@ -698,7 +742,7 @@ protected internal override IReadOnlyList<SdkResolver> LoadResolversFromManifest
+ 
+             internal override IReadOnlyList<SdkResolver> GetDefaultResolvers()
+             {
+-                return new List<SdkResolver>();
++                return _defaultResolvers;
+             }
+         }
+ 
+@@ -824,5 +868,18 @@ public override SdkResultBase Resolve(SdkReference sdk, SdkResolverContextBase r
+                 throw new ArithmeticException("EXMESSAGE");
+             }
+         }
++
++        private sealed class MockSdkResolverDefault : SdkResolver
++        {
++            public override string Name => nameof(MockSdkResolverDefault);
++            public override int Priority => 9999;
++
++            public override SdkResultBase Resolve(SdkReference sdk, SdkResolverContextBase resolverContext, SdkResultFactoryBase factory)
++            {
++                resolverContext.Logger.LogMessage("MockSdkResolverDefault running", MessageImportance.Normal);
++
++                return factory.IndicateSuccess("defaultpath", string.Empty);
++            }
++        }
+     }
+ }
+diff --git a/src/Build.UnitTests/Evaluation/Evaluator_Tests.cs b/src/Build.UnitTests/Evaluation/Evaluator_Tests.cs
+index 44a21a2321f..286d08a84a5 100644
+--- a/src/Build.UnitTests/Evaluation/Evaluator_Tests.cs
++++ b/src/Build.UnitTests/Evaluation/Evaluator_Tests.cs
+@@ -914,6 +914,31 @@ public void MultipleImportsVerifyImportsIncludingDuplicates()
+             }
+         }
+ 
++        [DotNetOnlyFact("Tests .NET SDK-only error")]
++        public void ImportWithVSPathThrowsCorrectError()
++        {
++            string importPath = null;
++
++            using (TestEnvironment env = TestEnvironment.Create())
++            {
++                // Does not matter that the file or folder does not exist, we are checking for the VS pathing here
++                importPath = "path\\that\\does\\not\\exist\\Microsoft\\VisualStudio\\FileName.txt";
++
++                var content = env.CreateTestProjectWithFiles(@"
++                    <Project ToolsVersion=""msbuilddefaulttoolsversion"" xmlns='msbuildnamespace' >
++                        <Import Project='" + importPath + @"'/>
++                    </Project>
++                ");
++
++                InvalidProjectFileException ex = Assert.Throws<InvalidProjectFileException>(() =>
++                {
++                        Project project = new Project(content.ProjectFile, null, null);
++                });
++
++                Assert.Contains("MSB4278", ex.ErrorCode);
++            }
++        }
++
+         /// <summary>
+         /// RecordDuplicateButNotCircularImports should not record circular imports (which do come under the category of "duplicate imports".
+         /// </summary>
+diff --git a/src/Build.UnitTests/Evaluation/ItemEvaluation_Tests.cs b/src/Build.UnitTests/Evaluation/ItemEvaluation_Tests.cs
+index 67b41b392cf..7f2cee834f7 100644
+--- a/src/Build.UnitTests/Evaluation/ItemEvaluation_Tests.cs
++++ b/src/Build.UnitTests/Evaluation/ItemEvaluation_Tests.cs
+@@ -562,8 +562,9 @@ public void LazyWildcardExpansionDoesNotEvaluateWildCardsIfNotReferenced()
+ <Project>
+    <Import Project=`foo/*.props`/>
+    <ItemGroup>
+-      <i Include=`**/foo/**/*.cs`/>
+-      <i2 Include=`**/bar/**/*.cs`/>
++      <i Include=`**/foo/**/*.cs` />
++      <i2 Include=`**/bar/**/*.cs` />
++      <i3 Include=`**/yyy/**/*.cs` Exclude=`mock-value` />
+    </ItemGroup>
+ 
+    <ItemGroup>
+@@ -584,11 +585,11 @@ public void LazyWildcardExpansionDoesNotEvaluateWildCardsIfNotReferenced()
+ ".Cleanup();
+             using (var env = TestEnvironment.Create())
+             {
+-                var projectFiles = env.CreateTestProjectWithFiles(content, new[] { "foo/extra.props", "foo/a.cs", "foo/b.cs", "bar/c.cs", "bar/d.cs" });
++                var projectFiles = env.CreateTestProjectWithFiles(content, new[] { "foo/extra.props", "foo/a.cs", "foo/b.cs", "bar/c.cs", "bar/d.cs", "yyy/d.cs" });
+ 
+                 File.WriteAllText(projectFiles.CreatedFiles[0], import);
+ 
+-                env.SetEnvironmentVariable("MsBuildSkipEagerWildCardEvaluationRegexes", ".*foo.*");
++                env.SetEnvironmentVariable("MsBuildSkipEagerWildCardEvaluationRegexes", ".*foo.*;.*yyy*.");
+ 
+                 EngineFileUtilities.CaptureLazyWildcardRegexes();
+ 
+@@ -596,6 +597,7 @@ public void LazyWildcardExpansionDoesNotEvaluateWildCardsIfNotReferenced()
+ 
+                 Assert.Equal("true", project.GetPropertyValue("FromImport"));
+                 Assert.Equal("**/foo/**/*.cs", project.GetConcatenatedItemsOfType("i"));
++                Assert.Equal("**/yyy/**/*.cs", project.GetConcatenatedItemsOfType("i3"));
+ 
+                 var expectedItems = "bar\\c.cs;bar\\d.cs";
+ 
+diff --git a/src/Build.UnitTests/Evaluation/ProjectSdkImplicitImport_Tests.cs b/src/Build.UnitTests/Evaluation/ProjectSdkImplicitImport_Tests.cs
+index 7f026071d8c..3b46c282d24 100644
+--- a/src/Build.UnitTests/Evaluation/ProjectSdkImplicitImport_Tests.cs
++++ b/src/Build.UnitTests/Evaluation/ProjectSdkImplicitImport_Tests.cs
+@@ -624,6 +624,9 @@ internal void SdkPropertiesAreExpanded(SdkPropertiesAreExpandedCase data)
+         {
+             _env.SetEnvironmentVariable("MSBuildSDKsPath", _testSdkRoot);
+             _env.SetEnvironmentVariable("MSBUILD_SDKREFERENCE_PROPERTY_EXPANSION_MODE", data.Mode.ToString());
++            _env.SetEnvironmentVariable("MSBUILDINCLUDEDEFAULTSDKRESOLVER", "false");
++
++            Build.BackEnd.SdkResolution.CachingSdkResolverLoader.ResetStateForTests();
+ 
+             File.WriteAllText(_sdkPropsPath, _sdkPropsContent);
+             File.WriteAllText(_sdkTargetsPath, _sdkTargetsContent);
+@@ -804,6 +807,7 @@ public override SdkResult Resolve(SdkReference sdk, SdkResolverContext resolverC
+         public void Dispose()
+         {
+             _env.Dispose();
++            Build.BackEnd.SdkResolution.CachingSdkResolverLoader.ResetStateForTests();
+         }
+ 
+         private void VerifyPropertyFromImplicitImport(Project project, string propertyName, string expectedContainingProjectPath, string expectedValue)
+diff --git a/src/Build/BackEnd/Components/SdkResolution/CachingSdkResolverLoader.cs b/src/Build/BackEnd/Components/SdkResolution/CachingSdkResolverLoader.cs
+index 4c765982f88..3e2536873a7 100644
+--- a/src/Build/BackEnd/Components/SdkResolution/CachingSdkResolverLoader.cs
++++ b/src/Build/BackEnd/Components/SdkResolution/CachingSdkResolverLoader.cs
+@@ -57,6 +57,15 @@ public CachingSdkResolverLoader()
+             _defaultResolvers = base.GetDefaultResolvers();
+         }
+ 
++        /// <summary>
++        /// Resets the cached state, intended for tests only.
++        /// </summary>
++        internal static void ResetStateForTests()
++        {
++            // Re-create the singleton to pick up environmental changes.
++            Instance = new CachingSdkResolverLoader();
++        }
++
+         #region SdkResolverLoader overrides
+ 
+         /// <inheritdoc />
+@@ -87,5 +96,6 @@ protected internal override IReadOnlyList<SdkResolver> LoadResolversFromManifest
+         }
+ 
+         #endregion
++
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/SdkResolution/SdkResolverService.cs b/src/Build/BackEnd/Components/SdkResolution/SdkResolverService.cs
+index 79c899b4dc2..56ff6299a87 100644
+--- a/src/Build/BackEnd/Components/SdkResolution/SdkResolverService.cs
++++ b/src/Build/BackEnd/Components/SdkResolution/SdkResolverService.cs
+@@ -118,6 +118,53 @@ public virtual void ClearCaches()
+         /// <inheritdoc cref="ISdkResolverService.ResolveSdk"/>
+         public virtual SdkResult ResolveSdk(int submissionId, SdkReference sdk, LoggingContext loggingContext, ElementLocation sdkReferenceLocation, string solutionPath, string projectPath, bool interactive, bool isRunningInVisualStudio, bool failOnUnresolvedSdk)
+         {
++            // If we are running in .NET core, we ask the built-in default resolver first.
++            // - It is a perf optimization (no need to discover and load any of the plug-in assemblies to resolve an "in-box" Sdk).
++            // - It brings `dotnet build` to parity with `MSBuild.exe` functionally, as the Framework build of Microsoft.DotNet.MSBuildSdkResolver
++            //   contains the same logic and it is the first resolver in priority order.
++            //
++            // In an attempt to avoid confusion, this text uses "SDK" to refer to the installation unit, e.g. "C:\Program Files\dotnet\sdk\8.0.100",
++            // and "Sdk" to refer to the set of imports for targeting a specific project type, e.g. "Microsoft.NET.Sdk.Web".
++            //
++            // Here's the flow on Framework (`MSBuild.exe`):
++            // 1. Microsoft.DotNet.MSBuildSdkResolver is loaded and asked to resolve the Sdk required by the project.
++            //    1.1. It resolves the SDK (as in installation directory) using machine-wide state and global.json.
++            //    1.2. It checks the Sdks subdirectory of the SDK installation directory for a matching in-box Sdk.
++            //    1.3. If no match, checks installed workloads.
++            // 2. If no match so far, Microsoft.Build.NuGetSdkResolver is loaded and asked to resolve the Sdk.
++            // 3. If no match still, DefaultSdkResolver checks the Sdks subdirectory of the Visual Studio\MSBuild directory.
++            //
++            // Here's the flow on Core (`dotnet build`):
++            // 1. DefaultSdkResolver checks the Sdks subdirectory of our SDK installation. Note that the work of resolving the
++            //    SDK version using machine-wide state and global.json (step 1.1. in `MSBuild.exe` above) has already been done
++            //    by the `dotnet` muxer. We know which SDK (capital letters) we are in, so the in-box Sdk lookup is trivial.
++            // 2. If no match, Microsoft.NET.Sdk.WorkloadMSBuildSdkResolver is loaded and asked to resolve the Sdk required by the project.
++            //    2.1. It checks installed workloads.
++            // 3. If no match still, Microsoft.Build.NuGetSdkResolver is loaded and asked to resolve the Sdk.
++            //
++            // Overall, while Sdk resolvers look like a general plug-in system, there are good reasons why some of the logic is hard-coded.
++            // It's not really meant to be modified outside of very special/internal scenarios.
++#if NETCOREAPP
++            if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_10))
++            {
++                if (TryResolveSdkUsingSpecifiedResolvers(
++                    _sdkResolverLoader.GetDefaultResolvers(),
++                    BuildEventContext.InvalidSubmissionId, // disables GetResolverState/SetResolverState
++                    sdk,
++                    loggingContext,
++                    sdkReferenceLocation,
++                    solutionPath,
++                    projectPath,
++                    interactive,
++                    isRunningInVisualStudio,
++                    out SdkResult sdkResult,
++                    out _,
++                    out _))
++                {
++                    return sdkResult;
++                }
++            }
++#endif
+             if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_4))
+             {
+                 return ResolveSdkUsingResolversWithPatternsFirst(submissionId, sdk, loggingContext, sdkReferenceLocation, solutionPath, projectPath, interactive, isRunningInVisualStudio, failOnUnresolvedSdk);
+@@ -398,6 +445,10 @@ internal void InitializeForTests(SdkResolverLoader resolverLoader = null, IReadO
+             {
+                 _sdkResolverLoader = resolverLoader;
+             }
++            else
++            {
++                _sdkResolverLoader = CachingSdkResolverLoader.Instance;
++            }
+ 
+             _specificResolversManifestsRegistry = null;
+             _generalResolversManifestsRegistry = null;
+@@ -486,15 +537,20 @@ private void RegisterResolversManifests(ElementLocation location)
+ 
+                 _manifestToResolvers = new Dictionary<SdkResolverManifest, IReadOnlyList<SdkResolver>>();
+ 
+-                // Load and add the manifest for the default resolvers, located directly in this dll.
+-                IReadOnlyList<SdkResolver> defaultResolvers = _sdkResolverLoader.GetDefaultResolvers();
+                 SdkResolverManifest sdkDefaultResolversManifest = null;
+-                if (defaultResolvers.Count > 0)
++#if NETCOREAPP
++                if (!ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_10))
++#endif
+                 {
+-                    MSBuildEventSource.Log.SdkResolverServiceLoadResolversStart();
+-                    sdkDefaultResolversManifest = new SdkResolverManifest(DisplayName: "DefaultResolversManifest", Path: null, ResolvableSdkRegex: null);
+-                    _manifestToResolvers[sdkDefaultResolversManifest] = defaultResolvers;
+-                    MSBuildEventSource.Log.SdkResolverServiceLoadResolversStop(sdkDefaultResolversManifest.DisplayName ?? string.Empty, defaultResolvers.Count);
++                    // Load and add the manifest for the default resolvers, located directly in this dll.
++                    IReadOnlyList<SdkResolver> defaultResolvers = _sdkResolverLoader.GetDefaultResolvers();
++                    if (defaultResolvers.Count > 0)
++                    {
++                        MSBuildEventSource.Log.SdkResolverServiceLoadResolversStart();
++                        sdkDefaultResolversManifest = new SdkResolverManifest(DisplayName: "DefaultResolversManifest", Path: null, ResolvableSdkRegex: null);
++                        _manifestToResolvers[sdkDefaultResolversManifest] = defaultResolvers;
++                        MSBuildEventSource.Log.SdkResolverServiceLoadResolversStop(sdkDefaultResolversManifest.DisplayName ?? string.Empty, defaultResolvers.Count);
++                    }
+                 }
+ 
+                 MSBuildEventSource.Log.SdkResolverServiceFindResolversManifestsStop(allResolversManifests.Count);
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index e048e5dd371..5ba4caef172 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -2304,6 +2304,8 @@ private LoadImportsResult ExpandAndLoadImportsFromUnescapedImportExpression(stri
+                                 continue;
+                             }
+ 
++                            VerifyVSDistributionPath(importElement.Project, importLocationInProject);
++
+                             ProjectErrorUtilities.ThrowInvalidProject(importLocationInProject, "ImportedProjectNotFound",
+                                                                       importFileUnescaped, importExpressionEscaped);
+                         }
+@@ -2577,6 +2579,8 @@ private void ThrowForImportedProjectWithSearchPathsNotFound(ProjectImportPathMat
+ 
+             string stringifiedListOfSearchPaths = StringifyList(onlyFallbackSearchPaths);
+ 
++            VerifyVSDistributionPath(importElement.Project, importElement.ProjectLocation);
++
+ #if FEATURE_SYSTEM_CONFIGURATION
+             string configLocation = AppDomain.CurrentDomain.SetupInformation.ConfigurationFile;
+ 
+@@ -2640,6 +2644,16 @@ private void SetAllProjectsProperty()
+                     mayBeReserved: false);
+             }
+         }
++
++        [Conditional("FEATURE_GUIDE_TO_VS_ON_UNSUPPORTED_PROJECTS")]
++        private void VerifyVSDistributionPath(string path, ElementLocation importLocationInProject)
++        {
++            if (path.IndexOf("Microsoft\\VisualStudio", StringComparison.OrdinalIgnoreCase) >= 0
++                || path.IndexOf("Microsoft/VisualStudio", StringComparison.OrdinalIgnoreCase) >= 0)
++            {
++                ProjectErrorUtilities.ThrowInvalidProject(importLocationInProject, "ImportedProjectFromVSDistribution", path);
++            }
++        }
+     }
+ 
+     /// <summary>
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index e0204681dca..6dbe8ad2c32 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -534,6 +534,10 @@
+     <value>MSB4019: The imported project "{0}" was not found. Confirm that the expression in the Import declaration "{1}" is correct, and that the file exists on disk.</value>
+     <comment>{StrBegin="MSB4019: "}LOCALIZATION: &lt;Import&gt; should not be localized.</comment>
+   </data>
++  <data name="ImportedProjectFromVSDistribution" xml:space="preserve">
++    <value>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </value>
++    <comment>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</comment>
++  </data>
+   <data name="ImportedProjectFromExtensionsPathNotFoundFromAppConfig" xml:space="preserve">
+     <value>MSB4226: The imported project "{0}" was not found. Also, tried to find "{1}" in the fallback search path(s) for {2} - {3} . These search paths are defined in "{4}". Confirm that the path in the &lt;Import&gt; declaration is correct, and that the file exists on disk in one of the search paths.</value>
+     <comment>{StrBegin="MSB4226: "}LOCALIZATION: &lt;Import&gt; should not be localized.</comment>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index c9ec6a6fddd..04049906e36 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: Na pozici {1} podmínky {0} je neočekávaná mezera. Nezapomněli jste ji odebrat?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index c107047505e..ea46bf46b82 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: Unerwartetes Leerzeichen an Position "{1}" der Bedingung "{0}". Haben Sie vergessen, ein Leerzeichen zu entfernen?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 56ed4dccfd7..8f4049417d9 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: Espacio inesperado en la posición "{1}" de la condición "{0}". ¿Olvidó quitar un espacio?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 55eff94f199..e73e949479c 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: espace inattendu à la position "{1}" de la condition "{0}". Avez-vous oublié de supprimer un espace ?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index cab3a25148a..1b1574c0c22 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: spazio imprevisto alla posizione "{1}" della condizione "{0}". Si è dimenticato di rimuovere uno spazio?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 83b60f86651..0f75ce39980 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: 条件 "{0}" の位置 "{1}" に予期しないスペースがあります。スペースを削除したか確認してください。</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 44d241a2598..064b07a0899 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: "{0}" 조건의 "{1}" 위치에 예기치 않은 공백이 있습니다. 공백을 제거했는지 확인하세요.</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index bb26b0a81e7..79d50915abb 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: Nieoczekiwana spacja na pozycji „{1}” warunku „{0}”. Czy zapomniano o usunięciu spacji?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index e51917d8393..fe4993e333f 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: espaço inesperado na posição "{1}" da condição "{0}". Você esqueceu de remover um espaço?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index c56d2e16208..3c40e2a59ce 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: неожиданный пробел в позиции "{1}" условия "{0}". Вы забыли удалить пробел?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 75517f3b4df..91d2792f907 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: "{0}" koşulunun "{1}" konumunda beklenmeyen boşluk var. Boşluğu kaldırmayı unutmuş olabilirsiniz.</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index edfaaee96c8..afa03fb641f 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: 在条件“{0}”的位置“{1}”处出现意外空格。是否忘记了删除空格?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 4845b358521..cd07bc4b1fb 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -268,6 +268,11 @@
+         <target state="translated">MSB4259: 條件 "{0}" 的位置 "{1}" 出現非預期的空格。忘記移除空格了嗎?</target>
+         <note>{StrBegin="MSB4259: "}</note>
+       </trans-unit>
++      <trans-unit id="ImportedProjectFromVSDistribution">
++        <source>MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </source>
++        <target state="new">MSB4278: The imported file "{0}" does not exist and appears to be part of a Visual Studio component. This file may require MSBuild.exe in order to be imported successfully, and so may fail to build in the dotnet CLI. </target>
++        <note>{StrBegin="MSB4278: "}LOCALIZATION: &lt;Import&gt; should not be localized.</note>
++      </trans-unit>
+       <trans-unit id="IncompatibleBinaryLoggerConfiguration">
+         <source>MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</source>
+         <target state="new">MSB4278: Incompatible binary logger parameter(s) provided: Only one of the provided configuration should be present for binary logger: binlog file argument of binaryLogger switch or uniqueFileName of binaryLoggerParameter switch.</target>
+diff --git a/src/Build/Utilities/EngineFileUtilities.cs b/src/Build/Utilities/EngineFileUtilities.cs
+index 5942dad9bad..e2d3c40a131 100644
+--- a/src/Build/Utilities/EngineFileUtilities.cs
++++ b/src/Build/Utilities/EngineFileUtilities.cs
+@@ -191,10 +191,14 @@ private static string[] GetFileList(
+             FileMatcher.SearchAction action = FileMatcher.SearchAction.None;
+             string excludeFileSpec = string.Empty;
+ 
+-            var noWildcards = !FilespecHasWildcards(filespecEscaped) || FilespecMatchesLazyWildcard(filespecEscaped, forceEvaluateWildCards);
+-
+-            // It is possible to return original string if no wildcard matches and no entries in Exclude set.
+-            if (noWildcards && excludeSpecsEscaped?.Any() != true)
++            var filespecHasNoWildCards = !FilespecHasWildcards(filespecEscaped);
++            var filespecMatchesLazyWildcard = FilespecMatchesLazyWildcard(filespecEscaped, forceEvaluateWildCards);
++            var excludeSpecsAreEmpty = excludeSpecsEscaped?.Any() != true;
++            
++            // Return original value if:
++            //      FileSpec matches lazyloading regex or
++            //      file has no wildcard and excludeSpecs are empty
++            if ( filespecMatchesLazyWildcard || (filespecHasNoWildCards && excludeSpecsAreEmpty) )
+             {
+                 // Just return the original string.
+                 fileList = new string[] { returnEscaped ? filespecEscaped : EscapingUtilities.UnescapeAll(filespecEscaped) };
+diff --git a/src/Directory.BeforeCommon.targets b/src/Directory.BeforeCommon.targets
+index 0352fbf056b..c855029462e 100644
+--- a/src/Directory.BeforeCommon.targets
++++ b/src/Directory.BeforeCommon.targets
+@@ -89,6 +89,7 @@
+     <CompilerToolsDir>$([System.IO.Path]::Combine($(ToolPackagesDir)Microsoft.Net.Compilers, $(CompilerToolsVersion), "tools"))$([System.IO.Path]::DirectorySeparatorChar)</CompilerToolsDir>
+     <DefineConstants>$(DefineConstants);FEATURE_ASSEMBLYLOADCONTEXT</DefineConstants>
+     <DefineConstants>$(DefineConstants);FEATURE_RUNTIMEINFORMATION</DefineConstants>
++    <DefineConstants>$(DefineConstants);FEATURE_GUIDE_TO_VS_ON_UNSUPPORTED_PROJECTS</DefineConstants>
+     <DefineConstants>$(DefineConstants);USE_MSBUILD_DLL_EXTN</DefineConstants>
+     <DefineConstants>$(DefineConstants);WORKAROUND_COREFX_19110</DefineConstants>
+     <DefineConstants>$(DefineConstants);FEATURE_SYMLINK_TARGET</DefineConstants>
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index afcb4153eb4..d678ab57d35 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -325,11 +325,6 @@ public bool? LogPropertiesAndItemsAfterEvaluation
+         /// </summary>
+         public readonly bool DisableSdkResolutionCache = Environment.GetEnvironmentVariable("MSBUILDDISABLESDKCACHE") == "1";
+ 
+-        /// <summary>
+-        /// Disable the NuGet-based SDK resolver.
+-        /// </summary>
+-        public readonly bool DisableNuGetSdkResolver = Environment.GetEnvironmentVariable("MSBUILDDISABLENUGETSDKRESOLVER") == "1";
+-
+         /// <summary>
+         /// Don't delete TargetPath metadata from associated files found by RAR.
+         /// </summary>
+diff --git a/src/MSBuild/Resources/xlf/Strings.cs.xlf b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+index 63f1e4b57e9..26d010b3288 100644
+--- a/src/MSBuild/Resources/xlf/Strings.cs.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+@@ -1336,7 +1336,7 @@ Když se nastaví na MessageUponIsolationViolation (nebo jeho krátký
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: Je nutné zadat název funkce pro přepínač dostupnosti funkcí.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.de.xlf b/src/MSBuild/Resources/xlf/Strings.de.xlf
+index 594aafe0c99..76ed83f2f1c 100644
+--- a/src/MSBuild/Resources/xlf/Strings.de.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.de.xlf
+@@ -1324,7 +1324,7 @@ Dieses Protokollierungsformat ist standardmäßig aktiviert.
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: Es muss ein Featurename für den Featureverfügbarkeitsschalter angegeben werden.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.es.xlf b/src/MSBuild/Resources/xlf/Strings.es.xlf
+index fdbbc390fb1..664150db0fe 100644
+--- a/src/MSBuild/Resources/xlf/Strings.es.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.es.xlf
+@@ -1330,7 +1330,7 @@ Esta marca es experimental y puede que no funcione según lo previsto.
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: debe proporcionar un nombre de característica para el conmutador de disponibilidad de características.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.fr.xlf b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+index 8834e00d9c3..df2477fa98c 100644
+--- a/src/MSBuild/Resources/xlf/Strings.fr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+@@ -1323,7 +1323,7 @@ Remarque : verbosité des enregistreurs d’événements de fichiers
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: vous devez fournir un nom de fonctionnalité pour le commutateur featureavailability.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.it.xlf b/src/MSBuild/Resources/xlf/Strings.it.xlf
+index eb32ad8f7ea..786ad121d82 100644
+--- a/src/MSBuild/Resources/xlf/Strings.it.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.it.xlf
+@@ -1334,7 +1334,7 @@ Nota: livello di dettaglio dei logger di file
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: È necessario fornire un nome funzionalità per il passaggio a disponibilità funzionalità.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.ja.xlf b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+index 9959eee142e..ae31872e6d5 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ja.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+@@ -1323,7 +1323,7 @@
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: featureavailability スイッチの機能名を指定する必要があります。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.ko.xlf b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+index 1b37fe9bf0a..d0983796b6b 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ko.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+@@ -1323,7 +1323,7 @@
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: featureavailability 스위치에 대한 기능 이름을 제공해야 합니다.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.pl.xlf b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+index 7c9f4c4f8db..bc3840aeadf 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pl.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+@@ -1334,7 +1334,7 @@ Ta flaga jest eksperymentalna i może nie działać zgodnie z oczekiwaniami.
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: Należy podać nazwę funkcji dla przełącznika dostępności funkcji.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+index 62fb9b8962e..f6760a0c80a 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+@@ -1324,7 +1324,7 @@ arquivo de resposta.
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: deve ser fornecido um nome de recurso para a opção de disponibilidade de recursos.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.ru.xlf b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+index 58cdfbad974..05fd4fafbd7 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ru.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+@@ -1322,7 +1322,7 @@
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: необходимо указать имя функции для переключения доступности функции.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.tr.xlf b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+index 2feeaee0f2e..673b039e685 100644
+--- a/src/MSBuild/Resources/xlf/Strings.tr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+@@ -1327,7 +1327,7 @@
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: Özellik kullanılabilirlik anahtarı için bir özellik adı belirtilmesi gerekli.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+index 048ca7aa3b2..1eaa3109c55 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+@@ -1323,7 +1323,7 @@
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: 必须为功能可用性开关提供功能名称。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+index 4e65455c5bd..72e2703e211 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+@@ -1323,7 +1323,7 @@
+       </trans-unit>
+       <trans-unit id="MissingFeatureAvailabilityError">
+         <source>MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</source>
+-        <target state="new">MSBUILD : error MSB1067: Must provide a feature name for the featureavailability switch.</target>
++        <target state="translated">MSBUILD : error MSB1067: 必須為功能可用性切換提供功能名稱。</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1067: "}UE: This happens if the user does something like "msbuild.exe -featureavailability". The user must pass in an actual feature name
+       following the switch, as in "msbuild.exe -featureavailability:blah".
+diff --git a/src/Tasks.UnitTests/Exec_Tests.cs b/src/Tasks.UnitTests/Exec_Tests.cs
+index 088e68c81b0..12e27c9f2de 100644
+--- a/src/Tasks.UnitTests/Exec_Tests.cs
++++ b/src/Tasks.UnitTests/Exec_Tests.cs
+@@ -1033,6 +1033,25 @@ public void EndToEndMultilineExec_EscapeSpecialCharacters()
+                 }
+             }
+         }
++
++        [Fact]
++        public void ConsoleOutputDoesNotTrimLeadingWhitespace()
++        {
++            string lineWithLeadingWhitespace = "    line with some leading whitespace";
++
++            using (var env = TestEnvironment.Create(_output))
++            {
++                var textFilePath = env.CreateFile("leading-whitespace.txt", lineWithLeadingWhitespace).Path;
++                Exec exec = PrepareExec(NativeMethodsShared.IsWindows ? $"type {textFilePath}" : $"cat {textFilePath}");
++                exec.ConsoleToMSBuild = true;
++
++                bool result = exec.Execute();
++
++                result.ShouldBeTrue();
++                exec.ConsoleOutput.Length.ShouldBe(1);
++                exec.ConsoleOutput[0].ItemSpec.ShouldBe(lineWithLeadingWhitespace);
++            }
++        }
+     }
+ 
+     internal sealed class ExecWrapper : Exec
+diff --git a/src/Tasks/Exec.cs b/src/Tasks/Exec.cs
+index 9faaa688874..64dcc470f86 100644
+--- a/src/Tasks/Exec.cs
++++ b/src/Tasks/Exec.cs
+@@ -410,7 +410,10 @@ protected override void LogEventsFromTextOutput(string singleLine, MessageImport
+ 
+             if (ConsoleToMSBuild)
+             {
+-                string trimmedTextLine = singleLine.Trim();
++                string trimmedTextLine = ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_10) ?
++                    singleLine.TrimEnd() :
++                    singleLine.Trim();
++
+                 if (trimmedTextLine.Length > 0)
+                 {
+                     // The lines read may be unescaped, so we need to escape them
+diff --git a/src/Tasks/Resources/xlf/Strings.cs.xlf b/src/Tasks/Resources/xlf/Strings.cs.xlf
+index 9c797f4a432..b4fc18d7e3f 100644
+--- a/src/Tasks/Resources/xlf/Strings.cs.xlf
++++ b/src/Tasks/Resources/xlf/Strings.cs.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">Pro SearchPath „{0}“ (přidáno odkazem na sestavení „{1}“)</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.de.xlf b/src/Tasks/Resources/xlf/Strings.de.xlf
+index 2251c957dfc..a185f1c58dc 100644
+--- a/src/Tasks/Resources/xlf/Strings.de.xlf
++++ b/src/Tasks/Resources/xlf/Strings.de.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">Für SearchPath "{0}" (hinzugefügt durch Verweis auf Assembly "{1}").</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.es.xlf b/src/Tasks/Resources/xlf/Strings.es.xlf
+index 41dad41d0ed..eef9d9a6a5e 100644
+--- a/src/Tasks/Resources/xlf/Strings.es.xlf
++++ b/src/Tasks/Resources/xlf/Strings.es.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">Para SearchPath "{0}" (agregado por el ensamblado de referencia "{1}").</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.fr.xlf b/src/Tasks/Resources/xlf/Strings.fr.xlf
+index 63d2059f984..0a38e39c972 100644
+--- a/src/Tasks/Resources/xlf/Strings.fr.xlf
++++ b/src/Tasks/Resources/xlf/Strings.fr.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">Pour SearchPath « {0} » (ajouté en référençant l’assembly « {1} »).</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.it.xlf b/src/Tasks/Resources/xlf/Strings.it.xlf
+index e1ddc66cb54..27b03e70d2e 100644
+--- a/src/Tasks/Resources/xlf/Strings.it.xlf
++++ b/src/Tasks/Resources/xlf/Strings.it.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">Per SearchPath "{0}" (aggiunto facendo riferimento all'assembly "{1}").</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.ja.xlf b/src/Tasks/Resources/xlf/Strings.ja.xlf
+index 59c6ce346a4..855a8a09ef6 100644
+--- a/src/Tasks/Resources/xlf/Strings.ja.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ja.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">SearchPath "{0}" の場合 (アセンブリ "{1}" を参照して追加)。</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.ko.xlf b/src/Tasks/Resources/xlf/Strings.ko.xlf
+index fc554541c82..9e7d5d6eabc 100644
+--- a/src/Tasks/Resources/xlf/Strings.ko.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ko.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">SearchPath "{0}"의 경우(어셈블리 "{1}"을(를) 참조하여 추가됨).</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.pl.xlf b/src/Tasks/Resources/xlf/Strings.pl.xlf
+index 1df8ecf7fb0..6f0ed65f8bc 100644
+--- a/src/Tasks/Resources/xlf/Strings.pl.xlf
++++ b/src/Tasks/Resources/xlf/Strings.pl.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">Dla elementu SearchPath „{0}” (dodanego przez odwołanie do zestawu „{1}”).</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.pt-BR.xlf b/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
+index 3ad977cbdf6..d6bccad1740 100644
+--- a/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">Para o SearchPath "{0}" (adicionado ao fazer referência ao assembly "{1}").</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.ru.xlf b/src/Tasks/Resources/xlf/Strings.ru.xlf
+index 51c8942e693..13636f628c9 100644
+--- a/src/Tasks/Resources/xlf/Strings.ru.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ru.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">Для SearchPath "{0}" (добавлено путем ссылки на сборку "{1}").</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.tr.xlf b/src/Tasks/Resources/xlf/Strings.tr.xlf
+index 7ddee294c8e..80e916c9578 100644
+--- a/src/Tasks/Resources/xlf/Strings.tr.xlf
++++ b/src/Tasks/Resources/xlf/Strings.tr.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">"{0}" SearchPath için ("{1}" başvuru derlemesi tarafından eklendi).</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf b/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
+index 110be270f43..fb45fb03527 100644
+--- a/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">对于 SearchPath“{0}”(通过引用程序集“{1}”添加)。</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">
+diff --git a/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf b/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
+index f85b2c33c5e..1ce29e770f5 100644
+--- a/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
+@@ -1688,7 +1688,7 @@
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchPathAddedByParentAssembly">
+         <source>For SearchPath "{0}" (added by referencing assembly "{1}").</source>
+-        <target state="new">For SearchPath "{0}" (added by referencing assembly "{1}").</target>
++        <target state="translated">針對 SearchPath "{0}" (由參考組件 "{1}" 新增)。</target>
+         <note> {1} is the name of the parent assembly for which SearchPath was used.</note>
+       </trans-unit>
+       <trans-unit id="ResolveAssemblyReference.SearchedAssemblyFoldersEx">

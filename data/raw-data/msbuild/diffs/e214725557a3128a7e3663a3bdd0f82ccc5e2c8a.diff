@@ -1,0 +1,157 @@
+diff --git a/src/Build.UnitTests/BackEnd/MockLoggingService.cs b/src/Build.UnitTests/BackEnd/MockLoggingService.cs
+index 8c7c480a220..6834ef03d6f 100644
+--- a/src/Build.UnitTests/BackEnd/MockLoggingService.cs
++++ b/src/Build.UnitTests/BackEnd/MockLoggingService.cs
+@@ -557,6 +557,11 @@ public bool HasBuildSubmissionLoggedErrors(int submissionId)
+             return false;
+         }
+ 
++        public bool ShouldTreatWarningAsError(string code, BuildEventContext context)
++        {
++            throw new NotImplementedException();
++        }
++
+         #endregion
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/Logging/ILoggingService.cs b/src/Build/BackEnd/Components/Logging/ILoggingService.cs
+index 42feb90220b..1caea0bee7a 100644
+--- a/src/Build/BackEnd/Components/Logging/ILoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/ILoggingService.cs
+@@ -349,6 +349,14 @@ bool IncludeTaskInputs
+         #endregion
+ 
+         #region Log warnings
++        /// <summary>
++        /// Determines if the specified warning code should be treated as an error.
++        /// </summary>
++        /// <param name="code">A <see cref="BuildWarningEventArgs"/> that specifies the warning.</param>
++        /// <param name="context">The event context for where the warning occurred</param>
++        /// <returns><code>true</code> if the warning should be treated as an error, otherwise <code>false</code>.</returns>
++        bool ShouldTreatWarningAsError(string code, BuildEventContext context);
++
+         /// <summary>
+         /// Log a warning based on an exception
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingContext.cs b/src/Build/BackEnd/Components/Logging/LoggingContext.cs
+index f32379d29c4..f92e4defc43 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingContext.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingContext.cs
+@@ -211,6 +211,15 @@ internal void LogFatalError(Exception exception, BuildEventFileInfo file, string
+         internal void LogWarning(string subcategoryResourceName, BuildEventFileInfo file, string messageResourceName, params object[] messageArgs)
+         {
+             ErrorUtilities.VerifyThrow(_isValid, "must be valid");
++
++            string warningCode = null;
++            ResourceUtilities.ExtractMessageCode(true, ResourceUtilities.GetResourceString(messageResourceName), out warningCode);
++
++            if(_loggingService.ShouldTreatWarningAsError(warningCode, _eventContext))
++            {
++                _loggingService.LogError(_eventContext, file, messageResourceName, messageArgs);
++            }
++            
+             _loggingService.LogWarning(_eventContext, subcategoryResourceName, file, messageResourceName, messageArgs);
+         }
+ 
+@@ -225,6 +234,12 @@ internal void LogWarning(string subcategoryResourceName, BuildEventFileInfo file
+         internal void LogWarningFromText(string subcategoryResourceName, string warningCode, string helpKeyword, BuildEventFileInfo file, string message)
+         {
+             ErrorUtilities.VerifyThrow(_isValid, "must be valid");
++
++            if (_loggingService.ShouldTreatWarningAsError(warningCode, _eventContext))
++            {
++                _loggingService.LogErrorFromText(_eventContext, subcategoryResourceName, warningCode, helpKeyword, file, message);
++            }
++
+             _loggingService.LogWarningFromText(_eventContext, subcategoryResourceName, warningCode, helpKeyword, file, message);
+         }
+ 
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index 85c95d728d1..652258124af 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -1605,6 +1605,39 @@ private bool ShouldTreatWarningAsError(BuildWarningEventArgs warningEvent)
+ 
+             return false;
+         }
++
++        public bool ShouldTreatWarningAsError(string code, BuildEventContext context)
++        {
++            // This only applies if the user specified /warnaserror from the command-line or added an empty set through the object model
++            //
++            if (WarningsAsErrors != null)
++            {
++                // Global warnings as errors apply to all projects.  If the list is empty or contains the code, the warning should be treated as an error
++                //
++                if (WarningsAsErrors.Count == 0 || WarningsAsErrors.Contains(code))
++                {
++                    return true;
++                }
++            }
++
++            // This only applies if the user specified <MSBuildTreatWarningsAsErrors>true</MSBuildTreatWarningsAsErrors or <MSBuildWarningsAsErrors />
++            // and there is a valid ProjectInstanceId for the warning.
++            //
++            if (_warningsAsErrorsByProject != null && context != null && context.ProjectInstanceId != BuildEventContext.InvalidProjectInstanceId)
++            {
++                // Attempt to get the list of warnings to treat as errors for the current project
++                //
++                if (_warningsAsErrorsByProject.TryGetValue(GetWarningsAsErrorOrMessageKey(context), out ISet<string> codesByProject))
++                {
++                    // We create an empty set if all warnings should be treated as errors so that should be checked first.
++                    // If the set is not empty, check the specific code.
++                    //
++                    return codesByProject != null && (codesByProject.Count == 0 || codesByProject.Contains(code));
++                }
++            }
++            
++            return false;
++        }
+         #endregion
+         #endregion
+     }
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index 8d830c38a0b..350d1c612e9 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -454,7 +454,7 @@ public void LogErrorEvent(Microsoft.Build.Framework.BuildErrorEventArgs e)
+         /// Thread safe.
+         /// </summary>
+         /// <param name="e">The event args</param>
+-        public void LogWarningEvent(Microsoft.Build.Framework.BuildWarningEventArgs e)
++        public void LogWarningEvent(BuildWarningEventArgs e)
+         {
+             lock (_callbackMonitor)
+             {
+@@ -486,7 +486,30 @@ public void LogWarningEvent(Microsoft.Build.Framework.BuildWarningEventArgs e)
+                 }
+ 
+                 e.BuildEventContext = _taskLoggingContext.BuildEventContext;
+-                _taskLoggingContext.LoggingService.LogBuildEvent(e);
++
++                if (_taskLoggingContext.LoggingService.ShouldTreatWarningAsError(e.Code, e.BuildEventContext))
++                {
++                    BuildErrorEventArgs errorEvent = new BuildErrorEventArgs
++                            (
++                                e.Subcategory,
++                                e.Code,
++                                e.File,
++                                e.LineNumber,
++                                e.ColumnNumber,
++                                e.EndLineNumber,
++                                e.EndColumnNumber,
++                                e.Message,
++                                e.HelpKeyword,
++                                e.SenderName
++                            );
++                    errorEvent.BuildEventContext = e.BuildEventContext;
++                    _taskLoggingContext.HasLoggedErrors = true;
++                    _taskLoggingContext.LoggingService.LogBuildEvent(errorEvent);
++                }
++                else
++                {
++                    _taskLoggingContext.LoggingService.LogBuildEvent(e);
++                }
+             }
+         }
+ 

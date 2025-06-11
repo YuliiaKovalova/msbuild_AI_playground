@@ -1,0 +1,602 @@
+diff --git a/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs b/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
+index dc86010e269..80a98eb8112 100644
+--- a/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
+@@ -10,6 +10,8 @@
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Evaluation;
++using Microsoft.Build.Experimental.ProjectCache;
++using Shouldly;
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
+ using Xunit;
+ 
+@@ -520,6 +522,31 @@ public void TestTraversalAffinityIsInProc()
+             Assert.Equal(request1, response[0].BuildRequest);
+         }
+ 
++        /// <summary>
++        /// Make sure that traversal projects are marked with an affinity of "InProc", which means that
++        /// even if multiple are available, we should still only have the single inproc node.
++        /// </summary>
++        [Fact]
++        public void TestProxyAffinityIsInProc()
++        {
++            _host.BuildParameters.MaxNodeCount = 4;
++            ReportDefaultParentRequestIsFinished();
++
++            CreateConfiguration(1, "foo.csproj");
++
++            BuildRequest request1 = CreateProxyBuildRequest(1, 1, new ProxyTargets(new Dictionary<string, string> {{"foo", "bar"}}), null);
++
++            BuildRequestBlocker blocker = new BuildRequestBlocker(-1, new string[] { }, new[] { request1 });
++            List<ScheduleResponse> response = new List<ScheduleResponse>(_scheduler.ReportRequestBlocked(1, blocker));
++
++            // There will be no request to create a new node, because both of the above requests are proxy build requests,
++            // which have an affinity of "inproc", and the inproc node already exists.
++            Assert.Single(response);
++            Assert.Equal(ScheduleActionType.ScheduleWithConfiguration, response[0].Action);
++            Assert.Equal(request1, response[0].BuildRequest);
++            Assert.Equal(Scheduler.InProcNodeId, response[0].NodeId);
++        }
++
+         /// <summary>
+         /// With something approximating the BuildManager's build loop, make sure that we don't end up
+         /// trying to create more nodes than we can actually support.
+@@ -729,8 +756,10 @@ private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[
+         /// <summary>
+         /// Creates a build request.
+         /// </summary>
+-        private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[] targets, NodeAffinity nodeAffinity, BuildRequest parentRequest)
++        private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[] targets, NodeAffinity nodeAffinity, BuildRequest parentRequest, ProxyTargets proxyTargets = null)
+         {
++            (targets == null ^ proxyTargets == null).ShouldBeTrue();
++
+             HostServices hostServices = null;
+ 
+             if (nodeAffinity != NodeAffinity.Any)
+@@ -739,8 +768,36 @@ private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[
+                 hostServices.SetNodeAffinity(String.Empty, nodeAffinity);
+             }
+ 
+-            BuildRequest request = new BuildRequest(1 /* submissionId */, nodeRequestId, configId, targets, hostServices, BuildEventContext.Invalid, parentRequest);
+-            return request;
++            if (targets != null)
++            {
++                return new BuildRequest(
++                    submissionId: 1,
++                    nodeRequestId,
++                    configId,
++                    targets,
++                    hostServices,
++                    BuildEventContext.Invalid,
++                    parentRequest);
++            }
++
++            parentRequest.ShouldBeNull();
++            return new BuildRequest(
++                submissionId: 1,
++                nodeRequestId,
++                configId,
++                proxyTargets,
++                hostServices);
++        }
++
++        private BuildRequest CreateProxyBuildRequest(int nodeRequestId, int configId, ProxyTargets proxyTargets, BuildRequest parentRequest)
++        {
++            return CreateBuildRequest(
++                nodeRequestId,
++                configId,
++                null,
++                NodeAffinity.Any,
++                parentRequest,
++                proxyTargets);
+         }
+ 
+         /// <summary>
+@@ -778,5 +835,11 @@ private void MockPerformSchedulingActions(IEnumerable<ScheduleResponse> response
+                 MockPerformSchedulingActions(moreResponses, ref nodeId, ref inProcNodeExists);
+             }
+         }
++
++        private void ReportDefaultParentRequestIsFinished()
++        {
++            var buildResult = new BuildResult(_defaultParentRequest);
++            _scheduler.ReportResult(_defaultParentRequest.NodeRequestId, buildResult);
++        }
+     }
+ }
+diff --git a/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs b/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
+index 8ccde2767a9..ec460ade72b 100644
+--- a/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
++++ b/src/Build.UnitTests/ProjectCache/ProjectCacheTests.cs
+@@ -398,6 +398,15 @@ public void ProjectCacheByBuildParametersAndGraphBuildWorks(GraphCacheResponse t
+ 
+             var graphResult = buildSession.BuildGraph(graph);
+ 
++            if (buildParameters.DisableInProcNode
++                && testData.NonCacheMissResults.Any(c => c.Value.ProxyTargets is not null))
++            {
++                // TODO: remove this branch when the DisableInProcNode failure is fixed by https://github.com/dotnet/msbuild/pull/6400
++                graphResult.OverallResult.ShouldBe(BuildResultCode.Failure);
++                buildSession.Logger.Errors.First().Code.ShouldBe("MSB4223");
++                return;
++            }
++
+             graphResult.OverallResult.ShouldBe(BuildResultCode.Success);
+ 
+             buildSession.Dispose();
+@@ -425,6 +434,17 @@ public void ProjectCacheByBuildParametersAndBottomUpBuildWorks(GraphCacheRespons
+             foreach (var node in graph.ProjectNodesTopologicallySorted)
+             {
+                 var buildResult = buildSession.BuildProjectFile(node.ProjectInstance.FullPath);
++
++                if (buildParameters.DisableInProcNode &&
++                    testData.NonCacheMissResults.TryGetValue(GetProjectNumber(node), out var cacheResult) &&
++                    cacheResult.ProxyTargets is not null)
++                {
++                    // TODO: remove this branch when the DisableInProcNode failure is fixed by https://github.com/dotnet/msbuild/pull/6400
++                    buildResult.OverallResult.ShouldBe(BuildResultCode.Failure);
++                    buildSession.Logger.Errors.First().Code.ShouldBe("MSB4223");
++                    return;
++                }
++
+                 buildResult.OverallResult.ShouldBe(BuildResultCode.Success);
+ 
+                 nodesToBuildResults[node] = buildResult;
+@@ -484,6 +504,65 @@ public void ProjectCacheByVSWorkaroundWorks(GraphCacheResponse testData, BuildPa
+             }
+         }
+ 
++        [Theory]
++        [InlineData(true)]
++        [InlineData(false)]
++        public void RunningProxyBuildsOnOutOfProcNodesShouldIssueWarning(bool disableInprocNodeViaEnvironmentVariable)
++        {
++            var testData = new GraphCacheResponse(
++                new Dictionary<int, int[]>
++                {
++                    {1, new[] {2}}
++                },
++                new Dictionary<int, CacheResult>
++                {
++                    {1, GraphCacheResponse.SuccessfulProxyTargetResult()},
++                    {2, GraphCacheResponse.SuccessfulProxyTargetResult()}
++                });
++
++            var graph = testData.CreateGraph(_env);
++            var mockCache = new InstanceMockCache(testData);
++
++            var buildParameters = new BuildParameters
++            {
++                MaxNodeCount = Environment.ProcessorCount,
++                ProjectCacheDescriptor = ProjectCacheDescriptor.FromInstance(
++                    mockCache,
++                    null,
++                    graph)
++            };
++
++            if (disableInprocNodeViaEnvironmentVariable)
++            {
++                _env.SetEnvironmentVariable("MSBUILDNOINPROCNODE", "1");
++            }
++            else
++            {
++                buildParameters.DisableInProcNode = true;
++            }
++
++            using var buildSession = new Helpers.BuildManagerSession(_env, buildParameters);
++
++            var graphResult = buildSession.BuildGraph(graph);
++
++            if (!disableInprocNodeViaEnvironmentVariable)
++            {
++                // TODO: remove this branch when the DisableInProcNode failure is fixed by https://github.com/dotnet/msbuild/pull/6400
++                graphResult.OverallResult.ShouldBe(BuildResultCode.Failure);
++                buildSession.Logger.Errors.First().Code.ShouldBe("MSB4223");
++                return;
++            }
++
++            graphResult.OverallResult.ShouldBe(BuildResultCode.Success);
++
++            buildSession.Dispose();
++
++            buildSession.Logger.FullLog.ShouldContain("Static graph based");
++
++            buildSession.Logger.AssertMessageCount("MSB4274", 1);
++
++        }
++
+         private void AssertCacheBuild(
+             ProjectGraph graph,
+             GraphCacheResponse testData,
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingContext.cs b/src/Build/BackEnd/Components/Logging/LoggingContext.cs
+index 6194726d5f4..5fd43fbbfb7 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingContext.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingContext.cs
+@@ -213,6 +213,12 @@ internal void LogFatalError(Exception exception, BuildEventFileInfo file, string
+             _hasLoggedErrors = true;
+         }
+ 
++        internal void LogWarning(string messageResourceName, params object[] messageArgs)
++        {
++            ErrorUtilities.VerifyThrow(_isValid, "must be valid");
++            _loggingService.LogWarning(_eventContext, null, BuildEventFileInfo.Empty, messageResourceName, messageArgs);
++        }
++
+         /// <summary>
+         /// Log a warning
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs b/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
+index 9305abe7c66..994f3b155e9 100644
+--- a/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
++++ b/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
+@@ -463,6 +463,8 @@ public void VerifyOneOfStates(SchedulableRequestState[] requiredStates)
+             ErrorUtilities.ThrowInternalError("State {0} is not one of the expected states.", _state);
+         }
+ 
++        public bool IsProxyBuildRequest() => BuildRequest.IsProxyBuildRequest();
++
+         /// <summary>
+         /// Change to the specified state.  Update internal counters.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index 1e335cedb85..03fc8f8a1ab 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -11,6 +11,7 @@
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Microsoft.Build.Execution;
++using Microsoft.Build.Experimental.ProjectCache;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+@@ -166,6 +167,10 @@ internal class Scheduler : IScheduler
+         /// </summary>
+         private AssignUnscheduledRequestsDelegate _customRequestSchedulingAlgorithm;
+ 
++        private NodeLoggingContext _inprocNodeContext;
++
++        private int _loggedWarningsForProxyBuildsOnOutOfProcNodes = 0;
++
+         /// <summary>
+         /// Constructor.
+         /// </summary>
+@@ -610,6 +615,7 @@ public void InitializeComponent(IBuildComponentHost host)
+             _componentHost = host;
+             _resultsCache = (IResultsCache)_componentHost.GetComponent(BuildComponentType.ResultsCache);
+             _configCache = (IConfigCache)_componentHost.GetComponent(BuildComponentType.ConfigCache);
++            _inprocNodeContext =  new NodeLoggingContext(_componentHost.LoggingService, InProcNodeId, true);
+         }
+ 
+         /// <summary>
+@@ -791,6 +797,9 @@ private void AssignUnscheduledRequestsToNodes(List<ScheduleResponse> responses,
+                 {
+                     // We want to find more work first, and we assign traversals to the in-proc node first, if possible.
+                     AssignUnscheduledRequestsByTraversalsFirst(responses, idleNodes);
++
++                    AssignUnscheduledProxyBuildRequestsToInProcNode(responses, idleNodes);
++
+                     if (idleNodes.Count == 0)
+                     {
+                         return;
+@@ -972,6 +981,27 @@ private void AssignUnscheduledRequestsByTraversalsFirst(List<ScheduleResponse> r
+             }
+         }
+ 
++        /// <summary>
++        /// Proxy build requests <see cref="ProxyTargets"/> should be really cheap (only return properties and items) and it's not worth
++        /// paying the IPC cost and re-evaluating them on out of proc nodes (they are guaranteed to be evaluated in the Scheduler process).
++        /// </summary>
++        private void AssignUnscheduledProxyBuildRequestsToInProcNode(List<ScheduleResponse> responses, HashSet<int> idleNodes)
++        {
++            if (idleNodes.Contains(InProcNodeId))
++            {
++                List<SchedulableRequest> unscheduledRequests = new List<SchedulableRequest>(_schedulingData.UnscheduledRequestsWhichCanBeScheduled);
++                foreach (SchedulableRequest request in unscheduledRequests)
++                {
++                    if (CanScheduleRequestToNode(request, InProcNodeId) && request.IsProxyBuildRequest())
++                    {
++                        AssignUnscheduledRequestToNode(request, InProcNodeId, responses);
++                        idleNodes.Remove(InProcNodeId);
++                        break;
++                    }
++                }
++            }
++        }
++
+         /// <summary>
+         /// Returns true if the request is for a traversal project.  Traversals are used to find more work.
+         /// </summary>
+@@ -1348,7 +1378,27 @@ private void AssignUnscheduledRequestToNode(SchedulableRequest request, int node
+ 
+             responses.Add(ScheduleResponse.CreateScheduleResponse(nodeId, request.BuildRequest, mustSendConfigurationToNode));
+             TraceScheduler("Executing request {0} on node {1} with parent {2}", request.BuildRequest.GlobalRequestId, nodeId, (request.Parent == null) ? -1 : request.Parent.BuildRequest.GlobalRequestId);
++
++            WarnWhenProxyBuildsGetScheduledOnOutOfProcNode();
++
+             request.ResumeExecution(nodeId);
++
++            void WarnWhenProxyBuildsGetScheduledOnOutOfProcNode()
++            {
++                if (request.IsProxyBuildRequest() && nodeId != InProcNodeId)
++                {
++                    ErrorUtilities.VerifyThrow(
++                        _componentHost.BuildParameters.DisableInProcNode || _forceAffinityOutOfProc,
++                        "Proxy requests should only get scheduled to out of proc nodes when the inproc node is disabled");
++
++                    var loggedWarnings = Interlocked.CompareExchange(ref _loggedWarningsForProxyBuildsOnOutOfProcNodes, 1, 0);
++
++                    if (loggedWarnings == 0)
++                    {
++                        _inprocNodeContext.LogWarning("ProxyRequestNotScheduledOnInprocNode");
++                    }
++                }
++            }
+         }
+ 
+         /// <summary>
+@@ -2057,6 +2107,11 @@ private NodeAffinity GetNodeAffinityForRequest(BuildRequest request)
+                 return NodeAffinity.InProc;
+             }
+ 
++            if (request.IsProxyBuildRequest())
++            {
++                return NodeAffinity.InProc;
++            }
++
+             BuildRequestConfiguration configuration = _configCache[request.ConfigurationId];
+ 
+             // The affinity may have been specified by the host services.
+diff --git a/src/Build/BackEnd/Shared/BuildRequest.cs b/src/Build/BackEnd/Shared/BuildRequest.cs
+index 4a0a4efb7f1..2bde7843447 100644
+--- a/src/Build/BackEnd/Shared/BuildRequest.cs
++++ b/src/Build/BackEnd/Shared/BuildRequest.cs
+@@ -419,5 +419,10 @@ internal static INodePacket FactoryForDeserialization(ITranslator translator)
+         }
+ 
+         #endregion
++
++        public bool IsProxyBuildRequest()
++        {
++            return ProxyTargets != null;
++        }
+     }
+ }
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 9bce56de852..2441874fb8f 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1894,4 +1894,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+   <data name="KillingProcessWithPid" xml:space="preserve">
+     <value>Killing process with pid = {0}.</value>
+   </data>
++  <data name="ProxyRequestNotScheduledOnInprocNode" xml:space="preserve">
++    <value>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</value>
++  </data>
+ </root>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index f223fa5d580..fd441c3a8d6 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Počáteční hodnota vlastnosti: $({0})={1} Zdroj: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: Projekt {0} přeskočil omezení izolace grafu v odkazovaném projektu {1}.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 14323a1cb89..e55f606d0d3 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Anfangswert der Eigenschaft: $({0})="{1}", Quelle: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: Das Projekt "{0}" hat Graphisolationseinschränkungen für das referenzierte Projekt "{1}" übersprungen.</target>
+diff --git a/src/Build/Resources/xlf/Strings.en.xlf b/src/Build/Resources/xlf/Strings.en.xlf
+index 035b1fdf1cb..2e20e50527d 100644
+--- a/src/Build/Resources/xlf/Strings.en.xlf
++++ b/src/Build/Resources/xlf/Strings.en.xlf
+@@ -257,6 +257,11 @@
+         <target state="new">Property initial value: $({0})="{1}" Source: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="new">MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 3ada5cb3c4a..1b26dadc718 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Valor inicial de la propiedad: $({0})="{1}" Origen: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: El proyecto "{0}" ha omitido las restricciones de aislamiento de gráficos en el proyecto "{1}" al que se hace referencia.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 90105ef4478..cdcca79f380 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Valeur initiale de la propriété : $({0})="{1}" Source : {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: le projet "{0}" a ignoré les contraintes d'isolement de graphe dans le projet référencé "{1}"</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 6711613ae06..bcd50a9ef47 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Valore iniziale della proprietà: $({0})="{1}". Origine: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: il progetto "{0}" ha ignorato i vincoli di isolamento del grafico nel progetto di riferimento "{1}"</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index aa758e3a206..e1a88799392 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">プロパティの初期値: $({0})="{1}" ソース: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: プロジェクト "{0}" は、参照先のプロジェクト "{1}" で、グラフの分離制約をスキップしました</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index af1e71f0f9a..75af46eda13 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">속성 초기 값: $({0})="{1}" 소스: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: 프로젝트 "{0}"에서 참조된 프로젝트 "{1}"의 그래프 격리 제약 조건을 건너뛰었습니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 791c924d51e..6ea85ee644b 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Wartość początkowa właściwości: $({0})=„{1}” Źródło: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: W przypadku projektu „{0}” pominięto ograniczenia izolacji grafu dla przywoływanego projektu „{1}”</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index a3c9bafe4a3..68cf6eb5dd8 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Valor inicial da propriedade: $({0})="{1}" Origem: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: o projeto "{0}" ignorou as restrições de isolamento do gráfico no projeto referenciado "{1}"</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index ea7ac3894a8..51547011c53 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Начальное значение свойства: $({0})="{1}" Источник: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: проект "{0}" пропустил ограничения изоляции графа в проекте "{1}", на который указывает ссылка.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 095ce39a05d..1cc28ff9a8e 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">Özellik başlangıç değeri: $({0})="{1}" Kaynak: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: "{0}" projesi, başvurulan "{1}" projesindeki graf yalıtımı kısıtlamalarını atladı</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index b976c8e4d9d..4059cf492db 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">属性初始值: $({0})=“{1}”，源: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: 项目“{0}”已跳过所引用的项目“{1}”上的图形隔离约束</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index ddebd381fbe..898c29d736e 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -257,6 +257,11 @@
+         <target state="translated">屬性初始值: $({0})="{1}" 來源: {2}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProxyRequestNotScheduledOnInprocNode">
++        <source>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</source>
++        <target state="new">MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="SkippedConstraintsOnRequest">
+         <source>MSB4260: Project "{0}" skipped graph isolation constraints on referenced project "{1}"</source>
+         <target state="translated">MSB4260: 專案 "{0}" 已跳過參考專案 "{1}" 上的圖形隔離條件約束</target>

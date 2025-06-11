@@ -1,0 +1,292 @@
+diff --git a/src/Build/Evaluation/Context/EvaluationContext.cs b/src/Build/Evaluation/Context/EvaluationContext.cs
+index 7dcb253fd40..b227f388adb 100644
+--- a/src/Build/Evaluation/Context/EvaluationContext.cs
++++ b/src/Build/Evaluation/Context/EvaluationContext.cs
+@@ -46,9 +46,7 @@ public enum SharingPolicy
+         internal FileMatcher FileMatcher { get; }
+ 
+         private IDirectoryCacheFactory _directoryCacheFactory;
+-        private ConditionalWeakTable<Project, IDirectoryCache> _directoryCachesPerProject;
+-
+-        private IDirectoryCache _defaultDirectoryCache;
++        private ConditionalWeakTable<Project, IFileSystem> _fileSystemsPerProject;
+ 
+         /// <summary>
+         /// Key to file entry list. Example usages: cache glob expansion and intermediary directory expansions during glob expansion.
+@@ -73,7 +71,7 @@ private EvaluationContext(SharingPolicy policy, IFileSystem fileSystem, IDirecto
+             if (directoryCacheFactory != null)
+             {
+                 _directoryCacheFactory = directoryCacheFactory;
+-                _directoryCachesPerProject = new ConditionalWeakTable<Project, IDirectoryCache>();
++                _fileSystemsPerProject = new ConditionalWeakTable<Project, IFileSystem>();
+             }
+         }
+ 
+@@ -154,23 +152,22 @@ internal EvaluationContext ContextForNewProject()
+             }
+         }
+ 
+-        internal IDirectoryCache GetDirectoryCacheForProject(Project project)
++        internal IFileSystem GetFileSystemForProject(Project project)
+         {
+-            IDirectoryCache directoryCache = _directoryCachesPerProject?.GetValue(
++            IFileSystem fileSystemForProject = _fileSystemsPerProject?.GetValue(
+                 project,
+-                project => _directoryCacheFactory.GetDirectoryCacheForProject(project));
+-
+-            // If we don't have a non-null directory cache factory or it returned null, lazily create a wrapper over IFileSystem.
+-            if (directoryCache == null)
+-            {
+-                directoryCache = Volatile.Read(ref _defaultDirectoryCache);
+-                if (directoryCache == null)
++                project =>
+                 {
+-                    directoryCache = new DirectoryCacheOverFileSystem(FileSystem);
+-                    Volatile.Write(ref _defaultDirectoryCache, directoryCache);
+-                }
+-            }
+-            return directoryCache;
++                    IDirectoryCache directoryCache = _directoryCacheFactory.GetDirectoryCacheForProject(project);
++                    if(directoryCache != null)
++                    {
++                        return new DirectoryCacheFileSystemWrapper(FileSystem, directoryCache);
++                    }
++                    return null;
++                });
++
++            // If we don't have a non-null directory cache factory or it returned null, fall back to returning the shared FileSystem.
++            return fileSystemForProject ?? FileSystem;
+         }
+     }
+ }
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 1355f91e9f1..ede85ad1e73 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -268,8 +268,8 @@ private Evaluator(
+             _streamImports.Add(string.Empty);
+ 
+             // Create a FileMatcher for the given combination of EvaluationContext and the project being evaluated.
+-            IDirectoryCache directoryCache = _evaluationContext.GetDirectoryCacheForProject(project);
+-            _fileMatcher = new FileMatcher(evaluationContext.FileSystem, evaluationContext.FileEntryExpansionCache);
++            IFileSystem fileSystem = _evaluationContext.GetFileSystemForProject(project);
++            _fileMatcher = new FileMatcher(fileSystem, evaluationContext.FileEntryExpansionCache);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/FileSystem/DirectoryCacheFileSystemWrapper.cs b/src/Build/FileSystem/DirectoryCacheFileSystemWrapper.cs
+new file mode 100644
+index 00000000000..af5958c7924
+--- /dev/null
++++ b/src/Build/FileSystem/DirectoryCacheFileSystemWrapper.cs
+@@ -0,0 +1,133 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using Microsoft.Build.Shared;
++using Microsoft.Build.Shared.FileSystem;
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++
++namespace Microsoft.Build.FileSystem
++{
++    internal class DirectoryCacheFileSystemWrapper : IFileSystem
++    {
++        /// <summary>
++        /// The base <see cref="IFileSystem"/> to fall back to for functionality not provided by <see cref="_directoryCache"/>.
++        /// </summary>
++        private readonly IFileSystem _fileSystem;
++
++        /// <summary>
++        /// A host-provided cache used for file existence and directory enumeration.
++        /// </summary>
++        private readonly IDirectoryCache _directoryCache;
++
++        public DirectoryCacheFileSystemWrapper(IFileSystem fileSystem, IDirectoryCache directoryCache)
++        {
++            _fileSystem = fileSystem;
++            _directoryCache = directoryCache;
++        }
++
++        #region IFileSystem implementation based on IDirectoryCache
++
++        public bool FileOrDirectoryExists(string path)
++        {
++            return _directoryCache.FileExists(path) || _directoryCache.DirectoryExists(path);
++        }
++
++        public bool DirectoryExists(string path)
++        {
++            return _directoryCache.DirectoryExists(path);
++        }
++
++        public bool FileExists(string path)
++        {
++            return _directoryCache.FileExists(path);
++        }
++
++        public IEnumerable<string> EnumerateDirectories(string path, string searchPattern = "*", SearchOption searchOption = SearchOption.TopDirectoryOnly)
++        {
++            if (searchOption != SearchOption.TopDirectoryOnly)
++            {
++                // Recursive enumeration is not used during evaluation, pass it through.
++                return _fileSystem.EnumerateDirectories(path, searchPattern, searchOption);
++            }
++            return EnumerateFullFileSystemPaths(path, searchPattern, includeFiles: false, includeDirectories: true);
++        }
++
++        public IEnumerable<string> EnumerateFiles(string path, string searchPattern = "*", SearchOption searchOption = SearchOption.TopDirectoryOnly)
++        {
++            if (searchOption != SearchOption.TopDirectoryOnly)
++            {
++                // Recursive enumeration is not used during evaluation, pass it through.
++                return _fileSystem.EnumerateFiles(path, searchPattern, searchOption);
++            }
++            return EnumerateFullFileSystemPaths(path, searchPattern, includeFiles: true, includeDirectories: false);
++        }
++
++        public IEnumerable<string> EnumerateFileSystemEntries(string path, string searchPattern = "*", SearchOption searchOption = SearchOption.TopDirectoryOnly)
++        {
++            if (searchOption != SearchOption.TopDirectoryOnly)
++            {
++                // Recursive enumeration is not used during evaluation, pass it through.
++                return _fileSystem.EnumerateFileSystemEntries(path, searchPattern, searchOption);
++            }
++            return EnumerateFullFileSystemPaths(path, searchPattern, includeFiles: true, includeDirectories: true);
++        }
++
++        private IEnumerable<string> EnumerateFullFileSystemPaths(string path, string searchPattern, bool includeFiles, bool includeDirectories)
++        {
++            FindPredicate predicate = (ref ReadOnlySpan<char> fileName) =>
++            {
++                string fileNameString = fileName.ToString();
++                return FileMatcher.IsAllFilesWildcard(searchPattern) || FileMatcher.IsMatch(fileNameString, searchPattern);
++            };
++            FindTransform<string> transform = (ref ReadOnlySpan<char> fileName) => Path.Combine(path, fileName.ToString());
++
++            IEnumerable<string> directories = includeDirectories
++                ? _directoryCache.EnumerateDirectories(path, predicate, transform)
++                : Enumerable.Empty<string>();
++            IEnumerable<string> files = includeFiles
++                ? _directoryCache.EnumerateFiles(path, predicate, transform)
++                : Enumerable.Empty<string>();
++
++            return Enumerable.Concat(directories, files);
++        }
++
++        #endregion
++
++        #region IFileSystem pass-through implementation
++
++        public FileAttributes GetAttributes(string path)
++        {
++            return _fileSystem.GetAttributes(path);
++        }
++
++        public DateTime GetLastWriteTimeUtc(string path)
++        {
++            return _fileSystem.GetLastWriteTimeUtc(path);
++        }
++
++        public TextReader ReadFile(string path)
++        {
++            return _fileSystem.ReadFile(path);
++        }
++
++        public Stream GetFileStream(string path, FileMode mode, FileAccess access, FileShare share)
++        {
++            return _fileSystem.GetFileStream(path, mode, access, share);
++        }
++
++        public string ReadFileAllText(string path)
++        {
++            return _fileSystem.ReadFileAllText(path);
++        }
++
++        public byte[] ReadFileAllBytes(string path)
++        {
++            return _fileSystem.ReadFileAllBytes(path);
++        }
++
++        #endregion
++    }
++}
+diff --git a/src/Build/FileSystem/DirectoryCacheOverFileSystem.cs b/src/Build/FileSystem/DirectoryCacheOverFileSystem.cs
+deleted file mode 100644
+index c6556409572..00000000000
+--- a/src/Build/FileSystem/DirectoryCacheOverFileSystem.cs
++++ /dev/null
+@@ -1,58 +0,0 @@
+-﻿// Copyright (c) Microsoft. All rights reserved.
+-// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+-
+-using Microsoft.Build.Shared;
+-using Microsoft.Build.Shared.FileSystem;
+-using System;
+-using System.Collections.Generic;
+-
+-namespace Microsoft.Build.FileSystem
+-{
+-    /// <summary>
+-    /// Implements <see cref="IDirectoryCache"/> on top of <see cref="IFileSystem"/>.
+-    /// </summary>
+-    internal sealed class DirectoryCacheOverFileSystem : IDirectoryCache
+-    {
+-        private IFileSystem _fileSystem;
+-
+-        public DirectoryCacheOverFileSystem(IFileSystem fileSystem)
+-        {
+-            _fileSystem = fileSystem;
+-        }
+-
+-        public bool FileExists(string path)
+-        {
+-            return _fileSystem.FileExists(path);
+-        }
+-
+-        public bool DirectoryExists(string path)
+-        {
+-            return _fileSystem.DirectoryExists(path);
+-        }
+-
+-        public IEnumerable<TResult> EnumerateDirectories<TResult>(string path, FindPredicate predicate, FindTransform<TResult> transform)
+-        {
+-            return EnumerateAndTransformFullPaths(_fileSystem.EnumerateDirectories(path), predicate, transform);
+-        }
+-
+-        public IEnumerable<TResult> EnumerateFiles<TResult>(string path, FindPredicate predicate, FindTransform<TResult> transform)
+-        {
+-            return EnumerateAndTransformFullPaths(_fileSystem.EnumerateFiles(path), predicate, transform);
+-        }
+-
+-        private IEnumerable<TResult> EnumerateAndTransformFullPaths<TResult>(IEnumerable<string> fullPaths, FindPredicate predicate, FindTransform<TResult> transform)
+-        {
+-            foreach (string fullPath in fullPaths)
+-            {
+-                // TODO: Call Path.GetFileName() from Microsoft.IO.
+-                int lastSlashPos = fullPath.LastIndexOfAny(FileUtilities.Slashes);
+-                ReadOnlySpan<char> fileName = fullPath.AsSpan(lastSlashPos + 1, fullPath.Length - lastSlashPos - 1);
+-
+-                if (predicate(ref fileName))
+-                {
+-                    yield return transform(ref fileName);
+-                }
+-            }
+-        }
+-    }
+-}
+diff --git a/src/Shared/FileMatcher.cs b/src/Shared/FileMatcher.cs
+index a73958d2c83..9d2b990b0b4 100644
+--- a/src/Shared/FileMatcher.cs
++++ b/src/Shared/FileMatcher.cs
+@@ -2564,7 +2564,7 @@ private static bool DirectoryEndsWithPattern(string directoryPath, string patter
+         /// Returns true if <paramref name="pattern"/> is <code>*</code> or <code>*.*</code>.
+         /// </summary>
+         /// <param name="pattern">The filename pattern to check.</param>
+-        private static bool IsAllFilesWildcard(string pattern) => pattern?.Length switch
++        internal static bool IsAllFilesWildcard(string pattern) => pattern?.Length switch
+         {
+             1 => pattern[0] == '*',
+             3 => pattern[0] == '*' && pattern[1] == '.' && pattern[2] == '*',

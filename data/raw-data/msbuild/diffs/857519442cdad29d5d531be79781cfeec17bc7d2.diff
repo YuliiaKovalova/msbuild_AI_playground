@@ -1,0 +1,759 @@
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+index 8bdcfbf09d9..dab5451a8dc 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+@@ -9,8 +9,6 @@
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+-#nullable disable
+-
+ namespace Microsoft.Build.Logging
+ {
+     /// <summary>
+@@ -28,6 +26,11 @@ static BinaryLogReplayEventSource()
+             _ = ItemGroupLoggingHelper.ItemGroupIncludeLogMessagePrefix;
+         }
+ 
++        /// <summary>
++        /// Raised once <see cref="BuildEventArgsReader"/> is created during replaying
++        /// </summary>
++        public event Action<IBuildEventArgsReaderNotifications>? NotificationsSourceCreated;
++
+         /// <summary>
+         /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
+         /// </summary>
+@@ -38,48 +41,77 @@ public void Replay(string sourceFilePath)
+         }
+ 
+         /// <summary>
+-        /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
++        /// Creates a <see cref="BinaryReader"/> for the provided binary log file.
++        /// Performs decompression and buffering in the optimal way.
++        /// Caller is responsible for disposing the returned reader.
+         /// </summary>
+-        /// <param name="sourceFilePath">The full file path of the binary log file</param>
+-        /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
+-        public void Replay(string sourceFilePath, CancellationToken cancellationToken)
++        /// <param name="sourceFilePath"></param>
++        /// <returns></returns>
++        public static BinaryReader OpenReader(string sourceFilePath)
+         {
+-            using (var stream = new FileStream(sourceFilePath, FileMode.Open, FileAccess.Read, FileShare.Read))
++            Stream? stream = null;
++            try
+             {
+-                var gzipStream = new GZipStream(stream, CompressionMode.Decompress, leaveOpen: true);
++                stream = new FileStream(sourceFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
++                var gzipStream = new GZipStream(stream, CompressionMode.Decompress, leaveOpen: false);
+ 
+                 // wrapping the GZipStream in a buffered stream significantly improves performance
+                 // and the max throughput is reached with a 32K buffer. See details here:
+                 // https://github.com/dotnet/runtime/issues/39233#issuecomment-745598847
+                 var bufferedStream = new BufferedStream(gzipStream, 32768);
+-                var binaryReader = new BinaryReader(bufferedStream);
++                return new BinaryReader(bufferedStream);
++            }
++            catch(Exception)
++            {
++                stream?.Dispose();
++                throw;
++            }
++        }
+ 
+-                int fileFormatVersion = binaryReader.ReadInt32();
++        /// <summary>
++        /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
++        /// </summary>
++        /// <param name="sourceFilePath">The full file path of the binary log file</param>
++        /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
++        public void Replay(string sourceFilePath, CancellationToken cancellationToken)
++        {
++            using var binaryReader = OpenReader(sourceFilePath);
++            Replay(binaryReader, cancellationToken);
++        }
++
++        /// <summary>
++        /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
++        /// </summary>
++        /// <param name="binaryReader">The binary log content binary reader - caller is responsible for disposing.</param>
++        /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
++        public void Replay(BinaryReader binaryReader, CancellationToken cancellationToken)
++        {
++            int fileFormatVersion = binaryReader.ReadInt32();
++
++            // the log file is written using a newer version of file format
++            // that we don't know how to read
++            if (fileFormatVersion > BinaryLogger.FileFormatVersion)
++            {
++                var text = ResourceUtilities.FormatResourceStringStripCodeAndKeyword("UnsupportedLogFileFormat", fileFormatVersion, BinaryLogger.FileFormatVersion);
++                throw new NotSupportedException(text);
++            }
+ 
+-                // the log file is written using a newer version of file format
+-                // that we don't know how to read
+-                if (fileFormatVersion > BinaryLogger.FileFormatVersion)
++            using var reader = new BuildEventArgsReader(binaryReader, fileFormatVersion);
++            NotificationsSourceCreated?.Invoke(reader);
++            while (true)
++            {
++                if (cancellationToken.IsCancellationRequested)
+                 {
+-                    var text = ResourceUtilities.FormatResourceStringStripCodeAndKeyword("UnsupportedLogFileFormat", fileFormatVersion, BinaryLogger.FileFormatVersion);
+-                    throw new NotSupportedException(text);
++                    return;
+                 }
+ 
+-                using var reader = new BuildEventArgsReader(binaryReader, fileFormatVersion);
+-                while (true)
++                BuildEventArgs? instance = reader.Read();
++                if (instance == null)
+                 {
+-                    if (cancellationToken.IsCancellationRequested)
+-                    {
+-                        return;
+-                    }
+-
+-                    BuildEventArgs instance = reader.Read();
+-                    if (instance == null)
+-                    {
+-                        break;
+-                    }
+-
+-                    Dispatch(instance);
++                    break;
+                 }
++
++                Dispatch(instance);
+             }
+         }
+     }
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index ddb7520a7fd..ccd61e871b9 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -13,14 +13,12 @@
+ using Microsoft.Build.Framework.Profiler;
+ using Microsoft.Build.Shared;
+ 
+-#nullable disable
+-
+ namespace Microsoft.Build.Logging
+ {
+     /// <summary>
+     /// Deserializes and returns BuildEventArgs-derived objects from a BinaryReader
+     /// </summary>
+-    public class BuildEventArgsReader : IDisposable
++    public class BuildEventArgsReader : IBuildEventArgsReaderNotifications, IDisposable
+     {
+         private readonly BinaryReader binaryReader;
+         private readonly int fileFormatVersion;
+@@ -45,13 +43,13 @@ public class BuildEventArgsReader : IDisposable
+         /// A "page-file" for storing strings we've read so far. Keeping them in memory would OOM the 32-bit MSBuild
+         /// when reading large binlogs. This is a no-op in a 64-bit process.
+         /// </summary>
+-        private StringStorage stringStorage = new StringStorage();
++        private readonly StringStorage stringStorage = new StringStorage();
+ 
+         // reflection is needed to set these three fields because public constructors don't provide
+         // a way to set these from the outside
+-        private static FieldInfo buildEventArgsFieldThreadId =
++        private static FieldInfo? buildEventArgsFieldThreadId =
+             typeof(BuildEventArgs).GetField("threadId", BindingFlags.Instance | BindingFlags.NonPublic);
+-        private static FieldInfo buildEventArgsFieldSenderName =
++        private static FieldInfo? buildEventArgsFieldSenderName =
+             typeof(BuildEventArgs).GetField("senderName", BindingFlags.Instance | BindingFlags.NonPublic);
+ 
+         /// <summary>
+@@ -67,18 +65,27 @@ public BuildEventArgsReader(BinaryReader binaryReader, int fileFormatVersion)
+ 
+         public void Dispose()
+         {
+-            if (stringStorage != null)
+-            {
+-                stringStorage.Dispose();
+-                stringStorage = null;
+-            }
++            stringStorage.Dispose();
+         }
+ 
++        /// <summary>
++        /// An event that allows the subscriber to be notified when a string is read from the binary log.
++        /// Subscriber may adjust the string by setting <see cref="StringReadEventArgs.StringToBeUsed"/> property.
++        /// The passed event arg can be reused and should not be stored.
++        /// </summary>
++        public event Action<StringReadEventArgs>? StringReadDone;
++
++        /// <summary>
++        /// An event that allows the caller to be notified when a string is encountered in the binary log.
++        /// BinaryReader passed in ctor is at the beginning of the string at this point.
++        /// </summary>
++        public event Action? StringEncountered;
++
+         /// <summary>
+         /// Raised when the log reader encounters a binary blob embedded in the stream.
+         /// The arguments include the blob kind and the byte buffer with the contents.
+         /// </summary>
+-        internal event Action<BinaryLogRecordKind, byte[]> OnBlobRead;
++        internal event Action<BinaryLogRecordKind, byte[]>? OnBlobRead;
+ 
+         /// <summary>
+         /// Reads the next log record from the <see cref="BinaryReader"/>.
+@@ -87,7 +94,7 @@ public void Dispose()
+         /// The next <see cref="BuildEventArgs"/>.
+         /// If there are no more records, returns <see langword="null"/>.
+         /// </returns>
+-        public BuildEventArgs Read()
++        public BuildEventArgs? Read()
+         {
+             BinaryLogRecordKind recordKind = (BinaryLogRecordKind)ReadInt32();
+ 
+@@ -114,7 +121,7 @@ public BuildEventArgs Read()
+                 recordKind = (BinaryLogRecordKind)ReadInt32();
+             }
+ 
+-            BuildEventArgs result = null;
++            BuildEventArgs? result = null;
+             switch (recordKind)
+             {
+                 case BinaryLogRecordKind.EndOfFile:
+@@ -242,8 +249,10 @@ private IDictionary<string, string> GetNameValueList(int id)
+                 var dictionary = ArrayDictionary<string, string>.Create(list.Length);
+                 for (int i = 0; i < list.Length; i++)
+                 {
+-                    string key = GetStringFromRecord(list[i].keyIndex);
+-                    string value = GetStringFromRecord(list[i].valueIndex);
++                    string? key = GetStringFromRecord(list[i].keyIndex);
++                    // passing null forward would require changes to API surface of existing events
++                    // (BuildStartedEventArgs.BuildEnvironment and ProjectStartedEventArgs.GlobalProperties)
++                    string value = GetStringFromRecord(list[i].valueIndex) ?? string.Empty;
+                     if (key != null)
+                     {
+                         dictionary.Add(key, value);
+@@ -258,9 +267,17 @@ private IDictionary<string, string> GetNameValueList(int id)
+                 $"NameValueList record number {recordNumber} is invalid: index {id} is not within {stringRecords.Count}.");
+         }
+ 
++        private readonly StringReadEventArgs stringReadEventArgs = new StringReadEventArgs(string.Empty);
+         private void ReadStringRecord()
+         {
++            this.StringEncountered?.Invoke();
+             string text = ReadString();
++            if (this.StringReadDone != null)
++            {
++                stringReadEventArgs.Reuse(text);
++                StringReadDone(stringReadEventArgs);
++                text = stringReadEventArgs.StringToBeUsed;
++            }
+             object storedString = stringStorage.Add(text);
+             stringRecords.Add(storedString);
+         }
+@@ -304,11 +321,11 @@ private BuildEventArgs ReadTargetSkippedEventArgs()
+             var targetName = ReadOptionalString();
+             var parentTarget = ReadOptionalString();
+ 
+-            string condition = null;
+-            string evaluatedCondition = null;
++            string? condition = null;
++            string? evaluatedCondition = null;
+             bool originallySucceeded = false;
+             TargetSkipReason skipReason = TargetSkipReason.None;
+-            BuildEventContext originalBuildEventContext = null;
++            BuildEventContext? originalBuildEventContext = null;
+             if (fileFormatVersion >= 13)
+             {
+                 condition = ReadOptionalString();
+@@ -381,7 +398,8 @@ private BuildEventArgs ReadBuildFinishedEventArgs()
+         private BuildEventArgs ReadProjectEvaluationStartedEventArgs()
+         {
+             var fields = ReadBuildEventArgsFields();
+-            var projectFile = ReadDeduplicatedString();
++            // Null message arg is not expected
++            var projectFile = ReadDeduplicatedString() ?? string.Empty;
+ 
+             var e = new ProjectEvaluationStartedEventArgs(
+                 ResourceUtilities.GetResourceString("EvaluationStarted"),
+@@ -396,7 +414,8 @@ private BuildEventArgs ReadProjectEvaluationStartedEventArgs()
+         private BuildEventArgs ReadProjectEvaluationFinishedEventArgs()
+         {
+             var fields = ReadBuildEventArgsFields();
+-            var projectFile = ReadDeduplicatedString();
++            // Null message arg is not expected
++            var projectFile = ReadDeduplicatedString() ?? string.Empty;
+ 
+             var e = new ProjectEvaluationFinishedEventArgs(
+                 ResourceUtilities.GetResourceString("EvaluationFinished"),
+@@ -408,7 +427,7 @@ private BuildEventArgs ReadProjectEvaluationFinishedEventArgs()
+ 
+             if (fileFormatVersion >= 12)
+             {
+-                IEnumerable globalProperties = null;
++                IEnumerable? globalProperties = null;
+                 if (ReadBoolean())
+                 {
+                     globalProperties = ReadStringDictionary();
+@@ -448,7 +467,7 @@ private BuildEventArgs ReadProjectEvaluationFinishedEventArgs()
+         private BuildEventArgs ReadProjectStartedEventArgs()
+         {
+             var fields = ReadBuildEventArgsFields();
+-            BuildEventContext parentContext = null;
++            BuildEventContext? parentContext = null;
+             if (ReadBoolean())
+             {
+                 parentContext = ReadBuildEventContext();
+@@ -459,7 +478,7 @@ private BuildEventArgs ReadProjectStartedEventArgs()
+             var targetNames = ReadDeduplicatedString();
+             var toolsVersion = ReadOptionalString();
+ 
+-            IDictionary<string, string> globalProperties = null;
++            IDictionary<string, string>? globalProperties = null;
+ 
+             if (fileFormatVersion > 6)
+             {
+@@ -747,10 +766,10 @@ private BuildEventArgs ReadPropertyReassignmentEventArgs()
+         {
+             var fields = ReadBuildEventArgsFields(readImportance: true);
+ 
+-            string propertyName = ReadDeduplicatedString();
+-            string previousValue = ReadDeduplicatedString();
+-            string newValue = ReadDeduplicatedString();
+-            string location = ReadDeduplicatedString();
++            string? propertyName = ReadDeduplicatedString();
++            string? previousValue = ReadDeduplicatedString();
++            string? newValue = ReadDeduplicatedString();
++            string? location = ReadDeduplicatedString();
+ 
+             var e = new PropertyReassignmentEventArgs(
+                 propertyName,
+@@ -769,7 +788,7 @@ private BuildEventArgs ReadPropertyReassignmentEventArgs()
+         private BuildEventArgs ReadUninitializedPropertyReadEventArgs()
+         {
+             var fields = ReadBuildEventArgsFields(readImportance: true);
+-            string propertyName = ReadDeduplicatedString();
++            string? propertyName = ReadDeduplicatedString();
+ 
+             var e = new UninitializedPropertyReadEventArgs(
+                 propertyName,
+@@ -786,9 +805,9 @@ private BuildEventArgs ReadPropertyInitialValueSetEventArgs()
+         {
+             var fields = ReadBuildEventArgsFields(readImportance: true);
+ 
+-            string propertyName = ReadDeduplicatedString();
+-            string propertyValue = ReadDeduplicatedString();
+-            string propertySource = ReadDeduplicatedString();
++            string? propertyName = ReadDeduplicatedString();
++            string? propertyValue = ReadDeduplicatedString();
++            string? propertySource = ReadDeduplicatedString();
+ 
+             var e = new PropertyInitialValueSetEventArgs(
+                 propertyName,
+@@ -808,11 +827,11 @@ private AssemblyLoadBuildEventArgs ReadAssemblyLoadEventArgs()
+             var fields = ReadBuildEventArgsFields(readImportance: false);
+ 
+             AssemblyLoadingContext context = (AssemblyLoadingContext)ReadInt32();
+-            string loadingInitiator = ReadDeduplicatedString();
+-            string assemblyName = ReadDeduplicatedString();
+-            string assemblyPath = ReadDeduplicatedString();
++            string? loadingInitiator = ReadDeduplicatedString();
++            string? assemblyName = ReadDeduplicatedString();
++            string? assemblyPath = ReadDeduplicatedString();
+             Guid mvid = ReadGuid();
+-            string appDomainName = ReadDeduplicatedString();
++            string? appDomainName = ReadDeduplicatedString();
+ 
+             var e = new AssemblyLoadBuildEventArgs(
+                 context,
+@@ -923,7 +942,7 @@ private BuildEventArgsFields ReadBuildEventArgsFields(bool readImportance = fals
+             if ((flags & BuildEventArgsFieldFlags.Arguments) != 0)
+             {
+                 int count = ReadInt32();
+-                object[] arguments = new object[count];
++                object?[] arguments = new object[count];
+                 for (int i = 0; i < count; i++)
+                 {
+                     arguments[i] = ReadDeduplicatedString();
+@@ -946,12 +965,12 @@ private void SetCommonFields(BuildEventArgs buildEventArgs, BuildEventArgsFields
+ 
+             if ((fields.Flags & BuildEventArgsFieldFlags.ThreadId) != 0)
+             {
+-                buildEventArgsFieldThreadId.SetValue(buildEventArgs, fields.ThreadId);
++                buildEventArgsFieldThreadId?.SetValue(buildEventArgs, fields.ThreadId);
+             }
+ 
+             if ((fields.Flags & BuildEventArgsFieldFlags.SenderName) != 0)
+             {
+-                buildEventArgsFieldSenderName.SetValue(buildEventArgs, fields.SenderName);
++                buildEventArgsFieldSenderName?.SetValue(buildEventArgs, fields.SenderName);
+             }
+ 
+             if ((fields.Flags & BuildEventArgsFieldFlags.Timestamp) != 0)
+@@ -960,7 +979,7 @@ private void SetCommonFields(BuildEventArgs buildEventArgs, BuildEventArgsFields
+             }
+         }
+ 
+-        private IEnumerable ReadPropertyList()
++        private IEnumerable? ReadPropertyList()
+         {
+             var properties = ReadStringDictionary();
+             if (properties == null || properties.Count == 0)
+@@ -1007,7 +1026,7 @@ private BuildEventContext ReadBuildEventContext()
+             return result;
+         }
+ 
+-        private IDictionary<string, string> ReadStringDictionary()
++        private IDictionary<string, string>? ReadStringDictionary()
+         {
+             if (fileFormatVersion < 10)
+             {
+@@ -1024,7 +1043,7 @@ private IDictionary<string, string> ReadStringDictionary()
+             return record;
+         }
+ 
+-        private IDictionary<string, string> ReadLegacyStringDictionary()
++        private IDictionary<string, string>? ReadLegacyStringDictionary()
+         {
+             int count = ReadInt32();
+             if (count == 0)
+@@ -1046,16 +1065,16 @@ private IDictionary<string, string> ReadLegacyStringDictionary()
+ 
+         private ITaskItem ReadTaskItem()
+         {
+-            string itemSpec = ReadDeduplicatedString();
++            string? itemSpec = ReadDeduplicatedString();
+             var metadata = ReadStringDictionary();
+ 
+             var taskItem = new TaskItemData(itemSpec, metadata);
+             return taskItem;
+         }
+ 
+-        private IEnumerable ReadProjectItems()
++        private IEnumerable? ReadProjectItems()
+         {
+-            IList<DictionaryEntry> list;
++            IList<DictionaryEntry>? list;
+ 
+             // starting with format version 10 project items are grouped by name
+             // so we only have to write the name once, and then the count of items
+@@ -1088,7 +1107,7 @@ private IEnumerable ReadProjectItems()
+                 list = new List<DictionaryEntry>();
+                 for (int i = 0; i < count; i++)
+                 {
+-                    string itemType = ReadDeduplicatedString();
++                    string itemType = ReadDeduplicatedString()!;
+                     var items = ReadTaskItemList();
+                     if (items != null)
+                     {
+@@ -1110,7 +1129,7 @@ private IEnumerable ReadProjectItems()
+ 
+                 while (true)
+                 {
+-                    string itemType = ReadDeduplicatedString();
++                    string itemType = ReadDeduplicatedString()!;
+                     if (string.IsNullOrEmpty(itemType))
+                     {
+                         break;
+@@ -1135,7 +1154,7 @@ private IEnumerable ReadProjectItems()
+             return list;
+         }
+ 
+-        private IEnumerable ReadTaskItemList()
++        private IEnumerable? ReadTaskItemList()
+         {
+             int count = ReadInt32();
+             if (count == 0)
+@@ -1159,7 +1178,7 @@ private string ReadString()
+             return binaryReader.ReadString();
+         }
+ 
+-        private string ReadOptionalString()
++        private string? ReadOptionalString()
+         {
+             if (fileFormatVersion < 10)
+             {
+@@ -1176,7 +1195,7 @@ private string ReadOptionalString()
+             return ReadDeduplicatedString();
+         }
+ 
+-        private string ReadDeduplicatedString()
++        private string? ReadDeduplicatedString()
+         {
+             if (fileFormatVersion < 10)
+             {
+@@ -1187,7 +1206,7 @@ private string ReadDeduplicatedString()
+             return GetStringFromRecord(index);
+         }
+ 
+-        private string GetStringFromRecord(int index)
++        private string? GetStringFromRecord(int index)
+         {
+             if (index == 0)
+             {
+@@ -1310,11 +1329,11 @@ internal class StringPosition
+         /// </summary>
+         internal class StringStorage : IDisposable
+         {
+-            private readonly string filePath;
+-            private FileStream stream;
+-            private StreamWriter streamWriter;
+-            private readonly StreamReader streamReader;
+-            private readonly StringBuilder stringBuilder;
++            private readonly string? filePath;
++            private FileStream? stream;
++            private StreamWriter? streamWriter;
++            private readonly StreamReader? streamReader;
++            private readonly StringBuilder? stringBuilder;
+ 
+             public const int StringSizeThreshold = 1024;
+ 
+@@ -1368,9 +1387,9 @@ public object Add(string text)
+ 
+                 var stringPosition = new StringPosition();
+ 
+-                stringPosition.FilePosition = stream.Position;
++                stringPosition.FilePosition = stream!.Position;
+ 
+-                streamWriter.Write(text);
++                streamWriter!.Write(text);
+ 
+                 stringPosition.StringLength = text.Length;
+                 return stringPosition;
+@@ -1385,16 +1404,16 @@ public string Get(object storedString)
+ 
+                 var position = (StringPosition)storedString;
+ 
+-                stream.Position = position.FilePosition;
+-                stringBuilder.Length = position.StringLength;
++                stream!.Position = position.FilePosition;
++                stringBuilder!.Length = position.StringLength;
+                 for (int i = 0; i < position.StringLength; i++)
+                 {
+-                    char ch = (char)streamReader.Read();
++                    char ch = (char)streamReader!.Read();
+                     stringBuilder[i] = ch;
+                 }
+ 
+                 stream.Position = stream.Length;
+-                streamReader.DiscardBufferedData();
++                streamReader!.DiscardBufferedData();
+ 
+                 string result = stringBuilder.ToString();
+                 stringBuilder.Clear();
+diff --git a/src/Build/Logging/BinaryLogger/IBuildEventArgsReaderNotifications.cs b/src/Build/Logging/BinaryLogger/IBuildEventArgsReaderNotifications.cs
+new file mode 100644
+index 00000000000..415bd7c71fd
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/IBuildEventArgsReaderNotifications.cs
+@@ -0,0 +1,13 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Logging
++{
++    /// <summary>
++    /// An interface for notifications from BuildEventArgsReader
++    /// </summary>
++    public interface IBuildEventArgsReaderNotifications : IBuildEventStringsReader
++    {
++        /* For future use */
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/IBuildEventStringsReader.cs b/src/Build/Logging/BinaryLogger/IBuildEventStringsReader.cs
+new file mode 100644
+index 00000000000..e9e7651ee78
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/IBuildEventStringsReader.cs
+@@ -0,0 +1,26 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Logging
++{
++    /// <summary>
++    /// An interface for notifications about reading strings from the binary log.
++    /// </summary>
++    public interface IBuildEventStringsReader
++    {
++        /// <summary>
++        /// An event that allows the subscriber to be notified when a string is read from the binary log.
++        /// Subscriber may adjust the string by setting <see cref="StringReadEventArgs.StringToBeUsed"/> property.
++        /// The passed event arg can be reused and should not be stored.
++        /// </summary>
++        public event Action<StringReadEventArgs>? StringReadDone;
++
++        /// <summary>
++        /// An event that allows the caller to be notified when a string is encountered in the binary log.
++        /// BinaryReader passed in ctor is at the beginning of the string at this point.
++        /// </summary>
++        public event Action? StringEncountered;
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/StringReadEventArgs.cs b/src/Build/Logging/BinaryLogger/StringReadEventArgs.cs
+new file mode 100644
+index 00000000000..e2a4c83d3cb
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/StringReadEventArgs.cs
+@@ -0,0 +1,35 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Logging
++{
++    /// <summary>
++    /// An event args for <see cref="IBuildEventStringsReader.StringReadDone"/> callback.
++    /// </summary>
++    public sealed class StringReadEventArgs : EventArgs
++    {
++        /// <summary>
++        /// The original string that was read from the binary log.
++        /// </summary>
++        public string OriginalString { get; private set; }
++
++        /// <summary>
++        /// The adjusted string (or the original string of none subscriber replaced it) that will be used by the reader.
++        /// </summary>
++        public string StringToBeUsed { get; set; }
++
++        public StringReadEventArgs(string str)
++        {
++            OriginalString = str;
++            StringToBeUsed = str;
++        }
++
++        internal void Reuse(string newValue)
++        {
++            OriginalString = newValue;
++            StringToBeUsed = newValue;
++        }
++    }
++}
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 976b452ff4c..39a953f2948 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -159,6 +159,9 @@
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+     <Compile Include="FileSystem\*.cs" />
+     <Compile Include="Evaluation\IItemTypeDefinition.cs" />
++    <Compile Include="Logging\BinaryLogger\IBuildEventArgsReaderNotifications.cs" />
++    <Compile Include="Logging\BinaryLogger\IBuildEventStringsReader.cs" />
++    <Compile Include="Logging\BinaryLogger\StringReadEventArgs.cs" />
+     <Compile Include="Utilities\ReaderWriterLockSlimExtensions.cs" />
+     <Compile Include="BackEnd\Node\ConsoleOutput.cs" />
+     <Compile Include="BackEnd\Node\PartialBuildTelemetry.cs" />
+diff --git a/src/Framework/AssemblyLoadBuildEventArgs.cs b/src/Framework/AssemblyLoadBuildEventArgs.cs
+index 4c6c8292cbc..49f827b19c9 100644
+--- a/src/Framework/AssemblyLoadBuildEventArgs.cs
++++ b/src/Framework/AssemblyLoadBuildEventArgs.cs
+@@ -20,7 +20,7 @@ public AssemblyLoadBuildEventArgs(
+             AssemblyLoadingContext loadingContext,
+             string? loadingInitiator,
+             string? assemblyName,
+-            string assemblyPath,
++            string? assemblyPath,
+             Guid mvid,
+             string? customAppDomainDescriptor,
+             MessageImportance importance = MessageImportance.Low)
+diff --git a/src/Framework/BuildStartedEventArgs.cs b/src/Framework/BuildStartedEventArgs.cs
+index d4c2882c4f9..09073ee9540 100644
+--- a/src/Framework/BuildStartedEventArgs.cs
++++ b/src/Framework/BuildStartedEventArgs.cs
+@@ -53,7 +53,7 @@ public BuildStartedEventArgs(
+         public BuildStartedEventArgs(
+             string? message,
+             string? helpKeyword,
+-            IDictionary<string, string> environmentOfBuild)
++            IDictionary<string, string>? environmentOfBuild)
+             : this(message, helpKeyword, DateTime.UtcNow)
+         {
+             environmentOnBuildStart = environmentOfBuild;
+diff --git a/src/Framework/ProjectStartedEventArgs.cs b/src/Framework/ProjectStartedEventArgs.cs
+index 539fae2b5e1..eba6c9ac5ab 100644
+--- a/src/Framework/ProjectStartedEventArgs.cs
++++ b/src/Framework/ProjectStartedEventArgs.cs
+@@ -76,11 +76,11 @@ public ProjectStartedEventArgs(
+             int projectId,
+             string message,
+             string helpKeyword,
+-            string projectFile,
+-            string targetNames,
+-            IEnumerable properties,
+-            IEnumerable items,
+-            BuildEventContext parentBuildEventContext)
++            string? projectFile,
++            string? targetNames,
++            IEnumerable? properties,
++            IEnumerable? items,
++            BuildEventContext? parentBuildEventContext)
+             : this(projectId, message, helpKeyword, projectFile, targetNames, properties, items, parentBuildEventContext, DateTime.UtcNow)
+         {
+         }
+@@ -103,13 +103,13 @@ public ProjectStartedEventArgs(
+             int projectId,
+             string message,
+             string helpKeyword,
+-            string projectFile,
+-            string targetNames,
+-            IEnumerable properties,
+-            IEnumerable items,
+-            BuildEventContext parentBuildEventContext,
+-            IDictionary<string, string> globalProperties,
+-            string toolsVersion)
++            string? projectFile,
++            string? targetNames,
++            IEnumerable? properties,
++            IEnumerable? items,
++            BuildEventContext? parentBuildEventContext,
++            IDictionary<string, string>? globalProperties,
++            string? toolsVersion)
+             : this(projectId, message, helpKeyword, projectFile, targetNames, properties, items, parentBuildEventContext)
+         {
+             this.GlobalProperties = globalProperties;
+@@ -130,10 +130,10 @@ public ProjectStartedEventArgs(
+         public ProjectStartedEventArgs(
+             string message,
+             string helpKeyword,
+-            string projectFile,
+-            string targetNames,
+-            IEnumerable properties,
+-            IEnumerable items,
++            string? projectFile,
++            string? targetNames,
++            IEnumerable? properties,
++            IEnumerable? items,
+             DateTime eventTimestamp)
+             : base(message, helpKeyword, "MSBuild", eventTimestamp)
+         {
+@@ -160,11 +160,11 @@ public ProjectStartedEventArgs(
+             int projectId,
+             string message,
+             string helpKeyword,
+-            string projectFile,
+-            string targetNames,
+-            IEnumerable properties,
+-            IEnumerable items,
+-            BuildEventContext parentBuildEventContext,
++            string? projectFile,
++            string? targetNames,
++            IEnumerable? properties,
++            IEnumerable? items,
++            BuildEventContext? parentBuildEventContext,
+             DateTime eventTimestamp)
+             : this(message, helpKeyword, projectFile, targetNames, properties, items, eventTimestamp)
+         {
+diff --git a/src/Framework/ResponseFileUsedEventArgs.cs b/src/Framework/ResponseFileUsedEventArgs.cs
+index bc027518a67..7e9f132a262 100644
+--- a/src/Framework/ResponseFileUsedEventArgs.cs
++++ b/src/Framework/ResponseFileUsedEventArgs.cs
+@@ -17,7 +17,7 @@ public ResponseFileUsedEventArgs()
+         /// <summary>
+         /// Initialize a new instance of the ResponseFileUsedEventArgs class.
+         /// </summary>
+-        public ResponseFileUsedEventArgs(string responseFilePath) : base()
++        public ResponseFileUsedEventArgs(string? responseFilePath) : base()
+         {
+             ResponseFilePath = responseFilePath;
+         }

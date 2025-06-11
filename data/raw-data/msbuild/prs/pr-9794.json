@@ -1,0 +1,197 @@
+{
+  "number": 9794,
+  "title": "Support environments with long variable values",
+  "body": "Fixes [AB#1527557](https://devdiv.visualstudio.com/0bdbc590-a062-4c3f-b0f6-9383f67865ee/_workitems/edit/1527557)\r\n\r\n### Context\r\n\r\nThe .NET Framework implementation of `Environment.SetEnvironmentVariable` has a hard-coded check for the 32,767 character limit and exceeding it fails the call with `ArgumentException`. The limit does not exist anymore on modern Windows and we've started seeing users run MSBuild in environments with very long variables. This is problematic because MSBuild contains logic to restore the environment, so even if the particular variable is not really used, we may end up trying to set it to an excessively long value.\r\n\r\n### Changes Made\r\n\r\n- Made `CommunicationUtilities.SetEnvironment` use a P/Invoke to `kernel32!SetEnvironmentVariable` on .NET Framework, to work around the problematic BCL implementation.\r\n- Optimized `CommunicationUtilities.SetEnvironment` to call `SetEnvironmentVariable` only if it doesn't already have the desired value.\r\n- Made `CommunicationUtilities.SetEnvironment` calls to restore the environment _best-effort_ in places where the process is anyways shutting done.\r\n- Changed `CommunicationUtilities.GetEnvironmentVariables` to use the custom implementation only on .NET Framework where it provides the perf benefit. On .NET Core it is actually slower than the BCL implementation.\r\n\r\n### Testing\r\n\r\nAdded a new unit test class and also pulled one existing test to it because it was unnecessarily running twice in its previous location.\r\n\r\n### Notes\r\n",
+  "state": "MERGED",
+  "createdAt": "2024-02-28T10:06:40Z",
+  "updatedAt": "2024-03-04T15:03:21Z",
+  "closedAt": "2024-03-04T15:03:17Z",
+  "mergedAt": "2024-03-04T15:03:17Z",
+  "additions": 210,
+  "deletions": 110,
+  "changedFiles": 6,
+  "headRefName": "envvar-roundtrip",
+  "isDraft": false,
+  "author": {
+    "login": "ladipro"
+  },
+  "milestone": null,
+  "assignees": {
+    "nodes": []
+  },
+  "labels": [],
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "oid": "0c5e38a05bff085dc501bff176be158509f702f4",
+          "message": "Support environments with long variable values",
+          "committedDate": "2024-02-28T10:05:42Z",
+          "author": {
+            "name": "Ladi Prosek",
+            "email": "laprosek@microsoft.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "6a369934cb59b0768d74f4af3d3d009680718fb7",
+          "message": "Update src/Shared/CommunicationsUtilities.cs\n\nCo-authored-by: Rainer Sigwald <raines@microsoft.com>",
+          "committedDate": "2024-02-28T20:35:14Z",
+          "author": {
+            "name": "Ladi Prosek",
+            "email": "ladi.prosek@gmail.com"
+          }
+        }
+      }
+    ]
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "How is .NET Core faster than a pinvoke?",
+        "createdAt": "2024-02-28T20:43:13Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "> How is .NET Core faster than a pinvoke?\r\n\r\nOh, to clarify, in this PR the `SetEnvironmentVariable` P/Invoke is being added for correctness (.NET Framework has an obsolete limit hard-coded in it). The perf related change here is in `GetEnvironmentVariables` which is more than just a P/Invoke.\r\n\r\nThese are the numbers on `net8.0`. \"Managed\" is BCL, \"Native\" is the MSBuild implementation, which I am not changing other than ifdefing it out of Core builds. In this benchmark both include the `Hashtable` -> `Dictionary<string, string>` conversion.\r\n\r\n```\r\n| Method  | Mean      | Error     | StdDev    |\r\n|-------- |----------:|----------:|----------:|\r\n| Managed |  9.873 us | 0.0541 us | 0.0479 us |\r\n| Native  | 10.776 us | 0.1072 us | 0.1003 us |\r\n```",
+        "createdAt": "2024-02-28T20:58:52Z",
+        "author": {
+          "login": "ladipro"
+        }
+      }
+    ]
+  },
+  "reviewThreads": {
+    "nodes": [
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Is this right, and why this isn't a runtime check for Windows instead of the `#if`?\r\n\r\n```suggestion\r\n        /// it's greater than or equal to 32,767 characters. This limitation does not exist on modern Windows or .NET.\r\n```",
+              "createdAt": "2024-02-28T17:09:17Z",
+              "path": "src/Shared/CommunicationsUtilities.cs",
+              "diffHunk": "@@ -240,23 +240,48 @@ internal static int NodeConnectionTimeout\n             get { return GetIntegerVariableOrDefault(\"MSBUILDNODECONNECTIONTIMEOUT\", DefaultNodeConnectionTimeout); }\n         }\n \n+#if NETFRAMEWORK\n         /// <summary>\n-        /// Get environment block\n+        /// Get environment block.\n         /// </summary>\n         [DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)]\n         internal static extern unsafe char* GetEnvironmentStrings();\n \n         /// <summary>\n-        /// Free environment block\n+        /// Free environment block.\n         /// </summary>\n         [DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)]\n         internal static extern unsafe bool FreeEnvironmentStrings(char* pStrings);\n \n         /// <summary>\n-        /// Copied from the BCL implementation to eliminate some expensive security asserts.\n+        /// Set environment variable P/Invoke.\n+        /// </summary>\n+        [DllImport(\"kernel32.dll\", EntryPoint = \"SetEnvironmentVariable\", SetLastError = true, CharSet = CharSet.Unicode)]\n+        [return: MarshalAs(UnmanagedType.Bool)]\n+        private static extern bool SetEnvironmentVariableNative(string name, string value);\n+\n+        /// <summary>\n+        /// Sets an environment variable using P/Invoke to workaround the .NET Framework BCL implementation.\n+        /// </summary>\n+        /// <remarks>\n+        /// .NET Framework implementation of SetEnvironmentVariable checks the length of the value and throws an exception if\n+        /// it's greater than or equal to 32,767 characters. This limitation does not exist on modern Windows.",
+              "author": {
+                "login": "rainersigwald"
+              }
+            },
+            {
+              "body": "Yes, `Environment.SetEnvironmentVariable` on .NET (Core) does not have this issue, so it can really be a compile-time check (netfx vs. core) and not a run-time platform check which I think is a tiny bit faster and cleaner. I hope I'm not misunderstanding your question.",
+              "createdAt": "2024-02-28T20:34:58Z",
+              "path": "src/Shared/CommunicationsUtilities.cs",
+              "diffHunk": "@@ -240,23 +240,48 @@ internal static int NodeConnectionTimeout\n             get { return GetIntegerVariableOrDefault(\"MSBUILDNODECONNECTIONTIMEOUT\", DefaultNodeConnectionTimeout); }\n         }\n \n+#if NETFRAMEWORK\n         /// <summary>\n-        /// Get environment block\n+        /// Get environment block.\n         /// </summary>\n         [DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)]\n         internal static extern unsafe char* GetEnvironmentStrings();\n \n         /// <summary>\n-        /// Free environment block\n+        /// Free environment block.\n         /// </summary>\n         [DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)]\n         internal static extern unsafe bool FreeEnvironmentStrings(char* pStrings);\n \n         /// <summary>\n-        /// Copied from the BCL implementation to eliminate some expensive security asserts.\n+        /// Set environment variable P/Invoke.\n+        /// </summary>\n+        [DllImport(\"kernel32.dll\", EntryPoint = \"SetEnvironmentVariable\", SetLastError = true, CharSet = CharSet.Unicode)]\n+        [return: MarshalAs(UnmanagedType.Bool)]\n+        private static extern bool SetEnvironmentVariableNative(string name, string value);\n+\n+        /// <summary>\n+        /// Sets an environment variable using P/Invoke to workaround the .NET Framework BCL implementation.\n+        /// </summary>\n+        /// <remarks>\n+        /// .NET Framework implementation of SetEnvironmentVariable checks the length of the value and throws an exception if\n+        /// it's greater than or equal to 32,767 characters. This limitation does not exist on modern Windows.",
+              "author": {
+                "login": "ladipro"
+              }
+            },
+            {
+              "body": "Exactly what I was asking, and what I wanted to hear :)",
+              "createdAt": "2024-02-28T21:46:06Z",
+              "path": "src/Shared/CommunicationsUtilities.cs",
+              "diffHunk": "@@ -240,23 +240,48 @@ internal static int NodeConnectionTimeout\n             get { return GetIntegerVariableOrDefault(\"MSBUILDNODECONNECTIONTIMEOUT\", DefaultNodeConnectionTimeout); }\n         }\n \n+#if NETFRAMEWORK\n         /// <summary>\n-        /// Get environment block\n+        /// Get environment block.\n         /// </summary>\n         [DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)]\n         internal static extern unsafe char* GetEnvironmentStrings();\n \n         /// <summary>\n-        /// Free environment block\n+        /// Free environment block.\n         /// </summary>\n         [DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)]\n         internal static extern unsafe bool FreeEnvironmentStrings(char* pStrings);\n \n         /// <summary>\n-        /// Copied from the BCL implementation to eliminate some expensive security asserts.\n+        /// Set environment variable P/Invoke.\n+        /// </summary>\n+        [DllImport(\"kernel32.dll\", EntryPoint = \"SetEnvironmentVariable\", SetLastError = true, CharSet = CharSet.Unicode)]\n+        [return: MarshalAs(UnmanagedType.Bool)]\n+        private static extern bool SetEnvironmentVariableNative(string name, string value);\n+\n+        /// <summary>\n+        /// Sets an environment variable using P/Invoke to workaround the .NET Framework BCL implementation.\n+        /// </summary>\n+        /// <remarks>\n+        /// .NET Framework implementation of SetEnvironmentVariable checks the length of the value and throws an exception if\n+        /// it's greater than or equal to 32,767 characters. This limitation does not exist on modern Windows.",
+              "author": {
+                "login": "rainersigwald"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Do we care about the other callers as well?",
+              "createdAt": "2024-02-28T18:44:04Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcNode.cs",
+              "diffHunk": "@@ -472,11 +472,18 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)\n             // so reset it away from a user-requested folder that may get deleted.\n             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);\n \n-            // Restore the original environment.\n+            // Restore the original environment, best effort.\n             // If the node was never configured, this will be null.\n             if (_savedEnvironment != null)\n             {\n-                CommunicationsUtilities.SetEnvironment(_savedEnvironment);\n+                try\n+                {\n+                    CommunicationsUtilities.SetEnvironment(_savedEnvironment);",
+              "author": {
+                "login": "JanKrivanek"
+              }
+            },
+            {
+              "body": "There are a few more callers but, unlike this place, there is a chance that failing to set the environment would impact the build. And we really don't want to be silently mis-building so I left those callers as is.",
+              "createdAt": "2024-02-28T20:40:33Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcNode.cs",
+              "diffHunk": "@@ -472,11 +472,18 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)\n             // so reset it away from a user-requested folder that may get deleted.\n             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);\n \n-            // Restore the original environment.\n+            // Restore the original environment, best effort.\n             // If the node was never configured, this will be null.\n             if (_savedEnvironment != null)\n             {\n-                CommunicationsUtilities.SetEnvironment(_savedEnvironment);\n+                try\n+                {\n+                    CommunicationsUtilities.SetEnvironment(_savedEnvironment);",
+              "author": {
+                "login": "ladipro"
+              }
+            },
+            {
+              "body": "Please consider introduce optional `bool forgiving = false` or something to avoid code duplicity.",
+              "createdAt": "2024-02-29T16:01:30Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcNode.cs",
+              "diffHunk": "@@ -472,11 +472,18 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)\n             // so reset it away from a user-requested folder that may get deleted.\n             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);\n \n-            // Restore the original environment.\n+            // Restore the original environment, best effort.\n             // If the node was never configured, this will be null.\n             if (_savedEnvironment != null)\n             {\n-                CommunicationsUtilities.SetEnvironment(_savedEnvironment);\n+                try\n+                {\n+                    CommunicationsUtilities.SetEnvironment(_savedEnvironment);",
+              "author": {
+                "login": "rokonec"
+              }
+            },
+            {
+              "body": "I could add a `NoThrow` wrapper but the callers are interested in logging the exception so that would have to be something like `Exception SetEnvironmentNoThrow(...)` which would be an awkward method signature. Maybe I am misunderstanding the suggestion. Please elaborate.",
+              "createdAt": "2024-03-03T15:00:09Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcNode.cs",
+              "diffHunk": "@@ -472,11 +472,18 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)\n             // so reset it away from a user-requested folder that may get deleted.\n             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);\n \n-            // Restore the original environment.\n+            // Restore the original environment, best effort.\n             // If the node was never configured, this will be null.\n             if (_savedEnvironment != null)\n             {\n-                CommunicationsUtilities.SetEnvironment(_savedEnvironment);\n+                try\n+                {\n+                    CommunicationsUtilities.SetEnvironment(_savedEnvironment);",
+              "author": {
+                "login": "ladipro"
+              }
+            },
+            {
+              "body": "I forget to mention it is NIT.\r\nI though in line of `SetEnvironment(IEnumerable<...> envVars, bool forgiving = false);` current usage would not change only places where we require to be forgiving you would add `forgiving: true` which would swallow and trace-log all those `Set` exceptions.",
+              "createdAt": "2024-03-03T18:27:11Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcNode.cs",
+              "diffHunk": "@@ -472,11 +472,18 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)\n             // so reset it away from a user-requested folder that may get deleted.\n             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);\n \n-            // Restore the original environment.\n+            // Restore the original environment, best effort.\n             // If the node was never configured, this will be null.\n             if (_savedEnvironment != null)\n             {\n-                CommunicationsUtilities.SetEnvironment(_savedEnvironment);\n+                try\n+                {\n+                    CommunicationsUtilities.SetEnvironment(_savedEnvironment);",
+              "author": {
+                "login": "rokonec"
+              }
+            },
+            {
+              "body": "The two callers with `try`/`catch` unfortunately don't use the same trace-logging mechanism. That itself may not be done for a good reason but I'd prefer to carefully step over this rabbit hole and merge as is.",
+              "createdAt": "2024-03-04T09:26:29Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcNode.cs",
+              "diffHunk": "@@ -472,11 +472,18 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)\n             // so reset it away from a user-requested folder that may get deleted.\n             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);\n \n-            // Restore the original environment.\n+            // Restore the original environment, best effort.\n             // If the node was never configured, this will be null.\n             if (_savedEnvironment != null)\n             {\n-                CommunicationsUtilities.SetEnvironment(_savedEnvironment);\n+                try\n+                {\n+                    CommunicationsUtilities.SetEnvironment(_savedEnvironment);",
+              "author": {
+                "login": "ladipro"
+              }
+            },
+            {
+              "body": "Ahhh, I missed it. I was only comparing logged message and have not notice different logging method. In such case scratch my node, i prefer current implementation  now.",
+              "createdAt": "2024-03-04T13:23:10Z",
+              "path": "src/Build/BackEnd/Node/OutOfProcNode.cs",
+              "diffHunk": "@@ -472,11 +472,18 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)\n             // so reset it away from a user-requested folder that may get deleted.\n             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);\n \n-            // Restore the original environment.\n+            // Restore the original environment, best effort.\n             // If the node was never configured, this will be null.\n             if (_savedEnvironment != null)\n             {\n-                CommunicationsUtilities.SetEnvironment(_savedEnvironment);\n+                try\n+                {\n+                    CommunicationsUtilities.SetEnvironment(_savedEnvironment);",
+              "author": {
+                "login": "rokonec"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "comments": {
+          "nodes": [
+            {
+              "body": "Should we call GetLastError here?",
+              "createdAt": "2024-02-28T18:48:23Z",
+              "path": "src/Shared/CommunicationsUtilities.cs",
+              "diffHunk": "@@ -268,107 +293,121 @@ internal static int NodeConnectionTimeout\n \n             Dictionary<string, string> table = new Dictionary<string, string>(200, StringComparer.OrdinalIgnoreCase); // Razzle has 150 environment variables\n \n-            if (NativeMethodsShared.IsWindows)\n+            unsafe\n             {\n-                unsafe\n+                char* pEnvironmentBlock = null;\n+\n+                try\n                 {\n-                    char* pEnvironmentBlock = null;\n+                    pEnvironmentBlock = GetEnvironmentStrings();\n+                    if (pEnvironmentBlock == null)\n+                    {\n+                        throw new OutOfMemoryException();",
+              "author": {
+                "login": "JanKrivanek"
+              }
+            },
+            {
+              "body": "Oh I see it comes frome here \r\nhttps://github.com/dotnet/runtime/blob/17fa327ff69000a8174b274fda24de8da81c7a21/src/libraries/System.Private.CoreLib/src/System/Environment.Variables.Windows.cs#L87",
+              "createdAt": "2024-02-28T18:55:01Z",
+              "path": "src/Shared/CommunicationsUtilities.cs",
+              "diffHunk": "@@ -268,107 +293,121 @@ internal static int NodeConnectionTimeout\n \n             Dictionary<string, string> table = new Dictionary<string, string>(200, StringComparer.OrdinalIgnoreCase); // Razzle has 150 environment variables\n \n-            if (NativeMethodsShared.IsWindows)\n+            unsafe\n             {\n-                unsafe\n+                char* pEnvironmentBlock = null;\n+\n+                try\n                 {\n-                    char* pEnvironmentBlock = null;\n+                    pEnvironmentBlock = GetEnvironmentStrings();\n+                    if (pEnvironmentBlock == null)\n+                    {\n+                        throw new OutOfMemoryException();",
+              "author": {
+                "login": "JanKrivanek"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

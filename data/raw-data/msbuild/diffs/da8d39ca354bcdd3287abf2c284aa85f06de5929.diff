@@ -1,0 +1,391 @@
+diff --git a/documentation/wiki/ChangeWaves.md b/documentation/wiki/ChangeWaves.md
+index 727b5ec915c..ef4b61564e3 100644
+--- a/documentation/wiki/ChangeWaves.md
++++ b/documentation/wiki/ChangeWaves.md
+@@ -27,6 +27,7 @@ A wave of features is set to "rotate out" (i.e. become standard functionality) t
+ - [Respect deps.json when loading assemblies](https://github.com/dotnet/msbuild/pull/7520)
+ - [Consider `Platform` as default during Platform Negotiation](https://github.com/dotnet/msbuild/pull/7511)
+ - [Adding accepted SDK name match pattern to SDK manifests](https://github.com/dotnet/msbuild/pull/7597)
++- [Throw warning indicating invalid project types](https://github.com/dotnet/msbuild/pull/7708)
+ - [MSBuild server](https://github.com/dotnet/msbuild/pull/7634)
+ 
+ ### 17.0
+diff --git a/src/Build/BackEnd/Components/Logging/ProjectLoggingContext.cs b/src/Build/BackEnd/Components/Logging/ProjectLoggingContext.cs
+index 6c7bb192575..2a9a83b0135 100644
+--- a/src/Build/BackEnd/Components/Logging/ProjectLoggingContext.cs
++++ b/src/Build/BackEnd/Components/Logging/ProjectLoggingContext.cs
+@@ -111,7 +111,7 @@ private ProjectLoggingContext(
+                 }
+                 else
+                 {
+-                    properties = projectProperties.Filter(p => p is not EnvironmentDerivedProjectPropertyInstance, p => new DictionaryEntry(p.Name, p.EvaluatedValue));
++                    properties = projectProperties.Filter(p => p is not EnvironmentDerivedProjectPropertyInstance || EnvironmentUtilities.IsWellKnownEnvironmentDerivedProperty(p.Name), p => new DictionaryEntry(p.Name, p.EvaluatedValue));
+                 }
+ 
+                 items = projectItems?.GetCopyOnReadEnumerable(item => new DictionaryEntry(item.ItemType, new TaskItem(item))) ?? Enumerable.Empty<DictionaryEntry>();
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index d95771ae3cd..7a1f6cc9c4f 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -820,6 +820,19 @@ private async Task BuildAndReport()
+ 
+                 thrownException = ex;
+             }
++            // This is a workaround for https://github.com/dotnet/msbuild/issues/2064. It catches the exception case and turns it into a more understandable warning.
++            catch (UnbuildableProjectTypeException ex)
++            {
++                thrownException = ex;
++                if (_projectLoggingContext is null)
++                {
++                    _nodeLoggingContext.LogWarning("SolutionParseUnknownProjectType", ex.Message);
++                }
++                else
++                {
++                    _projectLoggingContext.LogWarning("SolutionParseUnknownProjectType", ex.Message);
++                }
++            }
+             catch (Exception ex)
+             {
+                 thrownException = ex;
+diff --git a/src/Build/Definition/ProjectProperty.cs b/src/Build/Definition/ProjectProperty.cs
+index 157fc4366ec..058217689f8 100644
+--- a/src/Build/Definition/ProjectProperty.cs
++++ b/src/Build/Definition/ProjectProperty.cs
+@@ -98,7 +98,7 @@ string IProperty.EvaluatedValueEscaped
+             [DebuggerStepThrough]
+             get
+             {
+-                if (this is EnvironmentDerivedProjectProperty environmentProperty && environmentProperty.loggingContext is { IsValid: true } loggingContext && !environmentProperty._loggedEnvProperty)
++                if (this is EnvironmentDerivedProjectProperty environmentProperty && environmentProperty.loggingContext is { IsValid: true } loggingContext && !environmentProperty._loggedEnvProperty && !Traits.LogAllEnvironmentVariables)
+                 {
+                     EnvironmentVariableReadEventArgs args = new(Name, EvaluatedValueEscapedInternal);
+                     args.BuildEventContext = loggingContext.BuildEventContext;
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 6a99407a70a..37e520b9b21 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -824,8 +824,11 @@ private IEnumerable FilterOutEnvironmentDerivedProperties(PropertyDictionary<P>
+             List<P> list = new(dictionary.Count);
+             foreach (P p in dictionary)
+             {
+-                if (p is EnvironmentDerivedProjectPropertyInstance ||
+-                    (p is ProjectProperty pp && pp.IsEnvironmentProperty))
++                // This checks if a property was derived from the environment but is not one of the well-known environment variables we
++                // use to change build behavior.
++                if ((p is EnvironmentDerivedProjectPropertyInstance ||
++                    (p is ProjectProperty pp && pp.IsEnvironmentProperty)) &&
++                    !EnvironmentUtilities.IsWellKnownEnvironmentDerivedProperty(p.Name))
+                 {
+                     continue;
+                 }
+diff --git a/src/Build/Instance/ProjectPropertyInstance.cs b/src/Build/Instance/ProjectPropertyInstance.cs
+index c6fd6293e5d..ed7337062c5 100644
+--- a/src/Build/Instance/ProjectPropertyInstance.cs
++++ b/src/Build/Instance/ProjectPropertyInstance.cs
+@@ -90,7 +90,7 @@ string IProperty.EvaluatedValueEscaped
+         {
+             get
+             {
+-                if (this is EnvironmentDerivedProjectPropertyInstance envProperty && envProperty.loggingContext?.IsValid == true && !envProperty._loggedEnvProperty)
++                if (this is EnvironmentDerivedProjectPropertyInstance envProperty && envProperty.loggingContext?.IsValid == true && !envProperty._loggedEnvProperty && !Traits.LogAllEnvironmentVariables)
+                 {
+                     EnvironmentVariableReadEventArgs args = new(Name, _escapedValue);
+                     args.BuildEventContext = envProperty.loggingContext.BuildEventContext;
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+index 941cfccfc06..46f8eb085de 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+@@ -6,6 +6,7 @@
+ using System.Collections.Generic;
+ using System.Globalization;
+ using System.IO;
++using System.Linq;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation;
+@@ -253,7 +254,7 @@ private void Write(BuildStartedEventArgs e)
+             }
+             else
+             {
+-                Write(0);
++                Write(e.BuildEnvironment?.Where(kvp => EnvironmentUtilities.IsWellKnownEnvironmentDerivedProperty(kvp.Key)));
+             }
+         }
+ 
+diff --git a/src/Build/Logging/ParallelLogger/ParallelConsoleLogger.cs b/src/Build/Logging/ParallelLogger/ParallelConsoleLogger.cs
+index 6e16da044d7..3d184b648f1 100644
+--- a/src/Build/Logging/ParallelLogger/ParallelConsoleLogger.cs
++++ b/src/Build/Logging/ParallelLogger/ParallelConsoleLogger.cs
+@@ -12,6 +12,7 @@
+ using ColorSetter = Microsoft.Build.Logging.ColorSetter;
+ using ColorResetter = Microsoft.Build.Logging.ColorResetter;
+ using WriteHandler = Microsoft.Build.Logging.WriteHandler;
++using System.Linq;
+ 
+ #nullable disable
+ 
+@@ -235,6 +236,10 @@ public override void BuildStartedHandler(object sender, BuildStartedEventArgs e)
+             {
+                 WriteEnvironment(e.BuildEnvironment);
+             }
++            else
++            {
++                WriteEnvironment(e.BuildEnvironment?.Where(kvp => EnvironmentUtilities.IsWellKnownEnvironmentDerivedProperty(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value));
++            }
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/Logging/SerialConsoleLogger.cs b/src/Build/Logging/SerialConsoleLogger.cs
+index bbfc1978a44..abb9c752d78 100644
+--- a/src/Build/Logging/SerialConsoleLogger.cs
++++ b/src/Build/Logging/SerialConsoleLogger.cs
+@@ -11,6 +11,7 @@
+ using ColorSetter = Microsoft.Build.Logging.ColorSetter;
+ using ColorResetter = Microsoft.Build.Logging.ColorResetter;
+ using WriteHandler = Microsoft.Build.Logging.WriteHandler;
++using System.Linq;
+ 
+ #nullable disable
+ 
+@@ -112,6 +113,10 @@ public override void BuildStartedHandler(object sender, BuildStartedEventArgs e)
+             {
+                 WriteEnvironment(e.BuildEnvironment);
+             }
++            else
++            {
++                WriteEnvironment(e.BuildEnvironment?.Where(kvp => EnvironmentUtilities.IsWellKnownEnvironmentDerivedProperty(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value));
++            }
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/Xml/ProjectXmlUtilities.cs b/src/Build/Xml/ProjectXmlUtilities.cs
+index 7dec7be9239..40c33d8c30b 100644
+--- a/src/Build/Xml/ProjectXmlUtilities.cs
++++ b/src/Build/Xml/ProjectXmlUtilities.cs
+@@ -5,11 +5,25 @@
+ using System.Collections.Generic;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Construction;
++using System.IO;
++using System.Xml;
++using Microsoft.Build.Framework;
+ 
+ #nullable disable
+ 
+ namespace Microsoft.Build.Internal
+ {
++    /// <summary>
++    /// Exception indicating that we tried to build a type of project MSBuild did not recognize.
++    /// </summary>
++    internal sealed class UnbuildableProjectTypeException : Exception
++    {
++        internal UnbuildableProjectTypeException(string file)
++            : base(file)
++        {
++        }
++    }
++
+     /// <summary>
+     /// Project-related Xml utilities
+     /// </summary>
+@@ -68,13 +82,37 @@ internal static void ThrowProjectInvalidChildElement(string name, string parentN
+         /// <returns>True when the namespace is in the MSBuild namespace or no namespace.</returns>
+         internal static bool VerifyValidProjectNamespace(XmlElementWithLocation element)
+         {
+-            return
+-                // Prefix must be empty
+-                element.Prefix.Length == 0 &&
++            if (element.Prefix.Length != 0)
++            {
++                return false;
++            }
++            else if (string.Equals(element.NamespaceURI, XMakeAttributes.defaultXmlNamespace, StringComparison.OrdinalIgnoreCase))
++            {
++                return true;
++            }
++            else if (string.IsNullOrEmpty(element.NamespaceURI))
++            {
++                if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_4) && Path.GetExtension(element.Location.File).Equals(".dwproj", StringComparison.OrdinalIgnoreCase))
++                {
++                    bool validMSBuildProject = true;
++                    foreach (XmlNode child in element.ChildNodes)
++                    {
++                        if (child.Name.Equals("Database", StringComparison.OrdinalIgnoreCase))
++                        {
++                            validMSBuildProject = false;
++                            throw new UnbuildableProjectTypeException(element.Location.File);
++                        }
++                    }
++
++                    return validMSBuildProject;
++                }
+ 
+-                // Namespace must equal to the MSBuild namespace or empty
+-                (string.Equals(element.NamespaceURI, XMakeAttributes.defaultXmlNamespace,
+-                     StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(element.NamespaceURI));
++                return true;
++            }
++            else
++            {
++                return false;
++            }
+         }
+ 
+         /// <summary>
+diff --git a/src/Samples/PortableTask/PortableTask.csproj b/src/Samples/PortableTask/PortableTask.csproj
+index a497a305fb2..944a7d713ac 100644
+--- a/src/Samples/PortableTask/PortableTask.csproj
++++ b/src/Samples/PortableTask/PortableTask.csproj
+@@ -1,4 +1,4 @@
+-<Project Sdk="Microsoft.NET.Sdk">
++﻿<Project Sdk="Microsoft.NET.Sdk">
+   <PropertyGroup>
+     <UseProductOutputPath>true</UseProductOutputPath>
+     <CopyNuGetImplementations>false</CopyNuGetImplementations>
+@@ -12,7 +12,12 @@
+   </ItemGroup>
+   <ItemGroup>
+     <PackageReference Include="Microsoft.Build.Framework" Version="15.5.180" />
+-    <PackageReference Include="Microsoft.Build.Utilities.Core" Version="15.5.180" />
++    <PackageReference Include="Microsoft.Build.Utilities.Core" Version="15.5.180" GeneratePathProperty="true" />
+   </ItemGroup>
+   <Target Name="UpdateXlf" />
++
++  <!-- This is only needed for a test in the MSBuild repo; it is unrelated to the PortableTask sample itself. -->
++  <Target Name="CopyMSBuildUtilitiesToNewFolder" BeforeTargets="CopyFilesToOutputDirectory">
++    <Copy SourceFiles="$(PkgMicrosoft_Build_Utilities_Core)\lib\net46\Microsoft.Build.Utilities.Core.dll" DestinationFiles="$(OutDir)\OldMSBuild\Microsoft.Build.Utilities.Core.dll" />
++  </Target>
+ </Project>
+diff --git a/src/Shared/EnvironmentUtilities.cs b/src/Shared/EnvironmentUtilities.cs
+index 01cf349f2f8..7cb21b1abe2 100644
+--- a/src/Shared/EnvironmentUtilities.cs
++++ b/src/Shared/EnvironmentUtilities.cs
+@@ -12,5 +12,12 @@ internal static partial class EnvironmentUtilities
+ 
+         public static bool Is64BitOperatingSystem =>
+             Environment.Is64BitOperatingSystem;
++
++        public static bool IsWellKnownEnvironmentDerivedProperty(string propertyName)
++        {
++            return propertyName.StartsWith("MSBUILD") ||
++                propertyName.StartsWith("COMPLUS_") ||
++                propertyName.StartsWith("DOTNET_");
++        }
+     }
+ }
+diff --git a/src/Shared/TypeLoader.cs b/src/Shared/TypeLoader.cs
+index 9a1b027bd35..825bc0a41d3 100644
+--- a/src/Shared/TypeLoader.cs
++++ b/src/Shared/TypeLoader.cs
+@@ -59,10 +59,10 @@ private static string[] findRuntimeAssembliesWithMicrosoftBuildFramework()
+             string[] msbuildAssemblies = Directory.GetFiles(msbuildDirectory, "*.dll");
+             string[] runtimeAssemblies = Directory.GetFiles(RuntimeEnvironment.GetRuntimeDirectory(), "*.dll");
+ 
+-            List<string> msbuildAssembliesList = new(msbuildAssemblies);
+-            msbuildAssembliesList.AddRange(runtimeAssemblies);
++            List<string> runtimeAssembliesList = new(runtimeAssemblies);
++            runtimeAssembliesList.AddRange(msbuildAssemblies);
+ 
+-            return msbuildAssembliesList.ToArray();
++            return runtimeAssembliesList.ToArray();
+         }
+ 
+         /// <summary>
+@@ -192,10 +192,20 @@ private static Assembly LoadAssembly(AssemblyLoadInfo assemblyLoadInfo)
+         private static Assembly LoadAssemblyUsingMetadataLoadContext(AssemblyLoadInfo assemblyLoadInfo)
+         {
+             string path = assemblyLoadInfo.AssemblyFile;
+-            List<string> localPaths = new(Directory.GetFiles(Path.GetDirectoryName(path), "*.dll"));
+-            localPaths.AddRange(runtimeAssemblies);
++            string[] localAssemblies = Directory.GetFiles(Path.GetDirectoryName(path), "*.dll");
+ 
+-            _context = new(new PathAssemblyResolver(localPaths));
++            // Deduplicate between MSBuild assemblies and task dependencies. 
++            Dictionary<string, string> assembliesDictionary = new(localAssemblies.Length + runtimeAssemblies.Length);
++            foreach (string localPath in localAssemblies) {
++                assembliesDictionary.Add(Path.GetFileName(localPath), localPath);
++            }
++
++            foreach (string runtimeAssembly in runtimeAssemblies)
++            {
++                assembliesDictionary[Path.GetFileName(runtimeAssembly)] = runtimeAssembly;
++            }
++
++            _context = new(new PathAssemblyResolver(assembliesDictionary.Values));
+             return _context.LoadFromAssemblyPath(path);
+         }
+ 
+diff --git a/src/Shared/UnitTests/TypeLoader_Tests.cs b/src/Shared/UnitTests/TypeLoader_Tests.cs
+index 509f4c01565..54aa9961901 100644
+--- a/src/Shared/UnitTests/TypeLoader_Tests.cs
++++ b/src/Shared/UnitTests/TypeLoader_Tests.cs
+@@ -10,6 +10,7 @@
+ using Xunit;
+ using Xunit.Abstractions;
+ using Shouldly;
++using System.Linq;
+ 
+ #nullable disable
+ 
+@@ -20,6 +21,8 @@ public class TypeLoader_Tests
+         private static readonly string ProjectFileFolder = Path.Combine(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory, "PortableTask");
+         private const string ProjectFileName = "portableTaskTest.proj";
+         private const string DLLFileName = "PortableTask.dll";
++        private static string PortableTaskFolderPath = Path.GetFullPath(
++                    Path.Combine(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory, "..", "..", "..", "Samples", "PortableTask"));
+ 
+         private readonly ITestOutputHelper _output;
+ 
+@@ -90,6 +93,28 @@ public void LoadInsideAsssembly()
+             }
+         }
+ 
++        [Fact]
++        public void LoadTaskDependingOnMSBuild()
++        {
++            using (TestEnvironment env = TestEnvironment.Create())
++            {
++                TransientTestFolder folder = env.CreateFolder(createFolder: true);
++                string currentAssembly = Assembly.GetExecutingAssembly().Location;
++                string utilitiesName = "Microsoft.Build.Utilities.Core.dll";
++                string newAssemblyLocation = Path.Combine(folder.Path, Path.GetFileName(currentAssembly));
++
++                // The "first" directory is "Debug" or "Release"
++                string portableTaskPath = Path.Combine(Directory.GetDirectories(PortableTaskFolderPath).First(), "netstandard2.0", "OldMSBuild");
++                string utilities = Path.Combine(portableTaskPath, utilitiesName);
++                File.Copy(utilities, Path.Combine(folder.Path, utilitiesName));
++                File.Copy(currentAssembly, newAssemblyLocation);
++                TypeLoader typeLoader = new(TaskLoader.IsTaskClass);
++
++                // If we cannot accept MSBuild next to the task assembly we're loading, this will throw.
++                typeLoader.Load("TypeLoader_Tests", AssemblyLoadInfo.Create(null, newAssemblyLocation), useTaskHost: true);
++            }
++        }
++
+         [Fact]
+         public void LoadOutsideAssembly()
+         {
+diff --git a/src/Utilities/MuxLogger.cs b/src/Utilities/MuxLogger.cs
+index b58f7f10881..5f67d9265a7 100644
+--- a/src/Utilities/MuxLogger.cs
++++ b/src/Utilities/MuxLogger.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Linq;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+@@ -862,7 +863,10 @@ private void RaiseProjectStartedEvent(object sender, ProjectStartedEventArgs bui
+                         _firstProjectStartedEventContext = buildEvent.BuildEventContext;
+ 
+                         // We've never seen a project started event, so raise the build started event and save this project started event.
+-                        BuildStartedEventArgs startedEvent = new BuildStartedEventArgs(_buildStartedEvent.Message, _buildStartedEvent.HelpKeyword, Traits.LogAllEnvironmentVariables ? _buildStartedEvent.BuildEnvironment : null);
++                        BuildStartedEventArgs startedEvent =
++                            new BuildStartedEventArgs(_buildStartedEvent.Message,
++                            _buildStartedEvent.HelpKeyword,
++                            Traits.LogAllEnvironmentVariables ? _buildStartedEvent.BuildEnvironment : _buildStartedEvent.BuildEnvironment?.Where(kvp => EnvironmentUtilities.IsWellKnownEnvironmentDerivedProperty(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value));
+                         RaiseBuildStartedEvent(sender, startedEvent);
+                     }
+ 

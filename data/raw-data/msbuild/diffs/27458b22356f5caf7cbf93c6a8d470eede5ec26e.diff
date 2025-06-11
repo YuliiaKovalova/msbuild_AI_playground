@@ -1,0 +1,159 @@
+diff --git a/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs b/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
+index c6ae9b4eb49..b1516503006 100644
+--- a/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TaskExecutionHost_Tests.cs
+@@ -18,6 +18,7 @@
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
++using Microsoft.Build.Shared.Debugging;
+ using Shouldly;
+ using Xunit;
+ using InvalidProjectFileException = Microsoft.Build.Exceptions.InvalidProjectFileException;
+@@ -1060,9 +1061,13 @@ public void TaskExceptionHandlingTest(Type exceptionType, bool isCritical)
+             MockLogger ml = new MockLogger() { AllowTaskCrashes = true };
+ 
+             using TestEnvironment env = TestEnvironment.Create();
+-            var debugFolder = env.CreateFolder(true);
++            var debugFolder = env.CreateFolder();
+             // inject the location for failure logs - not to interact with other tests
+             env.SetEnvironmentVariable("MSBUILDDEBUGPATH", debugFolder.Path);
++            // Force initing the DebugPath from the env var - as we need it to be unique for those tests.
++            // The ProjectCacheTests DataMemberAttribute usages (specifically SuccessfulGraphsWithBuildParameters) lead
++            //  to the DebugPath being set before this test runs - and hence the env var is ignored.
++            DebugUtils.SetDebugPath();
+ 
+             ObjectModelHelpers.BuildProjectExpectFailure($"""
+                      <Project ToolsVersion=`msbuilddefaulttoolsversion` xmlns=`msbuildnamespace`>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index f1adb97b2bf..0214e3f4150 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -762,9 +762,13 @@ private void VerifyEntryInActiveOrWaitingState()
+ 
+         /// <summary>
+         /// The entry point for the request builder thread.
++        /// Launch the project and gather the results, reporting them back to the BuildRequestEngine.
+         /// </summary>
+         private async Task RequestThreadProc(bool setThreadParameters)
+         {
++            Exception thrownException = null;
++            BuildResult result = null;
++
+             try
+             {
+                 if (setThreadParameters)
+@@ -772,42 +776,9 @@ private async Task RequestThreadProc(bool setThreadParameters)
+                     SetCommonWorkerThreadParameters();
+                 }
+                 MSBuildEventSource.Log.RequestThreadProcStart();
+-                await BuildAndReport();
+-                MSBuildEventSource.Log.RequestThreadProcStop();
+-            }
+-            catch (ThreadAbortException)
+-            {
+-                // Do nothing.  This will happen when the thread is forcibly terminated because we are shutting down, for example
+-                // when the unit test framework terminates.
+-                throw;
+-            }
+-            catch (Exception e)
+-            {
+-                // Dump all engine exceptions to a temp file
+-                // so that we have something to go on in the
+-                // event of a failure
+-                ExceptionHandling.DumpExceptionToFile(e);
+-
+-                // This is fatal: process will terminate: make sure the
+-                // debugger launches
+-                ErrorUtilities.ThrowInternalError(e.Message, e);
+-                throw;
+-            }
+-        }
+-
+-        /// <summary>
+-        /// Launch the project and gather the results, reporting them back to the BuildRequestEngine.
+-        /// </summary>
+-        private async Task BuildAndReport()
+-        {
+-            Exception thrownException = null;
+-            BuildResult result = null;
+-            VerifyEntryInActiveState();
+-
+-            // Start the build request
+-            try
+-            {
++                VerifyEntryInActiveState();
+                 result = await BuildProject();
++                MSBuildEventSource.Log.RequestThreadProcStop();
+             }
+             catch (InvalidProjectFileException ex)
+             {
+@@ -853,6 +824,12 @@ private async Task BuildAndReport()
+ 
+                     loggingContext.LogCommentFromText(MessageImportance.Low, ex.ToString());
+                 }
++                else if (ex is ThreadAbortException)
++                {
++                    // Do nothing.  This will happen when the thread is forcibly terminated because we are shutting down, for example
++                    // when the unit test framework terminates.
++                    throw;
++                }
+                 else if (ex is not CriticalTaskException)
+                 {
+                     (((LoggingContext)_projectLoggingContext) ?? _nodeLoggingContext).LogError(BuildEventFileInfo.Empty, "UnhandledMSBuildError", ex.ToString());
+@@ -860,10 +837,19 @@ private async Task BuildAndReport()
+ 
+                 if (ExceptionHandling.IsCriticalException(ex))
+                 {
++                    // Dump all engine exceptions to a temp file
++                    // so that we have something to go on in the
++                    // event of a failure
++                    ExceptionHandling.DumpExceptionToFile(ex);
++
+                     // This includes InternalErrorException, which we definitely want a callstack for.
+                     // Fortunately the default console UnhandledExceptionHandler will log the callstack even
+                     // for unhandled exceptions thrown from threads other than the main thread, like here.
+                     // Less fortunately NUnit doesn't.
++
++                    // This is fatal: process will terminate: make sure the
++                    // debugger launches
++                    ErrorUtilities.ThrowInternalError(ex.Message, ex);
+                     throw;
+                 }
+             }
+@@ -879,8 +865,6 @@ private async Task BuildAndReport()
+ 
+                 ReportResultAndCleanUp(result);
+             }
+-
+-            return;
+         }
+ 
+         /// <summary>
+diff --git a/src/Shared/Debugging/DebugUtils.cs b/src/Shared/Debugging/DebugUtils.cs
+index cd81d66dc0c..de83a6de360 100644
+--- a/src/Shared/Debugging/DebugUtils.cs
++++ b/src/Shared/Debugging/DebugUtils.cs
+@@ -21,6 +21,13 @@ private enum NodeMode
+         }
+ 
+         static DebugUtils()
++        {
++            SetDebugPath();
++        }
++
++        // DebugUtils are initialized early on by the test runner - during preparing data for DataMemeberAttribute of some test,
++        //  for that reason it is not easily possible to inject the DebugPath in tests via env var (unless we want to run expensive exec style test).
++        internal static void SetDebugPath()
+         {
+             string environmentDebugPath = FileUtilities.TrimAndStripAnyQuotes(Environment.GetEnvironmentVariable("MSBUILDDEBUGPATH"));
+             string debugDirectory = environmentDebugPath;
+@@ -95,7 +102,7 @@ private static bool CurrentProcessMatchesDebugName()
+ 
+         public static readonly bool ShouldDebugCurrentProcess = CurrentProcessMatchesDebugName();
+ 
+-        public static string DebugPath { get; }
++        public static string DebugPath { get; private set; }
+ 
+         public static string FindNextAvailableDebugFilePath(string fileName)
+         {

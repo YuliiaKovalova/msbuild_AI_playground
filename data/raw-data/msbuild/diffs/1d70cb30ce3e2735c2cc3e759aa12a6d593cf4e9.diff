@@ -1,0 +1,927 @@
+diff --git a/documentation/specs/BuildCheck/Codes.md b/documentation/specs/BuildCheck/Codes.md
+index 5c28d36261b..9845c431061 100644
+--- a/documentation/specs/BuildCheck/Codes.md
++++ b/documentation/specs/BuildCheck/Codes.md
+@@ -9,6 +9,7 @@ Report codes are chosen to conform to suggested guidelines. Those guidelines are
+ | [BC0103](#bc0103---used-environment-variable) | Suggestion | Project | 9.0.100 | Used environment variable. |
+ | [BC0104](#bc0104---projectreference-is-preferred-to-reference) | Warning | N/A | 9.0.200 | ProjectReference is preferred to Reference. |
+ | [BC0105](#bc0105---embeddedresource-should-specify-culture-metadata) | Warning | N/A | 9.0.200 | Culture specific EmbeddedResource should specify Culture metadata. |
++| [BC0106](#bc0106---copytooutputdirectoryalways-should-be-avoided) | Warning | N/A | 9.0.200 | CopyToOutputDirectory='Always' should be avoided. |
+ | [BC0107](#bc0107---targetframework-and-targetframeworks-specified-together) | Warning | N/A | 9.0.200 | TargetFramework and TargetFrameworks specified together. |
+ | [BC0201](#bc0201---usage-of-undefined-property) | Warning | Project | 9.0.100 | Usage of undefined property. |
+ | [BC0202](#bc0202---property-first-declared-after-it-was-used) | Warning | Project | 9.0.100 | Property first declared after it was used. |
+@@ -78,6 +79,36 @@ Examples:
+ <a name="RespectAlreadyAssignedItemCulture"></a>
+ **Note:** In Full Framework version of MSBuild (msbuild.exe, Visual Studio) and in .NET SDK prior 9.0 a global or project specific property `RespectAlreadyAssignedItemCulture` needs to be set to `'true'` in order for the explicit `Culture` metadata to be respected. Otherwise the explicit culture will be overwritten by MSBuild engine and if different from the extension - a `MSB3002` warning is emitted (`"MSB3002: Explicitly set culture "{0}" for item "{1}" was overwritten with inferred culture "{2}", because 'RespectAlreadyAssignedItemCulture' property was not set."`)
+ 
++<a name="BC0106"></a>
++## BC0106 - CopyToOutputDirectory='Always' should be avoided.
++
++"Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying."
++
++[`CopyToOutputDirectory` metadata](https://learn.microsoft.com/en-us/visualstudio/msbuild/common-msbuild-project-items) can take the values:
++ * `Never`
++ * `Always`
++ * `PreserveNewest`
++ * `IfDifferent`
++
++`Always` is not recommended, as it causes the files to be copied in every build, even when the destination file content is identical to the source.
++
++Before the introduction of `IfDifferent`, `Always` was needed to work around cases where the destination file could have changed between builds (e.g. an asset that can be changed during test run, but needs to be reset by the build). `IfDifferent` preserves this behavior without unnecessary copying.
++
++In order to avoid the need to change copy metadata for a large number of items, it's now possible to specify the `SkipUnchangedFilesOnCopyAlways` property in order to flip all copy behavior of `CopyToOutputDirectory=Always` to behave identically to `CopyToOutputDirectory=IfDifferent`:
++
++```xml
++<PropertyGroup>
++    <SkipUnchangedFilesOnCopyAlways>True</SkipUnchangedFilesOnCopyAlways>
++</PropertyGroup>
++
++<ItemGroup>
++    <None Include="File1.txt" CopyToOutputDirectory="Always" />
++    <None Include="File2.txt" CopyToOutputDirectory="IfDifferent" />
++</ItemGroup>
++```
++
++Both items in above example are treated same and no BC0106 diagnostic is issued.
++
+ <a name="BC0107"></a>
+ ## BC0107 - TargetFramework and TargetFrameworks specified together.
+ 
+diff --git a/src/Build/BuildCheck/Checks/CopyAlwaysCheck.cs b/src/Build/BuildCheck/Checks/CopyAlwaysCheck.cs
+new file mode 100644
+index 00000000000..1d0565cb84f
+--- /dev/null
++++ b/src/Build/BuildCheck/Checks/CopyAlwaysCheck.cs
+@@ -0,0 +1,94 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System.Collections.Generic;
++using System.IO;
++using Microsoft.Build.Collections;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Experimental.BuildCheck.Checks;
++internal class CopyAlwaysCheck : Check
++{
++    private const string RuleId = "BC0106";
++    public static CheckRule SupportedRule = new CheckRule(RuleId, "AvoidCopyAlways",
++        ResourceUtilities.GetResourceString("BuildCheck_BC0106_Title")!,
++        ResourceUtilities.GetResourceString("BuildCheck_BC0106_MessageFmt")!,
++        new CheckConfiguration() { RuleId = RuleId, Severity = CheckResultSeverity.Warning });
++
++    public override string FriendlyName => "MSBuild.CopyAlwaysCheck";
++
++    public override IReadOnlyList<CheckRule> SupportedRules { get; } = [SupportedRule];
++
++    public override void Initialize(ConfigurationContext configurationContext)
++    {
++        /* This is it - no custom configuration */
++    }
++
++    public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++    {
++        registrationContext.RegisterEvaluatedPropertiesAction(EvaluatedPropertiesAction);
++        registrationContext.RegisterEvaluatedItemsAction(EvaluatedItemsAction);
++    }
++
++    internal override bool IsBuiltIn => true;
++
++    private readonly HashSet<string> _projectsSeen = new(MSBuildNameIgnoreCaseComparer.Default);
++
++    private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedPropertiesCheckData> context)
++    {
++        // We want to avoid repeated checking of a same project (as it might be evaluated multiple times)
++        //  for this reason we use a hashset with already seen projects.
++        // We want to do the same prevention for both registered actions: EvaluatedPropertiesAction and EvaluatedItemsAction.
++        //  To avoid the need to have separate hashset for each of those functions - we use a single one and we use the fact that
++        //  both functions are always called after each other (EvaluatedPropertiesAction first, then EvaluatedItemsAction),
++        //  so this function just checks the hashset (not to prevent execution of EvaluatedItemsAction) and EvaluatedItemsAction
++        //  updates the hashset.
++        if (_projectsSeen.Contains(context.Data.ProjectFilePath))
++        {
++            return;
++        }
++
++        context.Data.EvaluatedProperties.TryGetValue("SkipUnchangedFilesOnCopyAlways", out string? skipUnchanged);
++
++        if (skipUnchanged.IsMSBuildTrueString())
++        {
++            // Now we know that copy logic is optimized - so we do not need to check items. Avoiding the items check by inserting into lookup.
++            _projectsSeen.Add(context.Data.ProjectFilePath);
++        }
++    }
++
++    private void EvaluatedItemsAction(BuildCheckDataContext<EvaluatedItemsCheckData> context)
++    {
++        // We want to avoid repeated checking of a same project (as it might be evaluated multiple times)
++        //  for this reason we use a hashset with already seen projects.
++        if (!_projectsSeen.Add(context.Data.ProjectFilePath))
++        {
++            return;
++        }
++
++        foreach (ItemData itemData in context.Data.EnumerateItemsOfTypes([ItemNames.Content, ItemNames.Compile, ItemNames.None, ItemNames.EmbeddedResource]))
++        {
++            foreach (KeyValuePair<string, string> keyValuePair in itemData.EnumerateMetadata())
++            {
++                if (MSBuildNameIgnoreCaseComparer.Default.Equals(keyValuePair.Key, ItemMetadataNames.copyToOutputDirectory))
++                {
++                    if (MSBuildNameIgnoreCaseComparer.Default.Equals(keyValuePair.Value, ItemMetadataNames.copyAlways))
++                    {
++                        // Project {0} specifies '{0}' item '{1}', ...
++                        context.ReportResult(BuildCheckResult.Create(
++                            SupportedRule,
++                            // Populating precise location tracked via https://github.com/dotnet/msbuild/issues/10383
++                            ElementLocation.EmptyLocation,
++                            Path.GetFileName(context.Data.ProjectFilePath),
++                            itemData.Type,
++                            itemData.EvaluatedInclude));
++                    }
++
++                    break;
++                }
++            }
++        }
++    }
++}
+diff --git a/src/Build/BuildCheck/Checks/EmbeddedResourceCheck.cs b/src/Build/BuildCheck/Checks/EmbeddedResourceCheck.cs
+index 73c7e6af9ed..aaeda56eaa6 100644
+--- a/src/Build/BuildCheck/Checks/EmbeddedResourceCheck.cs
++++ b/src/Build/BuildCheck/Checks/EmbeddedResourceCheck.cs
+@@ -43,7 +43,7 @@ private void EvaluatedItemsAction(BuildCheckDataContext<EvaluatedItemsCheckData>
+             return;
+         }
+ 
+-        foreach (ItemData itemData in context.Data.EnumerateItemsOfType("EmbeddedResource"))
++        foreach (ItemData itemData in context.Data.EnumerateItemsOfType(ItemNames.EmbeddedResource))
+         {
+             string evaluatedEmbedItem = itemData.EvaluatedInclude;
+             bool hasDoubleExtension = HasDoubleExtension(evaluatedEmbedItem);
+@@ -74,7 +74,7 @@ private void EvaluatedItemsAction(BuildCheckDataContext<EvaluatedItemsCheckData>
+             {
+                 context.ReportResult(BuildCheckResult.Create(
+                     SupportedRule,
+-                    // Populating precise location tracked via https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=58661732
++                    // Populating precise location tracked via https://github.com/dotnet/msbuild/issues/10383
+                     ElementLocation.EmptyLocation,
+                     Path.GetFileName(context.Data.ProjectFilePath),
+                     evaluatedEmbedItem,
+diff --git a/src/Build/BuildCheck/Checks/PreferProjectReferenceCheck.cs b/src/Build/BuildCheck/Checks/PreferProjectReferenceCheck.cs
+index 373a41d20e6..85bbc9d8ba6 100644
+--- a/src/Build/BuildCheck/Checks/PreferProjectReferenceCheck.cs
++++ b/src/Build/BuildCheck/Checks/PreferProjectReferenceCheck.cs
+@@ -70,7 +70,7 @@ private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedProperties
+         {
+             context.ReportResult(BuildCheckResult.Create(
+                 SupportedRule,
+-                // Populating precise location tracked via https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=58661732
++                // Populating precise location tracked via https://github.com/dotnet/msbuild/issues/10383
+                 ElementLocation.EmptyLocation,
+                 Path.GetFileName(context.Data.ProjectFilePath),
+                 Path.GetFileName(projectProducingOutput.Item1),
+@@ -87,7 +87,7 @@ private void EvaluatedItemsAction(BuildCheckDataContext<EvaluatedItemsCheckData>
+             return;
+         }
+ 
+-        foreach (ItemData itemData in context.Data.EnumerateItemsOfType(ItemNames.reference))
++        foreach (ItemData itemData in context.Data.EnumerateItemsOfType(ItemNames.Reference))
+         {
+             string evaluatedReferencePath = itemData.EvaluatedInclude;
+             string referenceFullPath = BuildCheckUtilities.RootEvaluatedPath(evaluatedReferencePath, context.Data.ProjectFilePath);
+@@ -98,7 +98,7 @@ private void EvaluatedItemsAction(BuildCheckDataContext<EvaluatedItemsCheckData>
+             {
+                 context.ReportResult(BuildCheckResult.Create(
+                     SupportedRule,
+-                    // Populating precise location tracked via https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=58661732
++                    // Populating precise location tracked via https://github.com/dotnet/msbuild/issues/10383
+                     ElementLocation.EmptyLocation,
+                     Path.GetFileName(projectReferencedViaOutput),
+                     Path.GetFileName(context.Data.ProjectFilePath),
+diff --git a/src/Build/BuildCheck/Checks/SharedOutputPathCheck.cs b/src/Build/BuildCheck/Checks/SharedOutputPathCheck.cs
+index 7aeb00266d1..fe80a4ded80 100644
+--- a/src/Build/BuildCheck/Checks/SharedOutputPathCheck.cs
++++ b/src/Build/BuildCheck/Checks/SharedOutputPathCheck.cs
+@@ -76,7 +76,7 @@ private void EvaluatedPropertiesAction(BuildCheckDataContext<EvaluatedProperties
+         {
+             context.ReportResult(BuildCheckResult.CreateBuiltIn(
+                 SupportedRule,
+-                // Populating precise location tracked via https://github.com/orgs/dotnet/projects/373/views/1?pane=issue&itemId=58661732
++                // Populating precise location tracked via https://github.com/dotnet/msbuild/issues/10383
+                 ElementLocation.EmptyLocation,
+                 Path.GetFileName(projectPath),
+                 Path.GetFileName(conflictingProject),
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 3476f3dbf8a..cc9ee125ac1 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -147,6 +147,7 @@ internal readonly record struct BuiltInCheckFactory(
+             [
+                 new BuiltInCheckFactory([SharedOutputPathCheck.SupportedRule.Id], SharedOutputPathCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<SharedOutputPathCheck>),
+                 new BuiltInCheckFactory([PreferProjectReferenceCheck.SupportedRule.Id], PreferProjectReferenceCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<PreferProjectReferenceCheck>),
++                new BuiltInCheckFactory([CopyAlwaysCheck.SupportedRule.Id], CopyAlwaysCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<CopyAlwaysCheck>),
+                 new BuiltInCheckFactory([DoubleWritesCheck.SupportedRule.Id], DoubleWritesCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<DoubleWritesCheck>),
+                 new BuiltInCheckFactory([NoEnvironmentVariablePropertyCheck.SupportedRule.Id], NoEnvironmentVariablePropertyCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<NoEnvironmentVariablePropertyCheck>),
+                 new BuiltInCheckFactory([EmbeddedResourceCheck.SupportedRule.Id], EmbeddedResourceCheck.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<EmbeddedResourceCheck>),
+diff --git a/src/Build/BuildCheck/OM/ParsedItemsCheckData.cs b/src/Build/BuildCheck/OM/ParsedItemsCheckData.cs
+index 260b02cc466..c24ba4bda1d 100644
+--- a/src/Build/BuildCheck/OM/ParsedItemsCheckData.cs
++++ b/src/Build/BuildCheck/OM/ParsedItemsCheckData.cs
+@@ -79,6 +79,11 @@ internal EvaluatedItemsCheckData(
+     /// Lazy enumerates evaluated items for a current project. Only items with matching type will be returned (case-insensitive, MSBuild valid names only).
+     /// </summary>
+     public IEnumerable<ItemData> EnumerateItemsOfType(string typeName) => _evaluationFinishedEventArgs.EnumerateItemsOfType(typeName);
++
++    /// <summary>
++    /// Lazy enumerates evaluated items for a current project. Only items with matching type will be returned (case-insensitive, MSBuild valid names only, matching any type from the given list).
++    /// </summary>
++    public IEnumerable<ItemData> EnumerateItemsOfTypes(string[] typeNames) => _evaluationFinishedEventArgs.EnumerateItemsOfTypes(typeNames);
+ }
+ 
+ /// <summary>
+diff --git a/src/Build/Logging/BuildEventArgsExtensions.cs b/src/Build/Logging/BuildEventArgsExtensions.cs
+index e65ffcd7902..33b971eefc1 100644
+--- a/src/Build/Logging/BuildEventArgsExtensions.cs
++++ b/src/Build/Logging/BuildEventArgsExtensions.cs
+@@ -45,6 +45,15 @@ public static IEnumerable<ItemData> EnumerateItemsOfType(
+         this ProjectEvaluationFinishedEventArgs eventArgs, string typeName)
+         => EnumerateItemsOfType(eventArgs.Items, typeName);
+ 
++    /// <summary>
++    /// Lazy enumerates and partially strong types items from Items property. Only items with any matching type will be returned (case-insensitive, MSBuild valid names only).
++    /// The actual item value is proxied via accessor methods - to be able to provide defined interface
++    /// </summary>
++    /// <returns></returns>
++    public static IEnumerable<ItemData> EnumerateItemsOfTypes(
++        this ProjectEvaluationFinishedEventArgs eventArgs, string[] typeNames)
++        => EnumerateItemsOfTypes(eventArgs.Items, typeNames);
++
+     /// <summary>
+     /// Lazy enumerates and strong types items from Items property.
+     /// The actual item value is proxied via accessor methods - to be able to provide defined interface
+@@ -62,6 +71,15 @@ public static IEnumerable<ItemData> EnumerateItemsOfType(
+         this ProjectStartedEventArgs eventArgs, string typeName)
+         => EnumerateItemsOfType(eventArgs.Items, typeName);
+ 
++    /// <summary>
++    /// Lazy enumerates and partially strong types items from Items property. Only items with any matching type will be returned (case-insensitive, MSBuild valid names only).
++    /// The actual item value is proxied via accessor methods - to be able to provide defined interface
++    /// </summary>
++    /// <returns></returns>
++    public static IEnumerable<ItemData> EnumerateItemsOfTypes(
++        this ProjectStartedEventArgs eventArgs, string[] typeNames)
++        => EnumerateItemsOfTypes(eventArgs.Items, typeNames);
++
+     private static IEnumerable<PropertyData> EnumerateProperties(IEnumerable? properties)
+         => Internal.Utilities.EnumerateProperties(properties);
+ 
+@@ -70,4 +88,7 @@ private static IEnumerable<ItemData> EnumerateItems(IEnumerable? items)
+ 
+     private static IEnumerable<ItemData> EnumerateItemsOfType(IEnumerable? items, string typeName)
+         => Internal.Utilities.EnumerateItemsOfType(items, typeName);
++
++    private static IEnumerable<ItemData> EnumerateItemsOfTypes(IEnumerable? items, string[] typeNames)
++        => Internal.Utilities.EnumerateItemsOfTypes(items, typeNames);
+ }
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 0a1505b7eb2..01ebc97d203 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -2176,11 +2176,19 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+   </data>
+   <data name="BuildCheck_BC0105_Title" xml:space="preserve">
+     <value>It is recommended to specify explicit 'Culture' metadata, or 'WithCulture=false' metadata with 'EmbeddedResource' item in order to avoid wrong or nondeterministic culture estimation.</value>
+-	<comment>Terms in quotes are not to be translated.</comment>
++	  <comment>Terms in quotes are not to be translated.</comment>
+   </data>
+   <data name="BuildCheck_BC0105_MessageFmt" xml:space="preserve">
+     <value>Project {0} specifies 'EmbeddedResource' item '{1}', that has possibly a culture denoting extension ('{2}'), but explicit 'Culture' nor 'WithCulture=false' metadata are not specified.</value>
+-	<comment>Terms in quotes are not to be translated.</comment>
++	  <comment>Terms in quotes are not to be translated.</comment>
++  </data>
++  <data name="BuildCheck_BC0106_Title" xml:space="preserve">
++    <value>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</value>
++	  <comment>Terms in quotes are not to be translated.</comment>
++  </data>
++  <data name="BuildCheck_BC0106_MessageFmt" xml:space="preserve">
++    <value>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</value>
++	  <comment>Terms in quotes are not to be translated.</comment>
+   </data>
+   <data name="BuildCheck_BC0107_Title" xml:space="preserve">
+     <value>'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</value>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 084e04fd5a5..f21e4ff48ce 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">K vlastnosti: {0} bylo přistupováno, ale nebyla nikdy inicializována.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 8fde61320d0..592405151c0 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Auf die Eigenschaft „{0}“ wurde zugegriffen, sie wurde jedoch nie initialisiert.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index cdd78c485b5..a0b554c8313 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propiedad: se obtuvo acceso a "{0}", pero nunca se inicializó.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index e760ea25baf..f5aef23bd15 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propriété : « {0} » a été consultée, mais elle n'a jamais été initialisée.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index c87332a45c1..b3afa26c544 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">È stato eseguito l'accesso alla proprietà '{0}', ma non è mai stata inizializzata.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 34fb04dee89..0272fbbc633 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">プロパティ: '{0}' にアクセスしましたが、初期化されませんでした。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index c43856c93f3..d161bd1f570 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">속성: '{0}'에 액세스했지만 초기화되지 않았습니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 15dd91c7e45..ca9fe6569f8 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Właściwość: uzyskano dostęp do „{0}”, ale nigdy nie dokonano inicjacji.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 3f11cf9738b..2777e8e9701 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Propriedade: "{0}" foi acessada, mas nunca foi inicializada.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index c80b270fb6d..eb0191433c3 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">Свойство: к "{0}" получен доступ, но он не инициализирован.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 290ae352625..ff96e148c91 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">'{0}' özelliğine erişildi, ancak hiç başlatılmadı.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 93ab2e25078..e9b3d3bca96 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">已访问属性“{0}”，但从未将其初始化过。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index dca8d748933..474738effa9 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -201,6 +201,16 @@
+         <target state="new">'TargetFramework' (singular) and 'TargetFrameworks' (plural) properties should not be specified in the scripts at the same time.</target>
+         <note>Terms in quotes are not to be translated.</note>
+       </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_MessageFmt">
++        <source>Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</source>
++        <target state="new">Project {0} specifies '{1}' item '{2}', that has 'CopyToOutputDirectory' set as 'Always'. Change the metadata or use 'CopyToOutputDirectory' property.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
++      <trans-unit id="BuildCheck_BC0106_Title">
++        <source>Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</source>
++        <target state="new">Avoid specifying 'Always' for 'CopyToOutputDirectory' as this can lead to unnecessary copy operations during build. Use 'PreserveNewest' or 'IfDifferent' metadata value, or set the 'SkipUnchangedFilesOnCopyAlways' property to true to employ more effective copying.</target>
++        <note>Terms in quotes are not to be translated.</note>
++      </trans-unit>
+       <trans-unit id="BuildCheck_BC0201_MessageFmt">
+         <source>Property: '{0}' was accessed, but it was never initialized.</source>
+         <target state="translated">已存取屬性: '{0}'，但從未初始化。</target>
+diff --git a/src/Build/Utilities/Utilities.cs b/src/Build/Utilities/Utilities.cs
+index 6811def46cd..f68d76b00c1 100644
+--- a/src/Build/Utilities/Utilities.cs
++++ b/src/Build/Utilities/Utilities.cs
+@@ -758,7 +758,38 @@ public static IEnumerable<ItemData> EnumerateItemsOfType(IEnumerable items, stri
+             }
+             else
+             {
+-                return CastItemsOneByOne(items, typeName);
++                return CastItemsOneByOne(items, [typeName]);
++            }
++        }
++
++        /// <summary>
++        /// Enumerates the given nongeneric enumeration and tries to match or wrap appropriate item types.
++        /// Only items with matching type (case insensitive, MSBuild valid names only) will be returned.
++        /// </summary>
++        public static IEnumerable<ItemData> EnumerateItemsOfTypes(IEnumerable items, string[] typeNames)
++        {
++            if (items == null)
++            {
++                return [];
++            }
++
++            if (items is ItemDictionary<ProjectItemInstance> projectItemInstanceDictionary)
++            {
++                return typeNames.Select(typeName =>
++                    projectItemInstanceDictionary[typeName]
++                        .Select(i => new ItemData(i.ItemType, (IItemData)i)))
++                        .SelectMany(j => j);
++            }
++            else if (items is ItemDictionary<ProjectItem> projectItemDictionary)
++            {
++                return typeNames.Select(typeName =>
++                        projectItemDictionary[typeName]
++                            .Select(i => new ItemData(i.ItemType, (IItemData)i)))
++                    .SelectMany(j => j);
++            }
++            else
++            {
++                return CastItemsOneByOne(items, typeNames);
+             }
+         }
+ 
+@@ -777,9 +808,9 @@ public static void EnumerateItems(IEnumerable items, Action<DictionaryEntry> cal
+         /// Enumerates the nongeneric items and attempts to cast them.
+         /// </summary>
+         /// <param name="items">Nongeneric list of items.</param>
+-        /// <param name="itemTypeNameToFetch">If not null, only the items with matching type (case insensitive, MSBuild valid names only) will be returned.</param>
++        /// <param name="itemTypeNamesToFetch">If not null, only the items with matching type (case insensitive, MSBuild valid names only) will be returned.</param>
+         /// <returns></returns>
+-        private static IEnumerable<ItemData> CastItemsOneByOne(IEnumerable items, string itemTypeNameToFetch)
++        private static IEnumerable<ItemData> CastItemsOneByOne(IEnumerable items, string[] itemTypeNamesToFetch)
+         {
+             foreach (var item in items)
+             {
+@@ -809,7 +840,7 @@ private static IEnumerable<ItemData> CastItemsOneByOne(IEnumerable items, string
+                 }
+ 
+                 // if itemTypeNameToFetch was not set - then return all items
+-                if (itemValue != null && (itemTypeNameToFetch == null || MSBuildNameIgnoreCaseComparer.Default.Equals(itemType, itemTypeNameToFetch)))
++                if (itemValue != null && (itemTypeNamesToFetch == null || itemTypeNamesToFetch.Any(tp => MSBuildNameIgnoreCaseComparer.Default.Equals(itemType, tp))))
+                 {
+                     // The ProjectEvaluationFinishedEventArgs.Items are currently assigned only in Evaluator.Evaluate()
+                     //  where the only types that can be assigned are ProjectItem or ProjectItemInstance
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 6cef54f4dd7..7a77cf746a1 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -12,6 +12,7 @@
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.UnitTests;
+ using Microsoft.Build.UnitTests.Shared;
++using Microsoft.VisualStudio.TestPlatform.Utilities;
+ using Shouldly;
+ using Xunit;
+ using Xunit.Abstractions;
+@@ -147,14 +148,6 @@ void AssertHasResourceForCulture(string culture, bool isResourceExpected)
+                     $"Unexpected resource for culture {culture} was found in deps.json:{Environment.NewLine}{output.DepsJsonResources.ToString()}");
+             }
+         }
+-
+-        int GetWarningsCount(string output)
+-        {
+-            Regex regex = new Regex(@"(\d+) Warning\(s\)");
+-            Match match = regex.Match(output);
+-            match.Success.ShouldBeTrue("Expected Warnings section not found in the build output.");
+-            return int.Parse(match.Groups[1].Value);
+-        }
+     }
+ 
+     private readonly record struct EmbedResourceTestOutput(String LogOutput, JsonObject DepsJsonResources);
+@@ -218,6 +211,111 @@ private static void CopyFilesRecursively(string sourcePath, string targetPath)
+         }
+     }
+ 
++    private static int GetWarningsCount(string output)
++    {
++        Regex regex = new Regex(@"(\d+) Warning\(s\)");
++        Match match = regex.Match(output);
++        match.Success.ShouldBeTrue("Expected Warnings section not found in the build output.");
++        return int.Parse(match.Groups[1].Value);
++    }
++
++    private readonly record struct CopyTestOutput(
++        String LogOutput,
++        string File1Path,
++        string File2Path,
++        DateTime File1WriteUtc,
++        DateTime File2WriteUtc,
++        DateTime File1AccessUtc,
++        DateTime File2AccessUtc);
++
++    private CopyTestOutput RunCopyToOutputTest(bool restore, bool skipUnchangedDuringCopy)
++    {
++        string output = RunnerUtilities.ExecBootstrapedMSBuild($"-check {(restore ? "-restore" : null)} /p:SkipUnchanged={(skipUnchangedDuringCopy ? "True" : "\"\"")}", out bool success);
++        _env.Output.WriteLine(output);
++        _env.Output.WriteLine("=========================");
++        success.ShouldBeTrue();
++
++        // We should get warning only if we didn't opted-into the new behavior
++        if (!skipUnchangedDuringCopy)
++        {
++            string expectedDiagnostic = "warning BC0106: .* that has 'CopyToOutputDirectory' set as 'Always'";
++            Regex.Matches(output, expectedDiagnostic).Count.ShouldBe(2);
++        }
++
++        GetWarningsCount(output).ShouldBe(skipUnchangedDuringCopy ? 0 : 1);
++
++        string[] outFile1 = Directory.GetFiles(".", "File1.txt", SearchOption.AllDirectories);
++        outFile1.Length.ShouldBe(1);
++
++        string[] outFile2 = Directory.GetFiles(".", "File2.txt", SearchOption.AllDirectories);
++        outFile2.Length.ShouldBe(1);
++
++        // File.Copy does reuse LastWriteTime of source file
++        return new(
++            output,
++            outFile1[0],
++            outFile2[0],
++            File.GetLastWriteTimeUtc(outFile1[0]),
++            File.GetLastWriteTimeUtc(outFile2[0]),
++            File.GetLastAccessTimeUtc(outFile1[0]),
++            File.GetLastAccessTimeUtc(outFile2[0]));
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public void CopyToOutputTest(bool skipUnchangedDuringCopy)
++    {
++        string testAssetsFolderName = "CopyAlwaysTest";
++        const string entryProjectName = "EntryProject";
++        TransientTestFolder workFolder = _env.CreateFolder(createFolder: true);
++
++        CopyFilesRecursively(Path.Combine(TestAssetsRootPath, testAssetsFolderName), workFolder.Path);
++
++        _env.SetCurrentDirectory(Path.Combine(workFolder.Path, entryProjectName));
++
++        var output1 = RunCopyToOutputTest(true, skipUnchangedDuringCopy);
++
++        // Run again - just Always should be copied
++        // Careful - unix based OS might not update access time on writes. 
++
++        var output2 = RunCopyToOutputTest(false, skipUnchangedDuringCopy);
++
++        // CopyToOutputDirectory="Always"
++        if (skipUnchangedDuringCopy)
++        {
++            output2.File1AccessUtc.ShouldBeEquivalentTo(output1.File1AccessUtc);
++            output2.File1WriteUtc.ShouldBeEquivalentTo(output1.File1WriteUtc);
++        }
++        else
++        {
++            output2.File1WriteUtc.ShouldBeEquivalentTo(output1.File1WriteUtc);
++        }
++        // CopyToOutputDirectory="IfDifferent"
++        output2.File2AccessUtc.ShouldBeEquivalentTo(output1.File2AccessUtc);
++        output2.File2WriteUtc.ShouldBeEquivalentTo(output1.File2WriteUtc);
++
++        // Change both in output
++
++        File.WriteAllLines(output2.File1Path, ["foo"]);
++        File.WriteAllLines(output2.File2Path, ["foo"]);
++
++        DateTime file1WriteUtc = File.GetLastWriteTimeUtc(output2.File1Path);
++        DateTime file2WriteUtc = File.GetLastWriteTimeUtc(output2.File2Path);
++
++        file1WriteUtc.ShouldBeGreaterThan(output2.File1WriteUtc);
++        file2WriteUtc.ShouldBeGreaterThan(output2.File2WriteUtc);
++
++        // Run again - both should be copied
++
++        var output3 = RunCopyToOutputTest(false, skipUnchangedDuringCopy);
++
++        // We are now overwriting the newer file in output with the older file from sources.
++        // Which is wanted - as we want to copy on any difference.
++        output3.File1WriteUtc.ShouldBeLessThan(file1WriteUtc);
++        output3.File2WriteUtc.ShouldBeLessThan(file2WriteUtc);
++    }
++
+ 
+     [Theory]
+     [InlineData(true, true)]
+@@ -303,14 +401,6 @@ void ReplaceStringInFile(string filePath, string original, string replacement)
+         }
+     }
+ 
+-    private static int GetWarningsCount(string output)
+-    {
+-        Regex regex = new Regex(@"(\d+) Warning\(s\)");
+-        Match match = regex.Match(output);
+-        match.Success.ShouldBeTrue("Expected Warnings section not found in the build output.");
+-        return int.Parse(match.Groups[1].Value);
+-    }
+-
+ 
+     [Fact]
+     public void ConfigChangeReflectedOnReuse()
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/Directory.Build.props b/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/Directory.Build.props
+new file mode 100644
+index 00000000000..be6dfe73b2c
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/Directory.Build.props
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project>
++
++  <PropertyGroup>
++    <SkipUnchangedFilesOnCopyAlways>$(SkipUnchanged)</SkipUnchangedFilesOnCopyAlways>
++  </PropertyGroup>
++
++</Project>
+\ No newline at end of file
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/EntryProject/EntryProject.csproj b/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/EntryProject/EntryProject.csproj
+new file mode 100644
+index 00000000000..1ac36d043de
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/EntryProject/EntryProject.csproj
+@@ -0,0 +1,13 @@
++﻿<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <TargetFramework>net9.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <ProjectReference Include="..\ReferencedProject\ReferencedProject.csproj" />
++  </ItemGroup>
++
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/ReferencedProject/File1.txt b/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/ReferencedProject/File1.txt
+new file mode 100644
+index 00000000000..e69de29bb2d
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/ReferencedProject/File2.txt b/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/ReferencedProject/File2.txt
+new file mode 100644
+index 00000000000..e69de29bb2d
+diff --git a/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/ReferencedProject/ReferencedProject.csproj b/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/ReferencedProject/ReferencedProject.csproj
+new file mode 100644
+index 00000000000..7b9f7116c8f
+--- /dev/null
++++ b/src/BuildCheck.UnitTests/TestAssets/CopyAlwaysTest/ReferencedProject/ReferencedProject.csproj
+@@ -0,0 +1,14 @@
++<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <TargetFramework>net9.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <None Include="File1.txt" CopyToOutputDirectory="Always" />
++    <None Include="File2.txt" CopyToOutputDirectory="IfDifferent" />
++  </ItemGroup>
++
++</Project>
+diff --git a/src/BuildCheck.UnitTests/TestAssets/EmbeddedResourceTest/ReferencedProject/ReferencedProject.csproj b/src/BuildCheck.UnitTests/TestAssets/EmbeddedResourceTest/ReferencedProject/ReferencedProject.csproj
+index 3950740a4da..4208181be80 100644
+--- a/src/BuildCheck.UnitTests/TestAssets/EmbeddedResourceTest/ReferencedProject/ReferencedProject.csproj
++++ b/src/BuildCheck.UnitTests/TestAssets/EmbeddedResourceTest/ReferencedProject/ReferencedProject.csproj
+@@ -7,25 +7,17 @@
+     <Nullable>enable</Nullable>
+   </PropertyGroup>
+ 
+-  <ItemGroup>
+-    <Compile Update="Resource1.Designer.cs">
+-      <DesignTime>True</DesignTime>
+-      <AutoGen>True</AutoGen>
+-      <DependentUpon>Resource1.resx</DependentUpon>
+-    </Compile>
+-  </ItemGroup>
+-
+-	<PropertyGroup>
+-		<RespectAlreadyAssignedItemCulture>$(RespectCulture)</RespectAlreadyAssignedItemCulture>
+-	</PropertyGroup>
++  <PropertyGroup>
++    <RespectAlreadyAssignedItemCulture>$(RespectCulture)</RespectAlreadyAssignedItemCulture>
++  </PropertyGroup>
+ 
+   <ItemGroup>
+     <EmbeddedResource Update="Resource1.resx">
+     </EmbeddedResource>
+-	  <EmbeddedResource Update="Resource1.en.resx">
+-		  <Culture>en</Culture>
+-		  <LogicalName>Test.en.resources</LogicalName>
+-	  </EmbeddedResource>
++    <EmbeddedResource Update="Resource1.en.resx">
++      <Culture>en</Culture>
++      <LogicalName>Test.en.resources</LogicalName>
++    </EmbeddedResource>
+     ###EmbeddedResourceToAdd
+   </ItemGroup>
+ 
+diff --git a/src/Shared/Constants.cs b/src/Shared/Constants.cs
+index 64a885f67e4..1139c492224 100644
+--- a/src/Shared/Constants.cs
++++ b/src/Shared/Constants.cs
+@@ -207,6 +207,8 @@ internal static class ItemMetadataNames
+         internal const string publicKeyToken = "PublicKeyToken";
+         internal const string culture = "Culture";
+         internal const string withCulture = "WithCulture";
++        internal const string copyToOutputDirectory = "CopyToOutputDirectory";
++        internal const string copyAlways = "Always";
+ 
+         /// <summary>
+         /// The output path for a given item.
+@@ -242,6 +244,10 @@ internal static class ItemMetadataNames
+     /// </summary>
+     internal static class ItemNames
+     {
+-        internal const string reference = "Reference";
++        internal const string Compile = "Compile";
++        internal const string Content = "Content";
++        internal const string EmbeddedResource = "EmbeddedResource";
++        internal const string None = "None";
++        internal const string Reference = "Reference";
+     }
+ }

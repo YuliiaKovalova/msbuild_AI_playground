@@ -1,0 +1,172 @@
+diff --git a/src/Build.UnitTests/Parser_Tests.cs b/src/Build.UnitTests/Parser_Tests.cs
+index bc7efd3b6ef..28691332f75 100644
+--- a/src/Build.UnitTests/Parser_Tests.cs
++++ b/src/Build.UnitTests/Parser_Tests.cs
+@@ -2,7 +2,7 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using System;
+-
++using System.Linq;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Exceptions;
+ using Xunit;
+@@ -215,16 +215,16 @@ public void ItemFuncParseTest()
+             Console.WriteLine("ItemFuncParseTest()");
+ 
+             Parser p = new Parser();
+-            GenericExpressionNode tree = p.Parse("@(item->foo('ab'))", 
++            GenericExpressionNode tree = p.Parse("@(item->foo('ab'))",
+                 ParserOptions.AllowProperties | ParserOptions.AllowItemLists, _elementLocation);
+             Assert.IsType<StringExpressionNode>(tree);
+             Assert.Equal("@(item->foo('ab'))", tree.GetUnexpandedValue(null));
+ 
+-            tree = p.Parse("!@(item->foo())", 
++            tree = p.Parse("!@(item->foo())",
+                 ParserOptions.AllowProperties | ParserOptions.AllowItemLists, _elementLocation);
+             Assert.IsType<NotExpressionNode>(tree);
+ 
+-            tree = p.Parse("(@(item->foo('ab')) and @(item->foo('bc')))", 
++            tree = p.Parse("(@(item->foo('ab')) and @(item->foo('bc')))",
+                 ParserOptions.AllowProperties | ParserOptions.AllowItemLists, _elementLocation);
+             Assert.IsType<AndExpressionNode>(tree);
+         }
+@@ -527,5 +527,73 @@ public void VerifyNoWarningForOrder()
+             // Make sure the log contains the correct strings.
+             Assert.DoesNotContain("MSB4130:", ml.FullLog); // "No need to warn for this expression - ($(a) == 1 or $(b) == 2) and $(c) == 3."
+         }
++
++        // see https://github.com/dotnet/msbuild/issues/5436
++        [Theory]
++        [InlineData(true)]
++        [InlineData(false)]
++        public void SupportItemDefinationGroupInWhenOtherwise(bool context)
++        {
++            var projectContent = $@"
++                <Project ToolsVersion= `msbuilddefaulttoolsversion` xmlns= `msbuildnamespace`>
++                    <Choose>
++                        <When Condition= `{context}`>
++                            <PropertyGroup>
++                                <Foo>bar</Foo>
++                            </PropertyGroup>
++                            <ItemGroup>
++                                <A Include= `$(Foo)`>
++                                    <n>n1</n>
++                                </A>
++                            </ItemGroup>
++                            <ItemDefinitionGroup>
++                                <A>
++                                    <m>m1</m>
++                                    <n>n2</n>
++                                </A>
++                            </ItemDefinitionGroup>
++                        </When>
++                        <Otherwise>
++                            <PropertyGroup>
++                                <Foo>bar</Foo>
++                            </PropertyGroup>
++                            <ItemGroup>
++                                <A Include= `$(Foo)`>
++                                    <n>n1</n>
++                                </A>
++                            </ItemGroup>
++                            <ItemDefinitionGroup>
++                                <A>
++                                    <m>m2</m>
++                                    <n>n2</n>
++                                </A>
++                            </ItemDefinitionGroup>
++                        </Otherwise>
++                    </Choose>
++                </Project>
++                ".Cleanup();
++
++
++            var project = ObjectModelHelpers.CreateInMemoryProject(projectContent);
++
++            var projectItem = project.GetItems("A").FirstOrDefault();
++            Assert.Equal("bar", projectItem.EvaluatedInclude);
++
++            var metadatam = projectItem.GetMetadata("m");
++            if (context)
++            {
++                // Go to when 
++                Assert.Equal("m1", metadatam.EvaluatedValue);
++            }
++            else
++            {
++                // Go to Otherwise
++                Assert.Equal("m2", metadatam.EvaluatedValue);
++            }
++
++            var metadatan = projectItem.GetMetadata("n");
++            Assert.Equal("n1", metadatan.EvaluatedValue);
++            Assert.Equal("n2", metadatan.Predecessor.EvaluatedValue);
++        }
+     }
+ }
+diff --git a/src/Build/Construction/ProjectItemDefinitionGroupElement.cs b/src/Build/Construction/ProjectItemDefinitionGroupElement.cs
+index 29627027867..f55a6a0b1f5 100644
+--- a/src/Build/Construction/ProjectItemDefinitionGroupElement.cs
++++ b/src/Build/Construction/ProjectItemDefinitionGroupElement.cs
+@@ -30,7 +30,7 @@ internal ProjectItemDefinitionGroupElement(ProjectItemDefinitionGroupElementLink
+         /// <summary>
+         /// Initialize a parented ProjectItemDefinitionGroupElement
+         /// </summary>
+-        internal ProjectItemDefinitionGroupElement(XmlElement xmlElement, ProjectRootElement parent, ProjectRootElement containingProject)
++        internal ProjectItemDefinitionGroupElement(XmlElement xmlElement, ProjectElementContainer parent, ProjectRootElement containingProject)
+             : base(xmlElement, parent, containingProject)
+         {
+             ErrorUtilities.VerifyThrowArgumentNull(parent, nameof(parent));
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 37e520b9b21..1ee727c33ea 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -1542,6 +1542,9 @@ private bool EvaluateWhenOrOtherwiseChildren(IEnumerable<ProjectElement> childre
+                         case ProjectChooseElement choose:
+                             EvaluateChooseElement(choose);
+                             break;
++                        case ProjectItemDefinitionGroupElement itemDefinition:
++                            _itemDefinitionGroupElements.Add(itemDefinition);
++                            break;
+                         default:
+                             ErrorUtilities.ThrowInternalError("Unexpected child type");
+                             break;
+diff --git a/src/Build/Evaluation/ProjectParser.cs b/src/Build/Evaluation/ProjectParser.cs
+index 3b8c3f99a6f..6959e3709b0 100644
+--- a/src/Build/Evaluation/ProjectParser.cs
++++ b/src/Build/Evaluation/ProjectParser.cs
+@@ -181,7 +181,7 @@ private void Parse()
+                         break;
+ 
+                     case XMakeElements.itemDefinitionGroup:
+-                        _project.AppendParentedChildNoChecks(ParseProjectItemDefinitionGroupElement(childElement));
++                        _project.AppendParentedChildNoChecks(ParseProjectItemDefinitionGroupElement(childElement, _project));
+                         break;
+ 
+                     case XMakeElements.choose:
+@@ -709,11 +709,11 @@ private ProjectOutputElement ParseProjectOutputElement(XmlElementWithLocation el
+         /// <summary>
+         /// Parse a ProjectItemDefinitionGroupElement
+         /// </summary>
+-        private ProjectItemDefinitionGroupElement ParseProjectItemDefinitionGroupElement(XmlElementWithLocation element)
++        private ProjectItemDefinitionGroupElement ParseProjectItemDefinitionGroupElement(XmlElementWithLocation element, ProjectElementContainer parent)
+         {
+             ProjectXmlUtilities.VerifyThrowProjectAttributes(element, ValidAttributesOnlyConditionAndLabel);
+ 
+-            ProjectItemDefinitionGroupElement itemDefinitionGroup = new ProjectItemDefinitionGroupElement(element, _project, _project);
++            ProjectItemDefinitionGroupElement itemDefinitionGroup = new ProjectItemDefinitionGroupElement(element, parent, _project);
+ 
+             foreach (XmlElementWithLocation childElement in ProjectXmlUtilities.GetVerifyThrowProjectChildElements(element))
+             {
+@@ -865,6 +865,10 @@ private void ParseWhenOtherwiseChildren(XmlElementWithLocation element, ProjectE
+                         child = ParseProjectChooseElement(childElement, parent, nestingDepth);
+                         break;
+ 
++                    case XMakeElements.itemDefinitionGroup:
++                        child = ParseProjectItemDefinitionGroupElement(childElement, parent);
++                        break;
++
+                     default:
+                         ProjectXmlUtilities.ThrowProjectInvalidChildElement(childElement.Name, element.Name, element.Location);
+                         break;

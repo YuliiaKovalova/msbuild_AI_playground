@@ -1,0 +1,80 @@
+{
+  "number": 2697,
+  "title": "Improve ReuseableStringBuilderFactory",
+  "body": "There's a bunch of improvements that I've noticed will help a lot:\r\n\r\n- Don't evict the \"current\" stringbuilder if the requested capacity is larger than the max size, we'll never store it anyway\r\n- Allow reusable string builders to be increased in capacity after created (will help this case: https://github.com/Microsoft/msbuild/issues/2696)\r\n- Make sure everyone is setting a default capacity size that is sensible - it's currently 16. Expanding the string builder after it is created is about 6.6% of allocations",
+  "state": "CLOSED",
+  "createdAt": "2017-11-03T07:49:24Z",
+  "updatedAt": "2024-02-21T17:15:51Z",
+  "closedAt": "2021-12-02T16:30:41Z",
+  "author": {
+    "login": "davkean"
+  },
+  "labels": [
+    "Area: Performance",
+    "Priority:1",
+    "Priority:2",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": [
+      {
+        "login": "rokonec"
+      }
+    ]
+  },
+  "milestone": {
+    "title": "VS 17.1"
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "There is already some diagnostic logging in there in debug -- improving that and running some scenarios would be a great way to tune it to first order. Analogous to how the OpportunisticIntern class can dump stats to help adjust its thresholds. So much easier than iterating with a profiler right away.\r\n\r\nIn particular it would be interesting to log how large (both length and capacity) the builders are when they are returned (which indicates how large they needed to be, and how often they are discarded). My guess is that they are often getting discarded as too large (>1024 chars). If the threshold was higher, the default size wouldn't matter much as they would rarely be recreated. It could even be tuned, ie., if there's a lot of discards, then increase the size you accept; if not many, then there's likely less value in keeping it around.",
+        "createdAt": "2017-12-08T01:21:37Z",
+        "updatedAt": "2017-12-08T21:39:37Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "Labeling with size:1 as the cost of the initial investigation. Will open a follow-up issue if more work is identified.\r\nCan we deprecate ReuseableStringBuilder in favor of SpanBasedStringBuilder?",
+        "createdAt": "2021-10-12T12:47:22Z",
+        "updatedAt": "2021-10-12T12:47:22Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "MSBuild currently uses two string builder reusing caches:\r\n1) ReuseableStringBuilder/Factory - it is static process wide cache of one StringBuilder wrapper with think fa\u00e7ade of ReuseableStringBuilder. When returning SB capacity exceed max limit of 1024 chars, returning SB is abandoned and eventually collected. If capacity is bellow that, SB is Cleared in preparation for next reuse and rooted by stored into static variable. Although ReuseableStringBuilderFactory is designed to thread safe, using it heavily concurrently by multiple threads would invalidate its purpose.\r\n2) StringBuilderCache.Acquire/Release - this is clone of internal StringBuilderCache used at many places in runtime. It holds one SB per thread and its returning capacity limit is 360 chars.\r\n\r\nI have instrumented code and captured returning length of both in various scenarios.\r\nIt turned out SB are mostly used for logging purposes. \r\n\r\nIn default verbosity both SB behaves acceptably although I'd recommend to increase size limit of StringBuilderCache to 1024 to get into 66% percentile of data reuse.  Also MSBuild does not need to be as memory careful as Runtime.\r\n\r\nBellow is \"histogram\" of ReuseableStringBuilder returning length. Y axis is sum of returning length for given bucket.\r\n![image](https://user-images.githubusercontent.com/25249058/143782723-f998a7a3-0102-44f1-be57-508f73d5ae4c.png)\r\n\r\nWith diagnostics logging verbosity, the situation for ReuseableStringBuilder  is very different and much less optimal.\r\n\r\nOnly 47% percent of SB is reused. In other words comparing to create SB instance per call we safe only 47% of SB allocations. If we talk about allocated bytes we safes only 1.2% of allocated bytes.\r\n\r\nHistogram looks like this:\r\n![image](https://user-images.githubusercontent.com/25249058/143783375-6b56bbed-51eb-4872-8c29-7de03de758ae.png)\r\n\r\n## Conclusion\r\nIt is worth to devise a better way to invalidate/reuse ReuseableStringBuilder. The solution should take into consideration different usage patterns during normal vs diagnostics.",
+        "createdAt": "2021-11-28T19:45:42Z",
+        "updatedAt": "2021-11-28T19:45:42Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "Would it help if StringBuilder could get (and return) its backing arrays through an array pool? This would just move the caching down of course but it could be tuned to avoid any that go on LOH. It might be easier to reason about the caching strategy.\nIt would have to be a copy of the existing SB for now since SB is not IDisposable unfortunately. If it was generally valuable (which is not clear eg it might well make it slower) one could imagine changing SB proper eg by having Trim() return to the pool.",
+        "createdAt": "2021-11-28T21:02:38Z",
+        "updatedAt": "2021-11-28T21:02:38Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      },
+      {
+        "body": "Having SB which is backed up by array pool would be ideal, IMHO. I asked Stephen that question about half a year ago. \r\nInterpolatedStringHandler of C# 10 uses array pool, but having `ArrayPoolBackedStringBuilder` which would have most of its API identical to `StringBuilder` would make it easy for people to migrate to it in memory heavy applications.\r\nAlthough I already have some solution for our ReuseableStringBuilder, PR in day or two, having one well tuned shared ArrayPool looks appealing to me. Another interesting idea is to use @ladipro `SpanBasedStringBuilder` https://github.com/dotnet/msbuild/blob/a59d7a533c9154e8aa99b823625e7eff199ddf1a/src/StringTools/SpanBasedStringBuilder.cs#L9-L18 \r\nAs this is even better, in certain uses cases, than theoretical `ArrayPoolBackedStringBuilder`. `SpanBasedStringBuilder` has one less arraycopy than `ArrayPoolBackedStringBuilder` which has to arraycopy from source to buffer and then from buffer to final string `char[len]` while `SpanBasedStringBuilder` just arraycopy from spans to final string `char[len]`. It might make difference with some huge strings. `SpanBasedStringBuilder` have some missing API (`AppendFormat`, `Append(char)`, ...) to be used in some niche use cases though.\r\n",
+        "createdAt": "2021-11-28T21:56:24Z",
+        "updatedAt": "2021-11-28T21:56:57Z",
+        "author": {
+          "login": "rokonec"
+        }
+      },
+      {
+        "body": "cc @stephentoub in case he is interested in this discussion.\r\n\r\nI am mainly interested in case anything is learned that would be of general interest in the core libraries. (I doubt SpanBasedStringBuilder would be)\r\n\r\n>  it could be tuned to avoid any that go on LOH\r\n\r\nNever mind that part. I remembered that SB already has a max chunk size of 8KB, unless you initialize it with something smaller. So it would be necessary to establish that backing with an ArrayPool actually is helpful or is merely moving the caching around.\r\n",
+        "createdAt": "2021-11-29T20:38:49Z",
+        "updatedAt": "2021-11-29T20:38:49Z",
+        "author": {
+          "login": "danmoseley"
+        }
+      }
+    ]
+  }
+}

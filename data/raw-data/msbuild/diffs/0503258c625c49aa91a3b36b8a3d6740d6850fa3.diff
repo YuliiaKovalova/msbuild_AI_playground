@@ -1,0 +1,189 @@
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index 084878d566c..45414d7cf5c 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -517,6 +517,38 @@ public void LogWarningEvent(Microsoft.Build.Framework.BuildWarningEventArgs e)
+         /// <param name="e">The event args</param>
+         public void LogMessageEvent(Microsoft.Build.Framework.BuildMessageEventArgs e)
+         {
++            lock (_callbackMonitor)
++            {
++                ErrorUtilities.VerifyThrowArgumentNull(e);
++
++                if (!_activeProxy)
++                {
++                    // The task has been logging on another thread, typically
++                    // because of logging a spawned process's output, and has
++                    // not terminated this logging before it returned. This is common
++                    // enough that we don't want to crash and break the entire build. But
++                    // we don't have any good way to log it any more, as not only has this task
++                    // finished, the whole build might have finished! The task author will
++                    // just have to figure out that their task has a bug by themselves.
++                    if (s_breakOnLogAfterTaskReturns)
++                    {
++                        Trace.Fail(String.Format(CultureInfo.CurrentUICulture, "Task at {0}, after already returning, attempted to log '{1}'", _taskLocation.ToString(), e.Message));
++                    }
++
++                    return;
++                }
++
++                // If we are in building across process we need the events to be serializable. This method will
++                // check to see if we are building with multiple process and if the event is serializable. It will
++                // also log a warning if the event is not serializable and drop the logging message.
++                if (IsRunningMultipleNodes && !IsEventSerializable(e))
++                {
++                    return;
++                }
++
++                e.BuildEventContext = _taskLoggingContext.BuildEventContext;
++                _taskLoggingContext.LoggingService.LogBuildEvent(e);
++            }
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+index ca0586d7022..f8355738ff3 100644
+--- a/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
++++ b/src/Build/BackEnd/TaskExecutionHost/TaskExecutionHost.cs
+@@ -58,6 +58,7 @@ internal enum TaskRequirements
+     /// </summary>
+     internal class TaskExecutionHost : IDisposable
+     {
++        public readonly object lockObject = new object();
+         /// <summary>
+         /// Time interval in miliseconds to wait between receiving a cancelation signal and emitting the first warning that a non-cancelable task has not finished
+         /// </summary>
+@@ -338,24 +339,27 @@ public bool InitializeForBatch(TaskLoggingContext loggingContext, ItemBucket bat
+ #endif
+ 
+             // We instantiate a new task object for each batch
+-            TaskInstance = InstantiateTask(taskIdentityParameters);
+-
+-            if (TaskInstance == null)
++            lock (lockObject)
+             {
+-                return false;
+-            }
++                TaskInstance = InstantiateTask(taskIdentityParameters);
+ 
+-            string realTaskAssemblyLoaction = TaskInstance.GetType().Assembly.Location;
+-            if (!string.IsNullOrWhiteSpace(realTaskAssemblyLoaction) &&
+-                realTaskAssemblyLoaction != _taskFactoryWrapper.TaskFactoryLoadedType.Path)
+-            {
+-                _taskLoggingContext.LogComment(MessageImportance.Normal, "TaskAssemblyLocationMismatch", realTaskAssemblyLoaction, _taskFactoryWrapper.TaskFactoryLoadedType.Path);
+-            }
++                if (TaskInstance == null)
++                {
++                    return false;
++                }
+ 
+-            TaskInstance.BuildEngine = _buildEngine;
+-            TaskInstance.HostObject = _taskHost;
++                string realTaskAssemblyLoaction = TaskInstance.GetType().Assembly.Location;
++                if (!string.IsNullOrWhiteSpace(realTaskAssemblyLoaction) &&
++                    realTaskAssemblyLoaction != _taskFactoryWrapper.TaskFactoryLoadedType.Path)
++                {
++                    _taskLoggingContext.LogComment(MessageImportance.Normal, "TaskAssemblyLocationMismatch", realTaskAssemblyLoaction, _taskFactoryWrapper.TaskFactoryLoadedType.Path);
++                }
+ 
+-            return true;
++                TaskInstance.BuildEngine = _buildEngine;
++                TaskInstance.HostObject = _taskHost;
++
++                return true;
++            }
+         }
+ 
+         /// <summary>
+@@ -408,9 +412,12 @@ public bool SetTaskParameters(IDictionary<string, (string, ElementLocation)> par
+                 }
+             }
+ 
+-            if (this.TaskInstance is IIncrementalTask incrementalTask)
++            lock (lockObject)
+             {
+-                incrementalTask.FailIfNotIncremental = _buildComponentHost.BuildParameters.Question;
++                if (this.TaskInstance is IIncrementalTask incrementalTask)
++                {
++                    incrementalTask.FailIfNotIncremental = _buildComponentHost.BuildParameters.Question;
++                }
+             }
+ 
+             if (taskInitialized)
+@@ -813,7 +820,12 @@ private void RecordItemForDisconnectIfNecessary(TaskItem item)
+         /// </summary>
+         private ITaskItem[] GetItemOutputs(TaskPropertyInfo parameter)
+         {
+-            object outputs = _taskFactoryWrapper.GetPropertyValue(TaskInstance, parameter);
++            object outputs;
++
++            lock (lockObject)
++            {
++                outputs = _taskFactoryWrapper.GetPropertyValue(TaskInstance, parameter);
++            }
+ 
+             if (!(outputs is ITaskItem[] taskItemOutputs))
+             {
+@@ -828,7 +840,11 @@ private ITaskItem[] GetItemOutputs(TaskPropertyInfo parameter)
+         /// </summary>
+         private string[] GetValueOutputs(TaskPropertyInfo parameter)
+         {
+-            object outputs = _taskFactoryWrapper.GetPropertyValue(TaskInstance, parameter);
++            object outputs;
++            lock (lockObject)
++            {
++                outputs = _taskFactoryWrapper.GetPropertyValue(TaskInstance, parameter);
++            }
+ 
+             Array convertibleOutputs = parameter.PropertyType.IsArray ? (Array)outputs : new[] { outputs };
+ 
+@@ -1349,7 +1365,11 @@ private bool InternalSetTaskParameter(
+ 
+             try
+             {
+-                _taskFactoryWrapper.SetPropertyValue(TaskInstance, parameter, parameterValue);
++                lock (lockObject)
++                {
++                    _taskFactoryWrapper.SetPropertyValue(TaskInstance, parameter, parameterValue);
++                }
++                
+                 success = true;
+             }
+             catch (TargetInvocationException e)
+diff --git a/src/Build/Instance/TaskRegistry.cs b/src/Build/Instance/TaskRegistry.cs
+index 462dd82b14b..71677d96415 100644
+--- a/src/Build/Instance/TaskRegistry.cs
++++ b/src/Build/Instance/TaskRegistry.cs
+@@ -153,7 +153,7 @@ internal sealed class TaskRegistry : ITranslatable
+         /// This field may be null.
+         /// This is expected to be modified only during initialization via a single call, and all reads will occur only after the initialization is done - so no need for a concurrent dictionary.
+         /// </summary>
+-        private Dictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>> _taskRegistrations;
++        private ConcurrentDictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>> _taskRegistrations;
+ 
+         /// <summary>
+         /// Create another set containing architecture-specific task entries.
+@@ -748,11 +748,11 @@ private void RegisterTask(
+             registeredTaskEntries.Add(newRecord);
+         }
+ 
+-        private static Dictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>> CreateRegisteredTaskDictionary(int? capacity = null)
++        private static ConcurrentDictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>> CreateRegisteredTaskDictionary(int? capacity = null)
+         {
+             return capacity != null
+-                ? new Dictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>>(capacity.Value, RegisteredTaskIdentity.RegisteredTaskIdentityComparer.Exact)
+-                : new Dictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>>(RegisteredTaskIdentity.RegisteredTaskIdentityComparer.Exact);
++                ? new ConcurrentDictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>>(Environment.ProcessorCount, capacity.Value, RegisteredTaskIdentity.RegisteredTaskIdentityComparer.Exact)
++                : new ConcurrentDictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>>(RegisteredTaskIdentity.RegisteredTaskIdentityComparer.Exact);
+         }
+ 
+         /// <summary>
+@@ -1843,7 +1843,7 @@ public void Translate(ITranslator translator)
+ 
+             if (translator.Mode == TranslationDirection.ReadFromStream)
+             {
+-                _taskRegistrations = (Dictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>>)copy;
++                _taskRegistrations = (ConcurrentDictionary<RegisteredTaskIdentity, List<RegisteredTaskRecord>>)copy;
+ #if DEBUG
+                 _isInitialized = _taskRegistrations != null;
+ #endif

@@ -1,0 +1,454 @@
+diff --git a/src/Build/BuildCheck/API/BuildCheckResult.cs b/src/Build/BuildCheck/API/BuildCheckResult.cs
+index b6cb67e7d56..3cb36fed2c0 100644
+--- a/src/Build/BuildCheck/API/BuildCheckResult.cs
++++ b/src/Build/BuildCheck/API/BuildCheckResult.cs
+@@ -5,6 +5,7 @@
+ using System.IO;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck;
+ 
+@@ -16,12 +17,12 @@ namespace Microsoft.Build.Experimental.BuildCheck;
+ /// </summary>
+ public sealed class BuildCheckResult : IBuildCheckResult
+ {
+-    public static BuildCheckResult Create(BuildAnalyzerRule rule, ElementLocation location, params string[] messageArgs)
++    public static BuildCheckResult Create(BuildAnalyzerRule rule, IMsBuildElementLocation location, params string[] messageArgs)
+     {
+         return new BuildCheckResult(rule, location, messageArgs);
+     }
+ 
+-    public BuildCheckResult(BuildAnalyzerRule buildAnalyzerRule, ElementLocation location, string[] messageArgs)
++    public BuildCheckResult(BuildAnalyzerRule buildAnalyzerRule, IMsBuildElementLocation location, string[] messageArgs)
+     {
+         BuildAnalyzerRule = buildAnalyzerRule;
+         Location = location;
+@@ -42,7 +43,7 @@ internal BuildEventArgs ToEventArgs(BuildAnalyzerResultSeverity severity)
+     /// <summary>
+     /// Optional location of the finding (in near future we might need to support multiple locations).
+     /// </summary>
+-    public ElementLocation Location { get; }
++    public IMsBuildElementLocation Location { get; }
+ 
+     public string LocationString => Location.LocationString;
+ 
+diff --git a/src/Build/BuildCheck/API/IInternalBuildCheckRegistrationContext.cs b/src/Build/BuildCheck/API/IInternalBuildCheckRegistrationContext.cs
+new file mode 100644
+index 00000000000..b3f07220dc4
+--- /dev/null
++++ b/src/Build/BuildCheck/API/IInternalBuildCheckRegistrationContext.cs
+@@ -0,0 +1,13 @@
++﻿using System;
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++internal interface IInternalBuildCheckRegistrationContext : IBuildCheckRegistrationContext
++{
++    void RegisterPropertyReadAction(Action<BuildCheckDataContext<PropertyReadData>> propertyReadAction);
++
++    void RegisterPropertyWriteAction(Action<BuildCheckDataContext<PropertyWriteData>> propertyWriteAction);
++
++    void RegisterProjectProcessingDoneAction(Action<BuildCheckDataContext<ProjectProcessingDoneData>> propertyWriteAction);
++}
+diff --git a/src/Build/BuildCheck/API/InternalBuildAnalyzer.cs b/src/Build/BuildCheck/API/InternalBuildAnalyzer.cs
+new file mode 100644
+index 00000000000..fdeb987f347
+--- /dev/null
++++ b/src/Build/BuildCheck/API/InternalBuildAnalyzer.cs
+@@ -0,0 +1,27 @@
++﻿using System;
++using Microsoft.Build.Experimental.BuildCheck;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++internal abstract class InternalBuildAnalyzer : BuildAnalyzer
++{
++    /// <summary>
++    /// 
++    /// </summary>
++    /// <param name="registrationContext"></param>
++    public abstract void RegisterInternalActions(IInternalBuildCheckRegistrationContext registrationContext);
++
++    /// <summary>
++    /// This is intentionally not implemented, as it is extended by <see cref="RegisterInternalActions"/>.
++    /// </summary>
++    /// <param name="registrationContext"></param>
++    public override void RegisterActions(IBuildCheckRegistrationContext registrationContext)
++    {
++        if (registrationContext is not IInternalBuildCheckRegistrationContext internalRegistrationContext)
++        {
++            throw new ArgumentException("The registration context for InternalBuildAnalyzer must be of type IInternalBuildCheckRegistrationContext.", nameof(registrationContext));
++        }
++
++        this.RegisterInternalActions(internalRegistrationContext);
++    }
++}
+diff --git a/src/Build/BuildCheck/Analyzers/PropertiesUsageAnalyzer.cs b/src/Build/BuildCheck/Analyzers/PropertiesUsageAnalyzer.cs
+new file mode 100644
+index 00000000000..d6492de34d7
+--- /dev/null
++++ b/src/Build/BuildCheck/Analyzers/PropertiesUsageAnalyzer.cs
+@@ -0,0 +1,162 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using Microsoft.Build.Collections;
++using Microsoft.Build.Evaluation;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Experimental.BuildCheck.Infrastructure;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCheck.Analyzers;
++
++internal class PropertiesUsageAnalyzer : InternalBuildAnalyzer
++{
++    private static readonly BuildAnalyzerRule _usedBeforeInitializedRule = new BuildAnalyzerRule("BC0201", "PropertyUsedBeforeDeclared",
++        "A property that is accessed should be declared first.",
++        "Property: [{0}] was accessed, but it was never initialized.",
++        new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, EvaluationAnalysisScope = EvaluationAnalysisScope.ProjectOnly });
++
++    private static readonly BuildAnalyzerRule _initializedAfterUsedRule = new BuildAnalyzerRule("BC0202", "PropertyDeclaredAfterUsed",
++        "A property should be declared before it is first used.",
++        "Property: [{0}] first declared/initialized at [{1}] used before it was initialized.",
++        new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, EvaluationAnalysisScope = EvaluationAnalysisScope.ProjectOnly });
++
++    private static readonly BuildAnalyzerRule _unusedPropertyRule = new BuildAnalyzerRule("BC0203", "UnusedPropertyDeclared",
++        "A property that is not used should not be declared.",
++        "Property: [{0}] was declared/initialized, but it was never used.",
++        new BuildAnalyzerConfiguration() { Severity = BuildAnalyzerResultSeverity.Warning, EvaluationAnalysisScope = EvaluationAnalysisScope.ProjectOnly });
++
++    internal static readonly IReadOnlyList<BuildAnalyzerRule> SupportedRulesList = [_usedBeforeInitializedRule, _initializedAfterUsedRule, _unusedPropertyRule];
++
++    public override string FriendlyName => "MSBuild.PropertiesUsageAnalyzer";
++
++    public override IReadOnlyList<BuildAnalyzerRule> SupportedRules => SupportedRulesList;
++
++    private const string _allowUninitPropsInConditionsKey = "AllowUninitializedPropertiesInConditions";
++    private bool _allowUninitPropsInConditions = false;
++    // TODO: Add scope to configuration visible by the analyzer - and reflect on it
++    public override void Initialize(ConfigurationContext configurationContext)
++    {
++        bool? allowUninitPropsInConditionsRule1 = null;
++        bool? allowUninitPropsInConditionsRule2 = null;
++
++        foreach (CustomConfigurationData customConfigurationData in configurationContext.CustomConfigurationData)
++        {
++            allowUninitPropsInConditionsRule1 =
++                GetAllowUninitPropsInConditionsConfig(customConfigurationData, _usedBeforeInitializedRule.Id);
++            allowUninitPropsInConditionsRule2 =
++                GetAllowUninitPropsInConditionsConfig(customConfigurationData, _initializedAfterUsedRule.Id);
++        }
++
++        if (allowUninitPropsInConditionsRule1.HasValue &&
++            allowUninitPropsInConditionsRule2.HasValue &&
++            allowUninitPropsInConditionsRule1 != allowUninitPropsInConditionsRule2)
++        {
++            throw new BuildCheckConfigurationException(
++                $"[{_usedBeforeInitializedRule.Id}] and [{_initializedAfterUsedRule.Id}] are not allowed to have differing configuration value for [{_allowUninitPropsInConditionsKey}]");
++        }
++
++        if (allowUninitPropsInConditionsRule1.HasValue || allowUninitPropsInConditionsRule2.HasValue)
++        {
++            _allowUninitPropsInConditions = allowUninitPropsInConditionsRule1 ?? allowUninitPropsInConditionsRule2 ?? false;
++        }
++    }
++
++    private static bool? GetAllowUninitPropsInConditionsConfig(CustomConfigurationData customConfigurationData,
++        string ruleId)
++    {
++        if (customConfigurationData.RuleId.Equals(ruleId, StringComparison.InvariantCultureIgnoreCase) &&
++            (customConfigurationData.ConfigurationData?.TryGetValue(_allowUninitPropsInConditionsKey, out string? configVal) ?? false))
++        {
++            return bool.Parse(configVal);
++        }
++
++        return null;
++    }
++
++    public override void RegisterInternalActions(IInternalBuildCheckRegistrationContext registrationContext)
++    {
++        registrationContext.RegisterPropertyReadAction(ProcessPropertyRead);
++        registrationContext.RegisterPropertyWriteAction(ProcessPropertyWrite);
++        registrationContext.RegisterProjectProcessingDoneAction(DoneWithProject);
++    }
++
++    private Dictionary<string, IMsBuildElementLocation?> _writenProperties = new(MSBuildNameIgnoreCaseComparer.Default);
++    private HashSet<string> _readProperties = new(MSBuildNameIgnoreCaseComparer.Default);
++    private Dictionary<string, IMsBuildElementLocation> _uninitializedReads = new(MSBuildNameIgnoreCaseComparer.Default);
++
++    // TODO: this is temporary - will be improved once we have scoping argument propagated to user config data.
++    private bool IsActionInObservedScope(IMsBuildElementLocation? location, string projectFilePath)
++    {
++        return location != null && location.File == projectFilePath;
++    }
++
++    private void ProcessPropertyWrite(BuildCheckDataContext<PropertyWriteData> context)
++    {
++        PropertyWriteData writeData = context.Data;
++
++        if (IsActionInObservedScope(writeData.ElementLocation, writeData.ProjectFilePath))
++        {
++            _writenProperties[writeData.PropertyName] = writeData.ElementLocation;
++        }
++
++        if (!writeData.IsEmpty &&
++            _uninitializedReads.TryGetValue(writeData.PropertyName, out IMsBuildElementLocation? uninitReadLocation))
++        {
++            _uninitializedReads.Remove(writeData.PropertyName);
++
++            context.ReportResult(BuildCheckResult.Create(
++                _initializedAfterUsedRule,
++                uninitReadLocation,
++                writeData.PropertyName, writeData.ElementLocation?.LocationString ?? string.Empty));
++        }
++    }
++
++    private void ProcessPropertyRead(BuildCheckDataContext<PropertyReadData> context)
++    {
++        PropertyReadData readData = context.Data;
++
++        if (readData.PropertyReadContext != PropertyReadContext.PropertyEvaluationSelf)
++        {
++            _readProperties.Add(readData.PropertyName);
++        }
++
++        if (readData.IsUninitialized &&
++            readData.PropertyReadContext != PropertyReadContext.PropertyEvaluationSelf &&
++            readData.PropertyReadContext != PropertyReadContext.ConditionEvaluationWithOneSideEmpty &&
++            (!_allowUninitPropsInConditions ||
++             readData.PropertyReadContext != PropertyReadContext.ConditionEvaluation) &&
++            IsActionInObservedScope(readData.ElementLocation, readData.ProjectFilePath))
++        {
++            _uninitializedReads[readData.PropertyName] = readData.ElementLocation;
++        }
++    }
++
++    private void DoneWithProject(BuildCheckDataContext<ProjectProcessingDoneData> context)
++    {
++        foreach (var propWithLocation in _writenProperties)
++        {
++            if (propWithLocation.Value != null && !_readProperties.Contains(propWithLocation.Key))
++            {
++                context.ReportResult(BuildCheckResult.Create(
++                    _unusedPropertyRule,
++                    propWithLocation.Value,
++                    propWithLocation.Key));
++            }
++        }
++
++        foreach (var uninitializedRead in _uninitializedReads)
++        {
++            context.ReportResult(BuildCheckResult.Create(
++                _usedBeforeInitializedRule,
++                uninitializedRead.Value,
++                uninitializedRead.Key));
++        }
++
++        _readProperties = new HashSet<string>(MSBuildNameIgnoreCaseComparer.Default);
++        _writenProperties = new Dictionary<string, IMsBuildElementLocation?>(MSBuildNameIgnoreCaseComparer.Default);
++        _uninitializedReads = new Dictionary<string, IMsBuildElementLocation>(MSBuildNameIgnoreCaseComparer.Default);
++    }
++}
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
+index 69f3335681d..81d065a1438 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckConfigurationException.cs
+@@ -26,4 +26,7 @@ public BuildCheckConfigurationException(string message, BuildCheckConfigurationE
+     {
+         this.buildCheckConfigurationErrorScope = buildCheckConfigurationErrorScope;
+     }
++
++    public BuildCheckConfigurationException(string message, Exception innerException) : base(message, innerException)
++    { }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+index 76ac5ec7767..1446e05df8c 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+@@ -3,11 +3,12 @@
+ 
+ using System;
+ using System.Threading;
++using Microsoft.Build.BuildCheck.Analyzers;
+ using Microsoft.Build.Experimental.BuildCheck;
+ 
+ namespace Microsoft.Build.Experimental.BuildCheck.Infrastructure;
+ 
+-internal sealed class BuildCheckRegistrationContext(BuildAnalyzerWrapper analyzerWrapper, BuildCheckCentralContext buildCheckCentralContext) : IBuildCheckRegistrationContext
++internal sealed class BuildCheckRegistrationContext(BuildAnalyzerWrapper analyzerWrapper, BuildCheckCentralContext buildCheckCentralContext) : IInternalBuildCheckRegistrationContext
+ {
+     public void RegisterEvaluatedPropertiesAction(Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction)
+     {
+@@ -23,4 +24,13 @@ public void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvoca
+     {
+         buildCheckCentralContext.RegisterTaskInvocationAction(analyzerWrapper, taskInvocationAction);
+     }
++
++    public void RegisterPropertyReadAction(Action<BuildCheckDataContext<PropertyReadData>> propertyReadAction)
++        => buildCheckCentralContext.RegisterPropertyReadAction(analyzerWrapper, propertyReadAction);
++
++    public void RegisterPropertyWriteAction(Action<BuildCheckDataContext<PropertyWriteData>> propertyWriteAction)
++        => buildCheckCentralContext.RegisterPropertyWriteAction(analyzerWrapper, propertyWriteAction);
++
++    public void RegisterProjectProcessingDoneAction(Action<BuildCheckDataContext<ProjectProcessingDoneData>> projectDoneAction)
++        => buildCheckCentralContext.RegisterProjectProcessingDoneAction(analyzerWrapper, projectDoneAction);
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 3e8d53982c5..4e639911f88 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -9,6 +9,7 @@
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.BuildCheck.Analyzers;
+ using Microsoft.Build.Experimental.BuildCheck;
+ using Microsoft.Build.Experimental.BuildCheck.Acquisition;
+ using Microsoft.Build.Experimental.BuildCheck.Analyzers;
+@@ -143,7 +144,11 @@ private static readonly (string[] ruleIds, bool defaultEnablement, BuildAnalyzer
+                 ([NoEnvironmentVariablePropertyAnalyzer.SupportedRule.Id], NoEnvironmentVariablePropertyAnalyzer.SupportedRule.DefaultConfiguration.IsEnabled ?? false, Construct<NoEnvironmentVariablePropertyAnalyzer>)
+             ],
+             // BuildCheckDataSource.Execution
+-            []
++            [
++                (PropertiesUsageAnalyzer.SupportedRulesList.Select(r => r.Id).ToArray(),
++                    PropertiesUsageAnalyzer.SupportedRulesList.Any(r => r.DefaultConfiguration.IsEnabled ?? false),
++                    Construct<PropertiesUsageAnalyzer>)
++            ]
+         ];
+ 
+         /// <summary>
+@@ -515,7 +520,19 @@ public BuildAnalyzer Factory()
+ 
+             public BuildAnalyzerWrapper Initialize(BuildAnalyzer ba, ConfigurationContext configContext)
+             {
+-                ba.Initialize(configContext);
++                try
++                {
++                    ba.Initialize(configContext);
++                }
++                catch (BuildCheckConfigurationException)
++                {
++                    throw;
++                }
++                catch (Exception e)
++                {
++                    throw new BuildCheckConfigurationException(
++                        $"The analyzer '{ba.FriendlyName}' failed to initialize: {e.Message}", e);
++                }
+                 return new BuildAnalyzerWrapper(ba);
+             }
+ 
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 3e67f786ac8..35e586f0195 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -614,13 +614,16 @@ private static ProjectTargetInstance ReadNewTargetElement(ProjectTargetElement t
+         private void Evaluate()
+         {
+             string projectFile = String.IsNullOrEmpty(_projectRootElement.ProjectFileLocation.File) ? "(null)" : _projectRootElement.ProjectFileLocation.File;
+-            using (AssemblyLoadsTracker.StartTracking(_evaluationLoggingContext, AssemblyLoadingContext.Evaluation))
+             using (_evaluationProfiler.TrackPass(EvaluationPass.TotalEvaluation))
+             {
+                 ErrorUtilities.VerifyThrow(_data.EvaluationId == BuildEventContext.InvalidEvaluationId, "There is no prior evaluation ID. The evaluator data needs to be reset at this point");
+                 _data.EvaluationId = _evaluationLoggingContext.BuildEventContext.EvaluationId;
+                 _evaluationLoggingContext.LogProjectEvaluationStarted();
+ 
++                // Track loads only after start of evaluation was actually logged
++                using var assemblyLoadsTracker =
++                    AssemblyLoadsTracker.StartTracking(_evaluationLoggingContext, AssemblyLoadingContext.Evaluation);
++
+                 _logProjectImportedEvents = Traits.Instance.EscapeHatches.LogProjectImports;
+ 
+                 int globalPropertiesCount;
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index c8c14113148..4ae18c83de0 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.IO;
++using System.Text.RegularExpressions;
+ using System.Xml;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.UnitTests;
+@@ -31,6 +32,60 @@ public EndToEndTests(ITestOutputHelper output)
+ 
+     public void Dispose() => _env.Dispose();
+ 
++    [Fact]
++    public void PropertiesUsageAnalyzerTest()
++    {
++        using TestEnvironment env = TestEnvironment.Create();
++        string contents = """
++                              <Project DefaultTargets="PrintEnvVar">
++
++                              <PropertyGroup>
++                              <!--
++                              <MyProp1>value-of-prop1</MyProp1>
++                              <MyProp2>$(MyProp1)</MyProp2>
++                              <MyProp3>blah</MyProp3>
++                              -->
++                              </PropertyGroup>
++
++
++                              <PropertyGroup Condition="'$(MyProp12)' == ''">
++                                <MyProp13>$(MyProp11)</MyProp13>
++                              </PropertyGroup>
++
++
++                              <!--
++                              <ItemGroup>
++                                <a Include="$(nonexistent)" />
++                              </ItemGroup>
++                              -->
++
++                              <Target Name="PrintEnvVar">
++                              <Message Text="MyPropT2 has value $(MyPropT2)" Importance="High" Condition="'$(MyPropT2)' == ''" />
++                              <PropertyGroup>
++                              <MyPropT2>$(MyPropT2);xxx</MyPropT2>
++                              </PropertyGroup>
++                              </Target>
++
++                              </Project>
++                              """;
++        TransientTestFolder logFolder = env.CreateFolder(createFolder: true);
++        TransientTestFile projectFile = env.CreateFile(logFolder, "myProj.proj", contents);
++
++        string output = RunnerUtilities.ExecBootstrapedMSBuild($"{projectFile.Path} -analyze", out bool success);
++        _env.Output.WriteLine(output);
++        _env.Output.WriteLine("=========================");
++        success.ShouldBeTrue(output);
++
++        output.ShouldMatch(@"BC0201: .* Property: \[MyProp11\]");
++        output.ShouldMatch(@"BC0202: .* Property: \[MyPropT2\]");
++        output.ShouldMatch(@"BC0203: .* Property: \[MyProp13\]");
++
++        // each finding should be found just once - but reported twice, due to summary
++        Regex.Matches(output, "BC0201: .* Property").Count.ShouldBe(2);
++        Regex.Matches(output, "BC0202: .* Property").Count.ShouldBe(2);
++        Regex.Matches(output, "BC0203: .* Property").Count.ShouldBe(2);
++    }
++
+     [Theory]
+     [InlineData(true, true)]
+     [InlineData(false, true)]
+diff --git a/src/Shared/IElementLocation.cs b/src/Shared/IElementLocation.cs
+index 39f520475ba..1623d1582eb 100644
+--- a/src/Shared/IElementLocation.cs
++++ b/src/Shared/IElementLocation.cs
+@@ -20,7 +20,7 @@ internal interface IElementLocation : IMsBuildElementLocation, ITranslatable { }
+     /// This is currently internal - but it is prepared to be made public once it will be needed by other public BuildCheck OM
+     /// (e.g. by property read/write OM)
+     /// </remarks>
+-    internal interface IMsBuildElementLocation
++    public interface IMsBuildElementLocation
+     {
+         /// <summary>
+         /// The file from which this particular element originated.  It may

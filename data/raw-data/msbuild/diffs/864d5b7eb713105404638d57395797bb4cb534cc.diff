@@ -1,0 +1,199 @@
+diff --git a/src/Tasks.UnitTests/Copy_Tests.cs b/src/Tasks.UnitTests/Copy_Tests.cs
+index 8bdddb235b8..4c5b81190b2 100644
+--- a/src/Tasks.UnitTests/Copy_Tests.cs
++++ b/src/Tasks.UnitTests/Copy_Tests.cs
+@@ -2096,6 +2096,84 @@ public void InvalidErrorIfLinkFailed()
+             Assert.False(result);
+             engine.AssertLogContains("MSB3892");
+         }
++
++        /// <summary>
++        /// An existing link source should not be modified.
++        /// </summary>
++        [Theory]
++        [InlineData(false, false)]
++        [InlineData(false, true)]
++        [InlineData(true, false)]
++        public void Issue8273_DonotCorruptSourceOfLink(bool useHardLink, bool useSymbolicLink)
++        {
++            string sourceFile1 = FileUtilities.GetTemporaryFile();
++            string sourceFile2 = FileUtilities.GetTemporaryFile();
++            string temp = Path.GetTempPath();
++            string destFolder = Path.Combine(temp, "2A333ED756AF4dc392E728D0F864A398");
++            string destFile = Path.Combine(destFolder, "The Destination");
++
++            try
++            {
++                File.WriteAllText(sourceFile1, "This is the first source temp file."); // HIGHCHAR: Test writes in UTF8 without preamble.
++                File.WriteAllText(sourceFile2, "This is the second source temp file."); // HIGHCHAR: Test writes in UTF8 without preamble.
++
++                // Don't create the dest folder, let task do that
++
++                ITaskItem[] sourceFiles = { new TaskItem(sourceFile1) };
++                ITaskItem[] destinationFiles = { new TaskItem(destFile) };
++
++                var me = new MockEngine(true);
++                var t = new Copy
++                {
++                    RetryDelayMilliseconds = 1, // speed up tests!
++                    BuildEngine = me,
++                    SourceFiles = sourceFiles,
++                    DestinationFiles = destinationFiles,
++                    SkipUnchangedFiles = true,
++                    UseHardlinksIfPossible = useHardLink,
++                    UseSymboliclinksIfPossible = useSymbolicLink,
++                };
++
++                bool success = t.Execute();
++
++                Assert.True(success); // "success"
++                Assert.True(File.Exists(destFile)); // "destination exists"
++
++                string destinationFileContents = File.ReadAllText(destFile);
++                Assert.Equal("This is the first source temp file.", destinationFileContents);
++
++                sourceFiles = new TaskItem[] { new TaskItem(sourceFile2) };
++
++                t = new Copy
++                {
++                    RetryDelayMilliseconds = 1, // speed up tests!
++                    BuildEngine = me,
++                    SourceFiles = sourceFiles,
++                    DestinationFiles = destinationFiles,
++                    SkipUnchangedFiles = true,
++                    UseHardlinksIfPossible = false,
++                    UseSymboliclinksIfPossible = false,
++                };
++
++                success = t.Execute();
++
++                Assert.True(success); // "success"
++                Assert.True(File.Exists(destFile)); // "destination exists"
++
++                destinationFileContents = File.ReadAllText(destFile);
++                Assert.Equal("This is the second source temp file.", destinationFileContents);
++
++                // Read the source file (it should not have been overwritten)
++                string sourceFileContents = File.ReadAllText(sourceFile1);
++                Assert.Equal("This is the first source temp file.", sourceFileContents);
++
++                ((MockEngine)t.BuildEngine).AssertLogDoesntContain("MSB3026"); // Didn't do retries
++            }
++            finally
++            {
++                Helpers.DeleteFiles(sourceFile1, sourceFile2, destFile);
++            }
++        }
+     }
+ 
+     public class CopyHardLink_Tests : Copy_Tests
+diff --git a/src/Tasks/Copy.cs b/src/Tasks/Copy.cs
+index 117ce5f3042..bff68d1bade 100644
+--- a/src/Tasks/Copy.cs
++++ b/src/Tasks/Copy.cs
+@@ -226,8 +226,6 @@ private void LogDiagnostic(string message, params object[] messageArgs)
+             FileState sourceFileState,      // The source file
+             FileState destinationFileState)  // The destination file
+         {
+-            bool destinationFileExists = false;
+-
+             if (destinationFileState.DirectoryExists)
+             {
+                 Log.LogErrorWithCodeFromResources("Copy.DestinationIsDirectory", sourceFileState.Name, destinationFileState.Name);
+@@ -269,7 +267,14 @@ private void LogDiagnostic(string message, params object[] messageArgs)
+             if (OverwriteReadOnlyFiles)
+             {
+                 MakeFileWriteable(destinationFileState, true);
+-                destinationFileExists = destinationFileState.FileExists;
++            }
++
++            // If the destination file is a hard or symbolic link, File.Copy would overwrite the source.
++            // To prevent this, we need to delete the existing entry before we Copy or create a link.
++            // We could try to figure out if the file is a link, but I can't think of a reason to not simply delete it always.
++            if (destinationFileState.FileExists && !destinationFileState.IsReadOnly)
++            {
++                FileUtilities.DeleteNoThrow(destinationFileState.Name);
+             }
+ 
+             bool symbolicLinkCreated = false;
+@@ -279,7 +284,7 @@ private void LogDiagnostic(string message, params object[] messageArgs)
+             // Create hard links if UseHardlinksIfPossible is true
+             if (UseHardlinksIfPossible)
+             {
+-                TryCopyViaLink(HardLinkComment, MessageImportance.Normal, sourceFileState, destinationFileState, ref destinationFileExists, out hardLinkCreated, ref errorMessage, (source, destination, errMessage) => NativeMethods.MakeHardLink(destination, source, ref errorMessage, Log));
++                TryCopyViaLink(HardLinkComment, MessageImportance.Normal, sourceFileState, destinationFileState, out hardLinkCreated, ref errorMessage, (source, destination, errMessage) => NativeMethods.MakeHardLink(destination, source, ref errorMessage, Log));
+                 if (!hardLinkCreated)
+                 {
+                     if (UseSymboliclinksIfPossible)
+@@ -297,13 +302,14 @@ private void LogDiagnostic(string message, params object[] messageArgs)
+             // Create symbolic link if UseSymboliclinksIfPossible is true and hard link is not created
+             if (!hardLinkCreated && UseSymboliclinksIfPossible)
+             {
+-                TryCopyViaLink(SymbolicLinkComment, MessageImportance.Normal, sourceFileState, destinationFileState, ref destinationFileExists, out symbolicLinkCreated, ref errorMessage, (source, destination, errMessage) => NativeMethodsShared.MakeSymbolicLink(destination, source, ref errorMessage));
+-                if (!NativeMethodsShared.IsWindows)
+-                {
+-                    errorMessage = Log.FormatResourceString("Copy.NonWindowsLinkErrorMessage", "symlink()", errorMessage);
+-                }
++                TryCopyViaLink(SymbolicLinkComment, MessageImportance.Normal, sourceFileState, destinationFileState, out symbolicLinkCreated, ref errorMessage, (source, destination, errMessage) => NativeMethodsShared.MakeSymbolicLink(destination, source, ref errorMessage));
+                 if (!symbolicLinkCreated)
+                 {
++                    if (!NativeMethodsShared.IsWindows)
++                    {
++                        errorMessage = Log.FormatResourceString("Copy.NonWindowsLinkErrorMessage", "symlink()", errorMessage);
++                    }
++
+                     Log.LogMessage(MessageImportance.Normal, RetryingAsFileCopy, sourceFileState.Name, destinationFileState.Name, errorMessage);
+                 }
+             }
+@@ -324,41 +330,28 @@ private void LogDiagnostic(string message, params object[] messageArgs)
+                 Log.LogMessage(MessageImportance.Normal, FileComment, sourceFilePath, destinationFilePath);
+ 
+                 File.Copy(sourceFileState.Name, destinationFileState.Name, true);
++
++                // If the destinationFile file exists, then make sure it's read-write.
++                // The File.Copy command copies attributes, but our copy needs to
++                // leave the file writeable.
++                if (sourceFileState.IsReadOnly)
++                {
++                    destinationFileState.Reset();
++                    MakeFileWriteable(destinationFileState, false);
++                }
+             }
+ 
+             // Files were successfully copied or linked. Those are equivalent here.
+             WroteAtLeastOneFile = true;
+ 
+-            destinationFileState.Reset();
+-
+-            // If the destinationFile file exists, then make sure it's read-write.
+-            // The File.Copy command copies attributes, but our copy needs to
+-            // leave the file writeable.
+-            if (sourceFileState.IsReadOnly)
+-            {
+-                MakeFileWriteable(destinationFileState, false);
+-            }
+-
+             return true;
+         }
+ 
+-        private void TryCopyViaLink(string linkComment, MessageImportance messageImportance, FileState sourceFileState, FileState destinationFileState, ref bool destinationFileExists, out bool linkCreated, ref string errorMessage, Func<string, string, string, bool> createLink)
++        private void TryCopyViaLink(string linkComment, MessageImportance messageImportance, FileState sourceFileState, FileState destinationFileState, out bool linkCreated, ref string errorMessage, Func<string, string, string, bool> createLink)
+         {
+             // Do not log a fake command line as well, as it's superfluous, and also potentially expensive
+             Log.LogMessage(MessageImportance.Normal, linkComment, sourceFileState.Name, destinationFileState.Name);
+ 
+-            if (!OverwriteReadOnlyFiles)
+-            {
+-                destinationFileExists = destinationFileState.FileExists;
+-            }
+-
+-            // CreateHardLink and CreateSymbolicLink cannot overwrite an existing file or link
+-            // so we need to delete the existing entry before we create the hard or symbolic link.
+-            if (destinationFileExists)
+-            {
+-                FileUtilities.DeleteNoThrow(destinationFileState.Name);
+-            }
+-
+             linkCreated = createLink(sourceFileState.Name, destinationFileState.Name, errorMessage);
+         }
+ 

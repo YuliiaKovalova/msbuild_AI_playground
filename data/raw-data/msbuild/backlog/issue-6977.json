@@ -1,0 +1,120 @@
+{
+  "number": 6977,
+  "title": "Use Span-based path manipulation",
+  "body": "MSBuild still uses the old string-based path manipulation almost everywhere, which leads to avoidable allocations in cases where the result of e.g. `Path.GetFileName()` is not stored on the heap.\r\n\r\nHere's one example use of `Path.GetFileName()` which could be easily converted to Span:\r\n\r\nhttps://github.com/dotnet/msbuild/blob/356825cf62bb36ebd215572c8b7e7eabc88ca7fc/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs#L293\r\n\r\nbut there are many more, for other `Path` APIs as well as for helpers implemented in the MSBuild codebase. Some of them are trivial to fix, some will require deeper changes.\r\n\r\nNote that the new Span-based public surface is available in the Microsoft.IO.Redist package on .NET Framework under the namespace `Microsoft.IO` instead of `System.IO`.",
+  "state": "OPEN",
+  "createdAt": "2021-10-21T13:34:38Z",
+  "updatedAt": "2024-01-31T08:20:10Z",
+  "closedAt": null,
+  "author": {
+    "login": "ladipro"
+  },
+  "labels": [
+    "Area: Performance",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "Just to make sure I understand the change:\r\n\r\n```csharp\r\n#if FEATURE_MSIOREDIST\r\n   if (MemoryExtensions.Equals(Microsoft.IO.Path.GetFileName(ProjectFullPath.AsSpan()), \"dirs.proj\".AsSpan(), StringComparison.OrdinalIgnoreCase))\r\n#else\r\n   if (MemoryExtensions.Equals(Path.GetFileName(ProjectFullPath.AsSpan()), \"dirs.proj\", StringComparison.OrdinalIgnoreCase))\r\n#endif\r\n```",
+        "createdAt": "2021-10-26T15:22:48Z",
+        "updatedAt": "2021-10-26T15:22:48Z",
+        "author": {
+          "login": "stanciuadrian"
+        }
+      },
+      {
+        "body": "Yes, this is the desired change. It would be interesting to see if we can switch entire source files to Microsoft.IO to reduce the number of ifdefs:\r\n\r\n```C#\r\n#if FEATURE_MSIOREDIST\r\nusing Path = Microsoft.IO.Path;\r\n#else\r\nusing Path = System.IO.Path;\r\n#endif\r\n```",
+        "createdAt": "2021-10-26T15:30:28Z",
+        "updatedAt": "2021-10-26T15:30:28Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "And I guess there is no `AsSpan()` for `NETSTANDARD2_0`.\r\n\r\nIt looks to me that a single PR would be way too large. \r\nWhat do you think about splitting the work into chunks of ~10 fixes that would be easier to review/approve/merge?",
+        "createdAt": "2021-10-26T18:04:46Z",
+        "updatedAt": "2021-10-26T18:04:46Z",
+        "author": {
+          "login": "stanciuadrian"
+        }
+      },
+      {
+        "body": "Eventually we'd like to upgrade to 2.1, so there is hope (#6148). Until then `NETSTANDARD2_0` has to be handled specially.\r\n\r\nSplitting the work to multiple PRs is perfectly fine and, as you wrote, would make it easier to handle. Thank you!",
+        "createdAt": "2021-10-26T19:44:12Z",
+        "updatedAt": "2021-10-26T19:44:12Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "I'm wondering if it would be reasonable to make some helper method that takes, say, two strings and two functions and returns if they're equal after calling the functions on each of them. The idea then would be that if we later come up with something more efficient than Spanifying everything (hard to imagine in this case), it would be trivial to fix it everywhere at once.",
+        "createdAt": "2021-10-28T19:07:08Z",
+        "updatedAt": "2021-10-28T19:07:08Z",
+        "author": {
+          "login": "Forgind"
+        }
+      },
+      {
+        "body": "Unfortunately there are a lot of scenarios.\r\n\r\nI agree, it's a better choice in the long term. Thanks for the _early_ feedback.\r\n\r\n```csharp\r\n    static class IoUtil\r\n    {\r\n#if NETSTANDARD2_0\r\n        public static bool Equals(string s1, string s2, Func<string, string> f1, Func<string, string> f2, StringComparison sc)\r\n            => string.Equals(f1(s1), f2(s2), sc);\r\n#else\r\n        public delegate ReadOnlySpan<char> IoSpanFunc(ReadOnlySpan<char> input);\r\n\r\n        public static bool Equals(string s1, string s2, IoSpanFunc f1, IoSpanFunc f2, StringComparison sc)\r\n            => MemoryExtensions.Equals(f1(s1.AsSpan()), f2(s2.AsSpan()), sc);\r\n#endif\r\n    }\r\n\r\n\r\n// called below\r\nif (IoUtil.Equals(\r\n    NodeProviderOutOfProcTaskHost.TaskHostNameForClr2TaskHost,\r\n    msbuildLocation,\r\n    Path.GetFileNameWithoutExtension,\r\n    Path.GetFileNameWithoutExtension,\r\n    StringComparison.OrdinalIgnoreCase\r\n    ))\r\n```\r\n\r\nDo you think `StringTools` is a good host for this class?",
+        "createdAt": "2021-10-28T20:16:17Z",
+        "updatedAt": "2021-10-28T20:16:17Z",
+        "author": {
+          "login": "stanciuadrian"
+        }
+      },
+      {
+        "body": "With that structure, you would either need to be able to switch between them at the call site as well or ensure that f1 and f2 work as either Func<string, string> or IOSpanFunc. (The latter is probably a good assumption but makes it a little less flexible.) I was thinking something like:\r\n```C#\r\npublic static bool Equals(string s1, string s2, Func f1, Func f2, StringComparison sc)\r\n{\r\n#if NETSTANDARD2_0\r\n    // Verify function parameter then Equals call with string\r\n#else\r\n    // Verify function parameter then Equals call with span\r\n#endif\r\n}\r\n```\r\n\r\nMaximum flexibility, though you can't demand compile-time precision with f1 and f2.\r\n\r\nI believe StringTools is for things that we might want to share with others, so that sounds good to me. I'd let ladipro comment on the whole idea first, though; he normally finds any holes in my ideas \ud83d\ude42",
+        "createdAt": "2021-10-28T21:13:43Z",
+        "updatedAt": "2021-10-28T21:13:43Z",
+        "author": {
+          "login": "Forgind"
+        }
+      },
+      {
+        "body": "Below I've attempted to enumerate a few aspects to help assess the proposal:\r\n\r\n- **Would we ever want to use something else than Spans for this?** I'd say it's highly unlikely.\r\n- **Does passing the two callbacks have perf implications?** Yes, a bit of CPU for the indirect calls and callers would have to be careful to pass cacheable lambdas; otherwise we would be allocating delegates on every call. I'm afraid that @stanciuadrian's example of passing `Path.GetFileNameWithoutExtension` falls into this problematic case.\r\n- **Does calling `IoUtil.Equals` make it more readable?** That's subjective. Slightly harder to understand initially for someone who's never worked in the repo. Then could be more readable without the `AsSpan` calls and identifier names that make better sense in our context (`MemoryExtensions` sounds kind of low-level to me).\r\n\r\nBased on this I would personally vote for not doing this and make the changes without introducing new helpers. Or at least without helpers taking callbacks. To handle the `NETSTANDARD2_0` case, another options is implementing a simple version of `AsSpan`, `MemoryExtensions.Equals`, etc. for this target to make the code compile. Basically roll out a trivial implementation of Span.",
+        "createdAt": "2021-11-01T21:11:28Z",
+        "updatedAt": "2021-11-01T21:11:28Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "[This](https://github.com/dotnet/msbuild/blob/d41d6893f3f87527ac6c9ee0d6aa3bfe2d4fcb85/src/Utilities/ToolTask.cs#L491) is from a commit I reverted due to failing tests (long story, we'll get back to it). It was my initial proposal to deal with `NETSTANDARD2_0`.\r\n\r\nI could find the `string.AsSpan()` extension method but `Path.GetFileName` is missing the `System.ReadOnlySpan<char>` overload. `Path` is not `partial` and I couldn't get it to compile. Do you have an idea on how to fix it?\r\n\r\nAlso, is comparing `System.ReadOnlySpan<char>` lengths the same as comparing `string` lengths?",
+        "createdAt": "2021-11-17T22:28:12Z",
+        "updatedAt": "2021-11-17T22:28:12Z",
+        "author": {
+          "login": "stanciuadrian"
+        }
+      },
+      {
+        "body": "I see, so if your intent is to implement the missing `Path.GetFileName` overload I would do something like this. Let me know if it's reasonable:\r\n\r\n```C#\r\n#if NETSTANDARD2_0\r\nusing Path = Microsoft.Build.Shared.CompatPath;\r\n#elif FEATURE_MSIOREDIST\r\nusing Path = Microsoft.IO.Path;\r\n#else\r\nusing Path = System.IO.Path;\r\n#endif\r\n```\r\n\r\nWhere `CompatPath` would have the missing implementation. It would also have to declare all other `Path` methods used by the code and forward them to `Path`.\r\n\r\n> Also, is comparing `System.ReadOnlySpan<char>` lengths the same as comparing `string` lengths?\r\n\r\nYes, `pathToTool.AsSpan().Length` is the same as `pathToTool.Length`.",
+        "createdAt": "2021-11-18T11:10:32Z",
+        "updatedAt": "2021-11-18T11:10:32Z",
+        "author": {
+          "login": "ladipro"
+        }
+      },
+      {
+        "body": "Path isn't sealed, right? So to keep it a little simpler, CompatPath could directly extend Path.",
+        "createdAt": "2021-11-18T16:17:37Z",
+        "updatedAt": "2021-11-18T16:17:37Z",
+        "author": {
+          "login": "Forgind"
+        }
+      },
+      {
+        "body": "It is declared as `static` in C# which translates to `abstract sealed` in IL so extending is not allowed unfortunately. ",
+        "createdAt": "2021-11-18T18:55:47Z",
+        "updatedAt": "2021-11-18T18:55:47Z",
+        "author": {
+          "login": "ladipro"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,971 @@
+diff --git a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+index 5ea3ee2bde1..938e5e2183d 100644
+--- a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
++++ b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+@@ -4,6 +4,7 @@
+ using System.Collections.Generic;
+ using Microsoft.Build.BackEnd.Components.Caching;
+ using Microsoft.Build.BackEnd.SdkResolution;
++using Microsoft.Build.FileAccesses;
+ using Microsoft.Build.Shared;
+ 
+ #nullable disable
+@@ -80,6 +81,8 @@ public void RegisterDefaultFactories()
+ 
+             // SDK resolution
+             _componentEntriesByType[BuildComponentType.SdkResolverService] = new BuildComponentEntry(BuildComponentType.SdkResolverService, MainNodeSdkResolverService.CreateComponent, CreationPattern.Singleton);
++
++            _componentEntriesByType[BuildComponentType.FileAccessManager] = new BuildComponentEntry(BuildComponentType.FileAccessManager, FileAccessManager.CreateComponent, CreationPattern.Singleton);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs b/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs
+new file mode 100644
+index 00000000000..0c80b6d9539
+--- /dev/null
++++ b/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs
+@@ -0,0 +1,126 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Threading;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Framework.FileAccess;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.FileAccesses
++{
++    internal sealed class FileAccessManager : IFileAccessManager, IBuildComponent
++    {
++        private record Handlers(Action<BuildRequest, FileAccessData> FileAccessHander, Action<BuildRequest, ProcessData> ProcessHandler);
++
++        private IScheduler? _scheduler;
++        private IConfigCache? _configCache;
++
++        private object _handlersWriteLock = new object();
++        private Handlers[] _handlers = Array.Empty<Handlers>();
++
++        public static IBuildComponent CreateComponent(BuildComponentType type)
++        {
++            ErrorUtilities.VerifyThrowArgumentOutOfRange(type == BuildComponentType.FileAccessManager, nameof(type));
++            return new FileAccessManager();
++        }
++
++        public void InitializeComponent(IBuildComponentHost host)
++        {
++            _scheduler = host.GetComponent(BuildComponentType.Scheduler) as IScheduler;
++            _configCache = host.GetComponent(BuildComponentType.ConfigCache) as IConfigCache;
++        }
++
++        public void ShutdownComponent()
++        {
++            _scheduler = null;
++            _configCache = null;
++        }
++
++        public void ReportFileAccess(FileAccessData fileAccessData, int nodeId)
++        {
++            BuildRequest? buildRequest = GetBuildRequest(nodeId);
++            if (buildRequest != null)
++            {
++                Handlers[] localHandlers = _handlers;
++                foreach (Handlers handlers in localHandlers)
++                {
++                    handlers.FileAccessHander.Invoke(buildRequest, fileAccessData);
++                }
++            }
++        }
++
++        public void ReportProcess(ProcessData processData, int nodeId)
++        {
++            BuildRequest? buildRequest = GetBuildRequest(nodeId);
++            if (buildRequest != null)
++            {
++                Handlers[] localHandlers = _handlers;
++                foreach (Handlers handlers in localHandlers)
++                {
++                    handlers.ProcessHandler.Invoke(buildRequest, processData);
++                }
++            }
++        }
++
++        public HandlerRegistration RegisterHandlers(Action<BuildRequest, FileAccessData> fileAccessHandler, Action<BuildRequest, ProcessData> processHandler)
++        {
++            lock (_handlersWriteLock)
++            {
++                Handlers[] newHandlers = new Handlers[_handlers.Length + 1];
++                _handlers.CopyTo(newHandlers, 0);
++
++                Handlers addedHandlers = new(fileAccessHandler, processHandler);
++                newHandlers[_handlers.Length] = addedHandlers;
++
++                _handlers = newHandlers;
++
++                return new HandlerRegistration(() => UnregisterHandlers(addedHandlers));
++            }
++        }
++
++        private void UnregisterHandlers(Handlers handlersToRemove)
++        {
++            lock (_handlersWriteLock)
++            {
++                Handlers[] newHandlers = new Handlers[_handlers.Length - 1];
++                int newHandlersIdx = 0;
++                for (int handlersIdx = 0; handlersIdx < _handlers.Length; handlersIdx++)
++                {
++                    if (_handlers[handlersIdx] != handlersToRemove)
++                    {
++                        newHandlers[newHandlersIdx] = _handlers[handlersIdx];
++                        newHandlersIdx++;
++                    }
++                }
++
++                _handlers = newHandlers;
++            }
++        }
++
++        private BuildRequest? GetBuildRequest(int nodeId)
++        {
++            ErrorUtilities.VerifyThrow(
++                _scheduler != null && _configCache != null,
++                "Component has not been initialized");
++
++            // Note: If the node isn't executing anything it may be accessing binaries required to run, eg. the MSBuild binaries
++            return _scheduler!.GetExecutingRequestByNode(nodeId);
++        }
++
++        internal readonly struct HandlerRegistration : IDisposable
++        {
++            private readonly Action _unregisterAction;
++
++            public HandlerRegistration(Action unregisterAction)
++            {
++                _unregisterAction = unregisterAction;
++            }
++
++            public void Dispose()
++            {
++                _unregisterAction();
++            }
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs b/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs
+new file mode 100644
+index 00000000000..2834759f55b
+--- /dev/null
++++ b/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs
+@@ -0,0 +1,21 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Framework.FileAccess;
++
++namespace Microsoft.Build.FileAccesses
++{
++    internal interface IFileAccessManager
++    {
++        void ReportFileAccess(FileAccessData fileAccessData, int nodeId);
++
++        void ReportProcess(ProcessData processData, int nodeId);
++
++        // Note: HandlerRegistration is exposed directly instead of IDisposable to avoid boxing.
++        FileAccessManager.HandlerRegistration RegisterHandlers(
++            Action<BuildRequest, FileAccessData> fileAccessHandler,
++            Action<BuildRequest, ProcessData> processHandler);
++    }
++}
+diff --git a/src/Build/BackEnd/Components/IBuildComponentHost.cs b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+index bcbc7eac430..1711b9d27af 100644
+--- a/src/Build/BackEnd/Components/IBuildComponentHost.cs
++++ b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+@@ -130,6 +130,11 @@ internal enum BuildComponentType
+         /// The SDK resolution service.
+         /// </summary>
+         SdkResolverService,
++
++        /// <summary>
++        /// The component which is the sink for file access reports and forwards reports to other components.
++        /// </summary>
++        FileAccessManager,
+     }
+ 
+     /// <summary>
+diff --git a/src/Build/BackEnd/Components/Scheduler/IScheduler.cs b/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
+index d66e50d62c1..84e22a9c67c 100644
+--- a/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
+@@ -33,6 +33,11 @@ internal interface IScheduler : IBuildComponent
+         /// <returns>A positive configuration id if one exists in the plan, 0 otherwise.</returns>
+         int GetConfigurationIdFromPlan(string configurationPath);
+ 
++        /// <summary>
++        /// Retrieves the request executing on a node.
++        /// </summary>
++        BuildRequest GetExecutingRequestByNode(int nodeId);
++
+         /// <summary>
+         /// Reports to the scheduler that a request is blocked.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index bedccfe03cd..da2592baeb4 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -283,6 +283,20 @@ public int GetConfigurationIdFromPlan(string configPath)
+             return _schedulingPlan.GetConfigIdForPath(configPath);
+         }
+ 
++        /// <summary>
++        /// Retrieves the request executing on a node.
++        /// </summary>
++        public BuildRequest GetExecutingRequestByNode(int nodeId)
++        {
++            if (!_schedulingData.IsNodeWorking(nodeId))
++            {
++                return null;
++            }
++
++            SchedulableRequest request = _schedulingData.GetExecutingRequestByNode(nodeId);
++            return request.BuildRequest;
++        }
++
+         /// <summary>
+         /// Reports that the specified request has become blocked and cannot proceed.
+         /// </summary>
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 6e6725c439d..fab357ad8ec 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -1,4 +1,4 @@
+-<Project Sdk="Microsoft.NET.Sdk">
++﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <Import Project="..\Shared\FileSystemSources.proj" />
+   <Import Project="..\Shared\DebuggingSources.proj" />
+@@ -156,6 +156,8 @@
+     <Compile Include="BackEnd\Components\ProjectCache\*.cs" />
+     <Compile Include="BackEnd\Components\Communications\CurrentHost.cs" />
+     <Compile Include="BackEnd\Components\Communications\ServerNodeEndpointOutOfProc.cs" />
++    <Compile Include="BackEnd\Components\FileAccesses\FileAccessManager.cs" />
++    <Compile Include="BackEnd\Components\FileAccesses\IFileAccessManager.cs" />
+     <Compile Include="BackEnd\Components\RequestBuilder\AssemblyLoadsTracker.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\SdkResolverException.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+diff --git a/src/Framework/FileAccess/DesiredAccess.cs b/src/Framework/FileAccess/DesiredAccess.cs
+new file mode 100644
+index 00000000000..a205acf9d03
+--- /dev/null
++++ b/src/Framework/FileAccess/DesiredAccess.cs
+@@ -0,0 +1,109 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Framework.FileAccess
++{
++    /// <summary>
++    /// The requested access to the file or device.
++    /// </summary>
++    /// <remarks>
++    /// See https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants for a full list of values.
++    /// </remarks>
++    [Flags]
++
++    // TODO dshepelev: Fix suppression.
++#pragma warning disable CS3009 // Base type is not CLS-compliant.
++    public enum DesiredAccess : uint
++#pragma warning restore CS3009 // Base type is not CLS-compliant.
++    {
++        /// <summary>
++        /// For a directory, the right to list the contents of the directory.
++        /// </summary>
++        FILE_LIST_DIRECTORY = 0x00000001,
++
++        /// <summary>
++        /// For a directory, the right to create a file in the directory.
++        /// </summary>
++        FILE_ADD_FILE = 0x00000002,
++
++        /// <summary>
++        /// For a directory, the right to create a subdirectory.
++        /// </summary>
++        FILE_ADD_SUBDIRECTORY = 0x00000004,
++
++        /// <summary>
++        /// The right to read extended file attributes.
++        /// </summary>
++        FILE_READ_EA = 0x00000008,
++
++        /// <summary>
++        /// Right to delete an object.
++        /// </summary>
++        DELETE = 0x00010000,
++
++        /// <summary>
++        /// Right to wait on a handle.
++        /// </summary>
++        SYNCHRONIZE = 0x00100000,
++
++        /// <summary>
++        /// For a file object, the right to append data to the file. (For local files, write operations will not overwrite existing
++        /// data if this flag is specified without <see cref="FILE_WRITE_DATA"/>.) For a directory object, the right to create a subdirectory
++        /// (<see cref="FILE_ADD_SUBDIRECTORY"/>).
++        /// </summary>
++        FILE_APPEND_DATA = 0x00000004,
++
++        /// <summary>
++        /// The right to write extended file attributes.
++        /// </summary>
++        FILE_WRITE_EA = 0x00000010,
++
++        /// <summary>
++        /// For a native code file, the right to execute the file. This access right given to scripts may cause the script to be executable, depending on the script interpreter.
++        /// </summary>
++        FILE_EXECUTE = 0x00000020,
++
++        /// <summary>
++        /// For a directory, the right to delete a directory and all the files it contains, including read-only files.
++        /// </summary>
++        FILE_DELETE_CHILD = 0x00000040,
++
++        /// <summary>
++        /// The right to read file attributes.
++        /// </summary>
++        FILE_READ_ATTRIBUTES = 0x00000080,
++
++        /// <summary>
++        /// The right to write file attributes.
++        /// </summary>
++        FILE_WRITE_ATTRIBUTES = 0x00000100,
++
++        /// <summary>
++        /// For a file object, the right to write data to the file. For a directory object, the right to create a file in the
++        /// directory (<see cref="FILE_ADD_FILE"/>).
++        /// </summary>
++        FILE_WRITE_DATA = 0x00000002,
++
++        /// <summary>
++        /// All possible access rights.
++        /// </summary>
++        GENERIC_ALL = 0x10000000,
++
++        /// <summary>
++        /// Execute access.
++        /// </summary>
++        GENERIC_EXECUTE = 0x20000000,
++
++        /// <summary>
++        /// Write access.
++        /// </summary>
++        GENERIC_WRITE = 0x40000000,
++
++        /// <summary>
++        /// Read access.
++        /// </summary>
++        GENERIC_READ = 0x80000000,
++    }
++}
+diff --git a/src/Framework/FileAccess/FileAccessData.cs b/src/Framework/FileAccess/FileAccessData.cs
+new file mode 100644
+index 00000000000..e8b37a69f70
+--- /dev/null
++++ b/src/Framework/FileAccess/FileAccessData.cs
+@@ -0,0 +1,32 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Framework.FileAccess
++{
++    /// <summary>
++    /// File access data.
++    /// </summary>
++    /// <param name="Operation">The operation that performed the file access.</param>
++    /// <param name="RequestedAccess">The requested access.</param>
++    /// <param name="ProcessId">The process id.</param>
++    /// <param name="Error">The error code of the operation.</param>
++    /// <param name="DesiredAccess">The desired access.</param>
++    /// <param name="FlagsAndAttributes">The file flags and attributes.</param>
++    /// <param name="Path">The path being accessed.</param>
++    /// <param name="ProcessArgs">The process arguments.</param>
++    /// <param name="IsAnAugmentedFileAccess">Whether the file access is augmented.</param>
++    public readonly record struct FileAccessData(
++        ReportedFileOperation Operation,
++        RequestedAccess RequestedAccess,
++
++        // TODO dshepelev: Fix suppression.
++#pragma warning disable CS3001, CS3003 // Argument type is not CLS-compliant; Type is not CLS-compliant.
++        uint ProcessId,
++        uint Error,
++#pragma warning restore CS3001, CS3003 // Argument type is not CLS-compliant; Type is not CLS-compliant.
++        DesiredAccess DesiredAccess,
++        FlagsAndAttributes FlagsAndAttributes,
++        string Path,
++        string? ProcessArgs,
++        bool IsAnAugmentedFileAccess);
++}
+diff --git a/src/Framework/FileAccess/FlagsAndAttributes.cs b/src/Framework/FileAccess/FlagsAndAttributes.cs
+new file mode 100644
+index 00000000000..b386c2119f4
+--- /dev/null
++++ b/src/Framework/FileAccess/FlagsAndAttributes.cs
+@@ -0,0 +1,182 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Framework.FileAccess
++{
++    /// <summary>
++    /// The file or device attributes and flags.
++    /// </summary>
++    [Flags]
++
++    // TODO dshepelev: Fix suppression.
++#pragma warning disable CS3009 // Base type is not CLS-compliant.
++    public enum FlagsAndAttributes : uint
++#pragma warning restore CS3009 // Base type is not CLS-compliant.
++    {
++        /// <summary>
++        /// The file is read only. Applications can read the file but cannot write to or delete it.
++        /// </summary>
++        FILE_ATTRIBUTE_READONLY = 0x00000001,
++
++        /// <summary>
++        /// The file is hidden. Do not include it in an ordinary directory listing.
++        /// </summary>
++        FILE_ATTRIBUTE_HIDDEN = 0x00000002,
++
++        /// <summary>
++        /// The file is part of or used exclusively by an operating system.
++        /// </summary>
++        FILE_ATTRIBUTE_SYSTEM = 0x00000004,
++
++        /// <summary>
++        /// The path is a directory.
++        /// </summary>
++        FILE_ATTRIBUTE_DIRECTORY = 0x00000010,
++
++        /// <summary>
++        /// The file should be archived. Applications use this attribute to mark files for backup or removal.
++        /// </summary>
++        FILE_ATTRIBUTE_ARCHIVE = 0x00000020,
++
++        /// <summary>
++        /// The file does not have other attributes set. This attribute is valid only if used alone.
++        /// </summary>
++        FILE_ATTRIBUTE_NORMAL = 0x00000080,
++
++        /// <summary>
++        /// The file is being used for temporary storage.
++        /// </summary>
++        /// <remarks>
++        /// For more information, see the Caching Behavior section of this topic.
++        /// </remarks>
++        FILE_ATTRIBUTE_TEMPORARY = 0x00000100,
++
++        /// <summary>
++        /// The data of a file is not immediately available. This attribute indicates that file data is physically moved to offline
++        /// storage. This attribute is used by Remote Storage, the hierarchical storage management software. Applications should
++        /// not arbitrarily change this attribute.
++        /// </summary>
++        FILE_ATTRIBUTE_OFFLINE = 0x00001000,
++
++        /// <summary>
++        /// The file or directory is encrypted. For a file, this means that all data in the file is encrypted. For a directory,
++        /// this means that encryption is the default for newly created files and subdirectories. For more information, see File
++        /// Encryption.
++        /// </summary>
++        /// <remarks>
++        /// This flag has no effect if <see cref="FILE_ATTRIBUTE_SYSTEM"/> is also specified.
++        /// This flag is not supported on Home, Home Premium, Starter, or ARM editions of Windows.
++        /// </remarks>
++        FILE_ATTRIBUTE_ENCRYPED = 0x00004000,
++
++        /// <summary>
++        /// The file data is requested, but it should continue to be located in remote storage. It should not be transported back
++        /// to local storage. This flag is for use by remote storage systems.
++        /// </summary>
++        FILE_FLAG_OPEN_NO_RECALL = 0x00100000,
++
++        /// <summary>
++        /// Normal reparse point processing will not occur; CreateFile will attempt to open the reparse point. When a file is
++        /// opened, a file handle is returned, whether or not the filter that controls the reparse point is operational.
++        /// </summary>
++        /// <remarks>
++        /// This flag cannot be used with the CREATE_ALWAYS flag.
++        /// If the file is not a reparse point, then this flag is ignored.
++        /// For more information, see the Remarks section.
++        /// </remarks>
++        FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000,
++
++        /// <summary>
++        /// The file or device is being opened with session awareness. If this flag is not specified, then per-session devices
++        /// (such as a redirected USB device) cannot be opened by processes running in session 0. This flag has no effect for
++        /// callers not in session 0. This flag is supported only on server editions of Windows.
++        /// </summary>
++        /// <remarks>
++        /// Windows Server 2008 R2, Windows Server 2008, and Windows Server 2003: This flag is not supported before Windows Server
++        /// 2012.
++        /// </remarks>
++        FILE_FLAG_SESSION_AWARE = 0x00800000,
++
++        /// <summary>
++        /// Access will occur according to POSIX rules. This includes allowing multiple files with names, differing only in case,
++        /// for file systems that support that naming. Use care when using this option, because files created with this flag may
++        /// not be accessible by applications that are written for MS-DOS or 16-bit Windows.
++        /// </summary>
++        FILE_FLAG_POSIX_SEMANTICS = 0x01000000,
++
++        /// <summary>
++        /// The file is being opened or created for a backup or restore operation. The system ensures that the calling process
++        /// overrides file security checks when the process has SE_BACKUP_NAME and SE_RESTORE_NAME privileges. For more
++        /// information, see Changing Privileges in a Token.
++        /// </summary>
++        /// <remarks>
++        /// You must set this flag to obtain a handle to a directory. A directory handle can be passed to some functions instead of
++        /// a file handle. For more information, see the Remarks section.
++        /// </remarks>
++        FILE_FLAG_BACKUP_SEMANTICS = 0x02000000,
++
++        /// <summary>
++        /// The file is to be deleted immediately after all of its handles are closed, which includes the specified handle and any
++        /// other open or duplicated handles.
++        /// </summary>
++        /// <remarks>
++        /// If there are existing open handles to a file, the call fails unless they were all opened with the FILE_SHARE_DELETE
++        /// share mode.
++        /// Subsequent open requests for the file fail, unless the FILE_SHARE_DELETE share mode is specified.
++        /// </remarks>
++        FILE_FLAG_DELETE_ON_CLOSE = 0x04000000,
++
++        /// <summary>
++        /// Access is intended to be sequential from beginning to end. The system can use this as a hint to optimize file caching.
++        /// </summary>
++        /// <remarks>
++        /// This flag should not be used if read-behind (that is, reverse scans) will be used.
++        /// This flag has no effect if the file system does not support cached I/O and <see cref="FILE_FLAG_NO_BUFFERING"/> .
++        /// For more information, see the Caching Behavior section of this topic.
++        /// </remarks>
++        FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000,
++
++        /// <summary>
++        /// Access is intended to be random. The system can use this as a hint to optimize file caching.
++        /// </summary>
++        /// <remarks>
++        /// This flag has no effect if the file system does not support cached I/O and <see cref="FILE_FLAG_NO_BUFFERING"/>.
++        /// For more information, see the Caching Behavior section of this topic.
++        /// </remarks>
++        FILE_FLAG_RANDOM_ACCESS = 0x10000000,
++
++        /// <summary>
++        /// The file or device is being opened with no system caching for data reads and writes. This flag does not affect hard
++        /// disk caching or memory mapped files.
++        /// </summary>
++        /// <remarks>
++        /// There are strict requirements for successfully working with files opened with CreateFile using this
++        /// flag; for details, see File Buffering.
++        /// </remarks>
++        FILE_FLAG_NO_BUFFERING = 0x20000000,
++
++        /// <summary>
++        /// The file or device is being opened or created for asynchronous I/O.
++        /// </summary>
++        /// <remarks>
++        /// When subsequent I/O operations are completed on this handle, the event specified in the OVERLAPPED structure will be
++        /// set to the signaled state.
++        /// If this flag is specified, the file can be used for simultaneous read and write operations.
++        /// If this flag is not specified, then I/O operations are serialized, even if the calls to the read and write functions
++        /// specify an OVERLAPPED structure.
++        /// For information about considerations when using a file handle created with this flag, see the Synchronous and
++        /// Asynchronous I/O Handles section of this topic.
++        /// </remarks>
++        FILE_FLAG_OVERLAPPED = 0x40000000,
++
++        /// <summary>
++        /// Write operations will not go through any intermediate cache; they will go directly to disk.
++        /// </summary>
++        /// <remarks>
++        /// For additional information, see the Caching Behavior section of this topic.
++        /// </remarks>
++        FILE_FLAG_WRITE_THROUGH = 0x80000000,
++    }
++}
+diff --git a/src/Framework/FileAccess/ProcessData.cs b/src/Framework/FileAccess/ProcessData.cs
+new file mode 100644
+index 00000000000..18e1f57366a
+--- /dev/null
++++ b/src/Framework/FileAccess/ProcessData.cs
+@@ -0,0 +1,32 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Framework.FileAccess
++{
++    /// <summary>
++    /// Process data.
++    /// </summary>
++    /// <param name="ProcessName">The process name.</param>
++    /// <param name="ProcessId">The process id.</param>
++    /// <param name="ParentProcessId">The parent process id.</param>
++    /// <param name="CreationDateTime">The creation date time.</param>
++    /// <param name="ExitDateTime">The exit date time.</param>
++    /// <param name="ExitCode">The exit code.</param>
++    public readonly record struct ProcessData(
++        string ProcessName,
++
++        // TODO dshepelev: Fix suppression.
++#pragma warning disable CS3001, CS3003 // Argument type is not CLS-compliant; Type is not CLS-compliant.
++        uint ProcessId,
++        uint ParentProcessId,
++#pragma warning restore CS3001, CS3003 // Argument type is not CLS-compliant; Type is not CLS-compliant.
++        DateTime CreationDateTime,
++        DateTime ExitDateTime,
++
++        // TODO dshepelev: Fix suppression.
++#pragma warning disable CS3001, CS3003 // Argument type is not CLS-compliant; Type is not CLS-compliant.
++        uint ExitCode);
++#pragma warning restore CS3001, CS3003 // Argument type is not CLS-compliant; Type is not CLS-compliant.
++}
+diff --git a/src/Framework/FileAccess/ReportedFileOperation.cs b/src/Framework/FileAccess/ReportedFileOperation.cs
+new file mode 100644
+index 00000000000..205fc7f5b31
+--- /dev/null
++++ b/src/Framework/FileAccess/ReportedFileOperation.cs
+@@ -0,0 +1,257 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Framework.FileAccess
++{
++    /// <summary>
++    /// Which operation resulted in a reported file access.
++    /// </summary>
++    public enum ReportedFileOperation : byte
++    {
++        /// <summary>
++        /// Unknown operation.
++        /// </summary>
++        Unknown = 0,
++
++        /// <summary>
++        /// CreateFile.
++        /// </summary>
++        CreateFile,
++
++        /// <summary>
++        /// CreateProcess.
++        /// </summary>
++        CreateProcess,
++
++        /// <summary>
++        /// GetFileAttributes.
++        /// </summary>
++        GetFileAttributes,
++
++        /// <summary>
++        /// GetFileAttributesEx.
++        /// </summary>
++        GetFileAttributesEx,
++
++        /// <summary>
++        /// Process forked.
++        /// </summary>
++        Process,
++
++        /// <summary>
++        /// FindFirstFileEx.
++        /// </summary>
++        /// <remarks>
++        /// FindFirstFile also indicates this op, since we implement it in terms of FindFirstFileEx.
++        /// </remarks>
++        FindFirstFileEx,
++
++        /// <summary>
++        /// FindNextFile.
++        /// </summary>
++        FindNextFile,
++
++        /// <summary>
++        /// CreateDirectory.
++        /// </summary>
++        CreateDirectory,
++
++        /// <summary>
++        /// DeleteFile.
++        /// </summary>
++        DeleteFile,
++
++        /// <summary>
++        /// MoveFile (source; read and deleted).
++        /// </summary>
++        MoveFileSource,
++
++        /// <summary>
++        /// MoveFile (destination; written).
++        /// </summary>
++        MoveFileDestination,
++
++        /// <summary>
++        /// SetFileInformationByHandleSource (source; read and deleted).
++        /// </summary>
++        SetFileInformationByHandleSource,
++
++        /// <summary>
++        /// SetFileInformationByHandleDest (destination; written).
++        /// </summary>
++        SetFileInformationByHandleDest,
++
++        /// <summary>
++        /// ZwSetRenameInformationFileSource (source; read and deleted).
++        /// </summary>
++        ZwSetRenameInformationFileSource,
++
++        /// <summary>
++        /// ZwSetRenameInformationFileDest (destination; written).
++        /// </summary>
++        ZwSetRenameInformationFileDest,
++
++        /// <summary>
++        /// ZwSetLinkInformationFileDest.
++        /// </summary>
++        ZwSetLinkInformationFile,
++
++        /// <summary>
++        /// ZwSetDispositionInformationFile (delete-on-close; deleted).
++        /// </summary>
++        ZwSetDispositionInformationFile,
++
++        /// <summary>
++        /// ZwSetModeInformationFile (delete-on-close; deleted).
++        /// </summary>
++        ZwSetModeInformationFile,
++
++        /// <summary>
++        /// ZwSetFileNameInformationFile (source; read and written).
++        /// </summary>
++        ZwSetFileNameInformationFileSource,
++
++        /// <summary>
++        /// ZwSetFileNameInformationFile (destination; written).
++        /// </summary>
++        ZwSetFileNameInformationFileDest,
++
++        /// <summary>
++        /// CopyFile (source; read).
++        /// </summary>
++        CopyFileSource,
++
++        /// <summary>
++        /// CopyFile (destination; written).
++        /// </summary>
++        CopyFileDestination,
++
++        /// <summary>
++        /// CreateHardLink (source; read).
++        /// </summary>
++        CreateHardLinkSource,
++
++        /// <summary>
++        /// CreateHardLink (destination; written).
++        /// </summary>
++        CreateHardLinkDestination,
++
++        /// <summary>
++        /// RemoveDirectory.
++        /// </summary>
++        RemoveDirectory,
++
++        /// <summary>
++        /// RemoveDirectory (source; written).
++        /// </summary>
++        RemoveDirectorySource,
++
++        /// <summary>
++        /// NtQueryDirectoryFile.
++        /// </summary>
++        NtQueryDirectoryFile,
++
++        /// <summary>
++        /// ZwQueryDirectoryFile.
++        /// </summary>
++        ZwQueryDirectoryFile,
++
++        /// <summary>
++        /// NtCreateFile.
++        /// </summary>
++        NtCreateFile,
++
++        /// <summary>
++        /// ZwCreateFile.
++        /// </summary>
++        ZwCreateFile,
++
++        /// <summary>
++        /// ZwOpenFile.
++        /// </summary>
++        ZwOpenFile,
++
++        /// <summary>
++        /// This is a quasi operation. We issue this
++        /// report when Detours is changing file open
++        /// request with Read/Write access to Read access only.
++        /// </summary>
++        ChangedReadWriteToReadAccess,
++
++        /// <summary>
++        /// This is a quasi operation. The sandbox issues this only when FileAccessPolicy.OverrideAllowWriteForExistingFiles is set, representing
++        /// that an allow for write check was performed for a given path for the first time (in the scope of a process, another process in the same process 
++        /// tree may also report this for the same path).
++        /// </summary>
++        FirstAllowWriteCheckInProcess,
++
++        /// <summary>
++        /// This operation used to indicate to the engine by the Linux sandbox that a process being executed statically links libc
++        /// and may have missing file observations.
++        /// </summary>
++        StaticallyLinkedProcess,
++
++        /// <summary>
++        /// Access of reparse point target.
++        /// </summary>
++        ReparsePointTarget,
++
++        /// <summary>
++        /// Access of reparse point target, cached by Detours.
++        /// </summary>
++        ReparsePointTargetCached,
++
++        /// <summary>
++        /// Access checks for source of CreateSymbolicLink API.
++        /// </summary>
++        CreateSymbolicLinkSource,
++
++        /// <summary>
++        /// Access check for MoveFileWithgProgress source target.
++        /// </summary>
++        MoveFileWithProgressSource,
++
++        /// <summary>
++        /// Access check for MoveFileWithProgress dest target.
++        /// </summary>
++        MoveFileWithProgressDest,
++
++        /// <summary>
++        /// Multiple operations lumped into one.
++        /// </summary>
++        MultipleOperations,
++
++        /// <summary>
++        /// Process exited.
++        /// </summary>
++        ProcessExit,
++
++        #region Operation Names Reported by BuildXLSandbox (macOS sandbox implementation)
++        MacLookup,
++        MacReadlink,
++        MacVNodeCreate,
++        KAuthMoveSource,
++        KAuthMoveDest,
++        KAuthCreateHardlinkSource,
++        KAuthCreateHardlinkDest,
++        KAuthCopySource,
++        KAuthCopyDest,
++        KAuthDeleteDir,
++        KAuthDeleteFile,
++        KAuthOpenDir,
++        KAuthReadFile,
++        KAuthCreateDir,
++        KAuthWriteFile,
++        KAuthClose,
++        KAuthCloseModified,
++        KAuthGetAttributes,
++        KAuthVNodeExecute,
++        KAuthVNodeWrite,
++        KAuthVNodeRead,
++        KAuthVNodeProbe,
++        MacVNodeWrite,
++        MacVNodeCloneSource,
++        MacVNodeCloneDest,
++        #endregion
++    }
++}
+diff --git a/src/Framework/FileAccess/RequestedAccess.cs b/src/Framework/FileAccess/RequestedAccess.cs
+new file mode 100644
+index 00000000000..d86831f2979
+--- /dev/null
++++ b/src/Framework/FileAccess/RequestedAccess.cs
+@@ -0,0 +1,54 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Framework.FileAccess
++{
++    /// <summary>
++    /// Level of access requested by a reported file operation.
++    /// </summary>
++    [Flags]
++    public enum RequestedAccess : byte
++    {
++        /// <summary>
++        /// No access requested.
++        /// </summary>
++        None = 0,
++
++        /// <summary>
++        /// Read access requested.
++        /// </summary>
++        Read = 1,
++
++        /// <summary>
++        /// Write access requested.
++        /// </summary>
++        Write = 2,
++
++        /// <summary>
++        /// Metadata-only probe access requested (e.g. <see cref="ReportedFileOperation.GetFileAttributes"/>).
++        /// </summary>
++        Probe = 4,
++
++        /// <summary>
++        /// Directory enumeration access requested (on the directory itself; immediate children will be enumerated).
++        /// </summary>
++        Enumerate = 8,
++
++        /// <summary>
++        /// Metadata-only probe access requested; probed as part of a directory enumeration (e.g. <see cref="ReportedFileOperation.FindNextFile"/>).
++        /// </summary>
++        EnumerationProbe = 16,
++
++        /// <summary>
++        /// Both read and write access requested.
++        /// </summary>
++        ReadWrite = Read | Write,
++
++        /// <summary>
++        /// All defined access levels requested.
++        /// </summary>
++        All = Read | Write | Probe | Enumerate | EnumerationProbe,
++    }
++}
+diff --git a/src/Framework/NativeMethods.cs b/src/Framework/NativeMethods.cs
+index c71d9f49ff6..6e2a8439320 100644
+--- a/src/Framework/NativeMethods.cs
++++ b/src/Framework/NativeMethods.cs
+@@ -1300,7 +1300,7 @@ internal static int GetParentProcessId(int processId)
+                 // using (var r = FileUtilities.OpenRead("/proc/" + processId + "/stat"))
+                 // and could be again when FileUtilities moves to Framework
+ 
+-                using var fileStream = new FileStream("/proc/" + processId + "/stat", FileMode.Open, FileAccess.Read);
++                using var fileStream = new FileStream("/proc/" + processId + "/stat", FileMode.Open, System.IO.FileAccess.Read);
+                 using StreamReader r = new(fileStream);
+ 
+                 line = r.ReadLine();

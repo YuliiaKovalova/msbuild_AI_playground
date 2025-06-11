@@ -1,0 +1,340 @@
+diff --git a/ref/Microsoft.Build/net/Microsoft.Build.cs b/ref/Microsoft.Build/net/Microsoft.Build.cs
+index df63aa205be..53c843c112a 100644
+--- a/ref/Microsoft.Build/net/Microsoft.Build.cs
++++ b/ref/Microsoft.Build/net/Microsoft.Build.cs
+@@ -772,6 +772,7 @@ public enum ProjectLoadSettings
+         DoNotEvaluateElementsWithFalseCondition = 32,
+         IgnoreInvalidImports = 64,
+         ProfileEvaluation = 128,
++        FailOnUnresolvedSdk = 256,
+     }
+     public partial class ProjectMetadata : System.IEquatable<Microsoft.Build.Evaluation.ProjectMetadata>
+     {
+@@ -1047,6 +1048,8 @@ public enum BuildRequestDataFlags
+         SkipNonexistentTargets = 16,
+         ProvideSubsetOfStateAfterBuild = 32,
+         IgnoreMissingEmptyAndInvalidImports = 64,
++        SkipNonexistentNonEntryTargets = 128,
++        FailOnUnresolvedSdk = 256,
+     }
+     public partial class BuildResult
+     {
+diff --git a/ref/Microsoft.Build/netstandard/Microsoft.Build.cs b/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
+index 2e945e6c024..b1f8429b5cb 100644
+--- a/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
++++ b/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
+@@ -772,6 +772,7 @@ public enum ProjectLoadSettings
+         DoNotEvaluateElementsWithFalseCondition = 32,
+         IgnoreInvalidImports = 64,
+         ProfileEvaluation = 128,
++        FailOnUnresolvedSdk = 256,
+     }
+     public partial class ProjectMetadata : System.IEquatable<Microsoft.Build.Evaluation.ProjectMetadata>
+     {
+@@ -1042,6 +1043,8 @@ public enum BuildRequestDataFlags
+         SkipNonexistentTargets = 16,
+         ProvideSubsetOfStateAfterBuild = 32,
+         IgnoreMissingEmptyAndInvalidImports = 64,
++        SkipNonexistentNonEntryTargets = 128,
++        FailOnUnresolvedSdk = 256,
+     }
+     public partial class BuildResult
+     {
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index f11fec9e489..e795484bc95 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1702,6 +1702,11 @@ private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+                                 projectLoadSettings |= ProjectLoadSettings.IgnoreMissingImports | ProjectLoadSettings.IgnoreInvalidImports | ProjectLoadSettings.IgnoreEmptyImports;
+                             }
+ 
++                            if (submission.BuildRequestData.Flags.HasFlag(BuildRequestDataFlags.FailOnUnresolvedSdk))
++                            {
++                                projectLoadSettings |= ProjectLoadSettings.FailOnUnresolvedSdk;
++                            }
++
+                             return new ProjectInstance(
+                                 path,
+                                 properties,
+diff --git a/src/Build/BackEnd/BuildManager/BuildRequestData.cs b/src/Build/BackEnd/BuildManager/BuildRequestData.cs
+index 4123d7e0922..673ee5f0fdf 100644
+--- a/src/Build/BackEnd/BuildManager/BuildRequestData.cs
++++ b/src/Build/BackEnd/BuildManager/BuildRequestData.cs
+@@ -75,6 +75,21 @@ public enum BuildRequestDataFlags
+         /// This is especially useful during a restore since some imports might come from packages that haven't been restored yet.
+         /// </summary>
+         IgnoreMissingEmptyAndInvalidImports = 1 << 6,
++
++        /// <summary>
++        /// When this flag is present, non entry target(s) in the build request will be skipped if those targets
++        /// are not defined in the Project to build. The build will still fail if an entry target does not exist.
++        /// This only applies to this build request (if another target calls the "missing target" at any other point
++        /// this will still result in an error).
++        /// </summary>
++        SkipNonexistentNonEntryTargets = 1 << 7,
++
++        /// <summary>
++        /// When this flag is present, an unresolved MSBuild project SDK will fail the build.  This flag is used to
++        /// change the <see cref="IgnoreMissingEmptyAndInvalidImports" /> behavior to still fail when an SDK is missing
++        /// because those are more fatal.
++        /// </summary>
++        FailOnUnresolvedSdk = 1 << 8,
+     }
+ 
+     /// <summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
+index 79142963436..33486a859be 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
+@@ -143,15 +143,24 @@ public async Task<BuildResult> BuildTargets(ProjectLoggingContext loggingContext
+             foreach (string targetName in targetNames)
+             {
+                 var targetExists = _projectInstance.Targets.TryGetValue(targetName, out ProjectTargetInstance targetInstance);
+-                if (!targetExists && entry.Request.BuildRequestDataFlags.HasFlag(BuildRequestDataFlags.SkipNonexistentTargets))
++                
++                if (!targetExists)
+                 {
+-                    _projectLoggingContext.LogComment(Framework.MessageImportance.Low,
+-                        "TargetSkippedWhenSkipNonexistentTargets", targetName);
+-                }
+-                else
+-                {
+-                    targets.Add(new TargetSpecification(targetName, targetExists ? targetInstance.Location : _projectInstance.ProjectFileLocation));
++                    // Ignore the missing target if:
++                    //  SkipNonexistentTargets is set
++                    //  -or-
++                    //  SkipNonexistentNonEntryTargets and the target is is not a top level target
++                    if (entry.Request.BuildRequestDataFlags.HasFlag(BuildRequestDataFlags.SkipNonexistentTargets)
++                        || entry.Request.BuildRequestDataFlags.HasFlag(BuildRequestDataFlags.SkipNonexistentNonEntryTargets) && !entry.Request.Targets.Contains(targetName))
++                    {
++                        _projectLoggingContext.LogComment(Framework.MessageImportance.Low,
++                            "TargetSkippedWhenSkipNonexistentTargets", targetName);
++
++                        continue;
++                    }
+                 }
++
++                targets.Add(new TargetSpecification(targetName, targetExists ? targetInstance.Location : _projectInstance.ProjectFileLocation));
+             }
+ 
+             // Push targets onto the stack.  This method will reverse their push order so that they
+diff --git a/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs b/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
+index 97f9531e074..8398cb68479 100644
+--- a/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
++++ b/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
+@@ -466,6 +466,11 @@ internal void LoadProjectIntoConfiguration(
+                     projectLoadSettings |= ProjectLoadSettings.IgnoreMissingImports | ProjectLoadSettings.IgnoreInvalidImports | ProjectLoadSettings.IgnoreEmptyImports;
+                 }
+ 
++                if (buildRequestDataFlags.HasFlag(buildRequestDataFlags & BuildRequestDataFlags.FailOnUnresolvedSdk))
++                {
++                    projectLoadSettings |= ProjectLoadSettings.FailOnUnresolvedSdk;
++                }
++
+                 return new ProjectInstance(
+                     ProjectFullPath,
+                     globalProperties,
+diff --git a/src/Build/Definition/ProjectLoadSettings.cs b/src/Build/Definition/ProjectLoadSettings.cs
+index 7f1c9ad2d80..ef51122eca5 100644
+--- a/src/Build/Definition/ProjectLoadSettings.cs
++++ b/src/Build/Definition/ProjectLoadSettings.cs
+@@ -59,5 +59,10 @@ public enum ProjectLoadSettings
+         /// Whether to profile the evaluation
+         /// </summary>
+         ProfileEvaluation = 128,
++
++        /// <summary>
++        /// Used in combination with <see cref="IgnoreMissingImports" /> to still treat an unresolved MSBuild project SDK as an error.
++        /// </summary>
++        FailOnUnresolvedSdk = 256,
+     }
+ }
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 22107d15fcc..3c88d31cf0e 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -1773,7 +1773,8 @@ static string EvaluateProperty(string value, IElementLocation location,
+ 
+                 if (!sdkResult.Success)
+                 {
+-                    if (_loadSettings.HasFlag(ProjectLoadSettings.IgnoreMissingImports))
++                    // Ignore the missing import if IgnoreMissingImports is set unless FailOnUnresolvedSdk is also set
++                    if (_loadSettings.HasFlag(ProjectLoadSettings.IgnoreMissingImports) && !_loadSettings.HasFlag(ProjectLoadSettings.FailOnUnresolvedSdk))
+                     {
+                         ProjectImportedEventArgs eventArgs = new ProjectImportedEventArgs(
+                             importElement.Location.Line,
+diff --git a/src/MSBuild.UnitTests/XMake_Tests.cs b/src/MSBuild.UnitTests/XMake_Tests.cs
+index b3c65a114a6..e014f5652e3 100644
+--- a/src/MSBuild.UnitTests/XMake_Tests.cs
++++ b/src/MSBuild.UnitTests/XMake_Tests.cs
+@@ -2108,6 +2108,106 @@ public void RestoreIgnoresMissingImports()
+             logContents.ShouldContain(guid2);
+         }
+ 
++        /// <summary>
++        /// When specifying /t:restore, fail when an SDK can't be resolved.  Previous behavior was to try and continue anyway but then "restore" would succeed and build workflows continue on.
++        /// </summary>
++        [Fact]
++        public void RestoreFailsOnUnresolvedSdk()
++        {
++            string projectContents = ObjectModelHelpers.CleanupFileContents(
++$@"<Project>
++  <Sdk Name=""UnresolvedSdk"" />
++  <Target Name=""Restore"">
++    <Message Text=""Restore target ran"" />
++  </Target>
++</Project>");
++
++            string logContents = ExecuteMSBuildExeExpectFailure(projectContents, arguments: "/t:restore");
++
++            logContents.ShouldContain("error MSB4236: The SDK 'UnresolvedSdk' specified could not be found.");
++        }
++
++        /// <summary>
++        /// Verifies a non-existent target doesn't fail restore as long as its not considered an entry target, in this case Restore.
++        /// </summary>
++        [Fact]
++        public void RestoreSkipsNonExistentNonEntryTargets()
++        {
++            string restoreFirstProps = $"{Guid.NewGuid():N}.props";
++
++            string projectContents = ObjectModelHelpers.CleanupFileContents(
++$@"<Project DefaultTargets=""Build"" InitialTargets=""TargetThatComesFromRestore"">
++  <PropertyGroup>
++    <RestoreFirstProps>{restoreFirstProps}</RestoreFirstProps>
++  </PropertyGroup>
++  
++  <Import Project=""$(RestoreFirstProps)"" />
++  <Target Name=""Restore"">
++    <Message Text=""Restore target ran"" />
++    <ItemGroup>
++      <Lines Include=""&lt;Project&gt;&lt;Target Name=&quot;TargetThatComesFromRestore&quot;&gt;&lt;Message Text=&quot;Initial target ran&quot; /&gt;&lt;/Target&gt;&lt;/Project&gt;"" />
++    </ItemGroup>
++    
++    <WriteLinesToFile File=""$(RestoreFirstProps)"" Lines=""@(Lines)"" Overwrite=""true"" />
++  </Target>
++
++  <Target Name=""Build"">
++    <Message Text=""Build target ran&quot;"" />
++  </Target>
++</Project>");
++
++            string logContents = ExecuteMSBuildExeExpectSuccess(projectContents, arguments: "/restore");
++
++            logContents.ShouldContain("Restore target ran");
++            logContents.ShouldContain("Build target ran");
++            logContents.ShouldContain("Initial target ran");
++        }
++
++        /// <summary>
++        /// Verifies restore will fail if the entry target doesn't exist, in this case Restore.
++        /// </summary>
++        [Fact]
++        public void RestoreFailsWhenEntryTargetIsNonExistent()
++        {
++            string projectContents = ObjectModelHelpers.CleanupFileContents(
++@"<Project DefaultTargets=""Build"">
++  <Target Name=""Build"">
++    <Message Text=""Build target ran&quot;"" />
++  </Target>
++</Project>");
++
++            string logContents = ExecuteMSBuildExeExpectFailure(projectContents, arguments: "/t:restore");
++            
++            logContents.ShouldContain("error MSB4057: The target \"Restore\" does not exist in the project.");
++        }
++
++        /// <summary>
++        /// Verifies restore will run InitialTargets.
++        /// </summary>
++        [Fact]
++        public void RestoreRunsInitialTargets()
++        {
++            string projectContents = ObjectModelHelpers.CleanupFileContents(
++                @"<Project DefaultTargets=""Build"" InitialTargets=""InitialTarget"">
++  <Target Name=""InitialTarget"">
++    <Message Text=""InitialTarget target ran&quot;"" />
++  </Target>
++
++  <Target Name=""Restore"">
++    <Message Text=""Restore target ran&quot;"" />
++  </Target>
++
++  <Target Name=""Build"">
++    <Message Text=""Build target ran&quot;"" />
++  </Target>
++</Project>");
++
++            string logContents = ExecuteMSBuildExeExpectSuccess(projectContents, arguments: "/t:restore");
++
++            logContents.ShouldContain("InitialTarget target ran");
++            logContents.ShouldContain("Restore target ran");
++        }
++
+         /// <summary>
+         /// We check if there is only one target name specified and this logic caused a regression: https://github.com/Microsoft/msbuild/issues/3317
+         /// </summary>
+@@ -2312,6 +2412,24 @@ private string CopyMSBuild()
+         }
+ 
+         private string ExecuteMSBuildExeExpectSuccess(string projectContents, IDictionary<string, string> filesToCreate = null,  IDictionary<string, string> envsToCreate = null, params string[] arguments)
++        {
++            (bool result, string output) = ExecuteMSBuildExe(projectContents, filesToCreate, envsToCreate, arguments);
++
++            result.ShouldBeTrue(() => output);
++
++            return output;
++        }
++
++        private string ExecuteMSBuildExeExpectFailure(string projectContents, IDictionary<string, string> filesToCreate = null, IDictionary<string, string> envsToCreate = null, params string[] arguments)
++        {
++            (bool result, string output) = ExecuteMSBuildExe(projectContents, filesToCreate, envsToCreate, arguments);
++
++            result.ShouldBeFalse(() => output);
++
++            return output;
++        }
++
++        private (bool result, string output) ExecuteMSBuildExe(string projectContents, IDictionary<string, string> filesToCreate = null, IDictionary<string, string> envsToCreate = null, params string[] arguments)
+         {
+             using (TestEnvironment testEnvironment = UnitTests.TestEnvironment.Create())
+             {
+@@ -2336,10 +2454,8 @@ private string ExecuteMSBuildExeExpectSuccess(string projectContents, IDictionar
+                 bool success;
+ 
+                 string output = RunnerUtilities.ExecMSBuild($"\"{testProject.ProjectFile}\" {String.Join(" ", arguments)}", out success, _output);
+-
+-                success.ShouldBeTrue(() => output);
+-
+-                return output;
++                
++                return (success, output);
+             }
+         }
+     }
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index f6e3bc27f4b..792410a9964 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -1422,16 +1422,19 @@ private static (BuildResultCode result, Exception exception) ExecuteRestore(stri
+ 
+             // Create a new request with a Restore target only and specify:
+             //  - BuildRequestDataFlags.ClearCachesAfterBuild to ensure the projects will be reloaded from disk for subsequent builds
+-            //  - BuildRequestDataFlags.SkipNonexistentTargets to ignore missing targets since Restore does not require that all targets exist
++            //  - BuildRequestDataFlags.SkipNonexistentNonEntryTargets to ignore missing non-entry targets since Restore does not require that all targets
++            //      exist, only top-level ones like Restore itself
+             //  - BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports to ignore imports that don't exist, are empty, or are invalid because restore might
+             //     make available an import that doesn't exist yet and the <Import /> might be missing a condition.
++            //  - BuildRequestDataFlags.FailOnUnresolvedSdk to still fail in the case when an MSBuild project SDK can't be resolved since this is fatal and should
++            //     fail the build.
+             BuildRequestData restoreRequest = new BuildRequestData(
+                 projectFile,
+                 restoreGlobalProperties,
+                 toolsVersion,
+                 targetsToBuild: new[] { MSBuildConstants.RestoreTargetName },
+                 hostServices: null,
+-                flags: BuildRequestDataFlags.ClearCachesAfterBuild | BuildRequestDataFlags.SkipNonexistentTargets | BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports);
++                flags: BuildRequestDataFlags.ClearCachesAfterBuild | BuildRequestDataFlags.SkipNonexistentNonEntryTargets | BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports | BuildRequestDataFlags.FailOnUnresolvedSdk);
+ 
+             return ExecuteBuild(buildManager, restoreRequest);
+         }

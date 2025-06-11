@@ -1,0 +1,66 @@
+{
+  "number": 6993,
+  "title": "MSBuild assembly loading should use greater than or equal rather than exact assembly version comparisons",
+  "body": "The MSBuild assembly loading code has checks that the resolved assembly version exactly matches the requested version:\r\n\r\nhttps://github.com/dotnet/msbuild/blob/808b2ae2a176679d15f8c3299e551a63cb55b799/src/Shared/MSBuildLoadContext.cs#L66\r\nhttps://github.com/dotnet/msbuild/blob/808b2ae2a176679d15f8c3299e551a63cb55b799/src/Shared/CoreCLRAssemblyLoader.cs#L167\r\n\r\nThese should probably be changed to instead check that the resolved version is greater than or equal to the requested version, rather than checking for an exact match.\r\n\r\nThis caused a failure in creating the 6.0.100 build, in this commit: https://github.com/dotnet/sdk/tree/ff7b275720f88e6d5773c748eb6d320bc1365d63\r\n\r\nWhen building with this SDK, the following exception would occur in the RestoreTask:\r\n\r\n> System.MissingMethodException: Method not found: 'Void NuGet.RuntimeModel.JsonObjectWriter..ctor(Newtonsoft.Json.JsonWriter)'.\r\n   at NuGet.ProjectModel.LockFileFormat.WriteLockFile(LockFile lockFile)\r\n   at NuGet.ProjectModel.LockFileFormat.Write(TextWriter textWriter, LockFile lockFile)\r\n   at NuGet.ProjectModel.LockFileFormat.Write(Stream stream, LockFile lockFile)\r\n   at NuGet.ProjectModel.LockFileFormat.Write(String filePath, LockFile lockFile)\r\n   at NuGet.Commands.RestoreResult.<>c__DisplayClass48_0.<CommitAssetsFileAsync>b__2(String outputPath)\r\n   at NuGet.Common.FileUtility.Replace(Action`1 writeSourceFile, String destFilePath)\r\n   at NuGet.Commands.RestoreResult.CommitAssetsFileAsync(LockFileFormat lockFileFormat, IRestoreResult result, ILogger log, Boolean toolCommit, CancellationToken token)\r\n   at NuGet.Commands.RestoreResult.CommitAsync(ILogger log, CancellationToken token)\r\n   at NuGet.Commands.RestoreRunner.CommitAsync(RestoreResultPair restoreResult, CancellationToken token)\r\n   at NuGet.Commands.RestoreRunner.ExecuteAndCommitAsync(RestoreSummaryRequest summaryRequest, CancellationToken token)\r\n   at NuGet.Commands.RestoreRunner.CompleteTaskAsync(List`1 restoreTasks)\r\n   at NuGet.Commands.RestoreRunner.RunAsync(IEnumerable`1 restoreRequests, RestoreArgs restoreContext, CancellationToken token)\r\n   at NuGet.Commands.RestoreRunner.RunAsync(RestoreArgs restoreContext, CancellationToken token)\r\n   at NuGet.Build.Tasks.BuildTasksUtility.RestoreAsync(DependencyGraphSpec dependencyGraphSpec, Boolean interactive, Boolean recursive, Boolean noCache, Boolean ignoreFailedSources, Boolean disableParallel, Boolean force, Boolean forceEvaluate, Boolean hideWarningsAndErrors, Boolean restorePC, Boolean cleanupAssetsForUnsupportedProjects, ILogger log, CancellationToken cancellationToken)\r\n   at NuGet.Build.Tasks.RestoreTask.ExecuteAsync(ILogger log)\r\n\r\nThis happened because this SDK had different versions of some NuGet DLLs.  (The reason for this was that dotnet/templating needed to update to build with the final 6.0.0 NuGet packages.  That transitively updated the NuGet packages that templating depended on to 6.0.0 in the SDK repo.  However, there were other NuGet packages that the SDK depended on which did not get updated, and were still using version 6.0.0-rc.262).\r\n\r\nConcretely, the failure happened like this (or close to it, I believe):\r\n\r\nThe NuGet `RestoreTask` depended on `NuGet.ProjectModel`, and `NuGet.ProjectModel` depended on `Newtonsoft.Json`.  For both of these references, the exact version of the DLL that was referenced was found, so per the code in `MSBuildLoadContext`, these DLLs would be loaded into the `MSBuildLoadContext` `AssemblyLoadContext`.\r\n\r\n`NuGet.ProjectModel` also depended on `NuGet.Packaging`.  However, `NuGet.ProjectModel` was from the 6.0.0-rc.262 package, while the SDK was using the later 6.0.0 package for `NuGet.Packaging`.  So the resolved assembly version of `NuGet.Packaging` did not exactly match the requested version.  This caused the code in `MSBuildLoadContext` to not load `NuGet.Packaging` in that ALC.  Rather, it returned null, which caused the load to fall back to the default load context.  So `NuGet.Packaging` was loaded in the default assembly load context, and its dependency on `Newtonsoft.Json` was also loaded in the default ALC.\r\n\r\nSo when there was a call from `NuGet.ProjectModel` to `NuGet.Packaging` with a method parameter type that came from `Newtonsoft.Json`, the two assemblies did not agree on the assembly that type came from: `NuGet.ProjectModel` was using the version of `Newtonsoft.Json` from the `MSBuildLoadContext` ALC, and `NuGet.Packaging` was using the version of `Newtonsoft.Json` from the default ALC.  Hence the `MissingMethodException`.\r\n\r\nI think the way to fix this is to update the check to verify that the candidate assembly's version is greater than or equal to the requested version:\r\n\r\n```c#\r\nif (candidateAssemblyName.Version != assemblyName.Version)\r\n```\r\n\r\nThat way the dependencies of a task will be loaded in the task's ALC, whether or not the version matches exactly.\r\n\r\nThere is similar code in `CoreCLRAssemblyLoader`.  I don't think we hit that code path for this failure, but it should probably also be changed.\r\n\r\n",
+  "state": "CLOSED",
+  "createdAt": "2021-10-25T17:22:46Z",
+  "updatedAt": "2024-02-21T14:11:13Z",
+  "closedAt": "2022-09-06T17:00:28Z",
+  "author": {
+    "login": "dsplaisted"
+  },
+  "labels": [
+    "Partner request",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": {
+    "title": "VS 17.2"
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "Couple questions:\r\nWhen I was looking at the code, I noticed that https://github.com/dotnet/sdk/commit/87aaa5007dffd91206c371eb98c8bd2eec6f056e removed most of the -rtm.version parts but did not do so for Microsoft.TemplateEngine.Cli. Is that an intentional version mismatch for some reason? Why?\r\nThe change sounds very simple: replace != with >= in two (more?) places and possibly modify the default behavior if one is null. I thought the repro was to go to the commit you mentioned and try `build.cmd /restore`, but that succeeded on my computer. Do I need to have some specific nuget packages installed and others not? Do I need to use the newly built SDK to build something else?",
+        "createdAt": "2021-10-26T22:44:09Z",
+        "updatedAt": "2021-10-26T22:44:09Z",
+        "author": {
+          "login": "Forgind"
+        }
+      },
+      {
+        "body": "I think you need to build this commit: https://github.com/dotnet/sdk/tree/ff7b275720f88e6d5773c748eb6d320bc1365d63\r\n\r\nYou may also need to clear your NuGet global packages folder, as there were multiple different versions of the 6.0.0 NuGet packages produced.\r\n\r\nAlso for the SDK repo it restores by default, so it's possible that specifying `/restore` would mean it would only restore and not build.",
+        "createdAt": "2021-11-10T06:34:56Z",
+        "updatedAt": "2021-11-10T06:34:56Z",
+        "author": {
+          "login": "dsplaisted"
+        }
+      },
+      {
+        "body": "Reactivating since this was reverted in #7415.",
+        "createdAt": "2022-02-25T21:24:49Z",
+        "updatedAt": "2022-02-25T21:24:49Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Linking https://github.com/dotnet/msbuild/issues/4081 as a possibly-required part of reactivating this.",
+        "createdAt": "2022-03-15T15:03:11Z",
+        "updatedAt": "2022-03-15T15:03:11Z",
+        "author": {
+          "login": "baronfel"
+        }
+      },
+      {
+        "body": "I believe this is complete with the reenabled `.deps.json` behavior in #7594.",
+        "createdAt": "2022-09-06T17:00:28Z",
+        "updatedAt": "2022-09-06T17:00:28Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,527 @@
+{
+  "number": 3897,
+  "title": "Cultures aliased by ICU cannot be used for resource localization on non-Windows environments",
+  "body": "_From @CodingDinosaur on October 12, 2018 3:30_\n\nWhen building or running under .NET Core on a Unix-based environment, certain cultures cannot be utilized for resource localization, such as getting localized strings. This impacts both the build process (e.g., identifying and processing resource files) and the lookup of resources at runtime. These cultures can be used as expected when building or running under Windows.\r\n\r\nThe affected cultures are those which are aliased by ICU -- that is, to save on DB space for certain cases, ICU defines some locales as an \"alias\" of another. There are 42 locale aliases in ICU 57, of those two of the most common are zh-TW and zh-CN. For a full list of affected locales, see:  [ICU Aliased Locale List - CultureIssueDemonstration Readme](https://github.com/CodingDinosaur/CultureIssueDemonstration#icu-locale-alias-list).\r\n\r\nThis platform-inconsistent behavior when trying to localize certain resources, necessitates using special code and workarounds both at build and deploy time when developing cross-platform applications.\r\n\r\n**See a demo of this issue in [CodingDinosaur/CultureIssueDemonstration](https://github.com/CodingDinosaur/CultureIssueDemonstration)**\r\n\r\n# Symptoms\r\n- Resource files for the affected locales will not be generated into resource assemblies if building in a Unix-based environment.\r\n  - For example: *MyStrings.zh-TW.resx* will not have a resource assembly created if the build occurs on a Unix-based environment, but will if built under Windows\r\n- Resources for the affected locales will not be utilized even if the resource files are present, falling back to the default resources.\r\n  - For example: Consider *MyStrings.resx* and *MyStrings.zh-TW.resx*. If a custom build step is used to generate a copy the resource assembly for *MyStrings.zh-TW.resx* to workaround the first issue, requesting a resource utilizing culture zh-TW will still return the resource from the default *MyStrings.resx* resources.\r\n- Affected cultures are missing when running under Unix-based environments and calling *CultureInfo.GetCultures*\r\n- Some culture data for affected cultures is platform inconsistent, notably the parent locale\r\n\r\n# Expected behavior\r\n- Primarily, that whatever the \"correct\" behaviors for these locales are (as it relates to resources and CultureInfo) they be consistent between Windows and Unix-like environments.\r\n- Secondarily, that aliased locales would \"just work\" in .NET Core for resource localization - e.g., that we could have resources defined as *zh-TW*, just as we can on Windows today, and properly retrieve the expected resources.\r\n\r\n# Brief Analysis\r\nMost of the above symptoms boil down to *uloc_getAvailable* in ICU's C API.\r\n\r\nFor example, the zh-TW resource files do not get copied during build, because during the task *SplitResourcesByCulture*, the culture is validated against a cache based ultimately on *CultureInfo.GetCultures*, which in turn, on Unix, ultimately relies on ICU.  A diagnostic MSBuild log shows why the file is missing:\r\n\r\n```\r\nRemoved Item(s): \r\n  _MixedResourceWithNoCulture=\r\n    Resources/MyNetCoreProject.MyResources.zh-TW.resx\r\n        OriginalItemSpec=Resources/MyNetCoreProject.MyResources.zh-TW.resx\r\n        TargetPath=Resources/MyNetCoreProject.MyResources.zh-TW.resx\r\n        WithCulture=false\r\n```\r\n\r\nFrom which we can follow back to the offending path:\r\n\r\n[Microsoft/msbuild/src/Tasks/Microsoft.Common.CurrentVersion.targets - SplitResourceByCulture](https://github.com/Microsoft/msbuild/blob/master/src/Tasks/Microsoft.Common.CurrentVersion.targets#L2891) ->\r\n[Microsoft.Build.Tasks.AssignCulture.Execute](https://github.com/Microsoft/msbuild/blob/master/src/Tasks/AssignCulture.cs#L115) ->\r\n[Microsoft.Build.Tasks.Culture.GetItemCultureInfo](https://github.com/Microsoft/msbuild/blob/master/src/Tasks/Culture.cs#L29) ->\r\n[Microsoft.Build.Tasks.CultureInfoCache.IsValidCultureString](https://github.com/Microsoft/msbuild/blob/master/src/Tasks/CultureInfoCache.cs#L45-L48) ->\r\n[Microsoft.Build.Shared.AssemblyUtilities.GetAllCultures](https://github.com/Microsoft/msbuild/blob/master/src/Shared/AssemblyUtilities.cs#L105-L119) ->\r\n[CultureInfo.GetCultures](https://github.com/dotnet/coreclr/blob/master/src/System.Private.CoreLib/src/System/Globalization/CultureInfo.cs#L536-L545) ->\r\n[CultureData.GetCultures](https://github.com/dotnet/coreclr/blob/master/src/System.Private.CoreLib/shared/System/Globalization/CultureData.cs#L407-L440) ->\r\n[CultureData(Unix).EnumCultures](https://github.com/dotnet/coreclr/blob/master/src/System.Private.CoreLib/shared/System/Globalization/CultureData.Unix.cs#L359-L408) ->\r\n[System.Globalization.Native/locale.cpp:GlobalizationNative_GetLocales](https://github.com/dotnet/coreclr/blob/master/src/corefx/System.Globalization.Native/locale.cpp#L158-L199)\r\nhttps://github.com/dotnet/coreclr/blob/8ba838fb54d6c07271d026b2d77bedcb9e2a786a/src/corefx/System.Globalization.Native/locale.cpp#L162-L171\r\n\r\nICU does not return aliases when getting a list of locales -- whether with *uloc_getAvailable* or *Locale::getAvailableLocales* (and *uloc_countAvailable* does not include them in its count).\r\n\r\nThat ICU does not return the aliases in this manner **appears to be intentional**, both based on the numerous references to [a lack of alias mapping in the uloc documentation](http://www.icu-project.org/apiref/icu4c/uloc_8h.html), and the following bug:  \r\n\r\nhttps://unicode-org.atlassian.net/browse/ICU-4309\r\n> uloc_getAvailable returns sr_YU, even though it is an %%ALIAS locale. None of the other %%ALIAS locales are returned.\r\n\r\n> TracBot made changes - 01/Jul/18 1:59 PM<br/>Resolution\t\tFixed [ 10004 ]<br/>Status\tDone [ 10002 ]\tDone [ 10002 ]\r\n\r\n[ICU-4309](https://unicode-org.atlassian.net/browse/ICU-4309) was fixed via: https://github.com/unicode-org/icu/commit/ab68bb319601bc467784dcbdcc6d52131a2863d2\r\nWhich seems to further indicate that ICU not returning aliases when calling *uloc_getAvailable* is intentional.\r\n\r\n# In-Depth Analysis\r\nA full analysis can be seen in the test repo README: [CodingDinosaur/CultureIssueDemonstration](https://github.com/CodingDinosaur/CultureIssueDemonstration)\r\n\r\n# Test Repos\r\nI have two test repos that help demonstrate this issue:\r\n\r\n## CultureIssueDemonstration\r\n- https://github.com/CodingDinosaur/CultureIssueDemonstration\r\n- Demonstrates the symptoms described at both build-time and run-time\r\n- Running the provided test scripts will allow for running the test code under your current platform, or on Linux via Docker. Thus is is recommended to run under Windows with Docker installed to compare the results under both Windows and Linux.\r\n- Contains a README file that goes into more detail on the issue and the apparent cause\r\n\r\n## CultureIcuTest\r\n- https://github.com/CodingDinosaur/CultureIcuTest\r\n- Demonstrates the results of using the method utilized in mscorlib to get all locales along with similar methods in ICU directly\n\n_Copied from original issue: dotnet/coreclr#20388_",
+  "state": "CLOSED",
+  "createdAt": "2018-10-31T17:56:45Z",
+  "updatedAt": "2024-02-21T17:10:45Z",
+  "closedAt": "2022-08-11T08:34:41Z",
+  "author": {
+    "login": "tarekgh"
+  },
+  "labels": [
+    "Area: Localization",
+    "Partner request",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": [
+      {
+        "login": "benvillalobos"
+      }
+    ]
+  },
+  "milestone": {
+    "title": "VS 17.3"
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "Thanks @CodingDinosaur for reporting the issue and listing the details. this is very helpful. we'll take a look.",
+        "createdAt": "2018-10-31T17:56:47Z",
+        "updatedAt": "2018-10-31T17:56:47Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@cdmihai it is wrong to have msbuild depends on only the list returned from CultureInfo.GetCultures. this was ok before Windows 10 and Linux support but now it is not valid approach. \r\n\r\nhttps://github.com/Microsoft/msbuild/blob/e70a3159d64f9ed6ec3b60253ef863fa883a99b1/src/Shared/AssemblyUtilities.cs#L105\r\n\r\nfor example, in Windows 10, if you try to create any culture which Windows doesn't have data for, the operation still succeed and the culture can be created as long as the culture  name conform to BCP-47 spec. \r\nI understand may be msbuild doing that for perf reason which can be kept but will need to add extra case when failing finding any culture in the list, try to call CultureInfo.GetCultureInfo and find out if can create the culture. \r\n\r\nWe'll try to look how we can enhance the support for aliased culture as this issue suggested but whatever we do here, msbuild will need to do something more. do you want me open a new issue in msbuild to track that?\r\n\r\n",
+        "createdAt": "2018-10-31T17:56:48Z",
+        "updatedAt": "2018-10-31T17:56:48Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "_From @cdmihai on October 15, 2018 18:23_\n\n@tarekgh would this be a suitable issue? https://github.com/Microsoft/msbuild/issues/1454\r\n\r\nRegarding removing valid locale checks, the biggest issue with this is that it would be a breaking change for MSBuild. The msbuild repo build logic itself has the assumption that non-existing locales are rejected, so a lot of strings are put in Microsoft.shared.resx. If we remove the locale check in the `SplitResourceByCulture`, then the repo fails building with some invalid locale error (fuzzy memory from ~2 years ago). I have no data on this, but this could also break a lot of other existing repos.\r\n\r\nFYI @rainersigwald ",
+        "createdAt": "2018-10-31T17:56:49Z",
+        "updatedAt": "2018-10-31T17:56:49Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "> Regarding removing valid locale checks, the biggest issue with this is that it would be a breaking change for MSBuild. The msbuild repo build logic itself has the assumption that non-existing locales are rejected, so a lot of strings are put in Microsoft.shared.resx. If we remove the locale check in the SplitResourceByCulture, then the repo fails building with some invalid locale error (fuzzy memory from ~2 years ago). I have no data on this, but this could also break a lot of other existing repos.\r\n\r\nI am not sure I understand the breaking scenario here. The scenario you are describing can occur today. for example build some project with some culture introduced in Windows 10 and then run on down-level platform don't have this culture. \r\n\r\n",
+        "createdAt": "2018-10-31T17:56:50Z",
+        "updatedAt": "2018-10-31T17:56:50Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "_From @cdmihai on October 15, 2018 20:40_\n\nTrue, but that's the class of valid locales introduced in different windows versions. The new breaking scenario is for the class of always invalid locales, that were never meant to be locales, and users expect msbuild to not treat them as locales.",
+        "createdAt": "2018-10-31T17:56:51Z",
+        "updatedAt": "2018-10-31T17:56:51Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": ">  The new breaking scenario is for the class of always invalid locales, that were never meant to be locales, and users expect msbuild to not treat them as locales.\r\n\r\nI am not sure I agree with that. If the OS/.Net can create a culture for these, then those should be a valid locales to use. Why you think msbuild should reject such cultures? ",
+        "createdAt": "2018-10-31T17:56:52Z",
+        "updatedAt": "2018-10-31T17:56:52Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "_From @cdmihai on October 15, 2018 23:16_\n\nPersonally I agree that msbuild should not care and just do what the OS does, but I fear there are actual customers who depend on this behaviour, and changing this might break them. But this is just gut feeling based on the fact that the msbuild repo itself is doing it, and I don't have actual data on it. Alternatively we can only enable it in .net core msbuild, and then customers will have to opt-in to the break by transitioning to .net core. But it's not nice to diverge behaviour.",
+        "createdAt": "2018-10-31T17:56:53Z",
+        "updatedAt": "2018-10-31T17:56:53Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "The only  breaking scenario I can think of is when we allow creating resources with a culture not returned by CultureInfo.GetCultures and then move this resources to other machine which cannot understand the used culture. This scenario can happen today anyway. do you have any breaking scenario you can think of? \r\n\r\nMicrosoft/msbuild#1454 is specific to custom cultures. I would suggest updating it to include the other supported system cultures which is not enumerated by CultureInfo.GetCultures\r\n\r\n",
+        "createdAt": "2018-10-31T17:56:54Z",
+        "updatedAt": "2018-10-31T17:56:54Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "After looking at this issue, it looks ICU not enumerating the aliased cultures for good reasons. I believe the framework should follow that too and not enumerate such aliased cultures. The framework still can create such aliased culture if anyone want to use them. e.g.: \r\n\r\n```C#\r\nnew CultureInfo(\"zh-TW\"); \r\n```\r\n\r\nwill work fine. \r\n\r\nConsidering that, I believe the resource issue should be fixed from msbuild side. \r\nmsbuild should not depend on the enumerated list only not because of aliased cultures only but also for supporting the behavior of Windows 10 which can create any culture as long as the used name is conforming to the BCP-47 specs. \r\n\r\nI am going to move this issue to msbuild repo. \r\n\r\n@CodingDinosaur thanks again for reporting this issue.",
+        "createdAt": "2018-10-31T17:56:56Z",
+        "updatedAt": "2018-10-31T17:59:20Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "Is there any update to this issue, or at least a workaround?\r\n\r\nMy understanding is, that it's currently not possible to have an ASP.NET Core application localized with `zh-` cultures on Linux, which seems like a pretty common use case.",
+        "createdAt": "2019-07-23T09:50:00Z",
+        "updatedAt": "2019-07-23T09:50:00Z",
+        "author": {
+          "login": "mbp"
+        }
+      },
+      {
+        "body": "Any update? ",
+        "createdAt": "2021-03-31T02:02:51Z",
+        "updatedAt": "2021-03-31T02:02:51Z",
+        "author": {
+          "login": "EdiWang"
+        }
+      },
+      {
+        "body": "Team Triage: The design of resource localization is that we infer based on names whether the resource is culture specific. That means we need to be able to take a string and ask if it's a culture. Before the Windows 10 changes to how cultures worked, we just used `GetCultures` on Windows. The first draft of the Linux support was a hardcoded list of strings. Then we switched over to `GetCultures` when it's available.\r\n\r\n@tarekgh is there a multi-platform check for cultures that doesn't accept dramatically more strings as cultures on windows? Based on @Forgind 's testing it looks like if we just call `new CultureInfo()` we would incorrectly classify existing user resources as locale specific.\r\n\r\n/cc: @wli3 for loc",
+        "createdAt": "2021-05-05T15:27:14Z",
+        "updatedAt": "2021-05-05T15:27:14Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "@BenVillalobos the PR https://github.com/dotnet/msbuild/pull/6003 had the detailed discussion. Please let me know if there is any question not answered there, I can help answering here. My comment https://github.com/dotnet/msbuild/pull/6003#issuecomment-763909780 is answering your posted question, I guess. ",
+        "createdAt": "2021-05-05T16:35:10Z",
+        "updatedAt": "2021-05-05T16:35:10Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "Any updates?\r\nBecause this issue, I have to build my project on GitHub Action **Windows** runner, but on **Windows** runner, I can't build Linux image due to this issue: [Can not run Linux docker on Windows runner](https://github.com/actions/virtual-environments/issues/1143)\r\n\r\nSo I can't build my asp.net core project to Linux image, this is unacceptable.",
+        "createdAt": "2021-11-12T06:12:30Z",
+        "updatedAt": "2021-11-12T06:12:30Z",
+        "author": {
+          "login": "garyzhuosim"
+        }
+      },
+      {
+        "body": "CC @rainersigwald ",
+        "createdAt": "2021-11-12T17:54:40Z",
+        "updatedAt": "2021-11-12T17:54:40Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@BenVillalobos, you've been looking at this, right?",
+        "createdAt": "2021-11-12T18:01:38Z",
+        "updatedAt": "2021-11-12T18:01:38Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Yeah, this issue is blocked on [upgrading our projects](https://github.com/dotnet/msbuild/pull/6148) from netstandard2.0. Though the PR is out of date, I've been using a local branch and making decent progress. Once that's covered, I'll jump on this.",
+        "createdAt": "2021-11-12T18:25:55Z",
+        "updatedAt": "2021-11-12T18:26:32Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "Any updates?\r\nThere have different behaviors between msbuild and dotnet cli on windows, it bothers me a lot.",
+        "createdAt": "2021-11-17T05:50:15Z",
+        "updatedAt": "2021-11-17T05:50:15Z",
+        "author": {
+          "login": "jiaming0708"
+        }
+      },
+      {
+        "body": "> Any updates? There have different behaviors between msbuild and dotnet cli on windows, it bothers me a lot.\r\n\r\nme too.",
+        "createdAt": "2021-11-17T05:59:21Z",
+        "updatedAt": "2021-11-17T05:59:21Z",
+        "author": {
+          "login": "wyc730"
+        }
+      },
+      {
+        "body": "Problem also exists on Windows 10 + .NET 6 SDK with zh-CN & zh-TW\r\n\r\nRepo to reproduce: https://github.com/BornToBeRoot/NETworkManager",
+        "createdAt": "2021-11-30T01:45:33Z",
+        "updatedAt": "2021-11-30T01:45:33Z",
+        "author": {
+          "login": "BornToBeRoot"
+        }
+      },
+      {
+        "body": "@BornToBeRoot this is already discussed before in this thread. Please have a look at the comment https://github.com/dotnet/msbuild/issues/3897#issuecomment-434787301",
+        "createdAt": "2021-11-30T01:49:03Z",
+        "updatedAt": "2021-11-30T01:49:03Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "Any progress?",
+        "createdAt": "2022-01-20T10:45:55Z",
+        "updatedAt": "2022-01-20T10:45:55Z",
+        "author": {
+          "login": "chaoyebugao"
+        }
+      },
+      {
+        "body": "@chaoyebugao Yes! This is currently blocked by https://github.com/dotnet/msbuild/pull/6148, which is being worked on.",
+        "createdAt": "2022-01-20T18:08:20Z",
+        "updatedAt": "2022-01-20T18:08:20Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "`ku` is alias to `ckb` but could be `ku` is not enumerated when getting the whole list of cultures (through `CultureInfo.GetCultureInfo`). If you try to create culture object for `ku` this still work. The ICU ticket talking about similar issue [here](https://unicode-org.atlassian.net/browse/ICU-20181). \r\n\r\nmsbuild depends on the list returned from `CultureInfo.GetCultureInfo`. So, if you use `ku` for tagging a resource, this may fail during the build time. This is tracked by the [issue](https://github.com/dotnet/msbuild/issues/3897).",
+        "createdAt": "2022-02-09T23:59:51Z",
+        "updatedAt": "2022-02-10T00:00:59Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "Status update: https://github.com/dotnet/msbuild/pull/6148 is awaiting review/merge \ud83e\udd1e",
+        "createdAt": "2022-02-24T16:52:31Z",
+        "updatedAt": "2022-02-24T16:52:31Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "What's the current status of this? We have an ASP.NET Core application with zh-CN and zh-TW resource which we need to start deploying on Linux. So far we've identified that `CultureInfo.GetCultures(CultureTypes.AllCultures)` was not including either of those cultures when running on Linux.\r\n\r\n* As it stands, can we expect zh-CN/zh-TW resources to be compiled and loaded at runtime under Linux if the culture is set to `CultureInfo.GetCultureInfo(\"zh-TW\")`? \r\n* Can we expect `CultureInfo.GetCultures(CultureTypes.AllCultures)` start returning these cultures on Linux at some point or not?\r\n* Does it matter whether we build on Windows or Linux or only where we run? Should it matter?",
+        "createdAt": "2022-07-05T14:57:43Z",
+        "updatedAt": "2022-07-05T14:57:43Z",
+        "author": {
+          "login": "madelson"
+        }
+      },
+      {
+        "body": "> As it stands, can we expect zh-CN/zh-TW resources to be compiled and loaded at runtime under Linux if the culture is set to CultureInfo.GetCultureInfo(\"zh-TW\")?\r\n\r\nThis issue is open to fix this issue. When this issue is resolved, you'll be able to do so at that time.\r\n\r\n> Can we expect CultureInfo.GetCultures(CultureTypes.AllCultures) start returning these cultures on Linux at some point or not?\r\n\r\nNo, these names are not standard names. The standard names are `zh-Hans-CN` and `zh-Hant-TW`. You still can create the old name cultures as `CultureInfo.GetCultureInfo(\"zh-TW\")`.\r\n\r\n> Does it matter whether we build on Windows or Linux or only where we run? Should it matter?\r\n\r\nIt shouldn't matter. \r\n\r\nIn general, I recommend you create the resources with the cultures `zh-Hans` and `zh-Hant` instead. This will be allowed to do so from now, (I mean you don't have to wait for this issue to get resolved). And the resources will work on Windows and Linux. In addition, these resources will work just fine even if you set the UI culture to `zh-CN` or `zh-TW`\r\n",
+        "createdAt": "2022-07-05T16:03:11Z",
+        "updatedAt": "2022-07-05T16:03:11Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "Thanks for the context @tarekgh !\r\n\r\n> This issue is open to fix this issue. When this issue is resolved, you'll be able to do so at that time.\r\n\r\nGreat to hear. Is there a milestone or timeline for this? Is the issue suitable for a community contribution to accelerate?\r\n\r\n> In general, I recommend you create the resources with the cultures zh-Hans and zh-Hant instead\r\n\r\nWe'll probably be forced to do this as a workaround, but it will be disruptive to other systems we have in place for managing the translation process since we're talking about a huge number of files across hundreds of applications.",
+        "createdAt": "2022-07-18T20:16:09Z",
+        "updatedAt": "2022-07-18T20:16:09Z",
+        "author": {
+          "login": "madelson"
+        }
+      },
+      {
+        "body": "> Is there a milestone or timeline for this? Is the issue suitable for a community contribution to accelerate?\r\n\r\n@BenVillalobos could you please advise regarding that? \r\n\r\n> We'll probably be forced to do this as a workaround, but it will be disruptive to other systems we have in place for managing the translation process since we're talking about a huge number of files across hundreds of applications.\r\n\r\nI am not seeing this as a workaround, but it is the right thing to do for localizing Chinese resources. Doing that will make your localization work with other Chinese cultures for free (e.g. `zh-HK` for instance). I understand this will be disruptive and I can imagine the work needs to be done here, but I recommend it considering the benefits we will get from it. ",
+        "createdAt": "2022-07-18T20:44:55Z",
+        "updatedAt": "2022-07-18T20:44:55Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "> Is there a milestone or timeline for this? Is the issue suitable for a community contribution to accelerate?\r\n\r\nWe hear you, There's no current timeline for it, but in the coming days, we plan to spend some time designing a solution we feel comfortable opening up to a community contribution.",
+        "createdAt": "2022-07-18T23:28:52Z",
+        "updatedAt": "2022-07-18T23:28:52Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "investigation notes:\r\n\r\nhttps://github.com/CodingDinosaur/CultureIssueDemonstration#apparent-root-cause is a fantastic writeup, thanks @codingdinosaur!\r\n\r\nOff the top of my head, it sounds like a valid workaround would be to allow an opt-in (environment variable?), and follow the older hardcoded culture code path. In this case, something like \r\n\r\n```c#\r\nIf (Environment.GetEnvironmentVariable(\"UseHardcodedCultureAliases\") == 1)\r\n{\r\n\treturn HardcodedCultureNames;\r\n}\r\n```\r\n\r\n### The Quick Workaround\r\n1. Remove the `FEATURE_CULTUREINFO_GETCULTURES` flag from https://github.com/dotnet/msbuild/blob/a44cc43931208ecdac42a1023ce79d7b2bd6956e/src/Tasks/CultureInfoCache.cs#L62-L68\r\n2. add the if statement above right around here (it should be a flag in `Traits.cs` rather than a straight up env var check): https://github.com/dotnet/msbuild/blob/a44cc43931208ecdac42a1023ce79d7b2bd6956e/src/Tasks/CultureInfoCache.cs#L26-L32\r\n\r\n_Better yet_: it should check the hardcoded list as a backup if the culture isn't seen during `GetAllCultures`. This would help us avoid needing to update the list with all supported cultures over time.\r\n\r\nWill bring this up with the team. @madelson, would that be an acceptable workaround for you? It would require setting an environment variable on unix machines.\r\n\r\n#### Other Notes\r\nRight now the codepaths for the hardcodedculture names are behind `!FEATURE_CULTUREINFO_GETCULTURES`. `FEATURE_CULTUREINFO_GETCULTURES` is only defined when the targetframework starts with `net4` or `net3`.\r\n\r\nI'm confused as to why we reflect over the CultureInfo type to call GetCultures in non-net472/net35 scenarios. I'm not sure what this accomplishes? https://github.com/dotnet/msbuild/issues/2349#issuecomment-318161879 suggests that it's to tap into whatever version of net core we're on.\r\n\r\nhttps://github.com/dotnet/msbuild/blob/a44cc43931208ecdac42a1023ce79d7b2bd6956e/src/Framework/AssemblyUtilities.cs#L117-L142\r\n\r\nThe more I dig into this flag, the more I think it can be removed entirely, but I'd like @rainersigwald's take on that. It looks like the [motivation for creating that flag](https://github.com/dotnet/msbuild/issues/2349) was because early net standard didn't support that API, but net472 did. The API's have clearly caught up at this point.",
+        "createdAt": "2022-07-22T21:44:55Z",
+        "updatedAt": "2022-07-22T21:58:43Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "> [CodingDinosaur/CultureIssueDemonstration#apparent-root-cause](https://github.com/CodingDinosaur/CultureIssueDemonstration#apparent-root-cause) is a fantastic writeup, thanks again Tarek.\r\n\r\nJust clarify this is written by @CodingDinosaur :-)",
+        "createdAt": "2022-07-22T21:53:40Z",
+        "updatedAt": "2022-07-22T21:53:40Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@tarekgh whoops! Thanks @CodingDinosaur \u2764\ufe0f ",
+        "createdAt": "2022-07-22T21:58:11Z",
+        "updatedAt": "2022-07-22T21:58:11Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "Great to see your proposal @BenVillalobos !\r\n\r\n> Will bring this up with the team. @madelson, would that be an acceptable workaround for you? It would require setting an environment variable on unix machines.\r\n\r\n@BenVillalobos having an environment variable to make the aliased .resx files work sounds like a great workaround. Some clarifying questions:\r\n* Does this needs to be set only during runtime, only during the build, or both?\r\n* With this set, will things work exactly as they do on Windows regarding these cultures or will there still be some discrepancies to be aware of?\r\n* Are there any timing implications for setting this variable? Is this the kind of variable that needs to be set before process start? If this gets set at app runtime, can it be set in Main()? Later? I know sometimes with such things you have to set the value before a bunch of stuff gets cached and locked in.\r\n* Would this be supported long-term or only for a set number of releases?\r\n* As far as timing, I assume this would go into .NET 7; any chance it would also be back-ported to .NET 6? If this is an MSBuild fix, is there an MSBuild release this would appear in? What version would that be and what is the estimated release date?",
+        "createdAt": "2022-07-23T10:22:10Z",
+        "updatedAt": "2022-07-27T16:00:19Z",
+        "author": {
+          "login": "madelson"
+        }
+      },
+      {
+        "body": "Hi @BenVillalobos, I see that you have added this to the VS 17.3 milestone, but you also wrote\r\n> There's no current timeline for it\r\n\r\nCould you give me a _rough_ ETA on this issue? Will there be a new release _including this fix_ in, say, the next few weeks?",
+        "createdAt": "2022-07-26T17:08:53Z",
+        "updatedAt": "2022-07-26T17:08:53Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": "@Bartleby2718 I'll let @BenVillalobos answer your question but I am wondering what is failing in your scenario? I mean, are you running into the issue with the `zh` cultures? I am asking because if this is the case, it would be good you try to use the neutral cultures like `zh-Hans` and `zh-Hant` with your resources. This may unblock you.",
+        "createdAt": "2022-07-26T17:14:52Z",
+        "updatedAt": "2022-07-26T17:15:27Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@tarekgh Yes, I'm having issues with the two `zh` cultures, but unfortunately, switching to unaliased cultures throughout our translation pipeline is likely not a viable option, given the time-sensitive nature of the project I'm working on.\r\n\r\nAnother question for @BenVillalobos: apologies for my lack of understanding, but once the fix is released, will it compatible with .NET 6 as well, or does it require an upgrade to .NET 7?",
+        "createdAt": "2022-07-27T17:13:11Z",
+        "updatedAt": "2022-07-27T17:13:11Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": "@Bartleby2718 there is some idea you can try, I didn't try myself, but it is worth trying. \r\n\r\nIn your build machines, try to [enable the environment variable `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1`](https://docs.microsoft.com/en-us/dotnet/core/extensions/globalization-icu?ranMID=43674&ranEAID=rl2xnKiLcHs&ranSiteID=rl2xnKiLcHs-ycqWZ7HMWnoHviUqMJuIuQ&epi=rl2xnKiLcHs-ycqWZ7HMWnoHviUqMJuIuQ&irgwc=1&OCID=AID2200057_aff_7795_1243925&tduid=(ir__2m3q0nl02wkf6gcatnnkkvci0e2xv69zw13xgf9200)(7795)(1243925)(rl2xnKiLcHs-ycqWZ7HMWnoHviUqMJuIuQ)()&irclickid=_2m3q0nl02wkf6gcatnnkkvci0e2xv69zw13xgf9200#use-nls-instead-of-icu) globally and look if this unblock creating the desired `zh` resources.  \r\n\r\n",
+        "createdAt": "2022-07-27T17:52:03Z",
+        "updatedAt": "2022-07-27T17:52:03Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@tarekgh I've read that page before, but I believe that setting is just for Windows?\r\n\r\nhttps://docs.microsoft.com/en-us/dotnet/core/runtime-config/globalization#nls says (emphasis added):\r\n> * Determines whether .NET uses National Language Support (NLS) or International Components for Unicode (ICU) globalization APIs **_for Windows apps_**. .NET 5 and later versions use ICU globalization APIs by default on Windows 10 May 2019 Update and later versions.\r\n> * If you omit this setting, .NET uses ICU globalization APIs by default. This is equivalent to setting the value to false.",
+        "createdAt": "2022-07-27T18:14:00Z",
+        "updatedAt": "2022-07-27T18:14:00Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": "> I've read that page before, but I believe that setting is just for Windows?\r\n\r\nThat is right. Do you want to build the resources on Linux? You can just create them on Windows and use it with Linux runs as needed. I am trying to say, make a job in your pipeline to build these resources and on Linux you don't need to build the resources and instead copy the resources to output folder after finish building. I am just trying to provide some workaround to unblock you. I am not saying this is a solution as we still need to fix msbuild. ",
+        "createdAt": "2022-07-27T18:19:37Z",
+        "updatedAt": "2022-07-27T18:19:37Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "Makes sense. I'll try that as I wait for the response to other questions in this thread.",
+        "createdAt": "2022-07-27T18:21:32Z",
+        "updatedAt": "2022-07-27T18:21:32Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": "Q&A time \ud83e\udd14\r\n\r\n@madelson\r\n> Does this needs to be set only during runtime, only during the build, or both?\r\n\r\nDefinitely during build time. Can you describe your runtime scenario? Does this just mean \"calling our API for valid cultures?\" If so, it applies to both.\r\n\r\n> With this set, will things work exactly as they do on Windows regarding these cultures or will there still be some discrepancies to be aware of?\r\n\r\nIf we add this workaround as \"if it's not seen in the culture API, use our hardcoded list as a backup,\" I expect windows/non-windows to behave the same. The only situation to be worried about would be some culture alias not existing in the hardcoded list, so it would still fail on unix. We'd need to handle those on a case by case basis.\r\n\r\n> Are there any timing implications for setting this variable? Is this the kind of variable that needs to be set before process start? If this gets set at app runtime, can it be set in Main()? Later? I know sometimes with such things you have to set the value before a bunch of stuff gets cached and locked in.\r\n\r\nI believe it'll work as long as the env var is set by the time our API gets called. Though consider that `ValidCultureNames` is loaded into a **static** hashset within `CultureInfoCache`.\r\n\r\n> Would this be supported long-term or only for a set number of releases?\r\n\r\ncc @marcpopMSFT . The situation that concerns me is getting a flood of \"we need this alias to be supported\" in the long term, which isn't very maintainable.\r\n\r\n> As far as timing, I assume this would go into .NET 7; any chance it would also be back-ported to .NET 6?\r\n\r\n@marcpopMSFT \r\n\r\n@Bartleby2718 \r\n> Could you give me a rough ETA on this issue? Will there be a new release including this fix in, say, the next few weeks?\r\n\r\nStarting up a PR for it as soon as this comment gets posted.\r\n\r\n> will it compatible with .NET 6 as well, or does it require an upgrade to .NET 7?\r\n\r\nIt's a new codepath within our binaries, so It'd need an upgrade to net7 unless we backport.\r\n",
+        "createdAt": "2022-07-27T23:24:22Z",
+        "updatedAt": "2022-07-27T23:24:39Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "Thanks for the detail @BenVillalobos !\r\n\r\n> Can you describe your runtime scenario? Does this just mean \"calling our API for valid cultures?\" If so, it applies to both.\r\n\r\nMostly our runtime scenario is just setting `CultureInfo.CurrentUICulture` to (depending on the user) `zh-CN` or `zh-TW`, and then accessing resource strings in `.resx` files which currently have the `zh-CN`/`zh-TW` suffixes.\r\n\r\n*However*, we do also have some code that tries to iterate through all cultures for which we have translations at runtime using `CultureInfo.GetCultures`. This is much easier for us to work around however by substituting our own culture list.\r\n\r\n> unless we backport\r\n\r\nIt would be great to know whether this is possible/likely. If this doesn't happen, is there any way to work around this at build time (aside from renaming all the resource files of course)? I suppose we could have a build task which just copies and renames all the files.",
+        "createdAt": "2022-07-28T02:40:50Z",
+        "updatedAt": "2022-07-28T02:40:50Z",
+        "author": {
+          "login": "madelson"
+        }
+      },
+      {
+        "body": "Note: I have updated some of these after @tarekgh [let me know (and I confirmed) that the NLS mode is not enabled.](https://github.com/dotnet/msbuild/issues/3897#issuecomment-1204584853)\r\n\r\n@tarekgh I've tried setting `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1`, but the results don't exactly match what I expected. @BenVillalobos Could you please help me understand the results? I have a list of questions at the bottom.\r\n\r\n### Command Ran on Git Bash - Linux Container version\r\n```\r\ndocker commands to do some cleanup for reproducibility/idempotency; \\\r\ncd to the solution root && \\\r\ngit clean -dfx; \\\r\ndotnet publish My.Project -c Release --self-contained -r linux-x64 -o bin -property:SolutionDir=$(pwd) && \\\r\ndocker build -f My.Dockerfile -t myImage:1 . && \\\r\ndocker run --mount type=bind,src=$(pwd),dst=/App -d -p 127.0.0.1:6767:80/tcp myImage:1 && \\\r\nstart chrome \"http://localhost:myPort/page-containing-chinese-strings\"\r\n```\r\n### Command Ran on Git Bash - Windows version\r\n```\r\ngit clean -dfx; \\\r\nour custom command that basically runs msbuild against the solution && \\\r\nstart chrome \"http://localhost:myPort/page-containing-chinese-strings\"\r\n```\r\n### Specs for the Windows Machine Used\r\n|Key| Value|\r\n|---|---|\r\n|Edition\t| Windows 10 Enterprise |\r\n|Version\t|21H2|\r\n|Installed on\t|\u200e4/\u200e15/\u200e2022|\r\n|OS build\t|19044.1766|\r\n|Experience\t|Windows Feature Experience Pack 120.2212.4180.0|\r\n### Setup\r\nI tried 4 different cases. In each case, I:\r\n* made sure to set/unset environment variables properly by ~editing environment variables on Windows, restarting the git bash terminal, and setting/unsetting in git bash, to be extra careful~ setting `System.Globalization.UseNls` appropriately in the relevant `csproj` file.\r\n* printed every single culture in `CultureInfo.GetCultures(CultureTypes.AllCultures)` to a file.\r\n### Results\r\n\r\n||Windows version|Linux version|\r\n|---|---|---|\r\n|~Env var set~ `System.Globalization.UseNls` true|Chinese strings showed up<br>~813~ 857 cultures printed|Chinese strings showed up<br>783 cultures printed|\r\n|~Env var unset~ `System.Globalization.UseNls` false|Chinese strings showed up<br>813 cultures printed|Defaulted to English strings<br>783 cultures printed|\r\n\r\n### Miscellaneous Info\r\n* I have `<TargetFramework>net6.0</TargetFramework>` in `My.Project.csproj`.\r\n* I ensured that routing was done correctly every time.\r\n\r\n### Questions:\r\n1. Based on the Windows specs, it appears to me that Windows 10 May 2019 Update must have been installed. (Otherwise, `OS build` should be below `18362.116`, per [this page](https://support.microsoft.com/en-us/topic/update-for-windows-10-version-1903-may-19-2019-e43c649f-348a-1c94-fddd-11dc6774a43d).) This means that my app would [use ICU globalization APIs by default](https://docs.microsoft.com/en-us/dotnet/core/compatibility/globalization/5.0/icu-globalization-api#change-description), so setting `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1` should have resulted in a difference in `CultureInfo.GetCultures(CultureTypes.AllCultures)`. However, I got the same set of cultures whether I ran the app on the Windows host or inside the Linux container. What's the reason behind this?\r\n  - Edit: @tarekgh correctly pointed out that the environment variable was not being set. I confirmed that .NET picked up the environment variable only after I restarted the machine. (I've tried setting both user environment variable and system environment variable.) For faster iteration, I set `System.Globalization.UseNls` in the relevant `.cpsroj` file and observed that a) `CultureInfo.GetCultures(CultureTypes.AllCultures)` had more cultures, including `zh-CN`. This behavior now makes sense to me.\r\n2. Since we can build on Windows for the time being, I think `DOTNET_SYSTEM_GLOBALIZATION_USENLS` (or equivalent solutions like using `runtimeconfig.json`) can be a viable solution for now. **Is this setting going to be around for a long time?**\r\n3. Around 800 cultures were printed in all cases, but none of them included `zh-CN`. However, I expected `zh-CN` to show up when using NLS. Why is this?\r\n  - Edit: As mentioned above, this is no longer the case, and it behaves as expected.\r\n4. `My.Project` does have `zh-CN` resources, but how is `msbuild` able to create the `zh-CN` directory in `bin/Debug` (or `bin/Release`) even when `zh-CN` is not in `CultureInfo.GetCultures(CultureTypes.AllCultures)`?\r\n\r\nThank you very much in advance, and I look forward to hearing back from you.",
+        "createdAt": "2022-08-03T23:12:09Z",
+        "updatedAt": "2022-08-04T20:59:49Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": "> so setting DOTNET_SYSTEM_GLOBALIZATION_USENLS=1 should have resulted in a difference in CultureInfo.GetCultures(CultureTypes.AllCultures). However, I got the same set of cultures whether I ran the app on the Windows host or inside the Linux container.\r\n> Around 800 cultures were printed in all cases, but none of them included zh-CN. However, I expected zh-CN to show up when using NLS. Why is this?\r\n\r\nReading these two comments suggests the NLS mode is not enabled correctly. Could you add the following line in your code and send the output? \r\n\r\n```C#\r\n                Console.WriteLine($\".... UseNls:                 {typeof(object).Assembly.GetType(\"System.Globalization.GlobalizationMode\")!.GetProperty(\"UseNls\", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)} ....\");\r\n```\r\n",
+        "createdAt": "2022-08-03T23:37:58Z",
+        "updatedAt": "2022-08-03T23:37:58Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@tarekgh Thanks for pointing that out! I have updated my comment above accordingly.\r\n\r\nIt appears that the changes I made to environment variable were not applied for some reason. Properly enable the NLS mode answered two of my questions, but I'm still curious about the other two. **I'm especially curious about how long .NET will support NLS mode through runtime configuration. Will it survive in .NET 7?**",
+        "createdAt": "2022-08-04T15:31:46Z",
+        "updatedAt": "2022-08-04T15:31:46Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": "> how long .NET will support NLS mode through runtime configuration. Will it survive in .NET 7?\r\n\r\nYes, it will still be supported in .NET 7.0. We don't have any plan to abandon NLS support in the near future. \r\n\r\n@Bartleby2718 if there any questions now answered yet, please point at it and I'll be happy to answer it.",
+        "createdAt": "2022-08-04T16:51:11Z",
+        "updatedAt": "2022-08-04T17:00:40Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "One last recommendation to @Bartleby2718 is try **not** to set `System.Globalization.UseNls` in csproj and instead use the environment variable on the Windows build machine. The reason is when setting `System.Globalization.UseNls` in the csproj, will force the app to run using NLS which I don't think you need to do that. We are trying to work around the resource build issue only here and not changing the app behavior.",
+        "createdAt": "2022-08-04T17:35:06Z",
+        "updatedAt": "2022-08-04T17:35:06Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@tarekgh That makes sense. I think that answers all my questions. Thanks for the prompt responses!",
+        "createdAt": "2022-08-04T18:46:28Z",
+        "updatedAt": "2022-08-04T18:46:28Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": "@tarekgh  Actually I do have one more question. I believe there was one more option besides `csproj` and environment variable: `runtimeconfig.json`. Is it recommended or not?",
+        "createdAt": "2022-08-04T18:48:06Z",
+        "updatedAt": "2022-08-04T18:48:06Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": ">  I believe there was one more option besides csproj and environment variable: runtimeconfig.json. Is it recommended or not?\r\n\r\nIn your case, it is not recommended. This one will have the same effect as if you set the property in the csproj.",
+        "createdAt": "2022-08-04T18:55:53Z",
+        "updatedAt": "2022-08-04T18:55:53Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "Just another point of context on why supporting `zh-CN`/`zh-TW` would be valuable; this is the format that our translations management tool uses/expects: https://help.smartling.com/hc/en-us/articles/360049532693-Supported-Languages-",
+        "createdAt": "2022-08-10T15:32:26Z",
+        "updatedAt": "2022-08-10T15:32:26Z",
+        "author": {
+          "login": "madelson"
+        }
+      },
+      {
+        "body": "@tarekgh I see that a PR has been merged to fix this issue. \r\n1. In which .NET 7 preview will this be available?\r\n2. How do you suggest that I test that the PR does indeed fix the issue? Should I install the upcoming preview and test using that?",
+        "createdAt": "2022-08-15T13:43:36Z",
+        "updatedAt": "2022-08-15T13:43:36Z",
+        "author": {
+          "login": "Bartleby2718"
+        }
+      },
+      {
+        "body": "@BenVillalobos could you please help answering @Bartleby2718  questions?",
+        "createdAt": "2022-08-15T15:41:35Z",
+        "updatedAt": "2022-08-15T15:41:35Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@Bartleby2718 Testing should involve running builds that previously didn't output resources for aliases like zh-TW and ensuring you see the expected output.\r\n\r\nBased on how the SDK flows, it should be available whenever the next release is available. In a few days I believe",
+        "createdAt": "2022-08-15T16:56:22Z",
+        "updatedAt": "2022-08-15T16:56:22Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "There should be a new daily build available in a few days but the next official release (RC1) won't be available until September.",
+        "createdAt": "2022-08-15T17:21:31Z",
+        "updatedAt": "2022-08-15T17:21:31Z",
+        "author": {
+          "login": "marcpopMSFT"
+        }
+      },
+      {
+        "body": "@tarekgh I used DOTNET_SYSTEM_GLOBALIZATION_USENLS=1 to sort out our Windows build servers, but also build on Linux which is failing, is there a work around for that?",
+        "createdAt": "2022-08-31T04:06:17Z",
+        "updatedAt": "2022-08-31T04:06:17Z",
+        "author": {
+          "login": "Jetski5822"
+        }
+      },
+      {
+        "body": "@Jetski5822 https://github.com/dotnet/msbuild/issues/3897#issuecomment-1197153624. In short, there is no workaround for that except if you build the resources on Windows and then copy it to Linux build. Also, the issue should be fixed in https://github.com/dotnet/msbuild/pull/7853. You may consider using the new SDK?",
+        "createdAt": "2022-08-31T16:05:13Z",
+        "updatedAt": "2022-08-31T16:05:13Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@tarekgh Okay cool - so I flipped zh-CN to zh-Hans-CN; but to get them to compile, theres a difference between VS (im using latest stable) and Command line.\r\n\r\nVS = the resource set wont get built, and when debugging the test, it also wont load.\r\ndotnet build = Resource is built and placed in to bin folder.\r\n\r\nAny ideas why this would be happening?, also - the latest SDK, is that NET7?",
+        "createdAt": "2022-09-01T00:17:17Z",
+        "updatedAt": "2022-09-01T00:17:17Z",
+        "author": {
+          "login": "Jetski5822"
+        }
+      },
+      {
+        "body": "@Jetski5822 I guess, VS is using msbuild based on .NET Framework. @BenVillalobos will know for sure. \r\n\r\nMy question now is, is it possible you can just generate the resources with the name `zh-Hans`? This should work everywhere and will work nicely with zh-CN and zh-Hans-CN at runtime. ",
+        "createdAt": "2022-09-01T17:58:56Z",
+        "updatedAt": "2022-09-01T17:58:56Z",
+        "author": {
+          "login": "tarekgh"
+        }
+      },
+      {
+        "body": "@Jetski5822 yeah this behavior difference is unfortunately expected. The fix only works for net core scenarios, since that's where we get our fancy new API from.",
+        "createdAt": "2022-09-01T18:38:12Z",
+        "updatedAt": "2022-09-01T18:38:12Z",
+        "author": {
+          "login": "benvillalobos"
+        }
+      },
+      {
+        "body": "`new CultureInfo(\"zh-TW\"); ` \r\n\r\nHow to use this code in project? We have lot of services use zh-CN/zh-TW, I don't want to rename all one by one, is there any better  way to fix? Any insight is helpful. ",
+        "createdAt": "2023-01-04T06:45:49Z",
+        "updatedAt": "2023-01-04T06:48:30Z",
+        "author": {
+          "login": "shunyh"
+        }
+      }
+    ]
+  }
+}

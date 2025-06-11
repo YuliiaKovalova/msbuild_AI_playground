@@ -1,0 +1,229 @@
+diff --git a/src/Build.UnitTests/Graph/GetCompatiblePlatformGraph_Tests.cs b/src/Build.UnitTests/Graph/GetCompatiblePlatformGraph_Tests.cs
+index f1a31f7dbe6..b51ac379ddc 100644
+--- a/src/Build.UnitTests/Graph/GetCompatiblePlatformGraph_Tests.cs
++++ b/src/Build.UnitTests/Graph/GetCompatiblePlatformGraph_Tests.cs
+@@ -75,6 +75,47 @@ public void ValidateSetPlatformOverride()
+             }
+         }
+ 
++        [Fact]
++        public void ResolvesMultibleReferencesToSameProject()
++        {
++            using (var env = TestEnvironment.Create())
++            {
++
++                TransientTestFile entryProject = CreateProjectFile(env, 1, extraContent: @"<PropertyGroup>
++                                                                                                <EnableDynamicPlatformResolution>true</EnableDynamicPlatformResolution>
++                                                                                                <Platform>x64</Platform>
++                                                                                                <PlatformLookupTable>win32=x64</PlatformLookupTable>
++                                                                                            </PropertyGroup>
++                                                                                            <ItemGroup>
++                                                                                                <ProjectReference Include=""$(MSBuildThisFileDirectory)2.proj"" />
++                                                                                                <ProjectReference Include=""$(MSBuildThisFileDirectory)3.proj"" />
++                                                                                            </ItemGroup>");
++                var proj2 = env.CreateFile("2.proj", @"
++                                                    <Project>
++                                                        <PropertyGroup>
++                                                            <EnableDynamicPlatformResolution>true</EnableDynamicPlatformResolution>
++                                                            <Platforms>AnyCPU</Platforms>
++                                                        </PropertyGroup>
++                                                        <ItemGroup>
++                                                            <ProjectReference Include=""$(MSBuildThisFileDirectory)3.proj"" />
++                                                        </ItemGroup>
++                                                    </Project>");
++
++                var proj3 = env.CreateFile("3.proj", @"
++                                                    <Project>
++                                                        <PropertyGroup>
++                                                            <Platforms>AnyCPU</Platforms>
++                                                        </PropertyGroup>
++                                                    </Project>");
++
++
++                ProjectGraph graph = new ProjectGraph(entryProject.Path);
++                GetFirstNodeWithProjectNumber(graph, 2).ProjectInstance.GlobalProperties["Platform"].ShouldBe("AnyCPU");
++                GetFirstNodeWithProjectNumber(graph, 3).ProjectInstance.GlobalProperties["Platform"].ShouldBe("AnyCPU");
++
++            }
++        }
++
+         [Fact]
+         public void ResolvesViaPlatformLookupTable()
+         {
+diff --git a/src/Build/BackEnd/Shared/ConfigurationMetadata.cs b/src/Build/BackEnd/Shared/ConfigurationMetadata.cs
+index 83b3218f3fe..8f951bbcab3 100644
+--- a/src/Build/BackEnd/Shared/ConfigurationMetadata.cs
++++ b/src/Build/BackEnd/Shared/ConfigurationMetadata.cs
+@@ -58,12 +58,6 @@ public ConfigurationMetadata(string projectFullPath, PropertyDictionary<ProjectP
+             _toolsVersion = MSBuildConstants.CurrentToolsVersion;
+             _globalProperties = globalProperties;
+         }
+-        public ConfigurationMetadata(string projectFullPath, PropertyDictionary<ProjectPropertyInstance> globalProperties, string previousPlatform, string previousPlatformLookupTable, bool isSetPlatformHardCoded) : this(projectFullPath, globalProperties)
+-        {
+-            PreviousPlatform = previousPlatform;
+-            PreviousPlatformLookupTable = previousPlatformLookupTable;
+-            IsSetPlatformHardCoded = isSetPlatformHardCoded;
+-        }
+ 
+         public ConfigurationMetadata(ITranslator translator)
+         {
+@@ -87,11 +81,6 @@ public ConfigurationMetadata(ITranslator translator)
+         /// </summary>
+         public string ToolsVersion => _toolsVersion;
+ 
+-        public string PreviousPlatform { get; } = "";
+-
+-        public string PreviousPlatformLookupTable { get; } = "";
+-        public bool IsSetPlatformHardCoded { get; } = false;
+-
+         private PropertyDictionary<ProjectPropertyInstance> _globalProperties;
+ 
+         /// <summary>
+@@ -175,12 +164,9 @@ private bool InternalEquals(ConfigurationMetadata other)
+             {
+                 return true;
+             }
+-
+             return ProjectFullPath.Equals(other.ProjectFullPath, StringComparison.OrdinalIgnoreCase) &&
+-                   ToolsVersion.Equals(other.ToolsVersion, StringComparison.OrdinalIgnoreCase) &&
+-                   GlobalProperties.Equals(other.GlobalProperties) &&
+-                   PreviousPlatform.Equals(other.PreviousPlatform, StringComparison.OrdinalIgnoreCase) &&
+-                   PreviousPlatformLookupTable.Equals(other.PreviousPlatformLookupTable, StringComparison.OrdinalIgnoreCase);
++                ToolsVersion.Equals(other.ToolsVersion, StringComparison.OrdinalIgnoreCase) &&
++                GlobalProperties.Equals(other.GlobalProperties);
+         }
+ 
+         private string DebugString()
+diff --git a/src/Build/Graph/GraphBuilder.cs b/src/Build/Graph/GraphBuilder.cs
+index 28387389e8c..b2c2dad1fbb 100644
+--- a/src/Build/Graph/GraphBuilder.cs
++++ b/src/Build/Graph/GraphBuilder.cs
+@@ -22,10 +22,6 @@ namespace Microsoft.Build.Graph
+ {
+     internal class GraphBuilder
+     {
+-        private const string PlatformLookupTableMetadataName = "PlatformLookupTable";
+-        private const string PlatformMetadataName = "Platform";
+-        private const string PlatformsMetadataName = "Platforms";
+-        private const string EnableDynamicPlatformResolutionMetadataName = "EnableDynamicPlatformResolution";
+         internal const string SolutionItemReference = "_SolutionReference";
+         
+         /// <summary>
+@@ -505,44 +501,18 @@ private ParsedProject ParseProject(ConfigurationMetadata configurationMetadata)
+         {
+             // TODO: ProjectInstance just converts the dictionary back to a PropertyDictionary, so find a way to directly provide it.
+             var globalProperties = configurationMetadata.GlobalProperties.ToDictionary();
+-            ProjectGraphNode graphNode;
+-            ProjectInstance projectInstance;
+-            var negotiatePlatform = PlatformNegotiationEnabled && !configurationMetadata.IsSetPlatformHardCoded;
+ 
+-            projectInstance = _projectInstanceFactory(
+-                                configurationMetadata.ProjectFullPath,
+-                                negotiatePlatform ? null : globalProperties, // Platform negotiation requires an evaluation with no global properties first
+-                                _projectCollection);
+-
+-            if (ConversionUtilities.ValidBooleanTrue(projectInstance.GetPropertyValue(EnableDynamicPlatformResolutionMetadataName)))
+-            {
+-                PlatformNegotiationEnabled = true;
+-            }
++            var projectInstance = _projectInstanceFactory(
++                configurationMetadata.ProjectFullPath,
++                globalProperties,
++                _projectCollection);
+ 
+             if (projectInstance == null)
+             {
+                 throw new InvalidOperationException(ResourceUtilities.GetResourceString("NullReferenceFromProjectInstanceFactory"));
+             }
+ 
+-            if (negotiatePlatform)
+-            {
+-                var selectedPlatform = PlatformNegotiation.GetNearestPlatform(projectInstance.GetPropertyValue(PlatformMetadataName), projectInstance.GetPropertyValue(PlatformsMetadataName), projectInstance.GetPropertyValue(PlatformLookupTableMetadataName), configurationMetadata.PreviousPlatformLookupTable, projectInstance.FullPath, configurationMetadata.PreviousPlatform);
+-
+-                if (selectedPlatform.Equals(String.Empty))
+-                {
+-                    globalProperties.Remove(PlatformMetadataName);
+-                }
+-                else
+-                {
+-                    globalProperties[PlatformMetadataName] = selectedPlatform;
+-                }
+-                projectInstance = _projectInstanceFactory(
+-                                configurationMetadata.ProjectFullPath,
+-                                globalProperties,
+-                                _projectCollection);           
+-            }
+-
+-            graphNode = new ProjectGraphNode(projectInstance);
++            var graphNode = new ProjectGraphNode(projectInstance);
+ 
+             var referenceInfos = ParseReferences(graphNode);
+ 
+@@ -578,8 +548,9 @@ private void SubmitProjectForParsing(ConfigurationMetadata projectToEvaluate)
+         private List<ProjectInterpretation.ReferenceInfo> ParseReferences(ProjectGraphNode parsedProject)
+         {
+             var referenceInfos = new List<ProjectInterpretation.ReferenceInfo>();
++            
+ 
+-            foreach (var referenceInfo in _projectInterpretation.GetReferences(parsedProject.ProjectInstance))
++            foreach (var referenceInfo in _projectInterpretation.GetReferences(parsedProject.ProjectInstance, _projectCollection, _projectInstanceFactory))
+             {
+                 if (FileUtilities.IsSolutionFilename(referenceInfo.ReferenceConfiguration.ProjectFullPath))
+                 {
+diff --git a/src/Build/Graph/ProjectInterpretation.cs b/src/Build/Graph/ProjectInterpretation.cs
+index a838844f160..b8f397fa93c 100644
+--- a/src/Build/Graph/ProjectInterpretation.cs
++++ b/src/Build/Graph/ProjectInterpretation.cs
+@@ -29,6 +29,10 @@ internal sealed class ProjectInterpretation
+         private const string InnerBuildReferenceItemName = "_ProjectSelfReference";
+         internal static string TransitiveReferenceItemName = "_TransitiveProjectReference";
+         internal const string AddTransitiveProjectReferencesInStaticGraphPropertyName = "AddTransitiveProjectReferencesInStaticGraph";
++        private const string PlatformLookupTableMetadataName = "PlatformLookupTable";
++        private const string PlatformMetadataName = "Platform";
++        private const string PlatformsMetadataName = "Platforms";
++        private const string EnableDynamicPlatformResolutionMetadataName = "EnableDynamicPlatformResolution";
+ 
+         private static readonly char[] PropertySeparator = MSBuildConstants.SemicolonChar;
+ 
+@@ -59,7 +63,7 @@ public ReferenceInfo(ConfigurationMetadata referenceConfiguration, ProjectItemIn
+             }
+         }
+ 
+-        public IEnumerable<ReferenceInfo> GetReferences(ProjectInstance requesterInstance)
++        public IEnumerable<ReferenceInfo> GetReferences(ProjectInstance requesterInstance, ProjectCollection _projectCollection, ProjectGraph.ProjectInstanceFactoryFunc _projectInstanceFactory)
+         {
+             IEnumerable<ProjectItemInstance> projectReferenceItems;
+             IEnumerable<GlobalPropertiesModifier> globalPropertiesModifiers = null;
+@@ -101,13 +105,30 @@ public IEnumerable<ReferenceInfo> GetReferences(ProjectInstance requesterInstanc
+                 var requesterPlatform = "";
+                 var requesterPlatformLookupTable = "";
+ 
+-                if (ConversionUtilities.ValidBooleanTrue(requesterInstance.GetPropertyValue("EnableDynamicPlatformResolution")))
++                if (ConversionUtilities.ValidBooleanTrue(requesterInstance.GetPropertyValue(EnableDynamicPlatformResolutionMetadataName)) && !projectReferenceItem.HasMetadata("setplatform"))
+                 {
+                     requesterPlatform = requesterInstance.GetPropertyValue("Platform");
+                     requesterPlatformLookupTable = requesterInstance.GetPropertyValue("PlatformLookupTable");
++
++                    var  projectInstance = _projectInstanceFactory(
++                        projectReferenceFullPath,
++                        null, // Platform negotiation requires an evaluation with no global properties first
++                        _projectCollection);
++
++                    var selectedPlatform = PlatformNegotiation.GetNearestPlatform(projectInstance.GetPropertyValue(PlatformMetadataName), projectInstance.GetPropertyValue(PlatformsMetadataName), projectInstance.GetPropertyValue(PlatformLookupTableMetadataName), requesterInstance.GetPropertyValue(PlatformLookupTableMetadataName), projectInstance.FullPath, requesterInstance.GetPropertyValue(PlatformMetadataName));
++
++                    if (selectedPlatform.Equals(String.Empty))
++                    {
++                        referenceGlobalProperties.Remove(PlatformMetadataName);
++                    }
++                    else
++                    {
++                        var platformPropertyInstance = ProjectPropertyInstance.Create(PlatformMetadataName, selectedPlatform);
++                        referenceGlobalProperties[PlatformMetadataName] = platformPropertyInstance;
++                    }
+                 }
+ 
+-                var referenceConfig = new ConfigurationMetadata(projectReferenceFullPath, referenceGlobalProperties, requesterPlatform, requesterPlatformLookupTable, projectReferenceItem.HasMetadata("SetPlatform"));
++                var referenceConfig = new ConfigurationMetadata(projectReferenceFullPath, referenceGlobalProperties);
+ 
+                 yield return new ReferenceInfo(referenceConfig, projectReferenceItem);
+             }

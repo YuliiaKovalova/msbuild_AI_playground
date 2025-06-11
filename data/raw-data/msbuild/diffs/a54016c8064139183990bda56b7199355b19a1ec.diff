@@ -1,0 +1,774 @@
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs b/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
+index 9fe1638fd3a..28333110721 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogRecordKind.cs
+@@ -24,7 +24,7 @@ internal enum BinaryLogRecordKind
+         ProjectEvaluationStarted,
+         ProjectEvaluationFinished,
+         ProjectImported,
+-        ProjectImportArchive,
++        ProjectImportArchive = 17,
+         TargetSkipped,
+         PropertyReassignment,
+         UninitializedPropertyRead,
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+index a19a06c2d37..b21169ed135 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+@@ -26,11 +26,6 @@ static BinaryLogReplayEventSource()
+             _ = ItemGroupLoggingHelper.ItemGroupIncludeLogMessagePrefix;
+         }
+ 
+-        /// <summary>
+-        /// Raised once <see cref="BuildEventArgsReader"/> is created during replaying
+-        /// </summary>
+-        public event Action<IBuildEventArgsReaderNotifications>? NotificationsSourceCreated;
+-
+         /// <summary>
+         /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
+         /// </summary>
+@@ -68,6 +63,38 @@ public static BinaryReader OpenReader(string sourceFilePath)
+             }
+         }
+ 
++        /// <summary>
++        /// Creates a <see cref="BuildEventArgsReader"/> for the provided binary reader over binary log file.
++        /// Caller is responsible for disposing the returned reader.
++        /// </summary>
++        /// <param name="binaryReader"></param>
++        /// <param name="closeInput">Indicates whether the passed BinaryReader should be closed on disposing.</param>
++        /// <returns>BuildEventArgsReader over the given binlog file binary reader.</returns>
++        public static BuildEventArgsReader OpenBuildEventsReader(BinaryReader binaryReader, bool closeInput)
++        {
++            int fileFormatVersion = binaryReader.ReadInt32();
++
++            // the log file is written using a newer version of file format
++            // that we don't know how to read
++            if (fileFormatVersion > BinaryLogger.FileFormatVersion)
++            {
++                var text = ResourceUtilities.FormatResourceStringStripCodeAndKeyword("UnsupportedLogFileFormat", fileFormatVersion, BinaryLogger.FileFormatVersion);
++                throw new NotSupportedException(text);
++            }
++
++            return new BuildEventArgsReader(binaryReader, fileFormatVersion) { CloseInput = closeInput };
++        }
++
++        /// <summary>
++        /// Creates a <see cref="BinaryReader"/> for the provided binary log file.
++        /// Performs decompression and buffering in the optimal way.
++        /// Caller is responsible for disposing the returned reader.
++        /// </summary>
++        /// <param name="sourceFilePath"></param>
++        /// <returns>BinaryReader of the given binlog file.</returns>
++        public static BuildEventArgsReader OpenBuildEventsReader(string sourceFilePath)
++            => OpenBuildEventsReader(OpenReader(sourceFilePath), true);
++
+         /// <summary>
+         /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
+         /// </summary>
+@@ -75,30 +102,29 @@ public static BinaryReader OpenReader(string sourceFilePath)
+         /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
+         public void Replay(string sourceFilePath, CancellationToken cancellationToken)
+         {
+-            using var binaryReader = OpenReader(sourceFilePath);
+-            Replay(binaryReader, cancellationToken);
++            using var eventsReader = OpenBuildEventsReader(sourceFilePath);
++            Replay(eventsReader, cancellationToken);
+         }
+ 
+         /// <summary>
+         /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
+         /// </summary>
+         /// <param name="binaryReader">The binary log content binary reader - caller is responsible for disposing.</param>
++        /// <param name="closeInput">Indicates whether the passed BinaryReader should be closed on disposing.</param>
+         /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
+-        public void Replay(BinaryReader binaryReader, CancellationToken cancellationToken)
++        public void Replay(BinaryReader binaryReader, bool closeInput, CancellationToken cancellationToken)
+         {
+-            int fileFormatVersion = binaryReader.ReadInt32();
+-
+-            // the log file is written using a newer version of file format
+-            // that we don't know how to read
+-            if (fileFormatVersion > BinaryLogger.FileFormatVersion)
+-            {
+-                var text = ResourceUtilities.FormatResourceStringStripCodeAndKeyword("UnsupportedLogFileFormat", fileFormatVersion, BinaryLogger.FileFormatVersion);
+-                throw new NotSupportedException(text);
+-            }
+-
+-            using var reader = new BuildEventArgsReader(binaryReader, fileFormatVersion);
+-            NotificationsSourceCreated?.Invoke(reader);
++            using var reader = OpenBuildEventsReader(binaryReader, closeInput);
++            Replay(reader, cancellationToken);
++        }
+ 
++        /// <summary>
++        /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
++        /// </summary>
++        /// <param name="reader">The build events reader - caller is responsible for disposing.</param>
++        /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
++        public void Replay(BuildEventArgsReader reader, CancellationToken cancellationToken)
++        {
+             while (!cancellationToken.IsCancellationRequested && reader.Read() is { } instance)
+             {
+                 Dispatch(instance);
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogger.cs b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+index 6c4e32345fb..9c60914d4a0 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogger.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+@@ -63,6 +63,8 @@ public sealed class BinaryLogger : ILogger
+         //   - AssemblyLoadBuildEventArgs
+         // version 17:
+         //   - Added extended data for types implementing IExtendedBuildEventArgs
++        //   - Making ProjectStartedEventArgs, ProjectEvaluationFinishedEventArgs, AssemblyLoadBuildEventArgs equal
++        //     between de/serialization roundtrips.
+         internal const int FileFormatVersion = 17;
+ 
+         private Stream stream;
+@@ -117,7 +119,12 @@ public enum ProjectImportsCollectionMode
+         /// <summary>
+         /// Initializes the logger by subscribing to events of the specified event source.
+         /// </summary>
+-        public void Initialize(IEventSource eventSource)
++        public void Initialize(IEventSource eventSource) => Initialize(eventSource, null);
++
++        /// <summary>
++        /// Initializes the logger by subscribing to events of the specified event source and embedded content source.
++        /// </summary>
++        public void Initialize(IEventSource eventSource, IEmbeddedContentSource embeddedFilesSource)
+         {
+             _initialTargetOutputLogging = Environment.GetEnvironmentVariable("MSBUILDTARGETOUTPUTLOGGING");
+             _initialLogImports = Traits.Instance.EscapeHatches.LogProjectImports;
+@@ -132,6 +139,13 @@ public void Initialize(IEventSource eventSource)
+ 
+             ProcessParameters();
+ 
++            if (embeddedFilesSource != null)
++            {
++                CollectProjectImports = ProjectImportsCollectionMode.None;
++                embeddedFilesSource.EmbeddedContentRead += args =>
++                    eventArgsWriter.WriteBlob(args.ContentKind.ToBinaryLogRecordKind(), args.ContentStream, args.Length);
++            }
++
+             try
+             {
+                 string logDirectory = null;
+@@ -180,7 +194,9 @@ public void Initialize(IEventSource eventSource)
+             // wrapping the GZipStream in a buffered stream significantly improves performance
+             // and the max throughput is reached with a 32K buffer. See details here:
+             // https://github.com/dotnet/runtime/issues/39233#issuecomment-745598847
+-            stream = new BufferedStream(stream, bufferSize: 32768);
++            stream = Traits.Instance.DeterministicBinlogStreamBuffering ?
++                new GreedyBufferedStream(stream, bufferSize: 32768) :
++                new BufferedStream(stream, bufferSize: 32768);
+             binaryWriter = new BinaryWriter(stream);
+             eventArgsWriter = new BuildEventArgsWriter(binaryWriter);
+ 
+@@ -189,9 +205,15 @@ public void Initialize(IEventSource eventSource)
+                 eventArgsWriter.EmbedFile += EventArgsWriter_EmbedFile;
+             }
+ 
+-            binaryWriter.Write(FileFormatVersion);
+-
+-            LogInitialInfo();
++            if (embeddedFilesSource == null)
++            {
++                binaryWriter.Write(FileFormatVersion);
++                LogInitialInfo();
++            }
++            else
++            {
++                binaryWriter.Write(embeddedFilesSource.FileFormatVersion);
++            }
+ 
+             eventSource.AnyEventRaised += EventSource_AnyEventRaised;
+ 
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index 6c5ccd717d6..747a078a50c 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -63,9 +63,19 @@ public BuildEventArgsReader(BinaryReader binaryReader, int fileFormatVersion)
+             this.fileFormatVersion = fileFormatVersion;
+         }
+ 
++        /// <summary>
++        /// Directs whether the passed <see cref="BinaryReader"/> should be closed when this instance is disposed.
++        /// Defaults to "false".
++        /// </summary>
++        public bool CloseInput { private get; set; } = false;
++
+         public void Dispose()
+         {
+             stringStorage.Dispose();
++            if (CloseInput)
++            {
++                binaryReader.Dispose();
++            }
+         }
+ 
+         /// <summary>
+@@ -81,11 +91,14 @@ public void Dispose()
+         /// </summary>
+         public event Action? StringEncountered;
+ 
++        public int FileFormatVersion => fileFormatVersion;
++
+         /// <summary>
+-        /// Raised when the log reader encounters a binary blob embedded in the stream.
+-        /// The arguments include the blob kind and the byte buffer with the contents.
++        /// Raised when the log reader encounters a project import archive (embedded content) in the stream.
++        /// The subscriber must read the exactly given length of binary data from the stream - otherwise exception is raised.
++        /// If no subscriber is attached, the data is skipped.
+         /// </summary>
+-        internal event Action<BinaryLogRecordKind, byte[]>? OnBlobRead;
++        public event Action<EmbeddedContentEventArgs>? EmbeddedContentRead;
+ 
+         /// <summary>
+         /// Reads the next log record from the <see cref="BinaryReader"/>.
+@@ -113,7 +126,7 @@ public void Dispose()
+                 }
+                 else if (recordKind == BinaryLogRecordKind.ProjectImportArchive)
+                 {
+-                    ReadBlob(recordKind);
++                    ReadEmbeddedContent(recordKind);
+                 }
+ 
+                 recordNumber += 1;
+@@ -212,11 +225,30 @@ private static bool IsAuxiliaryRecord(BinaryLogRecordKind recordKind)
+                 || recordKind == BinaryLogRecordKind.ProjectImportArchive;
+         }
+ 
+-        private void ReadBlob(BinaryLogRecordKind kind)
++        private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+         {
+             int length = ReadInt32();
+-            byte[] bytes = binaryReader.ReadBytes(length);
+-            OnBlobRead?.Invoke(kind, bytes);
++            if (EmbeddedContentRead != null)
++            {
++                long preEventPosition = binaryReader.BaseStream.CanSeek ? binaryReader.BaseStream.Position : 0;
++                EmbeddedContentRead(new EmbeddedContentEventArgs(recordKind.ToEmbeddedContentKind(), binaryReader.BaseStream, length));
++                long postEventPosition = binaryReader.BaseStream.CanSeek ? binaryReader.BaseStream.Position : length;
++                if (postEventPosition - preEventPosition != length)
++                {
++                    throw new InvalidDataException($"The {nameof(EmbeddedContentRead)} event handler must read exactly {length} bytes from the stream.");
++                }
++            }
++            else
++            {
++                if (binaryReader.BaseStream.CanSeek)
++                {
++                    binaryReader.BaseStream.Seek(length, SeekOrigin.Current);
++                }
++                else
++                {
++                    binaryReader.ReadBytes(length);
++                }
++            }
+         }
+ 
+         private void ReadNameValueList()
+@@ -419,11 +451,12 @@ private BuildEventArgs ReadProjectEvaluationFinishedEventArgs()
+ 
+             if (fileFormatVersion >= 12)
+             {
+-                IEnumerable? globalProperties = null;
+-                if (ReadBoolean())
++                if (fileFormatVersion < 17)
+                 {
+-                    globalProperties = ReadStringDictionary();
++                    // Throw away, but need to advance past it
++                    ReadBoolean();
+                 }
++                IEnumerable? globalProperties = ReadStringDictionary();
+ 
+                 var propertyList = ReadPropertyList();
+                 var itemList = ReadProjectItems();
+@@ -474,10 +507,12 @@ private BuildEventArgs ReadProjectStartedEventArgs()
+ 
+             if (fileFormatVersion > 6)
+             {
+-                if (ReadBoolean())
++                if (fileFormatVersion < 17)
+                 {
+-                    globalProperties = ReadStringDictionary();
++                    // Throw away, but need to advance past it
++                    ReadBoolean();
+                 }
++                globalProperties = ReadStringDictionary();
+             }
+ 
+             var propertyList = ReadPropertyList();
+@@ -950,6 +985,7 @@ private AssemblyLoadBuildEventArgs ReadAssemblyLoadEventArgs()
+                 mvid,
+                 appDomainName);
+             SetCommonFields(e, fields);
++            e.ProjectFile = fields.ProjectFile;
+ 
+             return e;
+         }
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+index 0a21182e83c..d962530bcc1 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+@@ -2,6 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System;
++using System.Buffers;
+ using System.Collections;
+ using System.Collections.Generic;
+ using System.Globalization;
+@@ -229,20 +230,15 @@ private void WriteCore(BuildEventArgs e)
+             }
+         }
+ 
+-        public void WriteBlob(BinaryLogRecordKind kind, byte[] bytes)
+-        {
+-            // write the blob directly to the underlying writer,
+-            // bypassing the memory stream
+-            using var redirection = RedirectWritesToOriginalWriter();
+-
+-            Write(kind);
+-            Write(bytes.Length);
+-            Write(bytes);
+-        }
++        public void WriteBlob(BinaryLogRecordKind kind, Stream stream, int length)
++            => WriteBlobImpl(kind, stream, length);
+ 
+         public void WriteBlob(BinaryLogRecordKind kind, Stream stream)
++            => WriteBlobImpl(kind, stream, null);
++
++        private void WriteBlobImpl(BinaryLogRecordKind kind, Stream stream, int? length)
+         {
+-            if (stream.Length > int.MaxValue)
++            if (stream.CanSeek && stream.Length > int.MaxValue)
+             {
+                 throw new ArgumentOutOfRangeException(nameof(stream));
+             }
+@@ -252,8 +248,8 @@ public void WriteBlob(BinaryLogRecordKind kind, Stream stream)
+             using var redirection = RedirectWritesToOriginalWriter();
+ 
+             Write(kind);
+-            Write((int)stream.Length);
+-            Write(stream);
++            Write(length ?? (int)stream.Length);
++            Write(stream, length);
+         }
+ 
+         /// <summary>
+@@ -317,15 +313,7 @@ private void Write(ProjectEvaluationFinishedEventArgs e)
+             WriteBuildEventArgsFields(e, writeMessage: false);
+             WriteDeduplicatedString(e.ProjectFile);
+ 
+-            if (e.GlobalProperties == null)
+-            {
+-                Write(false);
+-            }
+-            else
+-            {
+-                Write(true);
+-                WriteProperties(e.GlobalProperties);
+-            }
++            WriteProperties(e.GlobalProperties);
+ 
+             WriteProperties(e.Properties);
+ 
+@@ -366,15 +354,7 @@ private void Write(ProjectStartedEventArgs e)
+             WriteDeduplicatedString(e.TargetNames);
+             WriteDeduplicatedString(e.ToolsVersion);
+ 
+-            if (e.GlobalProperties == null)
+-            {
+-                Write(false);
+-            }
+-            else
+-            {
+-                Write(true);
+-                Write(e.GlobalProperties);
+-            }
++            Write(e.GlobalProperties);
+ 
+             WriteProperties(e.Properties);
+ 
+@@ -1124,7 +1104,7 @@ private void Write(BinaryLogRecordKind kind)
+             Write((int)kind);
+         }
+ 
+-        private void Write(int value)
++        internal void Write(int value)
+         {
+             BinaryWriterExtensions.Write7BitEncodedInt(binaryWriter, value);
+         }
+@@ -1139,9 +1119,34 @@ private void Write(byte[] bytes)
+             binaryWriter.Write(bytes);
+         }
+ 
+-        private void Write(Stream stream)
++        private void Write(Stream stream, int? length)
+         {
+-            stream.CopyTo(binaryWriter.BaseStream);
++            if (length == null)
++            {
++                stream.CopyTo(binaryWriter.BaseStream);
++                return;
++            }
++
++            // borrowed from runtime from Stream.cs
++            const int defaultCopyBufferSize = 81920;
++            int bufferSize = Math.Min(defaultCopyBufferSize, length.Value);
++
++            byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
++            try
++            {
++                int bytesRead;
++                while (
++                    length > 0 &&
++                    (bytesRead = stream.Read(buffer, 0, Math.Min(buffer.Length, length.Value))) != 0)
++                {
++                    binaryWriter.BaseStream.Write(buffer, 0, bytesRead);
++                    length -= bytesRead;
++                }
++            }
++            finally
++            {
++                ArrayPool<byte>.Shared.Return(buffer);
++            }
+         }
+ 
+         private void Write(byte b)
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs
+new file mode 100644
+index 00000000000..59868eb43dd
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs
+@@ -0,0 +1,78 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++using System.IO.Compression;
++
++namespace Microsoft.Build.Logging
++{
++    public class ArchiveFile : IDisposable
++    {
++        public ArchiveFile(string fullPath, StreamReader contentReader)
++        {
++            FullPath = fullPath;
++            _contentReader = contentReader;
++        }
++
++        public static ArchiveFile From(ZipArchiveEntry entry)
++        {
++            return new ArchiveFile(CalculateArchivePath(entry.FullName), new StreamReader(entry.Open()));
++        }
++
++        public string FullPath { get; }
++
++        public StreamReader GetContentReader()
++        {
++            if (_stringAcquired)
++            {
++                throw new InvalidOperationException("Content already acquired as string via GetContent.");
++            }
++
++            _streamAcquired = true;
++            return _contentReader;
++        }
++
++        public string GetContent()
++        {
++            if (_streamAcquired)
++            {
++                throw new InvalidOperationException("Content already acquired as StreamReader via GetContnetReader.");
++            }
++
++            if (!_stringAcquired)
++            {
++                _stringAcquired = true;
++                _content = _contentReader.ReadToEnd();
++            }
++
++            return _content!;
++        }
++
++        private bool _streamAcquired;
++        private bool _stringAcquired;
++        private readonly StreamReader _contentReader;
++        private string? _content;
++
++        public static string CalculateArchivePath(string filePath)
++        {
++            string archivePath = filePath;
++
++            if (filePath.Contains(":") || (!filePath.StartsWith("\\") && !filePath.StartsWith("/")))
++            {
++                archivePath = archivePath.Replace(":", "");
++                archivePath = archivePath.Replace("/", "\\");
++                archivePath = archivePath.Replace("\\\\", "\\");
++            }
++            else
++            {
++                archivePath = archivePath.Replace("\\", "/");
++                archivePath = archivePath.Replace("//", "/");
++            }
++
++            return archivePath;
++        }
++
++        public void Dispose() => _contentReader.Dispose();
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
+new file mode 100644
+index 00000000000..b5d6e985783
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
+@@ -0,0 +1,22 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++
++namespace Microsoft.Build.Logging
++{
++    public sealed class EmbeddedContentEventArgs : EventArgs
++    {
++        public EmbeddedContentEventArgs(EmbeddedContentKind contentKind, Stream contentStream, int length)
++        {
++            ContentKind = contentKind;
++            ContentStream = contentStream;
++            Length = length;
++        }
++
++        public EmbeddedContentKind ContentKind { get; }
++        public Stream ContentStream { get; }
++        public int Length { get; }
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKind.cs b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKind.cs
+new file mode 100644
+index 00000000000..7f694c91363
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKind.cs
+@@ -0,0 +1,17 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.Logging
++{
++    public enum EmbeddedContentKind
++    {
++        Unknown = -1,
++        ProjectImportArchive = 17,
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKindExtensions.cs b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKindExtensions.cs
+new file mode 100644
+index 00000000000..73e9251cd77
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentKindExtensions.cs
+@@ -0,0 +1,22 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Logging
++{
++    internal static class EmbeddedContentKindExtensions
++    {
++        internal static EmbeddedContentKind ToEmbeddedContentKind(this BinaryLogRecordKind kind)
++        {
++            return kind == BinaryLogRecordKind.ProjectImportArchive
++                ? EmbeddedContentKind.ProjectImportArchive
++                : EmbeddedContentKind.Unknown;
++        }
++
++        internal static BinaryLogRecordKind ToBinaryLogRecordKind(this EmbeddedContentKind kind)
++        {
++            return kind == EmbeddedContentKind.ProjectImportArchive
++                ? BinaryLogRecordKind.ProjectImportArchive
++                : (BinaryLogRecordKind)EmbeddedContentKind.Unknown;
++        }
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/GreedyBufferedStream.cs b/src/Build/Logging/BinaryLogger/Postprocessing/GreedyBufferedStream.cs
+new file mode 100644
+index 00000000000..e334eac4b8f
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/GreedyBufferedStream.cs
+@@ -0,0 +1,83 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++
++namespace Microsoft.Build.Logging
++{
++    /// <summary>
++    /// This is write-only, append-only stream that always buffers the wrapped stream
++    /// into the chunks of the same size (except the possible shorter last chunk).
++    /// So unlike the <see cref="BufferedStream"/> it never writes to the wrapped stream
++    /// until it has full chunk or is closing.
++    ///
++    /// This is not supposed to bring performance benefits, but it allows to avoid nondeterministic
++    /// GZipStream output for the identical input.
++    /// </summary>
++    internal class GreedyBufferedStream : Stream
++    {
++        private readonly Stream _stream;
++        private readonly byte[] _buffer;
++        private int _position;
++
++        public GreedyBufferedStream(Stream stream, int bufferSize)
++        {
++            _stream = stream;
++            _buffer = new byte[bufferSize];
++        }
++
++        public override void Flush()
++        {
++            _stream.Write(_buffer, 0, _position);
++            _position = 0;
++        }
++
++        public override int Read(byte[] buffer, int offset, int count) => throw UnsupportedException;
++
++        public override long Seek(long offset, SeekOrigin origin) => throw UnsupportedException;
++
++        public override void SetLength(long value) => throw UnsupportedException;
++
++        public override void Write(byte[] buffer, int offset, int count)
++        {
++            // Appends input to the buffer until it is full - then flushes it to the wrapped stream.
++            // Repeat above until all input is processed.
++
++            int srcOffset = offset;
++            do
++            {
++                int currentCount = Math.Min(count, _buffer.Length - _position);
++                Buffer.BlockCopy(buffer, srcOffset, _buffer, _position, currentCount);
++                _position += currentCount;
++                count -= currentCount;
++                srcOffset += currentCount;
++
++                if (_position == _buffer.Length)
++                {
++                    Flush();
++                }
++            } while (count > 0);
++        }
++
++        public override bool CanRead => false;
++        public override bool CanSeek => false;
++        public override bool CanWrite => _stream.CanWrite;
++        public override long Length => _stream.Length + _position;
++
++        public override long Position
++        {
++            get => _stream.Position + _position;
++            set => throw UnsupportedException;
++        }
++
++        public override void Close()
++        {
++            Flush();
++            _stream.Close();
++            base.Close();
++        }
++
++        private Exception UnsupportedException => new NotSupportedException("GreedyBufferedStream is write-only, append-only");
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/IBuildEventArgsReaderNotifications.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventArgsReaderNotifications.cs
+similarity index 89%
+rename from src/Build/Logging/BinaryLogger/IBuildEventArgsReaderNotifications.cs
+rename to src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventArgsReaderNotifications.cs
+index 415bd7c71fd..41ec404904e 100644
+--- a/src/Build/Logging/BinaryLogger/IBuildEventArgsReaderNotifications.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventArgsReaderNotifications.cs
+@@ -6,7 +6,7 @@ namespace Microsoft.Build.Logging
+     /// <summary>
+     /// An interface for notifications from BuildEventArgsReader
+     /// </summary>
+-    public interface IBuildEventArgsReaderNotifications : IBuildEventStringsReader
++    public interface IBuildEventArgsReaderNotifications : IBuildEventStringsReader, IEmbeddedContentSource
+     {
+         /* For future use */
+     }
+diff --git a/src/Build/Logging/BinaryLogger/IBuildEventStringsReader.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventStringsReader.cs
+similarity index 100%
+rename from src/Build/Logging/BinaryLogger/IBuildEventStringsReader.cs
+rename to src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventStringsReader.cs
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs
+new file mode 100644
+index 00000000000..e0080148b1a
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs
+@@ -0,0 +1,13 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Logging
++{
++    public interface IEmbeddedContentSource
++    {
++        int FileFormatVersion { get; }
++        event Action<EmbeddedContentEventArgs> EmbeddedContentRead;
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/StringReadEventArgs.cs b/src/Build/Logging/BinaryLogger/Postprocessing/StringReadEventArgs.cs
+similarity index 100%
+rename from src/Build/Logging/BinaryLogger/StringReadEventArgs.cs
+rename to src/Build/Logging/BinaryLogger/Postprocessing/StringReadEventArgs.cs
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index a42e76cc270..81439958264 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -160,10 +160,6 @@
+     <Compile Include="FileAccess\ProcessData.cs" />
+     <Compile Include="FileAccess\ReportedFileOperation.cs" />
+     <Compile Include="FileAccess\RequestedAccess.cs" />
+-    <Compile Include="Logging\BinaryLogger\ExtendedDataFields.cs" />
+-    <Compile Include="Logging\BinaryLogger\IBuildEventArgsReaderNotifications.cs" />
+-    <Compile Include="Logging\BinaryLogger\IBuildEventStringsReader.cs" />
+-    <Compile Include="Logging\BinaryLogger\StringReadEventArgs.cs" />
+     <Compile Include="Utilities\ReaderWriterLockSlimExtensions.cs" />
+     <Compile Include="BackEnd\Node\ConsoleOutput.cs" />
+     <Compile Include="BackEnd\Node\PartialBuildTelemetry.cs" />
+@@ -527,6 +523,8 @@
+     <Compile Include="Logging\BinaryLogger\BuildEventArgsReader.cs" />
+     <Compile Include="Logging\BinaryLogger\BuildEventArgsWriter.cs" />
+     <Compile Include="Logging\BinaryLogger\ProjectImportsCollector.cs" />
++    <Compile Include="Logging\BinaryLogger\ExtendedDataFields.cs" />
++    <Compile Include="Logging\BinaryLogger\Postprocessing\*.cs" />
+     <Compile Include="Logging\ConsoleLogger.cs" />
+     <Compile Include="Logging\DistributedLoggers\DistributedFileLogger.cs" />
+     <Compile Include="Logging\DistributedLoggers\ConfigurableForwardingLogger.cs" />
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index 04b2fc90237..3c81043f963 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -120,6 +120,12 @@ public Traits()
+         /// </summary>
+         public readonly int LogPropertyTracking = ParseIntFromEnvironmentVariableOrDefault("MsBuildLogPropertyTracking", 0); // Default to logging nothing via the property tracker.
+ 
++        /// <summary>
++        /// Turn on greedy buffering stream decorator for binlog writer.
++        /// This will ensure that 2 identical binlog contents will result into identical binlog files (as writing different chunks to GZipStream can lead to different result).
++        /// </summary>
++        public readonly bool DeterministicBinlogStreamBuffering = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILDDETERMNISTICBINLOG"));
++
+         /// <summary>
+         /// When evaluating items, this is the minimum number of items on the running list to use a dictionary-based remove optimization.
+         /// </summary>

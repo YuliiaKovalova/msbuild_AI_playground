@@ -1,0 +1,143 @@
+diff --git a/src/Build.UnitTests/Definition/ProjectEvaluationContext_Tests.cs b/src/Build.UnitTests/Definition/ProjectEvaluationContext_Tests.cs
+index 9040df0e681..2d7464db54c 100644
+--- a/src/Build.UnitTests/Definition/ProjectEvaluationContext_Tests.cs
++++ b/src/Build.UnitTests/Definition/ProjectEvaluationContext_Tests.cs
+@@ -216,7 +216,7 @@ public static IEnumerable<object> ContextPinsGlobExpansionCacheData
+ 
+         [Theory]
+         [MemberData(nameof(ContextPinsGlobExpansionCacheData))]
+-        public void ContextCachesGlopExpansions(EvaluationContext.SharingPolicy policy, string[][] expectedGlobExpansions)
++        public void ContextCachesItemElementGlobExpansions(EvaluationContext.SharingPolicy policy, string[][] expectedGlobExpansions)
+         {
+             var projectDirectory = _env.DefaultTestDirectory.FolderPath;
+ 
+@@ -243,6 +243,46 @@ public void ContextCachesGlopExpansions(EvaluationContext.SharingPolicy policy,
+                 );
+         }
+ 
++        private static string[] _projectsWithGlobImports =
++        {
++            @"<Project>
++                <Import Project=`*.props` />
++            </Project>",
++
++            @"<Project>
++                <Import Project=`*.props` />
++            </Project>",
++        };
++
++        [Theory]
++        [MemberData(nameof(ContextPinsGlobExpansionCacheData))]
++        public void ContextCachesImportGlobExpansions(EvaluationContext.SharingPolicy policy, string[][] expectedGlobExpansions)
++        {
++            var projectDirectory = _env.DefaultTestDirectory.FolderPath;
++
++            _env.SetCurrentDirectory(projectDirectory);
++
++            var context = EvaluationContext.Create(policy);
++
++            var evaluationCount = 0;
++
++            File.WriteAllText(Path.Combine(projectDirectory, $"{evaluationCount}.props"), $"<Project><ItemGroup><i Include=`{evaluationCount}.cs`/></ItemGroup></Project>".Cleanup());
++
++            EvaluateProjects(
++                _projectsWithGlobImports,
++                context,
++                project =>
++                {
++                    var expectedGlobExpansion = expectedGlobExpansions[evaluationCount];
++                    evaluationCount++;
++
++                    File.WriteAllText(Path.Combine(projectDirectory, $"{evaluationCount}.props"), $"<Project><ItemGroup><i Include=`{evaluationCount}.cs`/></ItemGroup></Project>".Cleanup());
++
++                    ObjectModelHelpers.AssertItems(expectedGlobExpansion, project.GetItems("i"));
++                }
++                );
++        }
++
+         private static string[] _projectsWithConditions =
+         {
+             @"<Project>
+diff --git a/src/Build/Evaluation/Context/EvaluationContext.cs b/src/Build/Evaluation/Context/EvaluationContext.cs
+index a3a45ace8d0..07a36f6d034 100644
+--- a/src/Build/Evaluation/Context/EvaluationContext.cs
++++ b/src/Build/Evaluation/Context/EvaluationContext.cs
+@@ -6,6 +6,7 @@
+ using System.Collections.Immutable;
+ using System.Threading;
+ using Microsoft.Build.BackEnd.SdkResolution;
++using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Shared.FileSystem;
+ 
+@@ -32,17 +33,23 @@ public enum SharingPolicy
+ 
+         internal SharingPolicy Policy { get; }
+ 
+-        internal virtual ISdkResolverService SdkResolverService { get; } = new CachingSdkResolverService();
+-        internal IFileSystem FileSystem { get; } = new CachingFileSystemWrapper(FileSystems.Default);
++        internal ISdkResolverService SdkResolverService { get; }
++        internal IFileSystem FileSystem { get; }
++        internal EngineFileUtilities EngineFileUtilities { get; }
+ 
+         /// <summary>
+         /// Key to file entry list. Example usages: cache glob expansion and intermediary directory expansions during glob expansion.
+         /// </summary>
+-        internal ConcurrentDictionary<string, ImmutableArray<string>> FileEntryExpansionCache = new ConcurrentDictionary<string, ImmutableArray<string>>();
++        internal ConcurrentDictionary<string, ImmutableArray<string>> FileEntryExpansionCache { get; }
+ 
+         internal EvaluationContext(SharingPolicy policy)
+         {
+             Policy = policy;
++
++            SdkResolverService = new CachingSdkResolverService();
++            FileEntryExpansionCache = new ConcurrentDictionary<string, ImmutableArray<string>>();
++            FileSystem = new CachingFileSystemWrapper(FileSystems.Default);
++            EngineFileUtilities = new EngineFileUtilities(new FileMatcher(FileSystem, FileEntryExpansionCache));
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index 01de931c683..f2522087ef5 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -1536,7 +1536,7 @@ private void EvaluateItemElementUpdate(ProjectItemElement itemElement)
+                         (
+                             _expander.ExpandIntoStringLeaveEscaped(itemElement.Update, ExpanderOptions.ExpandPropertiesAndItems, itemElement.Location)
+                         )
+-                        .SelectMany(i => EngineFileUtilities.Default.GetFileListEscaped(_projectRootElement.DirectoryPath, i))
++                        .SelectMany(i => _evaluationContext.EngineFileUtilities.GetFileListEscaped(_projectRootElement.DirectoryPath, i))
+                         .Select(EscapingUtilities.UnescapeAll));
+ 
+             var itemsToUpdate = _data.GetItems(itemElement.ItemType).Where(i => expandedItemSet.Contains(i.EvaluatedInclude)).ToList();
+@@ -1567,7 +1567,7 @@ private void EvaluateItemElementInclude(bool itemGroupConditionResult, bool item
+ 
+                     foreach (string excludeSplit in excludeSplits)
+                     {
+-                        string[] excludeSplitFiles = EngineFileUtilities.Default.GetFileListEscaped(_projectRootElement.DirectoryPath, excludeSplit);
++                        string[] excludeSplitFiles = _evaluationContext.EngineFileUtilities.GetFileListEscaped(_projectRootElement.DirectoryPath, excludeSplit);
+ 
+                         foreach (string excludeSplitFile in excludeSplitFiles)
+                         {
+@@ -2202,7 +2202,7 @@ private LoadImportsResult ExpandAndLoadImportsFromUnescapedImportExpression(stri
+                     }
+ 
+                     // Expand the wildcards and provide an alphabetical order list of import statements.
+-                    importFilesEscaped = EngineFileUtilities.Default.GetFileListEscaped(directoryOfImportingFile, importExpressionEscapedItem, forceEvaluate: true);
++                    importFilesEscaped = _evaluationContext.EngineFileUtilities.GetFileListEscaped(directoryOfImportingFile, importExpressionEscapedItem, forceEvaluate: true);
+                 }
+                 catch (Exception ex) when (ExceptionHandling.IsIoRelatedException(ex))
+                 {
+diff --git a/src/Build/Evaluation/LazyItemEvaluator.cs b/src/Build/Evaluation/LazyItemEvaluator.cs
+index 18eeb58f94c..1e2f73cebfe 100644
+--- a/src/Build/Evaluation/LazyItemEvaluator.cs
++++ b/src/Build/Evaluation/LazyItemEvaluator.cs
+@@ -62,7 +62,7 @@ public LazyItemEvaluator(IEvaluatorData<P, I, M, D> data, IItemFactory<I, I> ite
+             _evaluationProfiler = evaluationProfiler;
+ 
+             FileSystem = evaluationContext.FileSystem;
+-            EngineFileUtilities = new EngineFileUtilities(new FileMatcher(FileSystem, evaluationContext.FileEntryExpansionCache));
++            EngineFileUtilities = evaluationContext.EngineFileUtilities;
+         }
+ 
+         private ImmutableList<I> GetItems(string itemType)

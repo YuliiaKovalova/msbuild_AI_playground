@@ -1,0 +1,908 @@
+diff --git a/Directory.Build.props b/Directory.Build.props
+index 889acdc0e67..b0454aa3564 100644
+--- a/Directory.Build.props
++++ b/Directory.Build.props
+@@ -57,7 +57,7 @@
+         RS0016 & RS0017: Roslyn analyzers seem to be bugged, claiming that API's that exist don't and vise-versa: https://github.com/dotnet/msbuild/issues/7903
+     -->
+ 
+-    <NoWarn>$(NoWarn);NU1507;NU1603;NU5105;1702;SYSLIB0011;SYSLIB0037;SYSLIB0044;RS0016;RS0017;</NoWarn>
++    <NoWarn>$(NoWarn);NU1507;NU1603;NU5105;1701;1702;SYSLIB0011;SYSLIB0037;SYSLIB0044;RS0016;RS0017;</NoWarn>
+     <!-- Loading certificate data through the constructor or Import is obsolete. Use X509CertificateLoader instead to load certific
+ ates https://learn.microsoft.com/en-gb/dotnet/fundamentals/syslib-diagnostics/syslib0057 -->
+     <NoWarn>$(NoWarn);SYSLIB0057;</NoWarn>
+diff --git a/eng/Packages.props b/eng/Packages.props
+index 8463cb362fe..28dcd31dbe1 100644
+--- a/eng/Packages.props
++++ b/eng/Packages.props
+@@ -36,7 +36,6 @@
+     <PackageVersion Include="Microsoft.VisualStudio.OpenTelemetry.Collector" Version="0.1.700-beta" />
+     <PackageVersion Include="Microsoft.VisualStudio.OpenTelemetry.ClientExtensions" Version="0.1.700-beta" />
+     <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.10.0" />
+-    <PackageVersion Include="OpenTelemetry.Exporter.Console" Version="1.10.0" />
+     <PackageVersion Include="OpenTelemetry" Version="1.10.0" />
+     <PackageVersion Include="System.Diagnostics.DiagnosticSource" Version="9.0.0" />
+     <PackageVersion Include="Microsoft.Bcl.AsyncInterfaces" Version="9.0.0" />
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index b366bc78b39..4240dc2e9fd 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -492,7 +492,7 @@ public void BeginBuild(BuildParameters parameters)
+                 parameters.DetailedSummary = true;
+                 parameters.LogTaskInputs = true;
+             }
+-            BuildTelemetryManager.Initialize(false);
++            OpenTelemetryManager.Initialize(false);
+ 
+             lock (_syncLock)
+             {
+@@ -1030,7 +1030,6 @@ public void EndBuild()
+             {
+                 try
+                 {
+-                    object TelemetryService = new();
+                     ILoggingService? loggingService = ((IBuildComponentHost)this).LoggingService;
+ 
+                     if (loggingService != null)
+@@ -1071,16 +1070,15 @@ public void EndBuild()
+                             var sacState = NativeMethodsShared.GetSACState();
+                             // The Enforcement would lead to build crash - but let's have the check for completeness sake.
+                             _buildTelemetry.SACEnabled = sacState == NativeMethodsShared.SAC_State.Evaluation || sacState == NativeMethodsShared.SAC_State.Enforcement;
+-                            // Debugger.Launch();
++
+                             loggingService.LogTelemetry(buildEventContext: null, _buildTelemetry.EventName, _buildTelemetry.GetProperties());
+-                            var endOfBuildTelemetry = BuildTelemetryManager.StartActivity(
+-                                "Build",
+-                                new Dictionary<string, object> {
+-                                    { "IsBuildCheckEnabled", _buildTelemetry.BuildCheckEnabled },
+-                                    { "Target", _buildTelemetry.Target ?? "" }
+-                                });
++                            Activity? endOfBuildTelemetry = OpenTelemetryManager.DefaultActivitySource?
++                                .StartActivity("Build")?
++                                .WithTags(_buildTelemetry)
++                                .WithStartTime(_buildTelemetry.InnerStartAt);
++
+                             endOfBuildTelemetry?.Dispose();
+-                            BuildTelemetryManager.Shutdown();
++                            OpenTelemetryManager.ForceFlush();
+ 
+                             // Clean telemetry to make it ready for next build submission.
+                             _buildTelemetry = null;
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index 465ff552079..25ac326c562 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -334,7 +334,7 @@ bool StartNewNode(int nodeId)
+ #endif
+                     // Create the node process
+                     INodeLauncher nodeLauncher = (INodeLauncher)_componentHost.GetComponent(BuildComponentType.NodeLauncher);
+-                    var activity = BuildTelemetryManager.StartActivity("NodeLaunching", new Dictionary<string, object>() { });
++                    var activity = OpenTelemetryManager.DefaultActivitySource.StartActivity("NodeLaunching");
+                     Process msbuildProcess = nodeLauncher.Start(msbuildLocation, commandLineArgs, nodeId);
+                     _processesToIgnore.TryAdd(GetProcessesToIgnoreKey(hostHandshake, msbuildProcess.Id), default);
+ 
+@@ -344,7 +344,7 @@ bool StartNewNode(int nodeId)
+ 
+                     // Now try to connect to it.
+                     Stream nodeStream = TryConnectToProcess(msbuildProcess.Id, TimeoutForNewNodeCreation, hostHandshake);
+-                    activity.Dispose();
++                    activity?.Dispose();
+                     if (nodeStream != null)
+                     {
+                         // Connection successful, use this node.
+diff --git a/src/Framework/Microsoft.Build.Framework.csproj b/src/Framework/Microsoft.Build.Framework.csproj
+index 7d4d4f22165..6a0b9e476e3 100644
+--- a/src/Framework/Microsoft.Build.Framework.csproj
++++ b/src/Framework/Microsoft.Build.Framework.csproj
+@@ -15,6 +15,7 @@
+ 
+   <ItemGroup>
+     <PackageReference Include="Microsoft.CodeAnalysis.Collections" PrivateAssets="all" />
++    <PackageReference Include="System.Diagnostics.DiagnosticSource" />
+   </ItemGroup>
+ 
+   <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'">
+@@ -22,6 +23,15 @@
+     <PackageReference Include="System.Runtime.CompilerServices.Unsafe" />
+     <PackageReference Include="Microsoft.VisualStudio.Setup.Configuration.Interop" PrivateAssets="all" />
+     <Reference Include="System.Xaml" />
++    <!-- Telemetry in Framework-->
++    <PackageReference Include="Microsoft.VisualStudio.OpenTelemetry.Collector" />
++    <PackageReference Include="Microsoft.VisualStudio.OpenTelemetry.ClientExtensions" />
++    <PackageReference Include="OpenTelemetry" />
++  </ItemGroup>
++
++  <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework' AND '$(Configuration)' == 'Debug'">
++    <!-- Exporter that works with .NET aspire only for debugging. Release should use hooked exporter. -->
++    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+   </ItemGroup>
+ 
+   <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETStandard'">
+@@ -44,18 +54,6 @@
+     </Compile>
+   </ItemGroup>
+   
+-  <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'">
+-    <PackageReference Include="Microsoft.VisualStudio.OpenTelemetry.Collector" />
+-    <PackageReference Include="Microsoft.VisualStudio.OpenTelemetry.ClientExtensions" />
+-  </ItemGroup>
+-
+-  <ItemGroup>
+-    <PackageReference Include="OpenTelemetry" />
+-    <PackageReference Include="OpenTelemetry.Exporter.Console" />
+-    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+-    <PackageReference Include="System.Diagnostics.DiagnosticSource" />
+-    
+-  </ItemGroup>
+ 
+   <ItemGroup Condition="'$(TargetFrameworkIdentifier)' != '.NETFramework'">
+     <Compile Remove="XamlTypes\**" />
+diff --git a/src/Framework/Telemetry/ActivityInstrumentation/IActivityTelemetryDataHolder.cs b/src/Framework/Telemetry/ActivityInstrumentation/IActivityTelemetryDataHolder.cs
+new file mode 100644
+index 00000000000..ec29dbd0d72
+--- /dev/null
++++ b/src/Framework/Telemetry/ActivityInstrumentation/IActivityTelemetryDataHolder.cs
+@@ -0,0 +1,18 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++
++namespace Microsoft.Build.Framework.Telemetry;
++
++internal record TelemetryItem(string Name, object Value, bool Hashed);
++
++/// <summary>
++/// 
++/// </summary>
++internal interface IActivityTelemetryDataHolder
++{
++    IList<TelemetryItem> GetActivityProperties();
++}
+\ No newline at end of file
+diff --git a/src/Framework/Telemetry/BuildTelemetry.cs b/src/Framework/Telemetry/BuildTelemetry.cs
+index c23d9269c9b..f877c6bcf6e 100644
+--- a/src/Framework/Telemetry/BuildTelemetry.cs
++++ b/src/Framework/Telemetry/BuildTelemetry.cs
+@@ -10,7 +10,7 @@ namespace Microsoft.Build.Framework.Telemetry
+     /// <summary>
+     /// Telemetry of build.
+     /// </summary>
+-    internal class BuildTelemetry : TelemetryBase
++    internal class BuildTelemetry : TelemetryBase, IActivityTelemetryDataHolder
+     {
+         public override string EventName => "build";
+ 
+@@ -167,5 +167,51 @@ public override IDictionary<string, string> GetProperties()
+ 
+             return properties;
+         }
++        public IList<TelemetryItem> GetActivityProperties() 
++        {
++            List<TelemetryItem> telemetryItems = new();
++
++            if (StartAt.HasValue && FinishedAt.HasValue)
++            {
++                telemetryItems.Add(new TelemetryItem("BuildDurationInMilliseconds", (FinishedAt.Value - StartAt.Value).TotalMilliseconds, false));
++            }
++
++            if (InnerStartAt.HasValue && FinishedAt.HasValue)
++            {
++                telemetryItems.Add(new TelemetryItem("InnerBuildDurationInMilliseconds", (FinishedAt.Value - InnerStartAt.Value).TotalMilliseconds, false));
++            }
++
++            if (Host != null)
++            {
++                telemetryItems.Add(new TelemetryItem("BuildEngineHost", Host, false));
++            }
++
++            if (Success.HasValue)
++            {
++                telemetryItems.Add(new TelemetryItem("BuildSuccess", Success, false));
++            }
++
++            if (Target != null)
++            {
++                telemetryItems.Add(new TelemetryItem("BuildTarget", Target, true));
++            }
++
++            if (Version != null)
++            {
++                telemetryItems.Add(new TelemetryItem("BuildEngineVersion", Version.ToString(), false));
++            }
++
++            if (BuildCheckEnabled != null)
++            {
++                telemetryItems.Add(new TelemetryItem("BuildCheckEnabled", BuildCheckEnabled, false));
++            }
++
++            if (SACEnabled != null)
++            {
++                telemetryItems.Add(new TelemetryItem("SACEnabled", SACEnabled, false));
++            }
++
++            return telemetryItems;
++        }
+     }
+ }
+diff --git a/src/Framework/Telemetry/NewOpenTelemetry.cs b/src/Framework/Telemetry/NewOpenTelemetry.cs
+deleted file mode 100644
+index 50f0cb5f8e4..00000000000
+--- a/src/Framework/Telemetry/NewOpenTelemetry.cs
++++ /dev/null
+@@ -1,296 +0,0 @@
+-﻿// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-using System;
+-using System.Collections.Generic;
+-using System.Diagnostics;
+-using System.Linq;
+-using System.Runtime.CompilerServices;
+-using System.Threading;
+-using System.Threading.Tasks;
+-using Microsoft.Extensions.Logging;
+-#if NETFRAMEWORK
+-using Microsoft.VisualStudio.OpenTelemetry.ClientExtensions;
+-using Microsoft.VisualStudio.OpenTelemetry.ClientExtensions.Exporters;
+-using Microsoft.VisualStudio.OpenTelemetry.Collector.Interfaces;
+-using Microsoft.VisualStudio.OpenTelemetry.Collector.Settings;
+-#endif
+-using OpenTelemetry;
+-using OpenTelemetry.Metrics;
+-using OpenTelemetry.Trace;
+-
+-namespace Microsoft.Build.Framework.Telemetry
+-{
+-
+-    public static class TelemetryConstants
+-    {
+-        public const string VSNamespace = "Microsoft.VisualStudio.OpenTelemetry.MSBuild";
+-        public const string MSBuildSourceName = "Microsoft.Build";
+-        public const string EventPrefix = "VS/MSBuild/";
+-        public const string PropertyPrefix = "VS.MSBuild.";
+-        public const string Version = "1.0.0";
+-    }
+-
+-    public class TelemetryConfiguration
+-    {
+-        private static readonly Lazy<TelemetryConfiguration> _instance =
+-            new(() => new TelemetryConfiguration());
+-
+-        public static TelemetryConfiguration Instance => _instance.Value;
+-
+-        // Will be populated with actual env vars later
+-        public const string OptOutEnvVar = "PLACEHOLDER_OPTOUT";
+-        public const string VSTelemetryOptOutEnvVar = "PLACEHOLDER_VS_OPTOUT";
+-        public const string OTLPExportEnvVar = "PLACEHOLDER_OTLP_ENABLE";
+-        public const string NoCollectorsEnvVar = "PLACEHOLDER_NO_COLLECTORS";
+-
+-        private TelemetryConfiguration()
+-        {
+-            RefreshConfiguration();
+-        }
+-
+-        public bool IsEnabled { get; private set; }
+-        public bool IsVSTelemetryEnabled { get; private set; }
+-        public bool IsOTLPExportEnabled { get; private set; }
+-        public bool ShouldInitializeCollectors { get; private set; }
+-
+-        public void RefreshConfiguration()
+-        {
+-            IsEnabled = !IsEnvVarEnabled(OptOutEnvVar);
+-            IsVSTelemetryEnabled = IsEnabled && !IsEnvVarEnabled(VSTelemetryOptOutEnvVar);
+-            // IsOTLPExportEnabled = IsEnabled && IsEnvVarEnabled(OTLPExportEnvVar);
+-#if DEBUG
+-            IsOTLPExportEnabled = true;
+-#endif
+-            ShouldInitializeCollectors = IsEnabled && !IsEnvVarEnabled(NoCollectorsEnvVar);
+-        }
+-
+-        private static bool IsEnvVarEnabled(string name) =>
+-            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(name));
+-    }
+-
+-    public static class BuildTelemetryManager
+-    {
+-        private static ITelemetrySession? _currentSession;
+-
+-        public static void Initialize(bool isVisualStudioBuild, string? hostName = null)
+-        {
+-            if (_currentSession != null)
+-            {
+-                throw new InvalidOperationException("Telemetry session already initialized");
+-            }
+-
+-            _currentSession = TelemetrySessionFactory.Create(isVisualStudioBuild, hostName);
+-        }
+-
+-        public static void Shutdown()
+-        {
+-            if (_currentSession != null)
+-            {
+-                _currentSession.Dispose();
+-                _currentSession = null;
+-            }
+-        }
+-
+-        public static Activity? StartActivity(string name, IDictionary<string, object>? tags = null)
+-        {
+-            return _currentSession?.StartActivity(
+-                $"{TelemetryConstants.EventPrefix}{name}",
+-                tags?.ToDictionary(
+-                    kvp => $"{TelemetryConstants.PropertyPrefix}{kvp.Key}",
+-                    kvp => kvp.Value));
+-        }
+-    }
+-
+-    // This would be internal in reality, shown here for completeness
+-    internal interface ITelemetrySession : IDisposable
+-    {
+-        Activity? StartActivity(string name, IDictionary<string, object>? tags = null);
+-    }
+-    internal static class TelemetrySessionFactory
+-    {
+-        public static ITelemetrySession Create(bool isVisualStudioBuild, string? hostName)
+-        {
+-            var session = new TelemetrySession(isVisualStudioBuild, hostName);
+-            session.Initialize();
+-            return session;
+-        }
+-    }
+-
+-    internal class TelemetrySession : ITelemetrySession
+-    {
+-        private readonly bool _isVisualStudioBuild;
+-        private readonly string? _hostName;
+-        private readonly MSBuildActivitySource _activitySource;
+-        private readonly List<IDisposable> _collectors;
+-        private bool _isDisposed;
+-
+-        public TelemetrySession(bool isVisualStudioBuild, string? hostName)
+-        {
+-            _isVisualStudioBuild = isVisualStudioBuild;
+-            _hostName = hostName;
+-            _activitySource = new MSBuildActivitySource();
+-            _collectors = new();
+-        }
+-
+-        public void Initialize()
+-        {
+-            var config = TelemetryConfiguration.Instance;
+-
+-            if (config.IsOTLPExportEnabled)
+-            {
+-                _collectors.Add(new OTLPCollector(_activitySource).Initialize());
+-            }
+-
+-#if NETFRAMEWORK
+-            if (_isVisualStudioBuild && config.IsVSTelemetryEnabled)
+-            {
+-                _collectors.Add(new VSCollector(_activitySource).Initialize());
+-            }
+-#endif
+-        }
+-
+-        public Activity? StartActivity(string name, IDictionary<string, object>? tags = null)
+-        {
+-            if (_isDisposed)
+-            {
+-                return null;
+-            }
+-
+-            return _activitySource.StartActivity(name, tags);
+-        }
+-
+-        public void Dispose()
+-        {
+-            if (_isDisposed)
+-            {
+-                return;
+-            }
+-
+-            _isDisposed = true;
+-
+-            foreach (var collector in _collectors)
+-            {
+-                collector.Dispose();
+-            }
+-
+-            _collectors.Clear();
+-        }
+-    }
+-
+-    internal class MSBuildActivitySource
+-    {
+-        private readonly ActivitySource _source;
+-
+-        public MSBuildActivitySource()
+-        {
+-            _source = new ActivitySource(
+-                TelemetryConstants.MSBuildSourceName,
+-                TelemetryConstants.Version);
+-        }
+-
+-        public Activity? StartActivity(string name, IDictionary<string, object>? tags)
+-        {
+-            var activity = Activity.Current?.HasRemoteParent == true
+-                ? _source.StartActivity(name, ActivityKind.Internal, parentId: Activity.Current.ParentId)
+-                : _source.StartActivity(name);
+-
+-            if (activity != null && tags != null)
+-            {
+-                foreach (var tag in tags)
+-                {
+-                    activity.SetTag(tag.Key, tag.Value);
+-                }
+-            }
+-
+-            return activity;
+-        }
+-    }
+-
+-    internal class OTLPCollector : IDisposable
+-    {
+-        private readonly MSBuildActivitySource _activitySource;
+-        private TracerProvider? _tracerProvider;
+-        private MeterProvider? _meterProvider;
+-
+-        public OTLPCollector(MSBuildActivitySource activitySource)
+-        {
+-            _activitySource = activitySource;
+-        }
+-
+-        public OTLPCollector Initialize()
+-        {
+-            _tracerProvider = Sdk.CreateTracerProviderBuilder()
+-                .AddSource(TelemetryConstants.MSBuildSourceName)
+-                .AddOtlpExporter()
+-                .Build();
+-
+-            _meterProvider = Sdk.CreateMeterProviderBuilder()
+-                .AddMeter(TelemetryConstants.MSBuildSourceName)
+-                .Build();
+-
+-            return this;
+-        }
+-
+-        public void Dispose()
+-        {
+-            _tracerProvider?.Dispose();
+-            _meterProvider?.Dispose();
+-        }
+-    }
+-
+-#if NETFRAMEWORK
+-    internal class VSCollector : IDisposable
+-    {
+-        private const string VsMajorVersion = "17.0";
+-
+-        private readonly MSBuildActivitySource _activitySource;
+-        private IOpenTelemetryCollector? _collector;
+-        private TracerProvider? _tracerProvider;
+-        private MeterProvider? _meterProvider;
+-
+-        public VSCollector(MSBuildActivitySource activitySource)
+-        {
+-            _activitySource = activitySource;
+-        }
+-
+-        public VSCollector Initialize()
+-        {
+-            var exporterSettings = OpenTelemetryExporterSettingsBuilder
+-                .CreateVSDefault(VsMajorVersion)
+-                .Build();
+-
+-            var collectorSettings = OpenTelemetryCollectorSettingsBuilder
+-                .CreateVSDefault(VsMajorVersion)
+-                .Build();
+-
+-            _tracerProvider = Sdk.CreateTracerProviderBuilder()
+-                .AddVisualStudioDefaultTraceExporter(exporterSettings)
+-                .AddSource(TelemetryConstants.MSBuildSourceName)
+-                .Build();
+-
+-            _meterProvider = Sdk.CreateMeterProviderBuilder()
+-                .AddVisualStudioDefaultMetricExporter(exporterSettings)
+-                .AddMeter(TelemetryConstants.MSBuildSourceName)
+-                .Build();
+-
+-            _collector = OpenTelemetryCollectorProvider.CreateCollector(collectorSettings);
+-
+-            _collector.StartAsync();
+-
+-            return this;
+-        }
+-
+-        public void Dispose()
+-        {
+-            if (_collector != null)
+-            {
+-                _collector.Dispose();
+-            }
+-            _tracerProvider?.Dispose();
+-            _meterProvider?.Dispose();
+-        }
+-    }
+-#endif
+-
+-}
+-
+diff --git a/src/Framework/Telemetry/OpenTelemetryManager.cs b/src/Framework/Telemetry/OpenTelemetryManager.cs
+new file mode 100644
+index 00000000000..dbb2a1d46d8
+--- /dev/null
++++ b/src/Framework/Telemetry/OpenTelemetryManager.cs
+@@ -0,0 +1,210 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Linq;
++using System.Runtime.CompilerServices;
++using System.Threading;
++using System.Threading.Tasks;
++
++#if NETFRAMEWORK
++using Microsoft.VisualStudio.OpenTelemetry.ClientExtensions;
++using Microsoft.VisualStudio.OpenTelemetry.ClientExtensions.Exporters;
++using Microsoft.VisualStudio.OpenTelemetry.Collector.Interfaces;
++using Microsoft.VisualStudio.OpenTelemetry.Collector.Settings;
++using OpenTelemetry;
++using OpenTelemetry.Trace;
++#endif
++#if DEBUG && NETFRAMEWORK
++using OpenTelemetry.Exporter;
++#endif
++
++namespace Microsoft.Build.Framework.Telemetry
++{
++
++    /// <summary>
++    /// Class for configuring and managing the telemetry infrastructure with System.Diagnostics.Activity, OpenTelemetry SDK and VS OpenTelemetry Collector.
++    /// </summary>
++    internal static class OpenTelemetryManager
++    {
++        private static bool _initialized = false;
++        private static readonly object s_initialize_lock = new();
++
++#if NETFRAMEWORK
++        private static TracerProvider? s_tracerProvider;
++        private static IOpenTelemetryCollector? s_collector;
++#endif
++
++        public static MSBuildActivitySource? DefaultActivitySource { get; set; }
++
++        public static void Initialize(bool isStandalone)
++        {
++            lock (s_initialize_lock)
++            {
++                if (!ShouldInitialize())
++                {
++                    return;
++                }
++
++                // create activity source
++                DefaultActivitySource = new MSBuildActivitySource(TelemetryConstants.DefaultActivitySourceNamespace);
++
++                // create trace exporter in framework
++#if NETFRAMEWORK
++                var exporterSettings = OpenTelemetryExporterSettingsBuilder
++                    .CreateVSDefault(TelemetryConstants.VSMajorVersion)
++                    .Build();
++
++                TracerProviderBuilder tracerProviderBuilder = OpenTelemetry.Sdk
++                    .CreateTracerProviderBuilder()
++                    .AddSource(TelemetryConstants.DefaultActivitySourceNamespace)
++                    .AddVisualStudioDefaultTraceExporter(exporterSettings);
++
++                s_tracerProvider =
++                    tracerProviderBuilder
++#if DEBUG
++                        .AddOtlpExporter()
++#endif
++                       .Build();
++
++                // create collector if not in vs
++                if (isStandalone)
++                {
++                    IOpenTelemetryCollectorSettings collectorSettings = OpenTelemetryCollectorSettingsBuilder
++                        .CreateVSDefault(TelemetryConstants.VSMajorVersion)
++                        .Build();
++
++                    s_collector = OpenTelemetryCollectorProvider
++                        .CreateCollector(collectorSettings);
++                    s_collector.StartAsync().Wait();
++                }
++#endif
++                _initialized = true;
++            }
++        }
++
++        public static void ForceFlush()
++        {
++            lock (s_initialize_lock)
++            {
++                if (_initialized)
++                {
++#if NETFRAMEWORK
++                    s_tracerProvider?.ForceFlush();
++#endif
++                }
++            }
++        }
++        private static bool ShouldInitialize()
++        {
++            // only initialize once
++            if (_initialized)
++            {
++                return false;
++            }
++
++            string? dotnetCliOptout = Environment.GetEnvironmentVariable(TelemetryConstants.DotnetOptOut);
++            if (dotnetCliOptout == "1" || dotnetCliOptout == "true")
++            {
++                return false;
++            }
++
++            string? msbuildCliOptout = Environment.GetEnvironmentVariable(TelemetryConstants.MSBuildOptout);
++            if (msbuildCliOptout == "1" || msbuildCliOptout == "true")
++            {
++                return false;
++            }
++
++            return true;
++        }
++
++        public static void Shutdown()
++        {
++            lock (s_initialize_lock)
++            {
++                if (_initialized)
++                {
++#if NETFRAMEWORK
++                    s_tracerProvider?.Shutdown();
++                    s_collector?.Dispose();
++#endif
++                }
++            }
++        }
++    }
++
++    internal class MSBuildActivitySource
++    {
++        private readonly ActivitySource _source;
++
++        public MSBuildActivitySource(string name)
++        {
++            _source = new ActivitySource(name);
++        }
++
++        public Activity? StartActivity(string name)
++        {
++            var activity = Activity.Current?.HasRemoteParent == true
++                ? _source.StartActivity($"{TelemetryConstants.EventPrefix}{name}", ActivityKind.Internal, parentId: Activity.Current.ParentId)
++                : _source.StartActivity($"{TelemetryConstants.EventPrefix}{name}");
++            return activity;
++        }
++    }
++
++    internal static class ActivityExtensions
++    {
++        public static Activity WithTags(this Activity activity, IActivityTelemetryDataHolder dataHolder)
++        {
++            if (dataHolder != null)
++            {
++                foreach ((string name, object value, bool hashed) in dataHolder.GetActivityProperties())
++                {
++                    object? hashedValue = null;
++                    if (hashed)
++                    {
++                        // TODO: make this work
++                        hashedValue = value;
++
++                        // Hash the value via Visual Studio mechanism in Framework & same algo as in core telemetry hashing
++                        // https://github.com/dotnet/sdk/blob/8bd19a2390a6bba4aa80d1ac3b6c5385527cc311/src/Cli/Microsoft.DotNet.Cli.Utils/Sha256Hasher.cs
++#if NETFRAMEWORK
++                        // hashedValue = new Microsoft.VisualStudio.Telemetry.TelemetryHashedProperty(value
++#endif
++                    }
++
++                    activity.SetTag($"{TelemetryConstants.PropertyPrefix}{name}", hashed ? hashedValue : value);
++                }
++            }
++            return activity;
++        }
++
++        public static Activity WithTags(this Activity activity, IDictionary<string, object>? tags)
++        {
++            if (tags != null)
++            {
++                foreach (var tag in tags)
++                {
++                    activity.SetTag($"{TelemetryConstants.PropertyPrefix}{tag.Key}", tag.Value);
++                }
++            }
++
++            return activity;
++        }
++
++        public static Activity WithTag(this Activity activity, string name, object value, bool hashed = false)
++        {
++            activity.SetTag($"{TelemetryConstants.PropertyPrefix}{name}", hashed ? value.GetHashCode() : value);
++            return activity;
++        }
++        
++        public static Activity WithStartTime(this Activity activity, DateTime? startTime)
++        {
++            if (startTime.HasValue)
++            {
++                activity.SetStartTime(startTime.Value);
++            }
++            return activity;
++        }
++    }
++}
+diff --git a/src/Framework/Telemetry/TelemetryConstants.cs b/src/Framework/Telemetry/TelemetryConstants.cs
+new file mode 100644
+index 00000000000..48badb4c813
+--- /dev/null
++++ b/src/Framework/Telemetry/TelemetryConstants.cs
+@@ -0,0 +1,135 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Linq;
++using System.Runtime.CompilerServices;
++using System.Threading;
++using System.Threading.Tasks;
++
++#if NETFRAMEWORK
++using Microsoft.VisualStudio.OpenTelemetry.ClientExtensions;
++using Microsoft.VisualStudio.OpenTelemetry.ClientExtensions.Exporters;
++using Microsoft.VisualStudio.OpenTelemetry.Collector.Interfaces;
++using Microsoft.VisualStudio.OpenTelemetry.Collector.Settings;
++using OpenTelemetry;
++using OpenTelemetry.Trace;
++#endif
++
++#if DEBUG && NETFRAMEWORK
++using OpenTelemetry.Exporter;
++#endif
++
++namespace Microsoft.Build.Framework.Telemetry
++{
++
++    internal static class TelemetryConstants
++    {
++        /// <summary>
++        /// "Microsoft.VisualStudio.OpenTelemetry.*" namespace is required by VS exporting/collection.
++        /// </summary>
++        public const string DefaultActivitySourceNamespace = "Microsoft.VisualStudio.OpenTelemetry.MSBuild";
++        public const string EventPrefix = "VS/MSBuild/";
++        public const string PropertyPrefix = "VS.MSBuild.";
++        /// <summary>
++        /// For VS OpenTelemetry Collector to apply the correct privacy policy.
++        /// </summary>
++        public const string VSMajorVersion = "17.0";
++
++        /// <summary>
++        /// https://learn.microsoft.com/en-us/dotnet/core/tools/telemetry
++        /// </summary>
++        public const string DotnetOptOut = "DOTNET_CLI_TELEMETRY_OPTOUT";
++        public const string MSBuildOptout = "MSBUILD_TELEMETRY_OPTOUT";
++    }
++
++    /*
++    internal class OTLPCollector : IDisposable
++    {
++        private readonly MSBuildActivitySource _activitySource;
++        private TracerProvider? _tracerProvider;
++        private MeterProvider? _meterProvider;
++
++        public OTLPCollector(MSBuildActivitySource activitySource)
++        {
++            _activitySource = activitySource;
++        }
++
++        public OTLPCollector Initialize()
++        {
++            _tracerProvider = Sdk.CreateTracerProviderBuilder()
++                .AddSource(TelemetryConstants.MSBuildSourceName)
++                .AddOtlpExporter()
++                .Build();
++
++            _meterProvider = Sdk.CreateMeterProviderBuilder()
++                .AddMeter(TelemetryConstants.MSBuildSourceName)
++                .Build();
++
++            return this;
++        }
++
++        public void Dispose()
++        {
++            _tracerProvider?.Dispose();
++            _meterProvider?.Dispose();
++        }
++    }
++    */
++    /*
++#if NETFRAMEWORK
++    internal class VSCollector : IDisposable
++    {
++        private const string VsMajorVersion = "17.0";
++
++        private readonly MSBuildActivitySource _activitySource;
++        private IOpenTelemetryCollector? _collector;
++        private TracerProvider? _tracerProvider;
++        private MeterProvider? _meterProvider;
++
++        public VSCollector(MSBuildActivitySource activitySource)
++        {
++            _activitySource = activitySource;
++        }
++
++        public VSCollector Initialize()
++        {
++            var exporterSettings = OpenTelemetryExporterSettingsBuilder
++                .CreateVSDefault(VsMajorVersion)
++                .Build();
++
++            var collectorSettings = OpenTelemetryCollectorSettingsBuilder
++                .CreateVSDefault(VsMajorVersion)
++                .Build();
++
++            _tracerProvider = Sdk.CreateTracerProviderBuilder()
++                .AddVisualStudioDefaultTraceExporter(exporterSettings)
++                .AddSource(TelemetryConstants.MSBuildSourceName)
++                .Build();
++
++            _meterProvider = Sdk.CreateMeterProviderBuilder()
++                .AddVisualStudioDefaultMetricExporter(exporterSettings)
++                .AddMeter(TelemetryConstants.MSBuildSourceName)
++                .Build();
++
++            _collector = OpenTelemetryCollectorProvider.CreateCollector(collectorSettings);
++
++            _collector.StartAsync();
++
++            return this;
++        }
++
++        public void Dispose()
++        {
++            if (_collector != null)
++            {
++                _collector.Dispose();
++            }
++            _tracerProvider?.Dispose();
++            _meterProvider?.Dispose();
++        }
++    }
++#endif
++*/
++}
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index aeddef7aba4..85717fb952e 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -246,6 +246,7 @@ string[] args
+ 
+             DebuggerLaunchCheck();
+ 
++            OpenTelemetryManager.Initialize(true);
+             // Initialize new build telemetry and record start of this build.
+             KnownTelemetry.PartialBuildTelemetry = new BuildTelemetry { StartAt = DateTime.UtcNow };
+ 
+@@ -296,6 +297,7 @@ string[] args
+                 DumpCounters(false /* log to console */);
+             }
+ 
++            OpenTelemetryManager.Shutdown();
+             return exitCode;
+         }
+ 

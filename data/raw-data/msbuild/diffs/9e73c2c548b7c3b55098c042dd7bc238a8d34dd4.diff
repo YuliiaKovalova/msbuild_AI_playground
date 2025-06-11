@@ -1,0 +1,206 @@
+diff --git a/src/Build.UnitTests/Definition/ProjectEvaluationContext_Tests.cs b/src/Build.UnitTests/Definition/ProjectEvaluationContext_Tests.cs
+index 0427761054c..1db68d798c0 100644
+--- a/src/Build.UnitTests/Definition/ProjectEvaluationContext_Tests.cs
++++ b/src/Build.UnitTests/Definition/ProjectEvaluationContext_Tests.cs
+@@ -103,7 +103,7 @@ public void PassedInFileSystemShouldBeReusedInSharedContext()
+ 
+             var projectCollection = _env.CreateProjectCollection().Collection;
+             var fileSystem = new Helpers.LoggingFileSystem();
+-            var evaluationContext = EvaluationContext.Create(EvaluationContext.SharingPolicy.Shared, fileSystem);
++            var evaluationContext = EvaluationContext.Create(EvaluationContext.SharingPolicy.Shared, fileSystem, null);
+ 
+             foreach (var projectFile in projectFiles)
+             {
+@@ -133,7 +133,7 @@ public void PassedInFileSystemShouldBeReusedInSharedContext()
+         public void NonSharedContextShouldNotSupportBeingPassedAFileSystem(EvaluationContext.SharingPolicy policy)
+         {
+             var fileSystem = new Helpers.LoggingFileSystem();
+-            Should.Throw<ArgumentException>(() => EvaluationContext.Create(policy, fileSystem));
++            Should.Throw<ArgumentException>(() => EvaluationContext.Create(policy, fileSystem, null));
+         }
+ 
+         [Theory]
+diff --git a/src/Build/Construction/ProjectRootElement.cs b/src/Build/Construction/ProjectRootElement.cs
+index 92e920c3f80..7c6d029c5c9 100644
+--- a/src/Build/Construction/ProjectRootElement.cs
++++ b/src/Build/Construction/ProjectRootElement.cs
+@@ -1963,6 +1963,8 @@ internal static bool IsEmptyXmlFile(string path)
+             {
+                 FileInfo fileInfo = new FileInfo(path);
+ 
++                // If file does not exist it will throw a FileNotFoundException
++                // which will be caught below and we'll end up returning false.
+                 if (fileInfo.Length == 0)
+                 {
+                     // Zero length files are empty
+diff --git a/src/Build/Definition/Project.cs b/src/Build/Definition/Project.cs
+index 741babe959c..141d786fe26 100644
+--- a/src/Build/Definition/Project.cs
++++ b/src/Build/Definition/Project.cs
+@@ -3714,7 +3714,7 @@ private void Reevaluate(
+                 ProjectLoadSettings loadSettings,
+                 EvaluationContext evaluationContext = null)
+             {
+-                evaluationContext = evaluationContext?.ContextForNewProject() ?? EvaluationContext.Create(EvaluationContext.SharingPolicy.Isolated);
++                evaluationContext = evaluationContext?.ContextForNewProject() ?? EvaluationContext.Create(EvaluationContext.SharingPolicy.Isolated, loadSettings);
+ 
+                 Evaluator<ProjectProperty, ProjectItem, ProjectMetadata, ProjectItemDefinition>.Evaluate(
+                     _data,
+diff --git a/src/Build/Evaluation/Context/EvaluationContext.cs b/src/Build/Evaluation/Context/EvaluationContext.cs
+index c4130775330..dd6d4d311e2 100644
+--- a/src/Build/Evaluation/Context/EvaluationContext.cs
++++ b/src/Build/Evaluation/Context/EvaluationContext.cs
+@@ -4,9 +4,11 @@
+ using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
++using System.Security.Policy;
+ using System.Threading;
+ using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.FileSystem;
++using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Shared.FileSystem;
+ 
+@@ -23,6 +25,8 @@ namespace Microsoft.Build.Evaluation.Context
+     /// </summary>
+     public class EvaluationContext
+     {
++        private readonly ProjectLoadSettings? _projectLoadSettings;
++
+         public enum SharingPolicy
+         {
+             /// <summary>
+@@ -60,17 +64,20 @@ public enum SharingPolicy
+         /// </summary>
+         private ConcurrentDictionary<string, IReadOnlyList<string>> FileEntryExpansionCache { get; }
+ 
+-        private EvaluationContext(SharingPolicy policy, IFileSystem fileSystem, ISdkResolverService sdkResolverService = null,
++        private EvaluationContext(SharingPolicy policy, IFileSystem fileSystem, ProjectLoadSettings? projectLoadSettings, ISdkResolverService sdkResolverService = null,
+             ConcurrentDictionary<string, IReadOnlyList<string>> fileEntryExpansionCache = null)
+         {
+             Policy = policy;
+ 
++            _projectLoadSettings = projectLoadSettings;
+             SdkResolverService = sdkResolverService ?? new CachingSdkResolverService();
+             FileEntryExpansionCache = fileEntryExpansionCache ?? new ConcurrentDictionary<string, IReadOnlyList<string>>();
+-            FileSystem = fileSystem ?? new CachingFileSystemWrapper(FileSystems.Default);
++            FileSystem = fileSystem ?? new CachingFileSystemWrapper(FileSystems.Default, SkipExistenceCheck);
+             FileMatcher = new FileMatcher(FileSystem, FileEntryExpansionCache);
+         }
+ 
++        private bool SkipExistenceCheck => (_projectLoadSettings?.HasFlag(ProjectLoadSettings.IgnoreMissingImports) ?? false) && Traits.Instance.SkipExistenceCheckForCache;
++
+         /// <summary>
+         ///     Factory for <see cref="EvaluationContext" />
+         /// </summary>
+@@ -78,7 +85,18 @@ private EvaluationContext(SharingPolicy policy, IFileSystem fileSystem, ISdkReso
+         public static EvaluationContext Create(SharingPolicy policy)
+         {
+             // Do not remove this method to avoid breaking binary compatibility.
+-            return Create(policy, fileSystem: null);
++            return Create(policy, fileSystem: null, projectLoadSettings: null);
++        }
++
++        /// <summary>
++        ///     Factory for <see cref="EvaluationContext" />
++        /// </summary>
++        /// <param name="policy">The <see cref="SharingPolicy"/> to use.</param>
++        /// <param name="projectLoadSettings">The <see cref="ProjectLoadSettings"/> to use.</param>
++        public static EvaluationContext Create(SharingPolicy policy, ProjectLoadSettings? projectLoadSettings)
++        {
++            // Do not remove this method to avoid breaking binary compatibility.
++            return Create(policy, fileSystem: null, projectLoadSettings: projectLoadSettings);
+         }
+ 
+         /// <summary>
+@@ -91,7 +109,8 @@ public static EvaluationContext Create(SharingPolicy policy)
+         ///     The reasoning is that these values guarantee not reusing file system caches between evaluations,
+         ///     and the passed in <paramref name="fileSystem"/> might cache state.
+         /// </param>
+-        public static EvaluationContext Create(SharingPolicy policy, MSBuildFileSystemBase fileSystem)
++        /// <param name="projectLoadSettings">The <see cref="ProjectLoadSettings"/> to use.</param>
++        public static EvaluationContext Create(SharingPolicy policy, MSBuildFileSystemBase fileSystem, ProjectLoadSettings? projectLoadSettings)
+         {
+             // Unsupported case: not-fully-shared context with non null file system.
+             ErrorUtilities.VerifyThrowArgument(
+@@ -100,7 +119,8 @@ public static EvaluationContext Create(SharingPolicy policy, MSBuildFileSystemBa
+ 
+             var context = new EvaluationContext(
+                 policy,
+-                fileSystem);
++                fileSystem,
++                projectLoadSettings);
+ 
+             TestOnlyHookOnCreate?.Invoke(context);
+ 
+@@ -122,7 +142,7 @@ internal EvaluationContext ContextForNewProject()
+                         return this;
+                     }
+                     // Create a copy if this context has already been used. Mark it used.
+-                    EvaluationContext context = new EvaluationContext(Policy, fileSystem: null, sdkResolverService: Policy == SharingPolicy.SharedSDKCache ? SdkResolverService : null)
++                    EvaluationContext context = new EvaluationContext(Policy, fileSystem: null, projectLoadSettings: _projectLoadSettings, sdkResolverService: Policy == SharingPolicy.SharedSDKCache ? SdkResolverService : null)
+                     {
+                         _used = 1,
+                     };
+@@ -142,7 +162,7 @@ internal EvaluationContext ContextForNewProject()
+         /// <returns>The new evaluation context.</returns>
+         internal EvaluationContext ContextWithFileSystem(IFileSystem fileSystem)
+         {
+-            return new EvaluationContext(Policy, fileSystem, SdkResolverService, FileEntryExpansionCache)
++            return new EvaluationContext(Policy, fileSystem, null, SdkResolverService, FileEntryExpansionCache)
+             {
+                 _used = 1,
+             };
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index 8e9d1e09d00..2098157dc41 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -50,6 +50,12 @@ public Traits()
+         /// </summary>
+         public readonly bool CacheFileExistence = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MsBuildCacheFileExistence"));
+ 
++        /// <summary>
++        /// If user specifies IgnoreMissingImports along with this Environment variable then do not perform
++        /// existence check for the file cache for performance reasons.
++        /// </summary>
++        public readonly bool SkipExistenceCheckForCache = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILDSKIPEXISTENCECHECKFORCACHE"));
++
+         public readonly bool UseSimpleProjectRootElementCacheConcurrency = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MsBuildUseSimpleProjectRootElementCacheConcurrency"));
+ 
+         /// <summary>
+diff --git a/src/Shared/FileSystem/CachingFileSystemWrapper.cs b/src/Shared/FileSystem/CachingFileSystemWrapper.cs
+index 9c143cb79e1..e86a420d0c7 100644
+--- a/src/Shared/FileSystem/CachingFileSystemWrapper.cs
++++ b/src/Shared/FileSystem/CachingFileSystemWrapper.cs
+@@ -15,10 +15,17 @@ internal sealed class CachingFileSystemWrapper : IFileSystem
+         private readonly IFileSystem _fileSystem;
+         private readonly ConcurrentDictionary<string, bool> _existenceCache = new ConcurrentDictionary<string, bool>();
+         private readonly ConcurrentDictionary<string, DateTime> _lastWriteTimeCache = new ConcurrentDictionary<string, DateTime>();
++        private readonly bool _skipExistenceCheck = false;
+ 
+         public CachingFileSystemWrapper(IFileSystem fileSystem)
++            : this(fileSystem, false)
++        {
++        }
++
++        public CachingFileSystemWrapper(IFileSystem fileSystem, bool skipExistenceCheck = false)
+         {
+             _fileSystem = fileSystem;
++            _skipExistenceCheck = skipExistenceCheck;
+         }
+ 
+         public bool FileOrDirectoryExists(string path)
+@@ -83,6 +90,12 @@ public IEnumerable<string> EnumerateFileSystemEntries(string path, string search
+ 
+         private bool CachedExistenceCheck(string path, Func<string, bool> existenceCheck)
+         {
++            if (_skipExistenceCheck)
++            {
++                _existenceCache[path] = true;
++                return true;
++            }
++
+             return _existenceCache.GetOrAdd(path, existenceCheck);
+         }
+     }

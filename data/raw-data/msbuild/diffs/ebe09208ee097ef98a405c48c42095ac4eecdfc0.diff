@@ -1,0 +1,157 @@
+diff --git a/src/Build.UnitTests/BackEnd/CacheSerialization_Tests.cs b/src/Build.UnitTests/BackEnd/CacheSerialization_Tests.cs
+new file mode 100644
+index 00000000000..b83a10f24b1
+--- /dev/null
++++ b/src/Build.UnitTests/BackEnd/CacheSerialization_Tests.cs
+@@ -0,0 +1,78 @@
++// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System.Collections.Generic;
++using System.IO;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Execution;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++using Xunit;
++
++#nullable disable
++
++namespace Microsoft.Build.UnitTests.BackEnd
++{
++    public class CacheSerialization_Tests
++    {
++        public static IEnumerable<object[]> CacheData {
++            get
++            {
++                var configCache = new ConfigCache();
++                var brq1 = new BuildRequestConfiguration(
++                   1,
++                   new BuildRequestData("path1", new Dictionary<string, string> { ["a1"] = "b1" }, Constants.defaultToolsVersion, new[] { "target1" }, null),
++                   Constants.defaultToolsVersion);
++
++                var brq2 = new BuildRequestConfiguration(
++                    2,
++                    new BuildRequestData("path2", new Dictionary<string, string> { ["a2"] = "b2" }, Constants.defaultToolsVersion, new[] { "target2" }, null),
++                    Constants.defaultToolsVersion);
++                var brq3 = new BuildRequestConfiguration(
++                   3,
++                   new BuildRequestData("path3", new Dictionary<string, string> { ["a3"] = "b3" }, Constants.defaultToolsVersion, new[] { "target3" }, null),
++                   Constants.defaultToolsVersion);
++
++                configCache.AddConfiguration(brq1);
++                configCache.AddConfiguration(brq2);
++                configCache.AddConfiguration(brq3);
++
++                var resultsCache = new ResultsCache();
++                var request1 = new BuildRequest(1, 0, 1, new string[] { "target1" }, null, BuildEventContext.Invalid, null);
++                var request2 = new BuildRequest(2, 0, 2, new string[] { "target2" }, null, BuildEventContext.Invalid, null);
++                var request3 = new BuildRequest(2, 0, 2, new string[] { "target2" }, null, BuildEventContext.Invalid, null);
++
++                resultsCache.AddResult(new BuildResult(request1));
++                resultsCache.AddResult(new BuildResult(request2));
++                resultsCache.AddResult(new BuildResult(request3));
++
++                return new List<object[]>
++                {
++                    new object[] { configCache, resultsCache },
++                };
++            }
++        }
++
++        [Theory]
++        [MemberData(nameof(CacheData))]
++        public void OnlySerializeCacheEntryWithSmallestConfigId(object configCache, object resultsCache)
++        {
++            string cacheFile = null;
++            try
++            {
++                cacheFile = FileUtilities.GetTemporaryFile("MSBuildResultsCache");
++                Assert.Null(CacheSerialization.SerializeCaches((ConfigCache)configCache, (ResultsCache)resultsCache, cacheFile));
++
++                var result = CacheSerialization.DeserializeCaches(cacheFile);
++                Assert.True(result.ConfigCache.HasConfiguration(1));
++                Assert.False(result.ConfigCache.HasConfiguration(2));
++                Assert.False(result.ConfigCache.HasConfiguration(3));
++            }
++            finally
++            {
++                File.Delete(cacheFile);
++            }
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/BuildManager/CacheSerialization.cs b/src/Build/BackEnd/BuildManager/CacheSerialization.cs
+index 4c337378637..950182296ab 100644
+--- a/src/Build/BackEnd/BuildManager/CacheSerialization.cs
++++ b/src/Build/BackEnd/BuildManager/CacheSerialization.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.IO;
++using System.Linq;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Shared;
+ 
+@@ -61,6 +62,27 @@ public static string SerializeCaches(IConfigCache configCache, IResultsCache res
+                             break;
+                     }
+ 
++                    // Avoid creating new config and results caches if no projects were built in violation
++                    // of isolation mode.
++                    if (configCacheToSerialize.Count() > 1)
++                    {
++                        // We need to preserve all configurations to enable the scheduler to dump them and their
++                        // associated requests, so create new caches to serialize storing solely data
++                        // associated with the project specified to be built in isolation (and not any
++                        // data associated with referenced projects needed for said project to complete
++                        // its build).
++                        var tempConfigCacheToSerialize = new ConfigCache();
++
++                        // The project that was built in isolation mode has the
++                        // smallest configuration id.
++                        int smallestCacheConfigId = configCacheToSerialize.GetSmallestConfigId();
++                        tempConfigCacheToSerialize.AddConfiguration(configCacheToSerialize[smallestCacheConfigId]);
++                        configCacheToSerialize = tempConfigCacheToSerialize;
++                        var tempResultsCacheToSerialize = new ResultsCache();
++                        tempResultsCacheToSerialize.AddResult(resultsCacheToSerialize.GetResultsForConfiguration(smallestCacheConfigId));
++                        resultsCacheToSerialize = tempResultsCacheToSerialize;
++                    }
++
+                     translator.Translate(ref configCacheToSerialize);
+                     translator.Translate(ref resultsCacheToSerialize);
+                 }
+diff --git a/src/Build/BackEnd/Components/Caching/ConfigCache.cs b/src/Build/BackEnd/Components/Caching/ConfigCache.cs
+index d2821aee570..7f37c6e6cdf 100644
+--- a/src/Build/BackEnd/Components/Caching/ConfigCache.cs
++++ b/src/Build/BackEnd/Components/Caching/ConfigCache.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Linq;
+ using Microsoft.Build.Shared;
+ 
+ #nullable disable
+@@ -200,6 +201,20 @@ public void ClearConfigurations()
+             }
+         }
+ 
++        /// <summary>
++        /// Gets the smallest configuration id of any configuration
++        /// in this cache.
++        /// </summary>
++        /// <returns>Gets the smallest configuration id of any
++        /// configuration in this cache.</returns>
++        public int GetSmallestConfigId()
++        {
++            lock (_lockObject)
++            {
++                return _configurations.OrderBy(kvp => kvp.Key).FirstOrDefault().Key;
++            }
++        }
++    
+         /// <summary>
+         /// Clears configurations from the configuration cache which have not been explicitly loaded.
+         /// </summary>

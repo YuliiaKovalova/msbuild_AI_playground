@@ -1,0 +1,142 @@
+diff --git a/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs b/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs
+index b51527858c8..42fb20e1be3 100644
+--- a/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs
++++ b/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs
+@@ -200,20 +200,24 @@ private void RunReadLoop(Stream localStream, ManualResetEvent localPacketPumpShu
+             try
+             {
+                 byte[] headerByte = new byte[5];
+-                Task<int> readTask = CommunicationsUtilities.ReadAsync(localStream, headerByte, headerByte.Length).AsTask();
++
++                // Use a separate reuseable wait handle to avoid allocating on Task.AsyncWaitHandle.
++                using AutoResetEvent readTaskEvent = new(false);
++                ValueTask<int> readTask = CommunicationsUtilities.ReadAsync(localStream, headerByte, headerByte.Length, readTaskEvent);
++
++                // Ordering of the wait handles is important. The first signalled wait handle in the array
++                // will be returned by WaitAny if multiple wait handles are signalled. We prefer to have the
++                // terminate event triggered so that we cannot get into a situation where packets are being
++                // spammed to the client and it never gets an opportunity to shutdown.
++                WaitHandle[] handles =
++                [
++                    localPacketPumpShutdownEvent,
++                    readTaskEvent,
++                ];
+ 
+                 bool continueReading = true;
+                 do
+                 {
+-                    // Ordering of the wait handles is important. The first signalled wait handle in the array
+-                    // will be returned by WaitAny if multiple wait handles are signalled. We prefer to have the
+-                    // terminate event triggered so that we cannot get into a situation where packets are being
+-                    // spammed to the client and it never gets an opportunity to shutdown.
+-                    WaitHandle[] handles =
+-                    [
+-                        localPacketPumpShutdownEvent,
+-                        ((IAsyncResult)readTask).AsyncWaitHandle
+-                    ];
+                     int waitId = WaitHandle.WaitAny(handles);
+                     switch (waitId)
+                     {
+@@ -227,7 +231,11 @@ private void RunReadLoop(Stream localStream, ManualResetEvent localPacketPumpShu
+                             {
+                                 // Client recieved a packet header. Read the rest of it.
+                                 int headerBytesRead = 0;
+-                                headerBytesRead = readTask.Result;
++
++                                // Avoid allocating an additional task instance when possible.
++                                // However if a ValueTask runs asynchronously, it must be converted to a Task before consuming the result.
++                                // Otherwise, the result will be undefined when not using async/await.
++                                headerBytesRead = readTask.IsCompleted ? readTask.Result : readTask.AsTask().Result;
+ 
+                                 if ((headerBytesRead != headerByte.Length) && !localPacketPumpShutdownEvent.WaitOne(0))
+                                 {
+@@ -287,7 +295,7 @@ private void RunReadLoop(Stream localStream, ManualResetEvent localPacketPumpShu
+                                 else
+                                 {
+                                     // Start reading the next package header.
+-                                    readTask = CommunicationsUtilities.ReadAsync(localStream, headerByte, headerByte.Length).AsTask();
++                                    readTask = CommunicationsUtilities.ReadAsync(localStream, headerByte, headerByte.Length);
+                                 }
+                             }
+                             break;
+diff --git a/src/Shared/CommunicationsUtilities.cs b/src/Shared/CommunicationsUtilities.cs
+index 0f5cfdfcc23..9e615c930e9 100644
+--- a/src/Shared/CommunicationsUtilities.cs
++++ b/src/Shared/CommunicationsUtilities.cs
+@@ -587,6 +587,19 @@ internal static int ReadIntForHandshake(this PipeStream stream, byte? byteToAcce
+ #nullable disable
+ 
+ #if !TASKHOST
++        /// <summary>
++        /// Allow interop with EAP / Event-based wait handles without additional allocations.
++        /// </summary>
++        internal static async ValueTask<int> ReadAsync(Stream stream, byte[] buffer, int bytesToRead, AutoResetEvent autoResetEvent)
++        {
++            int result = await ReadAsync(stream, buffer, bytesToRead).ConfigureAwait(false);
++
++            // Signal to the caller that the read is complete.
++            _ = autoResetEvent.Set();
++
++            return result;
++        }
++
+         internal static async ValueTask<int> ReadAsync(Stream stream, byte[] buffer, int bytesToRead)
+         {
+             int totalBytesRead = 0;
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index e161ddfa88c..6f86db9c054 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -522,7 +522,9 @@ private void RunReadLoop(BufferedReadStream localReadPipe, NamedPipeServerStream
+             CommunicationsUtilities.Trace("Entering read loop.");
+             byte[] headerByte = new byte[5];
+ #if !TASKHOST
+-            Task<int> readTask = CommunicationsUtilities.ReadAsync(localReadPipe, headerByte, headerByte.Length).AsTask();
++            // Use a separate reuseable wait handle to avoid allocating on Task.AsyncWaitHandle.
++            AutoResetEvent readTaskEvent = new(false);
++            ValueTask<int> readTask = CommunicationsUtilities.ReadAsync(localReadPipe, headerByte, headerByte.Length, readTaskEvent);
+ #else
+             IAsyncResult result = localReadPipe.BeginRead(headerByte, 0, headerByte.Length, null, null);
+ #endif
+@@ -532,7 +534,7 @@ private void RunReadLoop(BufferedReadStream localReadPipe, NamedPipeServerStream
+             WaitHandle[] handles = new WaitHandle[]
+             {
+ #if !TASKHOST
+-                ((IAsyncResult)readTask).AsyncWaitHandle,
++                readTaskEvent,
+ #else
+                 result.AsyncWaitHandle,
+ #endif
+@@ -552,7 +554,10 @@ private void RunReadLoop(BufferedReadStream localReadPipe, NamedPipeServerStream
+                             try
+                             {
+ #if !TASKHOST
+-                                bytesRead = readTask.Result;
++                                // Avoid allocating an additional task instance when possible.
++                                // However if a ValueTask runs asynchronously, it must be converted to a Task before consuming the result.
++                                // Otherwise, the result will be undefined when not using async/await.
++                                bytesRead = readTask.IsCompleted ? readTask.Result : readTask.AsTask().Result;
+ #else
+                                 bytesRead = localReadPipe.EndRead(result);
+ #endif
+@@ -612,8 +617,7 @@ private void RunReadLoop(BufferedReadStream localReadPipe, NamedPipeServerStream
+                             }
+ 
+ #if !TASKHOST
+-                            readTask = CommunicationsUtilities.ReadAsync(localReadPipe, headerByte, headerByte.Length).AsTask();
+-                            handles[0] = ((IAsyncResult)readTask).AsyncWaitHandle;
++                            readTask = CommunicationsUtilities.ReadAsync(localReadPipe, headerByte, headerByte.Length, readTaskEvent);
+ #else
+                             result = localReadPipe.BeginRead(headerByte, 0, headerByte.Length, null, null);
+                             handles[0] = result.AsyncWaitHandle;
+@@ -679,8 +683,8 @@ private void RunReadLoop(BufferedReadStream localReadPipe, NamedPipeServerStream
+             while (!exitLoop);
+         }
+ 
+-#endregion
++        #endregion
+ 
+-#endregion
++        #endregion
+     }
+ }

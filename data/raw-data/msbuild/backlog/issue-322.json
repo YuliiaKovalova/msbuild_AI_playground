@@ -1,0 +1,75 @@
+{
+  "number": 322,
+  "title": "Up to date checks check modification time of symlink, not its target",
+  "body": "This came up internally at Microsoft.  One of our teams makes heavy use of creating symlinks and using them in the build.  This causes problems when the symlink is newly created, but its target is old.  In that case, we unnecessarily choose to rebuild.\n\nFrom that internal thread:\n\n> You must examine the timestamp of the actual file, not the symlink file.  (For managed code, this means using File.GetLastWriteTime instead of FileInfo.GetLastWriteTime.  For native code, it means using GetFileTime instead of GetFileAttributesEx.)\n\n[`IsUpToDate`](https://github.com/Microsoft/msbuild/blob/9c260bc40fd23ba68c7232462fa6880f4ebc4854/src/Utilities/TrackedDependencies/CanonicalTrackedInputFiles.cs#L499) does the check through `NativeMethods.GetLastWriteTimeUtc`, which does indeed [call](https://github.com/Microsoft/msbuild/blob/9c260bc40fd23ba68c7232462fa6880f4ebc4854/src/Utilities/TrackedDependencies/NativeMethods.cs#L32) `GetFileAttributesEx`.\n",
+  "state": "CLOSED",
+  "createdAt": "2015-10-27T20:53:44Z",
+  "updatedAt": "2024-02-21T17:30:05Z",
+  "closedAt": "2016-06-27T19:07:04Z",
+  "author": {
+    "login": "rainersigwald"
+  },
+  "labels": [
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": [
+      {
+        "login": "rainersigwald"
+      }
+    ]
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "We should do this for Dev15 (not a future Update). Setting up for grabs. We will need to make sure this change is tested fully to ensure no regressions.\n",
+        "createdAt": "2015-11-04T22:36:20Z",
+        "updatedAt": "2015-11-04T22:36:20Z",
+        "author": {
+          "login": "AndyGerlicher"
+        }
+      },
+      {
+        "body": "Incremental build is handled in two ways in MSBuild:\n- Normal `Target` based `Inputs`/`Outputs`: The aptly named [`TargetUpToDateChecker`](https://github.com/Microsoft/msbuild/blob/8b488bd508807f415193fe38d5084cd590931cfb/src/XMakeBuildEngine/BackEnd/Components/RequestBuilder/TargetUpToDateChecker.cs#L1236-L1295) handles this--it compares `FileInfo.LastWriteTime`, so it sees the symlink's time.\n- Tracker-based incrementality: This is controlled by [`IsUpToDate`](https://github.com/Microsoft/msbuild/blob/9c260bc40fd23ba68c7232462fa6880f4ebc4854/src/Utilities/TrackedDependencies/CanonicalTrackedInputFiles.cs#L499), linked above. That calls out to the native method that gets the symlink's time.\n\nA solution to this should affect both mechanisms (or maybe even _unify_ the mechanisms :astonished:). It should also introduce tests that validate the symlink behavior.\n",
+        "createdAt": "2016-05-13T21:49:42Z",
+        "updatedAt": "2016-05-13T21:49:42Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "It looks like `File.GetLastWriteTimeUtc` does _not_ read through to the symlink target, so I'm going to have to try to `CreateFile`+`GetFileTime`, explicitly without `FILE_FLAG_OPEN_REPARSE_POINT`.\n",
+        "createdAt": "2016-05-20T21:46:16Z",
+        "updatedAt": "2016-05-20T21:46:16Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "After Target-level and FileTracker-style incrementality, the big remaining question for me is Copy with `SkipUnchangedFiles`.\n\nI wasn't quite sure what the current behavior was, so I explored it a bit, using this simple `symlink_copy.proj`:\n\n``` xml\n<Project xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">\n  <Target Name=\"b\">\n    <Copy SourceFiles=\"symlink.txt\"\n          DestinationFiles=\"destination.txt\"\n          SkipUnchangedFiles=\"$(copyIncremental)\" />\n  </Target>\n</Project>\n```\n\nA copy through a symlink creates a (real) output file that matches the symlink's target timestamp:\n\n``` ShellSession\nD:\\play\\symlink_copy>dir\n Volume in drive D is Data\n Volume Serial Number is DE97-EB96\n\n Directory of D:\\play\\symlink_copy\n\n06/14/2016  10:05 AM    <DIR>          .\n06/14/2016  10:05 AM    <DIR>          ..\n06/14/2016  09:57 AM                13 real_source.txt\n06/14/2016  10:01 AM    <SYMLINK>      symlink.txt [real_source.txt]\n06/14/2016  09:40 AM               254 symlink_copy.proj\n               3 File(s)            267 bytes\n               2 Dir(s)  10,601,353,052,160 bytes free\n\nD:\\play\\symlink_copy>msbuild symlink_copy.proj\nMicrosoft (R) Build Engine version 14.0.25123.0\nCopyright (C) Microsoft Corporation. All rights reserved.\n\nBuild started 6/14/2016 10:06:24 AM.\nProject \"D:\\play\\symlink_copy\\symlink_copy.proj\" on node 1 (default targets).\nb:\n  Copying file from \"symlink.txt\" to \"destination.txt\".\nDone Building Project \"D:\\play\\symlink_copy\\symlink_copy.proj\" (default targets).\n\n\nBuild succeeded.\n    0 Warning(s)\n    0 Error(s)\n\nTime Elapsed 00:00:00.01\n\nD:\\play\\symlink_copy>dir\n Volume in drive D is Data\n Volume Serial Number is DE97-EB96\n\n Directory of D:\\play\\symlink_copy\n\n06/14/2016  10:06 AM    <DIR>          .\n06/14/2016  10:06 AM    <DIR>          ..\n06/14/2016  09:57 AM                13 destination.txt\n06/14/2016  09:57 AM                13 real_source.txt\n06/14/2016  10:01 AM    <SYMLINK>      symlink.txt [real_source.txt]\n06/14/2016  09:40 AM               254 symlink_copy.proj\n               4 File(s)            280 bytes\n               2 Dir(s)  10,601,353,445,376 bytes free\n```\n\n(note `destination.txt` matches `real_source.txt` even though the project mentions only `symlink.txt`)\n\nWith incremental, the source (symlink) is newer than the destination, so the copy happens again:\n\n``` ShellSession\nD:\\play\\symlink_copy>msbuild symlink_copy.proj /p:copyIncremental=true\nMicrosoft (R) Build Engine version 14.0.25123.0\nCopyright (C) Microsoft Corporation. All rights reserved.\n\nBuild started 6/14/2016 10:11:14 AM.\nProject \"D:\\play\\symlink_copy\\symlink_copy.proj\" on node 1 (default targets).\nb:\n  Copying file from \"symlink.txt\" to \"destination.txt\".\nDone Building Project \"D:\\play\\symlink_copy\\symlink_copy.proj\" (default targets).\n\n\nBuild succeeded.\n    0 Warning(s)\n    0 Error(s)\n\nTime Elapsed 00:00:00.03\n```\n\nThat is suboptimal, but potentially nonfatal since it won't cause a rebuild cascade--the \"new\" output file has the same timestamp as the one from the previous run.\n",
+        "createdAt": "2016-06-14T16:01:52Z",
+        "updatedAt": "2016-06-14T16:01:52Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "(Partial) inventory of other places that call suspicious APIs:\n- `Shared\\FileUtilities.cs` has a few calls to `GetFileAttributesEx` but doesn't look at date fields\n- `NativeMethodsShared.GetLastWriteDirectoryUtcTime` calls `GetFileAttributesEx` but only on a directory.\n- Many tests, which should be fine since they don't operate on symlinks.\n- The `Touch` task sets metadata using `File.SetLastWriteTime` but that's OK because it _should_ operate on the symlink.\n- RAR has a `GetLastWriteTime` delegate, but it's [correctly set](https://github.com/Microsoft/msbuild/blob/651b523f28ac351b96b9d89c50e41c6403e99c52/src/XMakeTasks/AssemblyDependency/ResolveAssemblyReference.cs#L2903-L2903) to use the (now patched) `NativeMethodsShared.GetLastWriteFileUtcTime`.\n- The scheduler uses a `FileInfo` to [sort by size](https://github.com/Microsoft/msbuild/blob/651b523f28ac351b96b9d89c50e41c6403e99c52/src/XMakeBuildEngine/BackEnd/Components/Scheduler/Scheduler.cs#L969-L968) as a rough approximation of complexity, but if it's wrong no big deal.\n- `GenerateResources` uses a lot of `FileInfo` manipulations.\n\nThe last one is the only one I'm worried about.\n",
+        "createdAt": "2016-06-14T22:05:13Z",
+        "updatedAt": "2016-06-14T22:05:13Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Filed #703 to track possible future fixups in `Copy`.\n",
+        "createdAt": "2016-06-16T14:53:02Z",
+        "updatedAt": "2016-06-16T14:53:02Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      }
+    ]
+  }
+}

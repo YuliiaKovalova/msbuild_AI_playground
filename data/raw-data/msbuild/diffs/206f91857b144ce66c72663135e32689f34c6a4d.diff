@@ -1,0 +1,427 @@
+diff --git a/src/Build.OM.UnitTests/Microsoft.Build.Engine.OM.UnitTests.csproj b/src/Build.OM.UnitTests/Microsoft.Build.Engine.OM.UnitTests.csproj
+index 9760dcf7a92..51d86b2f804 100644
+--- a/src/Build.OM.UnitTests/Microsoft.Build.Engine.OM.UnitTests.csproj
++++ b/src/Build.OM.UnitTests/Microsoft.Build.Engine.OM.UnitTests.csproj
+@@ -1,4 +1,4 @@
+-﻿<Project Sdk="Microsoft.NET.Sdk">
++<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <Import Project="..\Shared\FileSystemSources.proj" />
+   <Import Project="..\Shared\DebuggingSources.proj" />
+@@ -78,8 +78,8 @@
+     <Compile Include="..\Shared\UnitTests\TestData\GlobbingTestData.cs">
+       <Link>TestData\GlobbingTestData.cs</Link>
+     </Compile>
++    <Compile Include="..\Shared\ProcessExtensions.cs" />
+     <Compile Include="..\UnitTests.Shared\RunnerUtilities.cs" />
+-
+     <None Include="..\Shared\UnitTests\App.config">
+       <Link>App.config</Link>
+       <SubType>Designer</SubType>
+diff --git a/src/Build.OM.UnitTests/NugetRestoreTests.cs b/src/Build.OM.UnitTests/NugetRestoreTests.cs
+index 3c75c36b772..daf8cbea8d0 100644
+--- a/src/Build.OM.UnitTests/NugetRestoreTests.cs
++++ b/src/Build.OM.UnitTests/NugetRestoreTests.cs
+@@ -10,8 +10,6 @@
+ #endif
+ using Xunit.Abstractions;
+ 
+-#nullable disable
+-
+ namespace Microsoft.Build.Engine.OM.UnitTests
+ {
+     public sealed class NugetRestoreTests
+@@ -29,7 +27,7 @@ public NugetRestoreTests(ITestOutputHelper output)
+         [Fact]
+         public void TestOldNuget()
+         {
+-            string msbuildExePath = Path.GetDirectoryName(RunnerUtilities.PathToCurrentlyRunningMsBuildExe);
++            string msbuildExePath = Path.GetDirectoryName(RunnerUtilities.PathToCurrentlyRunningMsBuildExe)!;
+             using TestEnvironment testEnvironment = TestEnvironment.Create();
+             TransientTestFolder folder = testEnvironment.CreateFolder(createFolder: true);
+             // The content of the solution isn't known to matter, but having a custom solution makes it easier to add requirements should they become evident.
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 4233e1ddffe..23f7853ed34 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -1,4 +1,4 @@
+-﻿// Copyright (c) Microsoft. All rights reserved.
++// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using System;
+@@ -416,7 +416,7 @@ private bool TryConnectToServer(int timeout)
+                 CommunicationsUtilities.Trace("Reading handshake from pipe {0}", _pipeName);
+ 
+ #if NETCOREAPP2_1_OR_GREATER || MONO
+-                _nodeStream.ReadEndOfHandshakeSignal(false, 1000); 
++                _nodeStream.ReadEndOfHandshakeSignal(false, 1000);
+ #else
+                 _nodeStream.ReadEndOfHandshakeSignal(false);
+ #endif
+diff --git a/src/Framework/Microsoft.Build.Framework.csproj b/src/Framework/Microsoft.Build.Framework.csproj
+index e24a13ff151..b4c3190f3b4 100644
+--- a/src/Framework/Microsoft.Build.Framework.csproj
++++ b/src/Framework/Microsoft.Build.Framework.csproj
+@@ -25,6 +25,11 @@
+     <Reference Include="System.Xaml" />
+   </ItemGroup>
+ 
++  <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETStandard'">
++    <!-- Need Win32 API on .NET Standard to ping registry for some methods in ToolLocationHelper -->
++    <PackageReference Include="Microsoft.Win32.Registry" />
++  </ItemGroup>
++
+   <ItemGroup>
+     <Compile Include="..\Shared\Constants.cs">
+       <Link>Shared\Constants.cs</Link>
+diff --git a/src/MSBuild.UnitTests/MSBuildServer_Tests.cs b/src/MSBuild.UnitTests/MSBuildServer_Tests.cs
+new file mode 100644
+index 00000000000..a7ecdde6176
+--- /dev/null
++++ b/src/MSBuild.UnitTests/MSBuildServer_Tests.cs
+@@ -0,0 +1,217 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Diagnostics;
++using System.Reflection;
++using System.Text.RegularExpressions;
++using System.Threading;
++using System.Threading.Tasks;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++using Microsoft.Build.UnitTests;
++using Microsoft.Build.UnitTests.Shared;
++#if NETFRAMEWORK
++using Microsoft.IO;
++#else
++using System.IO;
++#endif
++using Shouldly;
++using Xunit;
++using Xunit.Abstractions;
++
++namespace Microsoft.Build.Engine.UnitTests
++{
++    public class SleepingTask : Microsoft.Build.Utilities.Task
++    {
++        public int SleepTime { get; set; }
++
++        /// <summary>
++        /// Sleep for SleepTime milliseconds.
++        /// </summary>
++        /// <returns>Success on success.</returns>
++        public override bool Execute()
++        {
++            Thread.Sleep(SleepTime);
++            return !Log.HasLoggedErrors;
++        }
++    }
++
++    public class ProcessIdTask : Microsoft.Build.Utilities.Task
++    {
++        [Output]
++        public int Pid { get; set; }
++
++        /// <summary>
++        /// Log the id for this process.
++        /// </summary>
++        /// <returns></returns>
++        public override bool Execute()
++        {
++            Pid = Process.GetCurrentProcess().Id;
++            return true;
++        }
++    }
++
++    public class MSBuildServer_Tests : IDisposable
++    {
++        private readonly ITestOutputHelper _output;
++        private readonly TestEnvironment _env;
++        private static string printPidContents = @$"
++<Project>
++<UsingTask TaskName=""ProcessIdTask"" AssemblyFile=""{Assembly.GetExecutingAssembly().Location}"" />
++    <Target Name='AccessPID'>
++        <ProcessIdTask>
++            <Output PropertyName=""PID"" TaskParameter=""Pid"" />
++        </ProcessIdTask>
++        <Message Text=""Server ID is $(PID)"" Importance=""High"" />
++    </Target>
++</Project>";
++        private static string sleepingTaskContents = @$"
++<Project>
++<UsingTask TaskName=""SleepingTask"" AssemblyFile=""{Assembly.GetExecutingAssembly().Location}"" />
++    <Target Name='Sleep'>
++        <SleepingTask SleepTime=""100000"" />
++    </Target>
++</Project>";
++
++        public MSBuildServer_Tests(ITestOutputHelper output)
++        {
++            _output = output;
++            _env = TestEnvironment.Create(_output);
++        }
++
++        public void Dispose() => _env.Dispose();
++
++        [Fact]
++        public void MSBuildServerTest()
++        {
++            TransientTestFile project = _env.CreateFile("testProject.proj", printPidContents);
++            _env.SetEnvironmentVariable("MSBUILDUSESERVER", "1");
++            string output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out bool success, false, _output);
++            success.ShouldBeTrue();
++            int pidOfInitialProcess = ParseNumber(output, "Process ID is ");
++            int pidOfServerProcess = ParseNumber(output, "Server ID is ");
++            pidOfInitialProcess.ShouldNotBe(pidOfServerProcess, "We started a server node to execute the target rather than running it in-proc, so its pid should be different.");
++
++            output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++            success.ShouldBeTrue();
++            int newPidOfInitialProcess = ParseNumber(output, "Process ID is ");
++            newPidOfInitialProcess.ShouldNotBe(pidOfServerProcess, "We started a server node to execute the target rather than running it in-proc, so its pid should be different.");
++            newPidOfInitialProcess.ShouldNotBe(pidOfInitialProcess, "Process started by two MSBuild executions should be different.");
++            pidOfServerProcess.ShouldBe(ParseNumber(output, "Server ID is "), "Node used by both the first and second build should be the same.");
++
++            // Prep to kill the long-lived task we're about to start.
++            Task t = Task.Run(() =>
++            {
++                // Wait for the long-lived task to start
++                // If this test seems to fail randomly, increase this time.
++                Thread.Sleep(1000);
++
++                // Kill the server
++                ProcessExtensions.KillTree(Process.GetProcessById(pidOfServerProcess), 1000);
++            });
++
++            // Start long-lived task execution
++            TransientTestFile sleepProject = _env.CreateFile("napProject.proj", sleepingTaskContents);
++            RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, sleepProject.Path, out _);
++
++            t.Wait();
++
++            // Ensure that a new build can still succeed and that its server node is different.
++            output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++            success.ShouldBeTrue();
++            newPidOfInitialProcess = ParseNumber(output, "Process ID is ");
++            int newServerProcessId = ParseNumber(output, "Server ID is ");
++            newPidOfInitialProcess.ShouldNotBe(pidOfInitialProcess, "Process started by two MSBuild executions should be different.");
++            newPidOfInitialProcess.ShouldNotBe(newServerProcessId, "We started a server node to execute the target rather than running it in-proc, so its pid should be different.");
++            pidOfServerProcess.ShouldNotBe(newServerProcessId, "Node used by both the first and second build should not be the same.");
++        }
++
++        [Fact]
++        public void VerifyMixedLegacyBehavior()
++        {
++            TransientTestFile project = _env.CreateFile("testProject.proj", printPidContents);
++            _env.SetEnvironmentVariable("MSBUILDUSESERVER", "1");
++
++            string output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out bool success, false, _output);
++            success.ShouldBeTrue();
++            int pidOfInitialProcess = ParseNumber(output, "Process ID is ");
++            int pidOfServerProcess = ParseNumber(output, "Server ID is ");
++            pidOfInitialProcess.ShouldNotBe(pidOfServerProcess, "We started a server node to execute the target rather than running it in-proc, so its pid should be different.");
++
++            Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "");
++            output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++            success.ShouldBeTrue();
++            pidOfInitialProcess = ParseNumber(output, "Process ID is ");
++            int pidOfNewserverProcess = ParseNumber(output, "Server ID is ");
++            pidOfInitialProcess.ShouldBe(pidOfNewserverProcess, "We did not start a server node to execute the target, so its pid should be the same.");
++
++            Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "1");
++            output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++            success.ShouldBeTrue();
++            pidOfInitialProcess = ParseNumber(output, "Process ID is ");
++            pidOfNewserverProcess = ParseNumber(output, "Server ID is ");
++            pidOfInitialProcess.ShouldNotBe(pidOfNewserverProcess, "We started a server node to execute the target rather than running it in-proc, so its pid should be different.");
++            pidOfServerProcess.ShouldBe(pidOfNewserverProcess, "Server node should be the same as from earlier.");
++        }
++
++        [Fact]
++        public void BuildsWhileBuildIsRunningOnServer()
++        {
++            _env.SetEnvironmentVariable("MSBUILDUSESERVER", "1");
++            TransientTestFile project = _env.CreateFile("testProject.proj", printPidContents);
++            TransientTestFile sleepProject = _env.CreateFile("napProject.proj", sleepingTaskContents);
++
++            int pidOfServerProcess = -1;
++            Task? t = null;
++            try
++            {
++                // Start a server node and find its PID.
++                string output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out bool success, false, _output);
++                pidOfServerProcess = ParseNumber(output, "Server ID is ");
++
++                t = Task.Run(() =>
++                {
++                    RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, sleepProject.Path, out _, false, _output);
++                });
++
++                // The server will soon be in use; make sure we don't try to use it before that happens.
++                Thread.Sleep(1000);
++
++                Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "0");
++
++                output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++                success.ShouldBeTrue();
++                ParseNumber(output, "Server ID is ").ShouldBe(ParseNumber(output, "Process ID is "), "There should not be a server node for this build.");
++
++                Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "1");
++
++                output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++                success.ShouldBeTrue();
++                pidOfServerProcess.ShouldNotBe(ParseNumber(output, "Server ID is "), "The server should be otherwise occupied.");
++                pidOfServerProcess.ShouldNotBe(ParseNumber(output, "Process ID is "), "There should not be a server node for this build.");
++                ParseNumber(output, "Server ID is ").ShouldBe(ParseNumber(output, "Process ID is "), "Process ID and Server ID should coincide.");
++            }
++            finally
++            {
++                if (pidOfServerProcess > -1)
++                {
++                    ProcessExtensions.KillTree(Process.GetProcessById(pidOfServerProcess), 1000);
++                }
++
++                if (t is not null)
++                {
++                    t.Wait();
++                }
++            }
++        }
++
++        private int ParseNumber(string searchString, string toFind)
++        {
++            Regex regex = new(@$"{toFind}(\d+)");
++            Match match = regex.Match(searchString);
++            return int.Parse(match.Groups[1].Value);
++        }
++    }
++}
+diff --git a/src/MSBuild.UnitTests/Microsoft.Build.CommandLine.UnitTests.csproj b/src/MSBuild.UnitTests/Microsoft.Build.CommandLine.UnitTests.csproj
+index e301c3a16b3..ea90a86c84e 100644
+--- a/src/MSBuild.UnitTests/Microsoft.Build.CommandLine.UnitTests.csproj
++++ b/src/MSBuild.UnitTests/Microsoft.Build.CommandLine.UnitTests.csproj
+@@ -28,6 +28,7 @@
+     <Compile Include="..\Shared\RegistryDelegates.cs">
+       <Link>RegistryDelegates.cs</Link>
+     </Compile>
++    <Compile Include="..\Shared\ProcessExtensions.cs" />
+     <Compile Include="..\Shared\RegistryHelper.cs">
+       <Link>RegistryHelper.cs</Link>
+     </Compile>
+diff --git a/src/Tasks.UnitTests/Microsoft.Build.Tasks.UnitTests.csproj b/src/Tasks.UnitTests/Microsoft.Build.Tasks.UnitTests.csproj
+index e0f20bd2eec..e40af2fed60 100644
+--- a/src/Tasks.UnitTests/Microsoft.Build.Tasks.UnitTests.csproj
++++ b/src/Tasks.UnitTests/Microsoft.Build.Tasks.UnitTests.csproj
+@@ -57,6 +57,7 @@
+     <Compile Include="..\Shared\UnitTests\TestEnvironment.cs">
+       <Link>TestEnvironment.cs</Link>
+     </Compile>
++    <Compile Include="..\Shared\ProcessExtensions.cs" />
+     <Compile Include="..\UnitTests.Shared\RunnerUtilities.cs" />
+ 
+     <EmbeddedResource Include="SampleResx" />
+diff --git a/src/UnitTests.Shared/RunnerUtilities.cs b/src/UnitTests.Shared/RunnerUtilities.cs
+index 7911ea669d6..366b1bc4280 100644
+--- a/src/UnitTests.Shared/RunnerUtilities.cs
++++ b/src/UnitTests.Shared/RunnerUtilities.cs
+@@ -1,5 +1,4 @@
+ ﻿using Microsoft.Build.Shared;
+-using Microsoft.Build.Utilities;
+ using System;
+ using System.Diagnostics;
+ using Xunit.Abstractions;
+@@ -18,7 +17,7 @@ public static class RunnerUtilities
+         /// </summary>
+         public static string ExecMSBuild(string msbuildParameters, out bool successfulExit, ITestOutputHelper outputHelper = null)
+         {
+-            return ExecMSBuild(PathToCurrentlyRunningMsBuildExe, msbuildParameters, out successfulExit, false, outputHelper);
++            return ExecMSBuild(PathToCurrentlyRunningMsBuildExe, msbuildParameters, out successfulExit, outputHelper: outputHelper);
+         }
+ 
+         /// <summary>
+@@ -72,12 +71,15 @@ private static string ResolveRuntimeExecutableName()
+         /// </summary>
+         public static string RunProcessAndGetOutput(string process, string parameters, out bool successfulExit, bool shellExecute = false, ITestOutputHelper outputHelper = null)
+         {
++            outputHelper?.WriteLine($"{DateTime.Now.ToString("hh:mm:ss tt")}:RunProcessAndGetOutput:1");
++
+             if (shellExecute)
+             {
+                 // we adjust the psi data manually because on net core using ProcessStartInfo.UseShellExecute throws NotImplementedException
+                 AdjustForShellExecution(ref process, ref parameters);
+             }
+ 
++            outputHelper?.WriteLine($"{DateTime.Now.ToString("hh:mm:ss tt")}:RunProcessAndGetOutput:2");
+             var psi = new ProcessStartInfo(process)
+             {
+                 CreateNoWindow = true,
+@@ -87,11 +89,13 @@ public static string RunProcessAndGetOutput(string process, string parameters, o
+                 UseShellExecute = false,
+                 Arguments = parameters
+             };
+-            var output = string.Empty;
++            string output = string.Empty;
++            int pid = -1;
+ 
++            outputHelper?.WriteLine($"{DateTime.Now.ToString("hh:mm:ss tt")}:RunProcessAndGetOutput:3");
+             using (var p = new Process { EnableRaisingEvents = true, StartInfo = psi })
+             {
+-                p.OutputDataReceived += delegate (object sender, DataReceivedEventArgs args)
++                DataReceivedEventHandler handler = delegate (object sender, DataReceivedEventArgs args)
+                 {
+                     if (args != null)
+                     {
+@@ -99,13 +103,8 @@ public static string RunProcessAndGetOutput(string process, string parameters, o
+                     }
+                 };
+ 
+-                p.ErrorDataReceived += delegate (object sender, DataReceivedEventArgs args)
+-                {
+-                    if (args != null)
+-                    {
+-                        output += args.Data + "\r\n";
+-                    }
+-                };
++                p.OutputDataReceived += handler;
++                p.ErrorDataReceived += handler;
+ 
+                 outputHelper?.WriteLine("Executing [{0} {1}]", process, parameters);
+                 Console.WriteLine("Executing [{0} {1}]", process, parameters);
+@@ -114,19 +113,35 @@ public static string RunProcessAndGetOutput(string process, string parameters, o
+                 p.BeginOutputReadLine();
+                 p.BeginErrorReadLine();
+                 p.StandardInput.Dispose();
++
++                if (!p.WaitForExit(30_000))
++                {
++                    // Let's not create a unit test for which we need more than 30 sec to execute.
++                    // Please consider carefully if you would like to increase the timeout.
++                    p.KillTree(1000);
++                    throw new TimeoutException($"Test failed due to timeout: process {p.Id} is active for more than 30 sec.");
++                }
++
++                // We need the WaitForExit call without parameters because our processing of output/error streams is not synchronous.
++                // See https://docs.microsoft.com/en-us/dotnet/api/system.diagnostics.process.waitforexit?view=net-6.0#system-diagnostics-process-waitforexit(system-int32).
++                // The overload WaitForExit() waits for the error and output to be handled. The WaitForExit(int timeout) overload does not, so we could lose the data.
+                 p.WaitForExit();
+ 
++                pid = p.Id;
+                 successfulExit = p.ExitCode == 0;
+             }
+ 
+             outputHelper?.WriteLine("==== OUTPUT ====");
+             outputHelper?.WriteLine(output);
++            outputHelper?.WriteLine("Process ID is " + pid + "\r\n");
+             outputHelper?.WriteLine("==============");
+ 
+             Console.WriteLine("==== OUTPUT ====");
+             Console.WriteLine(output);
++            Console.WriteLine("Process ID is " + pid + "\r\n");
+             Console.WriteLine("==============");
+ 
++            output += "Process ID is " + pid + "\r\n";
+             return output;
+         }
+     }

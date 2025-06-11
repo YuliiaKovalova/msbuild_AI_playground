@@ -1,0 +1,1342 @@
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+index 3db0eeb4a3a..a6e37a369bd 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+@@ -3,7 +3,6 @@
+ 
+ using System;
+ using System.Collections.Generic;
+-using System.Diagnostics;
+ using System.Linq;
+ using System.Reflection;
+ using System.Threading;
+@@ -100,22 +99,17 @@ public static async Task<ProjectCacheService> FromDescriptorAsync(
+         // TODO: remove vsWorkaroundOverrideDescriptor after we change VS to set the cache descriptor via build parameters.
+         private async Task BeginBuildAsync(ProjectCacheDescriptor? vsWorkaroundOverrideDescriptor = null)
+         {
+-            var logger = new LoggingServiceToPluginLoggerAdapter(
++            BuildEventContext buildEventContext = BuildEventContext.Invalid;
++            BuildEventFileInfo buildEventFileInfo = BuildEventFileInfo.Empty;
++            var pluginLogger = new LoggingServiceToPluginLoggerAdapter(
+                 _loggingService,
+-                BuildEventContext.Invalid,
+-                BuildEventFileInfo.Empty);
++                buildEventContext,
++                buildEventFileInfo);
+ 
+             try
+             {
+                 SetState(ProjectCacheServiceState.BeginBuildStarted);
+-
+-                logger.LogMessage("Initializing project cache plugin", MessageImportance.Low);
+-                var timer = Stopwatch.StartNew();
+-
+-                if (_projectCacheDescriptor.VsWorkaround)
+-                {
+-                    logger.LogMessage("Running project cache with Visual Studio workaround");
+-                }
++                _loggingService.LogComment(buildEventContext, MessageImportance.Low, "ProjectCacheBeginBuild");
+ 
+                 var projectDescriptor = vsWorkaroundOverrideDescriptor ?? _projectCacheDescriptor;
+                 await _projectCachePlugin.BeginBuildAsync(
+@@ -124,12 +118,9 @@ await _projectCachePlugin.BeginBuildAsync(
+                         new DefaultMSBuildFileSystem(),
+                         projectDescriptor.ProjectGraph,
+                         projectDescriptor.EntryPoints),
+-                    logger,
++                    pluginLogger,
+                     _cancellationToken);
+ 
+-                timer.Stop();
+-                logger.LogMessage($"Finished initializing project cache plugin in {timer.Elapsed.TotalMilliseconds} ms", MessageImportance.Low);
+-
+                 SetState(ProjectCacheServiceState.BeginBuildFinished);
+             }
+             catch (Exception e)
+@@ -137,7 +128,7 @@ await _projectCachePlugin.BeginBuildAsync(
+                 HandlePluginException(e, nameof(ProjectCachePluginBase.BeginBuildAsync));
+             }
+ 
+-            if (logger.HasLoggedErrors)
++            if (pluginLogger.HasLoggedErrors)
+             {
+                 ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheInitializationFailed");
+             }
+@@ -297,7 +288,7 @@ LateInitializationForVSWorkaroundCompleted is null ||
+                 CacheResult cacheResult;
+                 try
+                 {
+-                    cacheResult = await GetCacheResultAsync(buildRequest, buildEventContext);
++                    cacheResult = await GetCacheResultAsync(buildRequest, cacheRequest.Configuration, buildEventContext);
+                 }
+                 catch (Exception ex)
+                 {
+@@ -464,7 +455,7 @@ static bool MSBuildStringIsTrue(string msbuildString) =>
+                 ConversionUtilities.ConvertStringToBool(msbuildString, nullOrWhitespaceIsFalse: true);
+         }
+ 
+-        private async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildRequest, BuildEventContext buildEventContext)
++        private async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildRequest, BuildRequestConfiguration buildRequestConfiguration, BuildEventContext buildEventContext)
+         {
+             lock (this)
+             {
+@@ -479,62 +470,94 @@ private async Task<CacheResult> GetCacheResultAsync(BuildRequestData buildReques
+ 
+             ErrorUtilities.VerifyThrowInternalNull(buildRequest.ProjectInstance, nameof(buildRequest.ProjectInstance));
+ 
+-            var queryDescription = $"{buildRequest.ProjectFullPath}" +
+-                                   $"\n\tTargets:[{string.Join(", ", buildRequest.TargetNames)}]" +
+-                                   $"\n\tGlobal Properties: {{{string.Join(",", buildRequest.GlobalProperties.Select(kvp => $"{kvp.Name}={kvp.EvaluatedValue}"))}}}";
+-
+             var buildEventFileInfo = new BuildEventFileInfo(buildRequest.ProjectFullPath);
+-            var logger = new LoggingServiceToPluginLoggerAdapter(
++            var pluginLogger = new LoggingServiceToPluginLoggerAdapter(
+                 _loggingService,
+                 buildEventContext,
+                 buildEventFileInfo);
+ 
+-            logger.LogMessage(
+-                "\n====== Querying project cache for project " + queryDescription,
+-                MessageImportance.High);
++            string? targetNames = buildRequest.TargetNames != null && buildRequest.TargetNames.Count > 0
++                ? string.Join(", ", buildRequest.TargetNames)
++                : null;
++            if (string.IsNullOrEmpty(targetNames))
++            {
++                _loggingService.LogComment(buildEventContext, MessageImportance.Normal, "ProjectCacheQueryStartedWithDefaultTargets", buildRequest.ProjectFullPath);
++            }
++            else
++            {
++                _loggingService.LogComment(buildEventContext, MessageImportance.Normal, "ProjectCacheQueryStartedWithTargetNames", buildRequest.ProjectFullPath, targetNames);
++            }
+ 
+             CacheResult cacheResult = null!;
+             try
+             {
+-                cacheResult = await _projectCachePlugin.GetCacheResultAsync(buildRequest, logger, _cancellationToken);
++                cacheResult = await _projectCachePlugin.GetCacheResultAsync(buildRequest, pluginLogger, _cancellationToken);
+             }
+             catch (Exception e)
+             {
+                 HandlePluginException(e, nameof(ProjectCachePluginBase.GetCacheResultAsync));
+             }
+ 
+-            if (logger.HasLoggedErrors || cacheResult.ResultType == CacheResultType.None)
++            if (pluginLogger.HasLoggedErrors || cacheResult.ResultType == CacheResultType.None)
+             {
+-                ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheQueryFailed", queryDescription);
++                ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheQueryFailed", buildRequest.ProjectFullPath);
+             }
+ 
+-            var message = $"------  Plugin result: {cacheResult.ResultType}.";
+-
+             switch (cacheResult.ResultType)
+             {
+                 case CacheResultType.CacheHit:
+-                    message += " Skipping project.";
++                    if (string.IsNullOrEmpty(targetNames))
++                    {
++                        _loggingService.LogComment(buildEventContext, MessageImportance.Normal, "ProjectCacheHitWithDefaultTargets", buildRequest.ProjectFullPath);
++                    }
++                    else
++                    {
++                        _loggingService.LogComment(buildEventContext, MessageImportance.Normal, "ProjectCacheHitWithTargetNames", buildRequest.ProjectFullPath, targetNames);
++                    }
++
++                    // Similar to CopyFilesToOutputDirectory from Microsoft.Common.CurrentVersion.targets, so that progress can be seen.
++                    // TODO: This should be indented by the console logger. That requires making these log events structured.
++                    if (!buildRequestConfiguration.IsTraversal)
++                    {
++                        _loggingService.LogComment(buildEventContext, MessageImportance.High, "ProjectCacheHitWithOutputs", buildRequest.ProjectInstance.GetPropertyValue(ReservedPropertyNames.projectName));
++                    }
++
+                     break;
+                 case CacheResultType.CacheMiss:
+-                case CacheResultType.CacheNotApplicable:
+-                    message += " Building project.";
++                    if (string.IsNullOrEmpty(targetNames))
++                    {
++                        _loggingService.LogComment(buildEventContext, MessageImportance.Normal, "ProjectCacheMissWithDefaultTargets", buildRequest.ProjectFullPath);
++                    }
++                    else
++                    {
++                        _loggingService.LogComment(buildEventContext, MessageImportance.Normal, "ProjectCacheMissWithTargetNames", buildRequest.ProjectFullPath, targetNames);
++                    }
++
+                     break;
+-                case CacheResultType.None:
++                case CacheResultType.CacheNotApplicable:
++                    if (string.IsNullOrEmpty(targetNames))
++                    {
++                        _loggingService.LogComment(buildEventContext, MessageImportance.Normal, "ProjectCacheNotApplicableWithDefaultTargets", buildRequest.ProjectFullPath);
++                    }
++                    else
++                    {
++                        _loggingService.LogComment(buildEventContext, MessageImportance.Normal, "ProjectCacheNotApplicableWithTargetNames", buildRequest.ProjectFullPath, targetNames);
++                    }
++
+                     break;
++                case CacheResultType.None: // Should not get here based on the throw above
+                 default:
+                     throw new ArgumentOutOfRangeException();
+             }
+ 
+-            logger.LogMessage(
+-                message,
+-                MessageImportance.High);
+-
+             return cacheResult;
+         }
+ 
+         public async Task ShutDown()
+         {
+-            var logger = new LoggingServiceToPluginLoggerAdapter(
++            BuildEventContext buildEventContext = BuildEventContext.Invalid;
++            BuildEventFileInfo buildEventFileInfo = BuildEventFileInfo.Empty;
++            var pluginLogger = new LoggingServiceToPluginLoggerAdapter(
+                 _loggingService,
+                 BuildEventContext.Invalid,
+                 BuildEventFileInfo.Empty);
+@@ -542,16 +565,11 @@ public async Task ShutDown()
+             try
+             {
+                 SetState(ProjectCacheServiceState.ShutdownStarted);
++                _loggingService.LogComment(buildEventContext, MessageImportance.Low, "ProjectCacheEndBuild");
+ 
+-                logger.LogMessage("Shutting down project cache plugin", MessageImportance.Low);
+-                var timer = Stopwatch.StartNew();
+-
+-                await _projectCachePlugin.EndBuildAsync(logger, _cancellationToken);
++                await _projectCachePlugin.EndBuildAsync(pluginLogger, _cancellationToken);
+ 
+-                timer.Stop();
+-                logger.LogMessage($"Finished shutting down project cache plugin in {timer.Elapsed.TotalMilliseconds} ms", MessageImportance.Low);
+-
+-                if (logger.HasLoggedErrors)
++                if (pluginLogger.HasLoggedErrors)
+                 {
+                     ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheShutdownFailed");
+                 }
+@@ -657,9 +675,9 @@ public override void LogWarning(string warning)
+             {
+                 _loggingService.LogWarningFromText(
+                     _buildEventContext,
+-                    null,
+-                    null,
+-                    null,
++                    subcategoryResourceName: null,
++                    warningCode: null,
++                    helpKeyword: null,
+                     _buildEventFileInfo,
+                     warning);
+             }
+@@ -670,10 +688,10 @@ public override void LogError(string error)
+ 
+                 _loggingService.LogErrorFromText(
+                     _buildEventContext,
+-                    null,
+-                    null,
+-                    null,
+-                    BuildEventFileInfo.Empty,
++                    subcategoryResourceName: null,
++                    errorCode: null,
++                    helpKeyword: null,
++                    _buildEventFileInfo,
+                     error);
+             }
+         }
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 240e5e0bf10..2a6e017322a 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1899,4 +1899,37 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+   <data name="ProxyRequestNotScheduledOnInprocNode" xml:space="preserve">
+     <value>MSB4274: Disabling the inproc node leads to performance degradation when using project cache plugins that emit proxy build requests.</value>
+   </data>
++  <data name="ProjectCacheBeginBuild" xml:space="preserve">
++    <value>Initializing project cache plugin.</value>
++  </data>
++  <data name="ProjectCacheEndBuild" xml:space="preserve">
++    <value>Shutting down project cache plugin.</value>
++  </data>
++  <data name="ProjectCacheQueryStartedWithTargetNames" xml:space="preserve">
++    <value>Project cache query "{0}" ({1} target(s)):</value>
++  </data>
++  <data name="ProjectCacheQueryStartedWithDefaultTargets" xml:space="preserve">
++    <value>Project cache query "{0}" (default targets):</value>
++  </data>
++  <data name="ProjectCacheHitWithDefaultTargets" xml:space="preserve">
++    <value>Project cache hit for "{0}" (default targets).</value>
++  </data>
++  <data name="ProjectCacheHitWithTargetNames" xml:space="preserve">
++    <value>Project cache hit for "{0}" ({1} target(s)).</value>
++  </data>
++  <data name="ProjectCacheHitWithOutputs" xml:space="preserve">
++    <value>{0} -> Cache Hit</value>
++  </data>
++  <data name="ProjectCacheMissWithDefaultTargets" xml:space="preserve">
++    <value>Project cache miss for "{0}" (default targets).</value>
++  </data>
++  <data name="ProjectCacheMissWithTargetNames" xml:space="preserve">
++    <value>Project cache miss for "{0}" ({1} target(s)).</value>
++  </data>
++  <data name="ProjectCacheNotApplicableWithDefaultTargets" xml:space="preserve">
++    <value>Project cache not applicable for "{0}" (default targets).</value>
++  </data>
++  <data name="ProjectCacheNotApplicableWithTargetNames" xml:space="preserve">
++    <value>Project cache not applicable for "{0}" ({1} target(s)).</value>
++  </data>
+ </root>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index cd731eb2a51..d4a11657c84 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: Musí se zadat jeden modul plug-in mezipaměti projektu, ale našlo se jich více: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: Mezipaměť projektu vyvolala neošetřenou výjimku z metody {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: Nepovedlo se inicializovat mezipaměť projektu.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: Při dotazování na následující projekt selhala jeho mezipaměť: {0}. Na mezipaměť se dotazy posílají paralelně pro několik projektů, takže tento konkrétní projekt nemusí být příčinou.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: Mezipaměť projektu se nepovedlo správně vypnout.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 4b581b9580a..f1ed3abf28a 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: Ein einzelnes Projektcache-Plug-In muss angegeben werden, es wurden jedoch mehrere gefunden: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: Der Projektcache hat über die Methode {0} eine unbehandelte Ausnahme ausgelöst.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: Fehler beim Initialisieren des Projektcache.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: Fehler beim Abfragen des Projektcache für das folgende Projekt: {0}. Der Cache wird für mehrere Projekte parallel abgefragt, sodass dieses spezifische Projekt möglicherweise nicht die Ursache darstellt.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: Der Projektcache konnte nicht ordnungsgemäß heruntergefahren werden.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 95ee0e4a72c..d94bfcbd1f2 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: Debe especificarse un solo complemento de caché de proyectos, pero se encontraron varios: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: la caché del proyecto inició una excepción no controlada desde el método {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: No se pudo inicializar la caché de proyectos.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: Error de la memoria caché de proyectos al consultar el proyecto siguiente: {0}. La memoria caché se consulta en paralelo para varios proyectos, por lo que puede que este proyecto específico no sea la causa.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: La memoria caché de proyectos no se cerró correctamente.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index c9ad104ebd1..9fa4b8685f3 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: un seul plug-in de cache de projet doit être spécifié, mais plusieurs plug-ins ont été trouvés : {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: le cache de projet a levé une exception non gérée à partir de la méthode {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: échec de l'initialisation du cache de projet.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: échec du cache de projet au moment où il a été interrogé pour le projet suivant : {0}. Dans la mesure où le cache est interrogé en parallèle pour plusieurs projets, ce projet spécifique n'est peut-être pas à l'origine du problème.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: le cache de projet ne s'est pas arrêté correctement.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 725cbbd4917..4bbb0cdf2e0 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: è necessario specificare un singolo plug-in della cache del progetto, ma ne sono trovati più di uno: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: la cache del progetto ha generato un'eccezione non gestita dal metodo {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: non è stato possibile inizializzare la cache del progetto.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: si è verificato un errore nella cache del progetto durante l'esecuzione della query relativa al progetto seguente: {0}. La query sulla cache viene eseguita in parallelo per più progetti, di conseguenza l'errore potrebbe non dipendere dal progetto specifico.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: non è stato possibile arrestare correttamente la cache del progetto.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 567f72d2e9b..f56b2ae56d6 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: 単一のプロジェクト キャッシュ プラグインを指定する必要がありますが、複数指定されています。{0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: プロジェクト キャッシュが {0} メソッドで処理されていない例外が返されました。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: プロジェクト キャッシュを初期化できませんでした。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: プロジェクト キャッシュは、プロジェクト {0} に対してクエリを実行しているときに失敗しました。このキャッシュでは複数のプロジェクトについて並列でクエリが実行されるため、この特定のプロジェクトが原因ではない可能性があります。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: プロジェクト キャッシュは正常にシャットダウンできませんでした。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 2113f42532f..4f01aa95460 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: 단일 프로젝트 캐시 플러그 인이 지정되어야 하지만, {0}에서 여러 개를 찾았습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: 프로젝트 캐시는 {0} 메서드에서 처리되지 않은 예외를 발생시켰습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: 프로젝트 캐시를 초기화하지 못했습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: {0} 프로젝트에 대해 쿼리되는 동안 프로젝트 캐시가 실패했습니다. 캐시는 여러 프로젝트에 대해 병렬로 쿼리되므로 이 특정 프로젝트가 원인이 아닐 수 있습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: 프로젝트 캐시가 제대로 종료되지 않았습니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index d1d82bbf96a..af9e1c1b5ce 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: należy określić jedną wtyczkę pamięci podręcznej projektu, ale znaleziono ich wiele: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: pamięć podręczna projektu zgłosiła nieobsługiwany wyjątek z metody {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: nie można zainicjować pamięci podręcznej projektu.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: w pamięci podręcznej projektu wystąpił błąd podczas wykonywania zapytania dotyczącego następującego projektu: {0}. Względem pamięci podręcznej równolegle są wykonywane zapytania o wiele projektów, dlatego ten konkretny projekt może nie być przyczyną.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: nie można poprawnie zamknąć pamięci podręcznej projektu.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 566907ee783..913c8bc2fbe 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: é necessário especificar só um plug-in de cache do projeto, mas foram encontrados vários: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: O cache do projeto lançou uma exceção sem tratamento do método {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: falha ao inicializar o cache do projeto.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: falha no cache do projeto durante a consulta do seguinte projeto: {0}. O cache é consultado em paralelo quanto a vários projetos, portanto, esse projeto específico pode não ser a causa.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: falha ao desligar o cache do projeto corretamente.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index af01c303893..1e91cb26890 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: должен быть указан один подключаемый модуль кэша проектов, но найдено несколько: {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: в кэше проектов возникло необработанное исключение из метода {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: не удалось инициализировать кэш проектов.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: произошел сбой кэша при выполнении запроса к следующему проекту: {0}. К кэшу выполнены параллельные запросы к нескольким проектам, поэтому, возможно, причина не в указанном проекте.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: не удалось правильно завершить работу кэша проектов.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 8761672c6a1..c90b6eed969 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: Tek bir proje önbellek eklentisi belirtilmelidir ancak birden çok eklenti bulundu: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: Proje önbelleği {0} yönteminden yakalanamayan özel durum oluşturdu.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: Proje önbelleği başlatılamadı.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: Proje önbelleği, {0} projesi için sorgulanırken başarısız oldu. Önbellek birden çok proje için paralel olarak sorgulandığından sorunun nedeni bu proje olmayabilir.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: Proje önbelleği düzgün bir şekilde kapatılamadı.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index f10c71a7bb1..5ebe470a507 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: 必须指定单个项目缓存插件，但找到多个位置: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: 项目缓存从 {0} 方法引发了未经处理的异常。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: 未能初始化项目缓存。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: 查询以下项目时，项目缓存失败: {0}。并行查询了多个项目的缓存，因此这一项目可能不是导致此问题的原因。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: 项目缓存未能正确关闭。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index ca6824404a6..0ee19d9c368 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -219,21 +219,76 @@
+         <target state="translated">MSB4265: 只可指定單一專案快取外掛程式，但發現多個指定項目: {0}</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheBeginBuild">
++        <source>Initializing project cache plugin.</source>
++        <target state="new">Initializing project cache plugin.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheEndBuild">
++        <source>Shutting down project cache plugin.</source>
++        <target state="new">Shutting down project cache plugin.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+         <target state="translated">MSB4273: 專案快取從 {0} 方法擲回未處理的例外狀況。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHitWithDefaultTargets">
++        <source>Project cache hit for "{0}" (default targets).</source>
++        <target state="new">Project cache hit for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithOutputs">
++        <source>{0} -&gt; Cache Hit</source>
++        <target state="new">{0} -&gt; Cache Hit</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheHitWithTargetNames">
++        <source>Project cache hit for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache hit for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+         <source>MSB4266: Failed to initialize the project cache.</source>
+         <target state="translated">MSB4266: 無法將專案快取初始化。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheMissWithDefaultTargets">
++        <source>Project cache miss for "{0}" (default targets).</source>
++        <target state="new">Project cache miss for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheMissWithTargetNames">
++        <source>Project cache miss for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache miss for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithDefaultTargets">
++        <source>Project cache not applicable for "{0}" (default targets).</source>
++        <target state="new">Project cache not applicable for "{0}" (default targets).</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheNotApplicableWithTargetNames">
++        <source>Project cache not applicable for "{0}" ({1} target(s)).</source>
++        <target state="new">Project cache not applicable for "{0}" ({1} target(s)).</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheQueryFailed">
+         <source>MSB4267: The project cache failed while being queried for the following project: {0}. The cache is queried in parallel for multiple projects so this specific project might not be the cause.</source>
+         <target state="translated">MSB4267: 查詢下列專案時，專案快取失敗: {0}。查詢多個專案時，會平行查詢快取，因此這個特定專案可能不是失敗原因。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithDefaultTargets">
++        <source>Project cache query "{0}" (default targets):</source>
++        <target state="new">Project cache query "{0}" (default targets):</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ProjectCacheQueryStartedWithTargetNames">
++        <source>Project cache query "{0}" ({1} target(s)):</source>
++        <target state="new">Project cache query "{0}" ({1} target(s)):</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheShutdownFailed">
+         <source>MSB4268: The project cache failed to shut down properly.</source>
+         <target state="translated">MSB4268: 無法正確關閉專案快取。</target>

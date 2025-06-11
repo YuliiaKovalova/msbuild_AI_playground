@@ -1,0 +1,263 @@
+diff --git a/src/Build/BackEnd/Components/Logging/BuildLoggingContext.cs b/src/Build/BackEnd/Components/Logging/BuildLoggingContext.cs
+index 4ff53f1d835..7577db70433 100644
+--- a/src/Build/BackEnd/Components/Logging/BuildLoggingContext.cs
++++ b/src/Build/BackEnd/Components/Logging/BuildLoggingContext.cs
+@@ -60,7 +60,7 @@ public bool IsInProcNode
+         internal void LogFatalTaskError(Exception exception, BuildEventFileInfo file, string taskName)
+         {
+             CheckValidity();
+-            LoggingService.LogFatalTaskError(BuildEventContext, exception, file, "MY CUSTOM ERROR MESSAGE: " + taskName);
++            LoggingService.LogFatalTaskError(BuildEventContext, exception, file, taskName);
+             _hasLoggedErrors = true;
+         }
+     }
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index c08622d49eb..3df297ff99f 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -80,7 +80,7 @@ internal partial class LoggingService : ILoggingService, INodePacketHandler
+         /// <summary>
+         /// The default maximum size for the logging event queue.
+         /// </summary>
+-        private const uint DefaultQueueCapacity = 200000;
++        private const uint DefaultQueueCapacity = 2000000;
+ 
+         /// <summary>
+         /// Lock for the nextProjectId
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingServiceLogMethods.cs b/src/Build/BackEnd/Components/Logging/LoggingServiceLogMethods.cs
+index f76e2a2853c..31c9f55eeb0 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingServiceLogMethods.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingServiceLogMethods.cs
+@@ -209,7 +209,7 @@ public void LogFatalTaskError(BuildEventContext buildEventContext, Exception exc
+         {
+             ErrorUtilities.VerifyThrow(taskName != null, "Must specify the name of the task that failed.");
+ 
+-            LogFatalError(buildEventContext, exception, file, "FatalTaskError", "DIFFERENT CUSTOM ERROR MESSAGE: " + taskName);
++            LogFatalError(buildEventContext, exception, file, "FatalTaskError", taskName);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+index d2d7a672ddc..4a5cd50ea7d 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+@@ -813,6 +813,10 @@ private async Task<WorkUnitResult> ExecuteInstantiatedTask(TaskExecutionHost tas
+                             {
+                                 taskResult = taskExecutionHost.Execute();
+                             }
++                            else if (taskLoggingContext.TargetLoggingContext.Target.Name == "_CompileTemporaryAssembly")
++                            {
++                                taskResult = taskExecutionHost.Execute();
++                            }
+                             else
+                             {
+                                 taskResult = taskExecutionHost.Execute();
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index 45414d7cf5c..9632543cf60 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -124,6 +124,7 @@ public TaskHost(IBuildComponentHost host, BuildRequestEntry requestEntry, Elemen
+             _targetBuilderCallback = targetBuilderCallback;
+             _continueOnError = false;
+             _activeProxy = true;
++            Thread.MemoryBarrier();
+             _callbackMonitor = new object();
+             _disableInprocNode = Traits.Instance.InProcNodeDisabled || host.BuildParameters.DisableInProcNode;
+             EngineServices = new EngineServicesImpl(this);
+@@ -517,38 +518,39 @@ public void LogWarningEvent(Microsoft.Build.Framework.BuildWarningEventArgs e)
+         /// <param name="e">The event args</param>
+         public void LogMessageEvent(Microsoft.Build.Framework.BuildMessageEventArgs e)
+         {
+-            lock (_callbackMonitor)
+-            {
+-                ErrorUtilities.VerifyThrowArgumentNull(e);
++            ErrorUtilities.VerifyThrowArgumentNull(e);
+ 
+-                if (!_activeProxy)
++            Thread.MemoryBarrier();
++            if (!_activeProxy)
++            {
++                // The task has been logging on another thread, typically
++                // because of logging a spawned process's output, and has
++                // not terminated this logging before it returned. This is common
++                // enough that we don't want to crash and break the entire build. But
++                // we don't have any good way to log it any more, as not only has this task
++                // finished, the whole build might have finished! The task author will
++                // just have to figure out that their task has a bug by themselves.
++                Thread.MemoryBarrier();
++                if (s_breakOnLogAfterTaskReturns)
+                 {
+-                    // The task has been logging on another thread, typically
+-                    // because of logging a spawned process's output, and has
+-                    // not terminated this logging before it returned. This is common
+-                    // enough that we don't want to crash and break the entire build. But
+-                    // we don't have any good way to log it any more, as not only has this task
+-                    // finished, the whole build might have finished! The task author will
+-                    // just have to figure out that their task has a bug by themselves.
+-                    if (s_breakOnLogAfterTaskReturns)
+-                    {
+-                        Trace.Fail(String.Format(CultureInfo.CurrentUICulture, "Task at {0}, after already returning, attempted to log '{1}'", _taskLocation.ToString(), e.Message));
+-                    }
+-
+-                    return;
++                    Trace.Fail(String.Format(CultureInfo.CurrentUICulture, "Task at {0}, after already returning, attempted to log '{1}'", _taskLocation.ToString(), e.Message));
+                 }
+ 
+-                // If we are in building across process we need the events to be serializable. This method will
+-                // check to see if we are building with multiple process and if the event is serializable. It will
+-                // also log a warning if the event is not serializable and drop the logging message.
+-                if (IsRunningMultipleNodes && !IsEventSerializable(e))
+-                {
+-                    return;
+-                }
++                return;
++            }
+ 
+-                e.BuildEventContext = _taskLoggingContext.BuildEventContext;
+-                _taskLoggingContext.LoggingService.LogBuildEvent(e);
++            // If we are in building across process we need the events to be serializable. This method will
++            // check to see if we are building with multiple process and if the event is serializable. It will
++            // also log a warning if the event is not serializable and drop the logging message.
++            Thread.MemoryBarrier();
++            if (IsRunningMultipleNodes && !IsEventSerializable(e))
++            {
++                return;
+             }
++
++            e.BuildEventContext = _taskLoggingContext.BuildEventContext;
++
++            _taskLoggingContext.LoggingService.LogBuildEvent(e);
+         }
+ 
+         /// <summary>
+@@ -1078,6 +1080,7 @@ internal void MarkAsInactive()
+             {
+                 VerifyActiveProxy();
+                 _activeProxy = false;
++                Thread.MemoryBarrier();
+ 
+                 ReleaseAllCores();
+ 
+diff --git a/src/Build/BackEnd/Shared/BuildRequest.cs b/src/Build/BackEnd/Shared/BuildRequest.cs
+index 47cee4ea849..95ca80683d2 100644
+--- a/src/Build/BackEnd/Shared/BuildRequest.cs
++++ b/src/Build/BackEnd/Shared/BuildRequest.cs
+@@ -258,14 +258,12 @@ public int GlobalRequestId
+             [DebuggerStepThrough]
+             get
+             {
+-                Thread.MemoryBarrier();
+                 return _globalRequestId;
+             }
+ 
+             set
+             {
+                 ErrorUtilities.VerifyThrow(_globalRequestId == InvalidGlobalRequestId, "Global Request ID cannot be set twice.");
+-                Thread.MemoryBarrier();
+                 _globalRequestId = value;
+             }
+         }
+diff --git a/src/Build/Resources/AssemblyResources.cs b/src/Build/Resources/AssemblyResources.cs
+index 0eca428e261..29a5f239bf6 100644
+--- a/src/Build/Resources/AssemblyResources.cs
++++ b/src/Build/Resources/AssemblyResources.cs
+@@ -1,6 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Collections.Concurrent;
+ using System.Globalization;
+ using System.Reflection;
+ using System.Resources;
+@@ -19,6 +20,8 @@ internal static class AssemblyResources
+         /// </summary>
+         private static ResourceManager s_msbuildExeResourceManager;
+ 
++        private static ConcurrentDictionary<string, string> resourceCache = new();
++
+         /// <summary>
+         /// The internals of the Engine are exposed to MSBuild.exe, so they must share the same AssemblyResources class and
+         /// ResourceUtilities class that uses it. To make this possible, MSBuild.exe registers its resources here and they are
+@@ -75,7 +78,12 @@ internal static string GetStringLookingInMSBuildExeResourcesFirst(string name)
+         /// <returns>The resource string, or null if not found.</returns>
+         private static string GetStringFromEngineResources(string name)
+         {
+-            string resource = s_resources.GetString(name, CultureInfo.CurrentUICulture);
++            if (resourceCache.TryGetValue(name, out string resource))
++            {
++                return resource;
++            }
++
++            resource = s_resources.GetString(name, CultureInfo.CurrentUICulture);
+ 
+             if (resource == null)
+             {
+@@ -84,6 +92,8 @@ private static string GetStringFromEngineResources(string name)
+ 
+             ErrorUtilities.VerifyThrow(resource != null, "Missing resource '{0}'", name);
+ 
++            resourceCache[name] = resource;
++
+             return resource;
+         }
+ 
+diff --git a/src/Framework/IItemData.cs b/src/Framework/IItemData.cs
+index bddfadbe570..7e87ec87d57 100644
+--- a/src/Framework/IItemData.cs
++++ b/src/Framework/IItemData.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Linq;
+ 
+ namespace Microsoft.Build.Framework;
+ 
+@@ -41,8 +42,6 @@ string EvaluatedInclude
+ /// </remarks>
+ public readonly struct ItemData
+ {
+-    private readonly Func<IEnumerable<KeyValuePair<string, string>>> _enumerateMetadata;
+-
+     public ItemData(string type, object value)
+     {
+ 
+@@ -56,17 +55,14 @@ public ItemData(string type, object value)
+         if (value is IItemData dt)
+         {
+             EvaluatedInclude = dt.EvaluatedInclude;
+-            _enumerateMetadata = dt.EnumerateMetadata;
+         }
+         else if (value is ITaskItem ti)
+         {
+             EvaluatedInclude = ti.ItemSpec;
+-            _enumerateMetadata = ti.EnumerateMetadata;
+         }
+         else
+         {
+             EvaluatedInclude = value.ToString() ?? string.Empty;
+-            _enumerateMetadata = () => [];
+         }
+     }
+ 
+@@ -91,5 +87,19 @@ public ItemData(string type, object value)
+     /// The item metadata
+     /// </summary>
+     public IEnumerable<KeyValuePair<string, string>> EnumerateMetadata()
+-        => _enumerateMetadata();
++    {
++        object? value = Value;
++        if (value is IItemData dt)
++        {
++            return dt.EnumerateMetadata();
++        }
++        else if (value is ITaskItem ti)
++        {
++            return ti.EnumerateMetadata();
++        }
++        else
++        {
++            return Enumerable.Empty<KeyValuePair<string, string>>();
++        }
++    }
+ }

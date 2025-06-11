@@ -1,0 +1,185 @@
+diff --git a/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs b/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
+index dc86010e269..80a98eb8112 100644
+--- a/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/Scheduler_Tests.cs
+@@ -10,6 +10,8 @@
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Evaluation;
++using Microsoft.Build.Experimental.ProjectCache;
++using Shouldly;
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
+ using Xunit;
+ 
+@@ -520,6 +522,31 @@ public void TestTraversalAffinityIsInProc()
+             Assert.Equal(request1, response[0].BuildRequest);
+         }
+ 
++        /// <summary>
++        /// Make sure that traversal projects are marked with an affinity of "InProc", which means that
++        /// even if multiple are available, we should still only have the single inproc node.
++        /// </summary>
++        [Fact]
++        public void TestProxyAffinityIsInProc()
++        {
++            _host.BuildParameters.MaxNodeCount = 4;
++            ReportDefaultParentRequestIsFinished();
++
++            CreateConfiguration(1, "foo.csproj");
++
++            BuildRequest request1 = CreateProxyBuildRequest(1, 1, new ProxyTargets(new Dictionary<string, string> {{"foo", "bar"}}), null);
++
++            BuildRequestBlocker blocker = new BuildRequestBlocker(-1, new string[] { }, new[] { request1 });
++            List<ScheduleResponse> response = new List<ScheduleResponse>(_scheduler.ReportRequestBlocked(1, blocker));
++
++            // There will be no request to create a new node, because both of the above requests are proxy build requests,
++            // which have an affinity of "inproc", and the inproc node already exists.
++            Assert.Single(response);
++            Assert.Equal(ScheduleActionType.ScheduleWithConfiguration, response[0].Action);
++            Assert.Equal(request1, response[0].BuildRequest);
++            Assert.Equal(Scheduler.InProcNodeId, response[0].NodeId);
++        }
++
+         /// <summary>
+         /// With something approximating the BuildManager's build loop, make sure that we don't end up
+         /// trying to create more nodes than we can actually support.
+@@ -729,8 +756,10 @@ private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[
+         /// <summary>
+         /// Creates a build request.
+         /// </summary>
+-        private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[] targets, NodeAffinity nodeAffinity, BuildRequest parentRequest)
++        private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[] targets, NodeAffinity nodeAffinity, BuildRequest parentRequest, ProxyTargets proxyTargets = null)
+         {
++            (targets == null ^ proxyTargets == null).ShouldBeTrue();
++
+             HostServices hostServices = null;
+ 
+             if (nodeAffinity != NodeAffinity.Any)
+@@ -739,8 +768,36 @@ private BuildRequest CreateBuildRequest(int nodeRequestId, int configId, string[
+                 hostServices.SetNodeAffinity(String.Empty, nodeAffinity);
+             }
+ 
+-            BuildRequest request = new BuildRequest(1 /* submissionId */, nodeRequestId, configId, targets, hostServices, BuildEventContext.Invalid, parentRequest);
+-            return request;
++            if (targets != null)
++            {
++                return new BuildRequest(
++                    submissionId: 1,
++                    nodeRequestId,
++                    configId,
++                    targets,
++                    hostServices,
++                    BuildEventContext.Invalid,
++                    parentRequest);
++            }
++
++            parentRequest.ShouldBeNull();
++            return new BuildRequest(
++                submissionId: 1,
++                nodeRequestId,
++                configId,
++                proxyTargets,
++                hostServices);
++        }
++
++        private BuildRequest CreateProxyBuildRequest(int nodeRequestId, int configId, ProxyTargets proxyTargets, BuildRequest parentRequest)
++        {
++            return CreateBuildRequest(
++                nodeRequestId,
++                configId,
++                null,
++                NodeAffinity.Any,
++                parentRequest,
++                proxyTargets);
+         }
+ 
+         /// <summary>
+@@ -778,5 +835,11 @@ private void MockPerformSchedulingActions(IEnumerable<ScheduleResponse> response
+                 MockPerformSchedulingActions(moreResponses, ref nodeId, ref inProcNodeExists);
+             }
+         }
++
++        private void ReportDefaultParentRequestIsFinished()
++        {
++            var buildResult = new BuildResult(_defaultParentRequest);
++            _scheduler.ReportResult(_defaultParentRequest.NodeRequestId, buildResult);
++        }
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index 1e335cedb85..fa7acaa1462 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -11,6 +11,7 @@
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Microsoft.Build.Execution;
++using Microsoft.Build.Experimental.ProjectCache;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+@@ -791,6 +792,9 @@ private void AssignUnscheduledRequestsToNodes(List<ScheduleResponse> responses,
+                 {
+                     // We want to find more work first, and we assign traversals to the in-proc node first, if possible.
+                     AssignUnscheduledRequestsByTraversalsFirst(responses, idleNodes);
++
++                    AssignUnscheduledProxyBuildRequestsToInProcNode(responses, idleNodes);
++
+                     if (idleNodes.Count == 0)
+                     {
+                         return;
+@@ -972,6 +976,30 @@ private void AssignUnscheduledRequestsByTraversalsFirst(List<ScheduleResponse> r
+             }
+         }
+ 
++        /// <summary>
++        /// Proxy build requests <see cref="ProxyTargets"/> should be really cheap (only return properties and items) and it's not worth
++        /// paying the IPC cost and re-evaluating them on out of proc nodes (they are guaranteed to be evaluated in the Scheduler process).
++        /// </summary>
++        private void AssignUnscheduledProxyBuildRequestsToInProcNode(List<ScheduleResponse> responses, HashSet<int> idleNodes)
++        {
++            if (idleNodes.Contains(InProcNodeId))
++            {
++                List<SchedulableRequest> unscheduledRequests = new List<SchedulableRequest>(_schedulingData.UnscheduledRequestsWhichCanBeScheduled);
++                foreach (SchedulableRequest request in unscheduledRequests)
++                {
++                    if (CanScheduleRequestToNode(request, InProcNodeId))
++                    {
++                        if (IsProxyBuildRequest(request.BuildRequest))
++                        {
++                            AssignUnscheduledRequestToNode(request, InProcNodeId, responses);
++                            idleNodes.Remove(InProcNodeId);
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++
+         /// <summary>
+         /// Returns true if the request is for a traversal project.  Traversals are used to find more work.
+         /// </summary>
+@@ -980,6 +1008,11 @@ private bool IsTraversalRequest(BuildRequest request)
+             return _configCache[request.ConfigurationId].IsTraversal;
+         }
+ 
++        private bool IsProxyBuildRequest(BuildRequest request)
++        {
++            return request.ProxyTargets != null;
++        }
++
+         /// <summary>
+         /// Assigns requests to nodes attempting to ensure each node has the same number of configurations assigned to it.
+         /// </summary>
+@@ -2057,6 +2090,11 @@ private NodeAffinity GetNodeAffinityForRequest(BuildRequest request)
+                 return NodeAffinity.InProc;
+             }
+ 
++            if (IsProxyBuildRequest(request))
++            {
++                return NodeAffinity.InProc;
++            }
++
+             BuildRequestConfiguration configuration = _configCache[request.ConfigurationId];
+ 
+             // The affinity may have been specified by the host services.

@@ -1,0 +1,159 @@
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index 0cfb9fa10f3..addc0b8858e 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -211,13 +211,17 @@ public void BinaryLoggerShouldEmbedFilesViaTaskOutput()
+         public void BinaryLoggerShouldEmbedSymlinkFilesViaTaskOutput()
+         {
+             string testFileName = "foobar.txt";
++            string symlinkName = "symlink1.txt";
++            string symlinkLvl2Name = "symlink2.txt";
+             TransientTestFolder testFolder = _env.DefaultTestDirectory.CreateDirectory("TestDir");
+             TransientTestFolder testFolder2 = _env.DefaultTestDirectory.CreateDirectory("TestDir2");
+             TransientTestFile testFile = testFolder.CreateFile(testFileName, string.Join(Environment.NewLine, new[] { "123", "456" }));
+-            string symlinkPath = Path.Combine(testFolder2.Path, testFileName);
++            string symlinkPath = Path.Combine(testFolder2.Path, symlinkName);
++            string symlinkLvl2Path = Path.Combine(testFolder2.Path, symlinkLvl2Name);
+ 
+             string errorMessage = string.Empty;
+             Assert.True(NativeMethodsShared.MakeSymbolicLink(symlinkPath, testFile.Path, ref errorMessage), errorMessage);
++            Assert.True(NativeMethodsShared.MakeSymbolicLink(symlinkLvl2Path, symlinkPath, ref errorMessage), errorMessage);
+ 
+             using var buildManager = new BuildManager();
+             var binaryLogger = new BinaryLogger()
+@@ -241,9 +245,12 @@ public void BinaryLoggerShouldEmbedSymlinkFilesViaTaskOutput()
+         <CreateItem Include=""{0}"">
+             <Output TaskParameter=""Include"" ItemName=""EmbedInBinlog"" />
+         </CreateItem>
++        <CreateItem Include=""{1}"">
++            <Output TaskParameter=""Include"" ItemName=""EmbedInBinlog"" />
++        </CreateItem>
+     </Target>
+ </Project>";
+-            var testProject = string.Format(testProjectFmt, symlinkPath);
++            var testProject = string.Format(testProjectFmt, symlinkPath, symlinkLvl2Path);
+             ObjectModelHelpers.BuildProjectExpectSuccess(testProject, binaryLogger);
+             var projectImportsZipPath = Path.ChangeExtension(_logFile, ".ProjectImports.zip");
+             using var fileStream = new FileStream(projectImportsZipPath, FileMode.Open);
+@@ -252,7 +259,8 @@ public void BinaryLoggerShouldEmbedSymlinkFilesViaTaskOutput()
+             // Can't just compare `Name` because `ZipArchive` does not handle unix directory separators well
+             // thus producing garbled fully qualified paths in the actual .ProjectImports.zip entries
+             zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith("testtaskoutputfile.txt"));
+-            zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith(testFileName));
++            zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith(symlinkName));
++            zipArchive.Entries.ShouldContain(zE => zE.Name.EndsWith(symlinkLvl2Name));
+         }
+ 
+         [Fact]
+diff --git a/src/Framework/NativeMethods.cs b/src/Framework/NativeMethods.cs
+index 85f940db852..f871d073876 100644
+--- a/src/Framework/NativeMethods.cs
++++ b/src/Framework/NativeMethods.cs
+@@ -10,6 +10,7 @@
+ using System.Reflection;
+ using System.Runtime.InteropServices;
+ using System.Runtime.Versioning;
++using System.Text;
+ using System.Threading;
+ 
+ using Microsoft.Build.Shared;
+@@ -1046,7 +1047,17 @@ internal static bool ExistAndHasContent(string path)
+     {
+         var fileInfo = new FileInfo(path);
+ 
+-        return fileInfo.Exists && (fileInfo.Length > 0 || IsSymLink(fileInfo));
++        // File exist and has some content
++        return fileInfo.Exists &&
++               (fileInfo.Length > 0 ||
++                    // Or final destination of the link is nonempty file
++                    (
++                        IsSymLink(fileInfo) &&
++                        TryGetFinalLinkTarget(fileInfo, out string finalTarget, out _) &&
++                        File.Exists(finalTarget) &&
++                        new FileInfo(finalTarget).Length > 0
++                    )
++               );
+     }
+ 
+     internal static bool IsSymLink(FileInfo fileInfo)
+@@ -1072,6 +1083,59 @@ internal static bool IsSymLink(string path)
+         return IsSymLink(new FileInfo(path));
+     }
+ 
++    internal static bool TryGetFinalLinkTarget(FileInfo fileInfo, out string finalTarget, out string errorMessage)
++    {
++        if (!IsWindows)
++        {
++            errorMessage = null;
++#if NET
++            while(!string.IsNullOrEmpty(fileInfo.LinkTarget))
++            {
++                fileInfo = new FileInfo(fileInfo.LinkTarget);
++            }
++            finalTarget = fileInfo.FullName;
++            return true;
++#else
++
++            finalTarget = null;
++            return false;
++#endif
++        }
++
++        using SafeFileHandle handle = OpenFileThroughSymlinks(fileInfo.FullName);
++        if (handle.IsInvalid)
++        {
++            // Link is broken.
++            errorMessage = Marshal.GetExceptionForHR(Marshal.GetHRForLastWin32Error()).Message;
++            finalTarget = null;
++            return false;
++        }
++
++        const int initialBufferSize = 4096;
++        char[] targetPathBuffer = new char[initialBufferSize];
++        uint result = GetFinalPathNameByHandle(handle, targetPathBuffer);
++
++        // Buffer too small
++        if (result > targetPathBuffer.Length)
++        {
++            targetPathBuffer = new char[(int)result];
++            result = GetFinalPathNameByHandle(handle, targetPathBuffer);
++        }
++
++        // Error
++        if (result == 0)
++        {
++            errorMessage = Marshal.GetExceptionForHR(Marshal.GetHRForLastWin32Error()).Message;
++            finalTarget = null;
++            return false;
++        }
++
++        // Normalize \\?\ and \??\ syntax.
++        finalTarget = new string(targetPathBuffer, 0, (int)result).TrimStart(new char[] { '\\', '?' });
++        errorMessage = null;
++        return true;
++    }
++
+     internal static bool MakeSymbolicLink(string newFileName, string exitingFileName, ref string errorMessage)
+     {
+         bool symbolicLinkCreated;
+@@ -1714,6 +1778,20 @@ out FILETIME lpLastWriteTime
+     [DllImport("libc", SetLastError = true)]
+     internal static extern int symlink(string oldpath, string newpath);
+ 
++    internal const uint FILE_NAME_NORMALIZED = 0x0;
++
++    [SupportedOSPlatform("windows")]
++    static uint GetFinalPathNameByHandle(SafeFileHandle fileHandle, char[] filePath) =>
++        GetFinalPathNameByHandle(fileHandle, filePath, (uint) filePath.Length, FILE_NAME_NORMALIZED);
++
++    [DllImport("Kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
++    [SupportedOSPlatform("windows")]
++    static extern uint GetFinalPathNameByHandle(
++        SafeFileHandle hFile,
++        [Out] char[] lpszFilePath,
++        uint cchFilePath,
++        uint dwFlags);
++
+     #endregion
+ 
+     #region helper methods

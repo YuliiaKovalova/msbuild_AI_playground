@@ -1,0 +1,910 @@
+diff --git a/documentation/wiki/ChangeWaves.md b/documentation/wiki/ChangeWaves.md
+index 1a778f77493..a9eb39bb9f2 100644
+--- a/documentation/wiki/ChangeWaves.md
++++ b/documentation/wiki/ChangeWaves.md
+@@ -26,6 +26,7 @@ A wave of features is set to "rotate out" (i.e. become standard functionality) t
+ ### 17.4
+ - [Respect deps.json when loading assemblies](https://github.com/dotnet/msbuild/pull/7520)
+ - [Remove opt in for new schema for CombineTargetFrameworkInfoProperties](https://github.com/dotnet/msbuild/pull/6928)
++- [MSBuild server](https://github.com/dotnet/msbuild/pull/7634)
+ 
+ ### 17.0
+ - [Scheduler should honor BuildParameters.DisableInprocNode](https://github.com/dotnet/msbuild/pull/6400)
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 59fff38950e..67ffde2c318 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -31,14 +31,10 @@ public sealed class MSBuildClient
+         private readonly Dictionary<string, string> _serverEnvironmentVariables;
+ 
+         /// <summary>
+-        /// Location of executable file to launch the server process. That should be either dotnet.exe or MSBuild.exe location.
++        /// Full path to current MSBuild.exe if executable is MSBuild.exe,
++        /// or to version of MSBuild.dll found to be associated with the current process.
+         /// </summary>
+-        private readonly string _exeLocation;
+-
+-        /// <summary>
+-        /// Location of dll file to launch the server process if needed. Empty if executable is msbuild.exe and not empty if dotnet.exe.
+-        /// </summary>
+-        private readonly string _dllLocation;
++        private readonly string _msbuildLocation;
+ 
+         /// <summary>
+         /// The MSBuild client execution result.
+@@ -84,18 +80,15 @@ public sealed class MSBuildClient
+         /// <summary>
+         /// Public constructor with parameters.
+         /// </summary>
+-        /// <param name="exeLocation">Location of executable file to launch the server process.
+-        /// That should be either dotnet.exe or MSBuild.exe location.</param>
+-        /// <param name="dllLocation">Location of dll file to launch the server process if needed.
+-        /// Empty if executable is msbuild.exe and not empty if dotnet.exe.</param>
+-        public MSBuildClient(string exeLocation, string dllLocation)
++        /// <param name="msbuildLocation"> Full path to current MSBuild.exe if executable is MSBuild.exe,
++        /// or to version of MSBuild.dll found to be associated with the current process.</param>
++        public MSBuildClient(string msbuildLocation)
+         {
+             _serverEnvironmentVariables = new();
+             _exitResult = new();
+ 
+             // dll & exe locations
+-            _exeLocation = exeLocation;
+-            _dllLocation = dllLocation;
++            _msbuildLocation = msbuildLocation;
+ 
+             // Client <-> Server communication stream
+             _handshake = GetHandshake();
+@@ -275,15 +268,20 @@ private bool TryLaunchServer()
+             }
+ 
+             string[] msBuildServerOptions = new string[] {
+-                _dllLocation,
+                 "/nologo",
+                 "/nodemode:8"
+             };
+ 
++            string? useMSBuildServerEnvVarValue = Environment.GetEnvironmentVariable(Traits.UseMSBuildServerEnvVarName);
+             try
+             {
+-                Process msbuildProcess = LaunchNode(_exeLocation, string.Join(" ", msBuildServerOptions),  _serverEnvironmentVariables);
+-                CommunicationsUtilities.Trace("Server is launched with PID: {0}", msbuildProcess.Id);
++                // Disable MSBuild server for a child process, preventing an infinite recurson.
++                Environment.SetEnvironmentVariable(Traits.UseMSBuildServerEnvVarName, "");
++
++                NodeLauncher nodeLauncher = new NodeLauncher();
++                CommunicationsUtilities.Trace("Starting Server...");
++                Process msbuildProcess = nodeLauncher.Start(_msbuildLocation, string.Join(" ", msBuildServerOptions));
++                CommunicationsUtilities.Trace("Server started with PID: {0}", msbuildProcess?.Id);
+             }
+             catch (Exception ex)
+             {
+@@ -291,32 +289,12 @@ private bool TryLaunchServer()
+                 _exitResult.MSBuildClientExitType = MSBuildClientExitType.LaunchError;
+                 return false;
+             }
+-
+-            return true;
+-        }
+-
+-        private Process LaunchNode(string exeLocation, string msBuildServerArguments, Dictionary<string, string> serverEnvironmentVariables)
+-        {
+-            CommunicationsUtilities.Trace("Launching server node from {0} with arguments {1}", exeLocation, msBuildServerArguments);
+-            ProcessStartInfo processStartInfo = new() 
+-            {
+-                FileName = exeLocation,
+-                Arguments = msBuildServerArguments,
+-                UseShellExecute = false
+-            };
+-
+-            foreach (var entry in serverEnvironmentVariables)
++            finally
+             {
+-                processStartInfo.Environment[entry.Key] = entry.Value;
++                Environment.SetEnvironmentVariable(Traits.UseMSBuildServerEnvVarName, useMSBuildServerEnvVarValue);
+             }
+ 
+-            // We remove env to enable MSBuild Server that might be equal to 1, so we do not get an infinite recursion here.
+-            processStartInfo.Environment[Traits.UseMSBuildServerEnvVarName] = "0";
+-
+-            processStartInfo.CreateNoWindow = true;
+-            processStartInfo.UseShellExecute = false;
+-
+-            return Process.Start(processStartInfo) ?? throw new InvalidOperationException("MSBuild server node failed to launch.");
++            return true;
+         }
+ 
+         private bool TrySendBuildCommand(string commandLine) => TrySendPacket(() => GetServerNodeBuildCommand(commandLine));
+diff --git a/src/Build/BackEnd/Components/Communications/CurrentHost.cs b/src/Build/BackEnd/Components/Communications/CurrentHost.cs
+new file mode 100644
+index 00000000000..81116ecb054
+--- /dev/null
++++ b/src/Build/BackEnd/Components/Communications/CurrentHost.cs
+@@ -0,0 +1,49 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System.Diagnostics;
++using System.IO;
++using Microsoft.Build.Shared;
++
++#nullable disable
++
++namespace Microsoft.Build.BackEnd
++{
++    internal static class CurrentHost
++    {
++
++#if RUNTIME_TYPE_NETCORE || MONO
++        private static string s_currentHost;
++#endif
++
++        /// <summary>
++        /// Identify the .NET host of the current process.
++        /// </summary>
++        /// <returns>The full path to the executable hosting the current process, or null if running on Full Framework on Windows.</returns>
++        public static string GetCurrentHost()
++        {
++#if RUNTIME_TYPE_NETCORE || MONO
++            if (s_currentHost == null)
++            {
++                string dotnetExe = Path.Combine(FileUtilities.GetFolderAbove(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory, 2),
++                    NativeMethodsShared.IsWindows ? "dotnet.exe" : "dotnet");
++                if (File.Exists(dotnetExe))
++                {
++                    s_currentHost = dotnetExe;
++                }
++                else
++                {
++                    using (Process currentProcess = Process.GetCurrentProcess())
++                    {
++                        s_currentHost = currentProcess.MainModule.FileName;
++                    }
++                }
++            }
++
++            return s_currentHost;
++#else
++            return null;
++#endif
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Components/Communications/NodeLauncher.cs b/src/Build/BackEnd/Components/Communications/NodeLauncher.cs
+new file mode 100644
+index 00000000000..652f7dda74c
+--- /dev/null
++++ b/src/Build/BackEnd/Components/Communications/NodeLauncher.cs
+@@ -0,0 +1,181 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++using System.Runtime.InteropServices;
++using Microsoft.Build.Exceptions;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++using Microsoft.Build.Shared.FileSystem;
++using BackendNativeMethods = Microsoft.Build.BackEnd.NativeMethods;
++
++#nullable disable
++
++namespace Microsoft.Build.BackEnd
++{
++    internal class NodeLauncher
++    {
++        /// <summary>
++        /// Creates a new MSBuild process
++        /// </summary>
++        public Process Start(string msbuildLocation, string commandLineArgs)
++        {
++            // Should always have been set already.
++            ErrorUtilities.VerifyThrowInternalLength(msbuildLocation, nameof(msbuildLocation));
++
++            if (!FileSystems.Default.FileExists(msbuildLocation))
++            {
++                throw new BuildAbortedException(ResourceUtilities.FormatResourceStringStripCodeAndKeyword("CouldNotFindMSBuildExe", msbuildLocation));
++            }
++
++            // Repeat the executable name as the first token of the command line because the command line
++            // parser logic expects it and will otherwise skip the first argument
++            commandLineArgs = $"\"{msbuildLocation}\" {commandLineArgs}";
++
++            BackendNativeMethods.STARTUP_INFO startInfo = new();
++            startInfo.cb = Marshal.SizeOf<BackendNativeMethods.STARTUP_INFO>();
++
++            // Null out the process handles so that the parent process does not wait for the child process
++            // to exit before it can exit.
++            uint creationFlags = 0;
++            if (Traits.Instance.EscapeHatches.EnsureStdOutForChildNodesIsPrimaryStdout)
++            {
++                creationFlags = BackendNativeMethods.NORMALPRIORITYCLASS;
++            }
++
++            if (String.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILDNODEWINDOW")))
++            {
++                if (!Traits.Instance.EscapeHatches.EnsureStdOutForChildNodesIsPrimaryStdout)
++                {
++                    // Redirect the streams of worker nodes so that this MSBuild.exe's
++                    // parent doesn't wait on idle worker nodes to close streams
++                    // after the build is complete.
++                    startInfo.hStdError = BackendNativeMethods.InvalidHandle;
++                    startInfo.hStdInput = BackendNativeMethods.InvalidHandle;
++                    startInfo.hStdOutput = BackendNativeMethods.InvalidHandle;
++                    startInfo.dwFlags = BackendNativeMethods.STARTFUSESTDHANDLES;
++                    creationFlags |= BackendNativeMethods.CREATENOWINDOW;
++                }
++            }
++            else
++            {
++                creationFlags |= BackendNativeMethods.CREATE_NEW_CONSOLE;
++            }
++
++            CommunicationsUtilities.Trace("Launching node from {0}", msbuildLocation);
++
++            string exeName = msbuildLocation;
++
++#if RUNTIME_TYPE_NETCORE || MONO
++            // Mono automagically uses the current mono, to execute a managed assembly
++            if (!NativeMethodsShared.IsMono)
++            {
++                // Run the child process with the same host as the currently-running process.
++                exeName = CurrentHost.GetCurrentHost();
++            }
++#endif
++
++            if (!NativeMethodsShared.IsWindows)
++            {
++                ProcessStartInfo processStartInfo = new ProcessStartInfo();
++                processStartInfo.FileName = exeName;
++                processStartInfo.Arguments = commandLineArgs;
++                if (!Traits.Instance.EscapeHatches.EnsureStdOutForChildNodesIsPrimaryStdout)
++                {
++                    // Redirect the streams of worker nodes so that this MSBuild.exe's
++                    // parent doesn't wait on idle worker nodes to close streams
++                    // after the build is complete.
++                    processStartInfo.RedirectStandardInput = true;
++                    processStartInfo.RedirectStandardOutput = true;
++                    processStartInfo.RedirectStandardError = true;
++                    processStartInfo.CreateNoWindow = (creationFlags | BackendNativeMethods.CREATENOWINDOW) == BackendNativeMethods.CREATENOWINDOW;
++                }
++                processStartInfo.UseShellExecute = false;
++
++                Process process;
++                try
++                {
++                    process = Process.Start(processStartInfo);
++                }
++                catch (Exception ex)
++                {
++                    CommunicationsUtilities.Trace
++                       (
++                           "Failed to launch node from {0}. CommandLine: {1}" + Environment.NewLine + "{2}",
++                           msbuildLocation,
++                           commandLineArgs,
++                           ex.ToString()
++                       );
++
++                    throw new NodeFailedToLaunchException(ex);
++                }
++
++                CommunicationsUtilities.Trace("Successfully launched {1} node with PID {0}", process.Id, exeName);
++                return process;
++            }
++            else
++            {
++#if RUNTIME_TYPE_NETCORE
++                // Repeat the executable name in the args to suit CreateProcess
++                commandLineArgs = $"\"{exeName}\" {commandLineArgs}";
++#endif
++
++                BackendNativeMethods.PROCESS_INFORMATION processInfo = new();
++                BackendNativeMethods.SECURITY_ATTRIBUTES processSecurityAttributes = new();
++                BackendNativeMethods.SECURITY_ATTRIBUTES threadSecurityAttributes = new();
++                processSecurityAttributes.nLength = Marshal.SizeOf<BackendNativeMethods.SECURITY_ATTRIBUTES>();
++                threadSecurityAttributes.nLength = Marshal.SizeOf<BackendNativeMethods.SECURITY_ATTRIBUTES>();
++
++                bool result = BackendNativeMethods.CreateProcess
++                    (
++                        exeName,
++                        commandLineArgs,
++                        ref processSecurityAttributes,
++                        ref threadSecurityAttributes,
++                        false,
++                        creationFlags,
++                        BackendNativeMethods.NullPtr,
++                        null,
++                        ref startInfo,
++                        out processInfo
++                    );
++
++                if (!result)
++                {
++                    // Creating an instance of this exception calls GetLastWin32Error and also converts it to a user-friendly string.
++                    System.ComponentModel.Win32Exception e = new System.ComponentModel.Win32Exception();
++
++                    CommunicationsUtilities.Trace
++                        (
++                            "Failed to launch node from {0}. System32 Error code {1}. Description {2}. CommandLine: {2}",
++                            msbuildLocation,
++                            e.NativeErrorCode.ToString(CultureInfo.InvariantCulture),
++                            e.Message,
++                            commandLineArgs
++                        );
++
++                    throw new NodeFailedToLaunchException(e.NativeErrorCode.ToString(CultureInfo.InvariantCulture), e.Message);
++                }
++
++                int childProcessId = processInfo.dwProcessId;
++
++                if (processInfo.hProcess != IntPtr.Zero && processInfo.hProcess != NativeMethods.InvalidHandle)
++                {
++                    NativeMethodsShared.CloseHandle(processInfo.hProcess);
++                }
++
++                if (processInfo.hThread != IntPtr.Zero && processInfo.hThread != NativeMethods.InvalidHandle)
++                {
++                    NativeMethodsShared.CloseHandle(processInfo.hThread);
++                }
++
++                CommunicationsUtilities.Trace("Successfully launched {1} node with PID {0}", childProcessId, exeName);
++                return Process.GetProcessById(childProcessId);
++            }
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+index b667e7a60f2..0beb610c0aa 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs
+@@ -19,13 +19,8 @@
+ #if FEATURE_APM
+ using Microsoft.Build.Eventing;
+ #endif
+-using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+-using Microsoft.Build.Shared.FileSystem;
+-using Microsoft.Build.Utilities;
+-
+-using BackendNativeMethods = Microsoft.Build.BackEnd.NativeMethods;
+ using Task = System.Threading.Tasks.Task;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.BackEnd.Logging;
+@@ -274,7 +269,8 @@ protected NodeContext GetNode(string msbuildLocation, string commandLineArgs, in
+ #endif
+ 
+                 // Create the node process
+-                Process msbuildProcess = LaunchNode(msbuildLocation, commandLineArgs);
++                NodeLauncher nodeLauncher = new NodeLauncher();
++                Process msbuildProcess = nodeLauncher.Start(msbuildLocation, commandLineArgs);
+                 _processesToIgnore.Add(GetProcessesToIgnoreKey(hostHandshake, msbuildProcess.Id));
+ 
+                 // Note, when running under IMAGEFILEEXECUTIONOPTIONS registry key to debug, the process ID
+@@ -332,7 +328,7 @@ protected NodeContext GetNode(string msbuildLocation, string commandLineArgs, in
+                 msbuildLocation = "MSBuild.exe";
+             }
+ 
+-            var expectedProcessName = Path.GetFileNameWithoutExtension(GetCurrentHost() ?? msbuildLocation);
++            var expectedProcessName = Path.GetFileNameWithoutExtension(CurrentHost.GetCurrentHost() ?? msbuildLocation);
+ 
+             List<Process> nodeProcesses = new List<Process>(Process.GetProcessesByName(expectedProcessName));
+ 
+@@ -441,199 +437,6 @@ private Stream TryConnectToProcess(int nodeProcessId, int timeout, Handshake han
+             return null;
+         }
+ 
+-        /// <summary>
+-        /// Creates a new MSBuild process
+-        /// </summary>
+-        private Process LaunchNode(string msbuildLocation, string commandLineArgs)
+-        {
+-            // Should always have been set already.
+-            ErrorUtilities.VerifyThrowInternalLength(msbuildLocation, nameof(msbuildLocation));
+-
+-            if (!FileSystems.Default.FileExists(msbuildLocation))
+-            {
+-                throw new BuildAbortedException(ResourceUtilities.FormatResourceStringStripCodeAndKeyword("CouldNotFindMSBuildExe", msbuildLocation));
+-            }
+-
+-            // Repeat the executable name as the first token of the command line because the command line
+-            // parser logic expects it and will otherwise skip the first argument
+-            commandLineArgs = $"\"{msbuildLocation}\" {commandLineArgs}";
+-
+-            BackendNativeMethods.STARTUP_INFO startInfo = new();
+-            startInfo.cb = Marshal.SizeOf<BackendNativeMethods.STARTUP_INFO>();
+-
+-            // Null out the process handles so that the parent process does not wait for the child process
+-            // to exit before it can exit.
+-            uint creationFlags = 0;
+-            if (Traits.Instance.EscapeHatches.EnsureStdOutForChildNodesIsPrimaryStdout)
+-            {
+-                creationFlags = BackendNativeMethods.NORMALPRIORITYCLASS;
+-            }
+-
+-            if (String.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBUILDNODEWINDOW")))
+-            {
+-                if (!Traits.Instance.EscapeHatches.EnsureStdOutForChildNodesIsPrimaryStdout)
+-                {
+-                    // Redirect the streams of worker nodes so that this MSBuild.exe's
+-                    // parent doesn't wait on idle worker nodes to close streams
+-                    // after the build is complete.
+-                    startInfo.hStdError = BackendNativeMethods.InvalidHandle;
+-                    startInfo.hStdInput = BackendNativeMethods.InvalidHandle;
+-                    startInfo.hStdOutput = BackendNativeMethods.InvalidHandle;
+-                    startInfo.dwFlags = BackendNativeMethods.STARTFUSESTDHANDLES;
+-                    creationFlags |= BackendNativeMethods.CREATENOWINDOW;
+-                }
+-            }
+-            else
+-            {
+-                creationFlags |= BackendNativeMethods.CREATE_NEW_CONSOLE;
+-            }
+-
+-            CommunicationsUtilities.Trace("Launching node from {0}", msbuildLocation);
+-
+-            string exeName = msbuildLocation;
+-
+-#if RUNTIME_TYPE_NETCORE || MONO
+-            // Mono automagically uses the current mono, to execute a managed assembly
+-            if (!NativeMethodsShared.IsMono)
+-            {
+-                // Run the child process with the same host as the currently-running process.
+-                exeName = GetCurrentHost();
+-            }
+-#endif
+-
+-            if (!NativeMethodsShared.IsWindows)
+-            {
+-                ProcessStartInfo processStartInfo = new ProcessStartInfo();
+-                processStartInfo.FileName = exeName;
+-                processStartInfo.Arguments = commandLineArgs;
+-                if (!Traits.Instance.EscapeHatches.EnsureStdOutForChildNodesIsPrimaryStdout)
+-                {
+-                    // Redirect the streams of worker nodes so that this MSBuild.exe's
+-                    // parent doesn't wait on idle worker nodes to close streams
+-                    // after the build is complete.
+-                    processStartInfo.RedirectStandardInput = true;
+-                    processStartInfo.RedirectStandardOutput = true;
+-                    processStartInfo.RedirectStandardError = true;
+-                    processStartInfo.CreateNoWindow = (creationFlags | BackendNativeMethods.CREATENOWINDOW) == BackendNativeMethods.CREATENOWINDOW;
+-                }
+-                processStartInfo.UseShellExecute = false;
+-
+-                Process process;
+-                try
+-                {
+-                    process = Process.Start(processStartInfo);
+-                }
+-                catch (Exception ex)
+-                {
+-                    CommunicationsUtilities.Trace
+-                       (
+-                           "Failed to launch node from {0}. CommandLine: {1}" + Environment.NewLine + "{2}",
+-                           msbuildLocation,
+-                           commandLineArgs,
+-                           ex.ToString()
+-                       );
+-
+-                    throw new NodeFailedToLaunchException(ex);
+-                }
+-
+-                CommunicationsUtilities.Trace("Successfully launched {1} node with PID {0}", process.Id, exeName);
+-                return process;
+-            }
+-            else
+-            {
+-#if RUNTIME_TYPE_NETCORE
+-                // Repeat the executable name in the args to suit CreateProcess
+-                commandLineArgs = $"\"{exeName}\" {commandLineArgs}";
+-#endif
+-
+-                BackendNativeMethods.PROCESS_INFORMATION processInfo = new();
+-                BackendNativeMethods.SECURITY_ATTRIBUTES processSecurityAttributes = new();
+-                BackendNativeMethods.SECURITY_ATTRIBUTES threadSecurityAttributes = new();
+-                processSecurityAttributes.nLength = Marshal.SizeOf<BackendNativeMethods.SECURITY_ATTRIBUTES>();
+-                threadSecurityAttributes.nLength = Marshal.SizeOf<BackendNativeMethods.SECURITY_ATTRIBUTES>();
+-
+-                bool result = BackendNativeMethods.CreateProcess
+-                    (
+-                        exeName,
+-                        commandLineArgs,
+-                        ref processSecurityAttributes,
+-                        ref threadSecurityAttributes,
+-                        false,
+-                        creationFlags,
+-                        BackendNativeMethods.NullPtr,
+-                        null,
+-                        ref startInfo,
+-                        out processInfo
+-                    );
+-
+-                if (!result)
+-                {
+-                    // Creating an instance of this exception calls GetLastWin32Error and also converts it to a user-friendly string.
+-                    System.ComponentModel.Win32Exception e = new System.ComponentModel.Win32Exception();
+-
+-                    CommunicationsUtilities.Trace
+-                        (
+-                            "Failed to launch node from {0}. System32 Error code {1}. Description {2}. CommandLine: {2}",
+-                            msbuildLocation,
+-                            e.NativeErrorCode.ToString(CultureInfo.InvariantCulture),
+-                            e.Message,
+-                            commandLineArgs
+-                        );
+-
+-                    throw new NodeFailedToLaunchException(e.NativeErrorCode.ToString(CultureInfo.InvariantCulture), e.Message);
+-                }
+-
+-                int childProcessId = processInfo.dwProcessId;
+-
+-                if (processInfo.hProcess != IntPtr.Zero && processInfo.hProcess != NativeMethods.InvalidHandle)
+-                {
+-                    NativeMethodsShared.CloseHandle(processInfo.hProcess);
+-                }
+-
+-                if (processInfo.hThread != IntPtr.Zero && processInfo.hThread != NativeMethods.InvalidHandle)
+-                {
+-                    NativeMethodsShared.CloseHandle(processInfo.hThread);
+-                }
+-
+-                CommunicationsUtilities.Trace("Successfully launched {1} node with PID {0}", childProcessId, exeName);
+-                return Process.GetProcessById(childProcessId);
+-            }
+-        }
+-
+-#if RUNTIME_TYPE_NETCORE || MONO
+-        private static string CurrentHost;
+-#endif
+-
+-        /// <summary>
+-        /// Identify the .NET host of the current process.
+-        /// </summary>
+-        /// <returns>The full path to the executable hosting the current process, or null if running on Full Framework on Windows.</returns>
+-        private static string GetCurrentHost()
+-        {
+-#if RUNTIME_TYPE_NETCORE || MONO
+-            if (CurrentHost == null)
+-            {
+-                string dotnetExe = Path.Combine(FileUtilities.GetFolderAbove(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory, 2),
+-                    NativeMethodsShared.IsWindows ? "dotnet.exe" : "dotnet");
+-                if (File.Exists(dotnetExe))
+-                {
+-                    CurrentHost = dotnetExe;
+-                }
+-                else
+-                {
+-                    using (Process currentProcess = Process.GetCurrentProcess())
+-                    {
+-                        CurrentHost = currentProcess.MainModule.FileName;
+-                    }
+-                }
+-            }
+-
+-            return CurrentHost;
+-#else
+-            return null;
+-#endif
+-        }
+-
+         /// <summary>
+         /// Class which wraps up the communications infrastructure for a given node.
+         /// </summary>
+diff --git a/src/Build/Definition/ProjectCollection.cs b/src/Build/Definition/ProjectCollection.cs
+index 485b905abe0..f5d45290cd2 100644
+--- a/src/Build/Definition/ProjectCollection.cs
++++ b/src/Build/Definition/ProjectCollection.cs
+@@ -145,6 +145,8 @@ public void Dispose()
+         /// </summary>
+         private static string s_assemblyDisplayVersion;
+ 
++        private static ProjectRootElementCacheBase s_projectRootElementCache = null;
++
+         /// <summary>
+         /// The projects loaded into this collection.
+         /// </summary>
+@@ -302,6 +304,26 @@ public ProjectCollection(IDictionary<string, string> globalProperties, IEnumerab
+         /// <param name="onlyLogCriticalEvents">If set to true, only critical events will be logged.</param>
+         /// <param name="loadProjectsReadOnly">If set to true, load all projects as read-only.</param>
+         public ProjectCollection(IDictionary<string, string> globalProperties, IEnumerable<ILogger> loggers, IEnumerable<ForwardingLoggerRecord> remoteLoggers, ToolsetDefinitionLocations toolsetDefinitionLocations, int maxNodeCount, bool onlyLogCriticalEvents, bool loadProjectsReadOnly)
++            : this(globalProperties, loggers, remoteLoggers, toolsetDefinitionLocations, maxNodeCount, onlyLogCriticalEvents, loadProjectsReadOnly, reuseProjectRootElementCache: false)
++        {
++        }
++
++        /// <summary>
++        /// Instantiates a project collection with specified global properties and loggers and using the
++        /// specified toolset locations, node count, and setting of onlyLogCriticalEvents.
++        /// Global properties and loggers may be null.
++        /// Throws InvalidProjectFileException if any of the global properties are reserved.
++        /// May throw InvalidToolsetDefinitionException.
++        /// </summary>
++        /// <param name="globalProperties">The default global properties to use. May be null.</param>
++        /// <param name="loggers">The loggers to register. May be null and specified to any build instead.</param>
++        /// <param name="remoteLoggers">Any remote loggers to register. May be null and specified to any build instead.</param>
++        /// <param name="toolsetDefinitionLocations">The locations from which to load toolsets.</param>
++        /// <param name="maxNodeCount">The maximum number of nodes to use for building.</param>
++        /// <param name="onlyLogCriticalEvents">If set to true, only critical events will be logged.</param>
++        /// <param name="loadProjectsReadOnly">If set to true, load all projects as read-only.</param>
++        /// <param name="reuseProjectRootElementCache">If set to true, it will try to reuse <see cref="ProjectRootElementCacheBase"/> singleton.</param>
++        public ProjectCollection(IDictionary<string, string> globalProperties, IEnumerable<ILogger> loggers, IEnumerable<ForwardingLoggerRecord> remoteLoggers, ToolsetDefinitionLocations toolsetDefinitionLocations, int maxNodeCount, bool onlyLogCriticalEvents, bool loadProjectsReadOnly, bool reuseProjectRootElementCache)
+         {
+             _loadedProjects = new LoadedProjectCollection();
+             ToolsetLocations = toolsetDefinitionLocations;
+@@ -311,10 +333,23 @@ public ProjectCollection(IDictionary<string, string> globalProperties, IEnumerab
+             {
+                 ProjectRootElementCache = new SimpleProjectRootElementCache();
+             }
++            else if (reuseProjectRootElementCache && s_projectRootElementCache != null)
++            {
++                ProjectRootElementCache = s_projectRootElementCache;
++            }
+             else
+             {
+-                ProjectRootElementCache = new ProjectRootElementCache(autoReloadFromDisk: false, loadProjectsReadOnly);
++                // When we are reusing ProjectRootElementCache we need to reload XMLs if it has changed between MSBuild Server sessions/builds.
++                // If we are not reusing, cache will be released at end of build and as we do not support project files will changes during build
++                // we do not need to auto reload.
++                bool autoReloadFromDisk = reuseProjectRootElementCache;
++                ProjectRootElementCache = new ProjectRootElementCache(autoReloadFromDisk, loadProjectsReadOnly);
++                if (reuseProjectRootElementCache)
++                {
++                    s_projectRootElementCache = ProjectRootElementCache;
++                }
+             }
++
+             OnlyLogCriticalEvents = onlyLogCriticalEvents;
+ 
+             try
+@@ -1603,6 +1638,12 @@ protected virtual void Dispose(bool disposing)
+             if (disposing)
+             {
+                 ShutDownLoggingService();
++                if (ProjectRootElementCache != null)
++                {
++                    ProjectRootElementCache.ProjectRootElementAddedHandler -= ProjectRootElementCache_ProjectRootElementAddedHandler;
++                    ProjectRootElementCache.ProjectRootElementDirtied -= ProjectRootElementCache_ProjectRootElementDirtiedHandler;
++                    ProjectRootElementCache.ProjectDirtied -= ProjectRootElementCache_ProjectDirtiedHandler;
++                }
+                 Tracing.Dump();
+             }
+         }
+diff --git a/src/Build/Evaluation/ProjectRootElementCache.cs b/src/Build/Evaluation/ProjectRootElementCache.cs
+index 17ecae43227..208a43ed668 100644
+--- a/src/Build/Evaluation/ProjectRootElementCache.cs
++++ b/src/Build/Evaluation/ProjectRootElementCache.cs
+@@ -415,6 +415,12 @@ internal override void Clear()
+         /// </summary>
+         internal override void DiscardImplicitReferences()
+         {
++            if (_autoReloadFromDisk)
++            {
++                // no need to clear it, as auto reload properly invalidates caches if changed.
++                return;
++            }
++
+             lock (_locker)
+             {
+                 // Make a new Weak cache only with items that have been explicitly loaded, this will be a small number, there will most likely
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 9c4bbac8ee4..f6c13b14634 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -1,4 +1,4 @@
+-﻿<Project Sdk="Microsoft.NET.Sdk">
++<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <Import Project="..\Shared\FileSystemSources.proj" />
+   <Import Project="..\Shared\DebuggingSources.proj" />
+@@ -149,6 +149,7 @@
+     <Compile Include="BackEnd\Components\Caching\ConfigCacheWithOverride.cs" />
+     <Compile Include="BackEnd\Components\Caching\ResultsCacheWithOverride.cs" />
+     <Compile Include="BackEnd\Components\ProjectCache\*.cs" />
++    <Compile Include="BackEnd\Components\Communications\CurrentHost.cs" />
+     <Compile Include="BackEnd\Components\Communications\ServerNodeEndpointOutOfProc.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\SdkResolverException.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+@@ -350,6 +351,7 @@
+     <Compile Include="BackEnd\Components\Communications\INodeProvider.cs" />
+     <Compile Include="BackEnd\Components\Communications\NodeEndpointInProc.cs" />
+     <Compile Include="BackEnd\Components\Communications\NodeInfo.cs" />
++    <Compile Include="BackEnd\Components\Communications\NodeLauncher.cs" />
+     <Compile Include="BackEnd\Components\Communications\NodeProviderInProc.cs" />
+     <Compile Include="BackEnd\Components\IBuildComponent.cs" />
+     <Compile Include="BackEnd\Components\IBuildComponentHost.cs" />
+diff --git a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+index 4e534a34a00..445f48157ac 100644
+--- a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+@@ -1,6 +1,7 @@
++Microsoft.Build.Evaluation.ProjectCollection.ProjectCollection(System.Collections.Generic.IDictionary<string, string> globalProperties, System.Collections.Generic.IEnumerable<Microsoft.Build.Framework.ILogger> loggers, System.Collections.Generic.IEnumerable<Microsoft.Build.Logging.ForwardingLoggerRecord> remoteLoggers, Microsoft.Build.Evaluation.ToolsetDefinitionLocations toolsetDefinitionLocations, int maxNodeCount, bool onlyLogCriticalEvents, bool loadProjectsReadOnly, bool reuseProjectRootElementCache) -> void
+ Microsoft.Build.Execution.MSBuildClient
+ Microsoft.Build.Execution.MSBuildClient.Execute(string commandLine, System.Threading.CancellationToken cancellationToken) -> Microsoft.Build.Execution.MSBuildClientExitResult
+-Microsoft.Build.Execution.MSBuildClient.MSBuildClient(string exeLocation, string dllLocation) -> void
++Microsoft.Build.Execution.MSBuildClient.MSBuildClient(string msbuildLocation) -> void
+ Microsoft.Build.Execution.MSBuildClientExitResult
+ Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildAppExitTypeString.get -> string
+ Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildAppExitTypeString.set -> void
+diff --git a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+index a5e2e1ca86b..eff393cd99f 100644
+--- a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+@@ -1,6 +1,7 @@
++Microsoft.Build.Evaluation.ProjectCollection.ProjectCollection(System.Collections.Generic.IDictionary<string, string> globalProperties, System.Collections.Generic.IEnumerable<Microsoft.Build.Framework.ILogger> loggers, System.Collections.Generic.IEnumerable<Microsoft.Build.Logging.ForwardingLoggerRecord> remoteLoggers, Microsoft.Build.Evaluation.ToolsetDefinitionLocations toolsetDefinitionLocations, int maxNodeCount, bool onlyLogCriticalEvents, bool loadProjectsReadOnly, bool reuseProjectRootElementCache) -> void
+ Microsoft.Build.Execution.MSBuildClient
+ Microsoft.Build.Execution.MSBuildClient.Execute(string commandLine, System.Threading.CancellationToken cancellationToken) -> Microsoft.Build.Execution.MSBuildClientExitResult
+-Microsoft.Build.Execution.MSBuildClient.MSBuildClient(string exeLocation, string dllLocation) -> void
++Microsoft.Build.Execution.MSBuildClient.MSBuildClient(string msbuildLocation) -> void
+ Microsoft.Build.Execution.MSBuildClientExitResult
+ Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildAppExitTypeString.get -> string
+ Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildAppExitTypeString.set -> void
+diff --git a/src/MSBuild/MSBuildClientApp.cs b/src/MSBuild/MSBuildClientApp.cs
+index de83c3a10e3..ef39eb8f1b3 100644
+--- a/src/MSBuild/MSBuildClientApp.cs
++++ b/src/MSBuild/MSBuildClientApp.cs
+@@ -42,34 +42,12 @@ public static MSBuildApp.ExitType Execute(
+             CancellationToken cancellationToken
+             )
+         {
+-            string? exeLocation;
+-            string? dllLocation;
+-
+-#if RUNTIME_TYPE_NETCORE || MONO
+-            // Run the child process with the same host as the currently-running process.
+-            // Mono automatically uses the current mono, to execute a managed assembly.
+-            if (!NativeMethodsShared.IsMono)
+-            {
+-                // _exeFileLocation consists the msbuild dll instead.
+-                dllLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
+-                exeLocation = GetCurrentHost();
+-            }
+-            else
+-            {
+-                // _exeFileLocation consists the msbuild dll instead.
+-                exeLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
+-                dllLocation = String.Empty;
+-            }
+-#else
+-            exeLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
+-            dllLocation = String.Empty;
+-#endif
++            string msbuildLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
+ 
+             return Execute(
+                 commandLine,
+                 cancellationToken,
+-                exeLocation,
+-                dllLocation
++                msbuildLocation
+             );
+         }
+ 
+@@ -80,10 +58,8 @@ CancellationToken cancellationToken
+         /// on the command line is assumed to be the name/path of the executable, and
+         /// is ignored.</param>
+         /// <param name="cancellationToken">Cancellation token.</param>
+-        /// <param name="exeLocation">Location of executable file to launch the server process.
+-        /// That should be either dotnet.exe or MSBuild.exe location.</param>
+-        /// <param name="dllLocation">Location of dll file to launch the server process if needed.
+-        /// Empty if executable is msbuild.exe and not empty if dotnet.exe.</param>
++        /// <param name="msbuildLocation"> Full path to current MSBuild.exe if executable is MSBuild.exe,
++        /// or to version of MSBuild.dll found to be associated with the current process.</param>
+         /// <returns>A value of type <see cref="MSBuildApp.ExitType"/> that indicates whether the build succeeded,
+         /// or the manner in which it failed.</returns>
+         public static MSBuildApp.ExitType Execute(
+@@ -93,8 +69,7 @@ public static MSBuildApp.ExitType Execute(
+             string[] commandLine,
+ #endif
+             CancellationToken cancellationToken,
+-            string exeLocation,
+-            string dllLocation
++            string msbuildLocation
+         )
+         {
+             // MSBuild client orchestration.
+@@ -103,7 +78,7 @@ string dllLocation
+ #else
+             string commandLineString = commandLine;
+ #endif
+-            MSBuildClient msbuildClient = new MSBuildClient(exeLocation, dllLocation); 
++            MSBuildClient msbuildClient = new MSBuildClient(msbuildLocation); 
+             MSBuildClientExitResult exitResult = msbuildClient.Execute(commandLineString, cancellationToken);
+ 
+             if (exitResult.MSBuildClientExitType == MSBuildClientExitType.ServerBusy ||
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index a14f09fccdb..fd1e59da287 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -222,10 +222,12 @@ string[] args
+             }
+ 
+             int exitCode;
+-            if (Environment.GetEnvironmentVariable(Traits.UseMSBuildServerEnvVarName) == "1")
++            if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_4) && Environment.GetEnvironmentVariable(Traits.UseMSBuildServerEnvVarName) == "1")
+             {
+                 Console.CancelKeyPress += Console_CancelKeyPress;
+ 
++                DebuggerLaunchCheck();
++
+                 // Use the client app to execute build in msbuild server. Opt-in feature.
+                 exitCode = ((s_initialized && MSBuildClientApp.Execute(
+ #if FEATURE_GET_COMMANDLINE
+@@ -484,6 +486,26 @@ private static string GetFriendlyCounterType(PerformanceCounterType type, string
+             }
+         }
+ #endif
++        /// <summary>
++        /// Launch debugger if it's requested by environment variable "MSBUILDDEBUGONSTART".
++        /// </summary>
++        private static void DebuggerLaunchCheck()
++        {
++            switch (Environment.GetEnvironmentVariable("MSBUILDDEBUGONSTART"))
++            {
++#if FEATURE_DEBUG_LAUNCH
++                case "1":
++                    Debugger.Launch();
++                    break;
++#endif
++                case "2":
++                    // Sometimes easier to attach rather than deal with JIT prompt
++                    Process currentProcess = Process.GetCurrentProcess();
++                    Console.WriteLine($"Waiting for debugger to attach ({currentProcess.MainModule.FileName} PID {currentProcess.Id}).  Press enter to continue...");
++                    Console.ReadLine();
++                    break;
++            }
++        }
+ 
+         /// <summary>
+         /// Orchestrates the execution of the application, and is also responsible
+@@ -508,20 +530,8 @@ string[] commandLine
+             // with our OM and modify and save them. They'll never do this for Microsoft.*.targets, though,
+             // and those form the great majority of our unnecessary memory use.
+             Environment.SetEnvironmentVariable("MSBuildLoadMicrosoftTargetsReadOnly", "true");
+-            switch (Environment.GetEnvironmentVariable("MSBUILDDEBUGONSTART"))
+-            {
+-#if FEATURE_DEBUG_LAUNCH
+-                case "1":
+-                    Debugger.Launch();
+-                    break;
+-#endif
+-                case "2":
+-                    // Sometimes easier to attach rather than deal with JIT prompt
+-                    Process currentProcess = Process.GetCurrentProcess();
+-                    Console.WriteLine($"Waiting for debugger to attach ({currentProcess.MainModule.FileName} PID {currentProcess.Id}).  Press enter to continue...");
+-                    Console.ReadLine();
+-                    break;
+-            }
++
++            DebuggerLaunchCheck();
+ 
+ #if FEATURE_GET_COMMANDLINE
+             ErrorUtilities.VerifyThrowArgumentLength(commandLine, nameof(commandLine));
+@@ -1083,7 +1093,8 @@ string[] commandLine
+                     toolsetDefinitionLocations,
+                     cpuCount,
+                     onlyLogCriticalEvents,
+-                    loadProjectsReadOnly: !preprocessOnly
++                    loadProjectsReadOnly: !preprocessOnly,
++                    reuseProjectRootElementCache: s_isServerNode
+                 );
+ 
+                 if (toolsVersion != null && !projectCollection.ContainsToolset(toolsVersion))
+@@ -1316,7 +1327,14 @@ string[] commandLine
+                 FileUtilities.ClearCacheDirectory();
+                 projectCollection?.Dispose();
+ 
+-                BuildManager.DefaultBuildManager.Dispose();
++                // Build manager shall be reused for all build sessions.
++                // If, for one reason or another, this behavior needs to change in future
++                // please be aware that current code creates and keep running  InProcNode even
++                // when its owning default build manager is disposed resulting in leek of memory and threads.
++                if (!s_isServerNode)
++                {
++                    BuildManager.DefaultBuildManager.Dispose();
++                }
+             }
+ 
+             return success;

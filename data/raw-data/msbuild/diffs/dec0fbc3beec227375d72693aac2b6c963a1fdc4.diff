@@ -1,0 +1,317 @@
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index 273cfd69f84..b2329da56b5 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -38,6 +38,16 @@ public sealed class MSBuildClient
+         /// </summary>
+         private readonly string _msbuildLocation;
+ 
++        /// <summary>
++        /// The command line to process.
++        /// The first argument on the command line is assumed to be the name/path of the executable, and is ignored.
++        /// </summary>
++#if FEATURE_GET_COMMANDLINE
++        private readonly string _commandLine;
++#else
++        private readonly string[] _commandLine;
++#endif
++
+         /// <summary>
+         /// The MSBuild client execution result.
+         /// </summary>
+@@ -87,14 +97,23 @@ public sealed class MSBuildClient
+         /// <summary>
+         /// Public constructor with parameters.
+         /// </summary>
++        /// <param name="commandLine">The command line to process. The first argument
++        /// on the command line is assumed to be the name/path of the executable, and is ignored</param>
+         /// <param name="msbuildLocation"> Full path to current MSBuild.exe if executable is MSBuild.exe,
+         /// or to version of MSBuild.dll found to be associated with the current process.</param>
+-        public MSBuildClient(string msbuildLocation)
++        public MSBuildClient(
++#if FEATURE_GET_COMMANDLINE
++            string commandLine,
++#else
++            string[] commandLine,
++#endif
++            string msbuildLocation)
+         {
+             _serverEnvironmentVariables = new();
+             _exitResult = new();
+ 
+             // dll & exe locations
++            _commandLine = commandLine;
+             _msbuildLocation = msbuildLocation;
+ 
+             // Client <-> Server communication stream
+@@ -114,15 +133,20 @@ public MSBuildClient(string msbuildLocation)
+         /// Orchestrates the execution of the build on the server,
+         /// responsible for client-server communication.
+         /// </summary>
+-        /// <param name="commandLine">The command line to process. The first argument
+-        /// on the command line is assumed to be the name/path of the executable, and
+-        /// is ignored.</param>
+         /// <param name="cancellationToken">Cancellation token.</param>
+         /// <returns>A value of type <see cref="MSBuildClientExitResult"/> that indicates whether the build succeeded,
+         /// or the manner in which it failed.</returns>
+-        public MSBuildClientExitResult Execute(string commandLine, CancellationToken cancellationToken)
++        public MSBuildClientExitResult Execute(CancellationToken cancellationToken)
+         {
+-            CommunicationsUtilities.Trace("Executing build with command line '{0}'", commandLine);
++            // Command line in one string used only in human readable content.
++            string descriptiveCommandLine =
++#if FEATURE_GET_COMMANDLINE
++                _commandLine;
++#else
++                string.Join(" ", _commandLine);
++#endif
++
++            CommunicationsUtilities.Trace("Executing build with command line '{0}'", descriptiveCommandLine);
+             string serverRunningMutexName = OutOfProcServerNode.GetRunningServerMutexName(_handshake);
+             string serverBusyMutexName = OutOfProcServerNode.GetBusyServerMutexName(_handshake);
+ 
+@@ -158,8 +182,8 @@ public MSBuildClientExitResult Execute(string commandLine, CancellationToken can
+ 
+             // Send build command.
+             // Let's send it outside the packet pump so that we easier and quicker deal with possible issues with connection to server.
+-            MSBuildEventSource.Log.MSBuildServerBuildStart(commandLine);
+-            if (!TrySendBuildCommand(commandLine))
++            MSBuildEventSource.Log.MSBuildServerBuildStart(descriptiveCommandLine);
++            if (!TrySendBuildCommand())
+             {
+                 CommunicationsUtilities.Trace("Failure to connect to a server.");
+                 _exitResult.MSBuildClientExitType = MSBuildClientExitType.ConnectionError;
+@@ -221,7 +245,7 @@ public MSBuildClientExitResult Execute(string commandLine, CancellationToken can
+                 _exitResult.MSBuildClientExitType = MSBuildClientExitType.Unexpected;
+             }
+ 
+-            MSBuildEventSource.Log.MSBuildServerBuildStop(commandLine, _numConsoleWritePackets, _sizeOfConsoleWritePackets, _exitResult.MSBuildClientExitType.ToString(), _exitResult.MSBuildAppExitTypeString);
++            MSBuildEventSource.Log.MSBuildServerBuildStop(descriptiveCommandLine, _numConsoleWritePackets, _sizeOfConsoleWritePackets, _exitResult.MSBuildClientExitType.ToString(), _exitResult.MSBuildAppExitTypeString);
+             CommunicationsUtilities.Trace("Build finished.");
+             return _exitResult;
+         }
+@@ -387,11 +411,11 @@ private bool TryLaunchServer()
+             return true;
+         }
+ 
+-        private bool TrySendBuildCommand(string commandLine) => TrySendPacket(() => GetServerNodeBuildCommand(commandLine));
++        private bool TrySendBuildCommand() => TrySendPacket(() => GetServerNodeBuildCommand());
+ 
+         private bool TrySendCancelCommand() => TrySendPacket(() => new ServerNodeBuildCancel());
+ 
+-        private ServerNodeBuildCommand GetServerNodeBuildCommand(string commandLine)
++        private ServerNodeBuildCommand GetServerNodeBuildCommand()
+         {
+             Dictionary<string, string> envVars = new();
+ 
+@@ -409,7 +433,7 @@ private ServerNodeBuildCommand GetServerNodeBuildCommand(string commandLine)
+             envVars[Traits.UseMSBuildServerEnvVarName] = "0";
+ 
+             return new ServerNodeBuildCommand(
+-                        commandLine,
++                        _commandLine,
+                         startupDirectory: Directory.GetCurrentDirectory(),
+                         buildProcessEnvironment: envVars,
+                         CultureInfo.CurrentCulture,
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index 0053b91705b..6a0b4c94242 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -20,7 +20,17 @@ namespace Microsoft.Build.Experimental
+     /// </summary>
+     public sealed class OutOfProcServerNode : INode, INodePacketFactory, INodePacketHandler
+     {
+-        private readonly Func<string, (int exitCode, string exitType)> _buildFunction;
++        /// <summary>
++        /// A callback used to execute command line build.
++        /// </summary>
++        public delegate (int exitCode, string exitType) BuildCallback(
++#if FEATURE_GET_COMMANDLINE
++            string commandLine);
++#else
++            string[] commandLine);
++#endif
++
++        private readonly BuildCallback _buildFunction;
+ 
+         /// <summary>
+         /// The endpoint used to talk to the host.
+@@ -64,7 +74,7 @@ public sealed class OutOfProcServerNode : INode, INodePacketFactory, INodePacket
+ 
+         private string _serverBusyMutexName = default!;
+ 
+-        public OutOfProcServerNode(Func<string, (int exitCode, string exitType)> buildFunction)
++        public OutOfProcServerNode(BuildCallback buildFunction)
+         {
+             _buildFunction = buildFunction;
+             new Dictionary<string, string>();
+diff --git a/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs b/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs
+index a83adf83e8c..32c551b78a8 100644
+--- a/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs
++++ b/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs
+@@ -14,7 +14,11 @@ namespace Microsoft.Build.BackEnd
+     /// </summary>
+     internal sealed class ServerNodeBuildCommand : INodePacket
+     {
++#if FEATURE_GET_COMMANDLINE
+         private string _commandLine = default!;
++#else
++        private string[] _commandLine = default!;
++#endif
+         private string _startupDirectory = default!;
+         private Dictionary<string, string> _buildProcessEnvironment = default!;
+         private CultureInfo _culture = default!;
+@@ -27,9 +31,13 @@ internal sealed class ServerNodeBuildCommand : INodePacket
+         public NodePacketType Type => NodePacketType.ServerNodeBuildCommand;
+ 
+         /// <summary>
+-        /// The startup directory
++        /// Command line including arguments
+         /// </summary>
++#if FEATURE_GET_COMMANDLINE
+         public string CommandLine => _commandLine;
++#else
++        public string[] CommandLine => _commandLine;
++#endif
+ 
+         /// <summary>
+         /// The startup directory
+@@ -63,7 +71,15 @@ private ServerNodeBuildCommand()
+         {
+         }
+ 
+-        public ServerNodeBuildCommand(string commandLine, string startupDirectory, Dictionary<string, string> buildProcessEnvironment, CultureInfo culture, CultureInfo uiCulture,
++        public ServerNodeBuildCommand(
++#if FEATURE_GET_COMMANDLINE
++            string commandLine,
++#else
++            string[] commandLine,
++#endif
++            string startupDirectory,
++            Dictionary<string, string> buildProcessEnvironment,
++            CultureInfo culture, CultureInfo uiCulture,
+             TargetConsoleConfiguration consoleConfiguration)
+         {
+             ErrorUtilities.VerifyThrowInternalNull(consoleConfiguration, nameof(consoleConfiguration));
+diff --git a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+index da542899bb9..c4de070516f 100644
+--- a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+@@ -1,7 +1,7 @@
+ Microsoft.Build.Evaluation.ProjectCollection.ProjectCollection(System.Collections.Generic.IDictionary<string, string> globalProperties, System.Collections.Generic.IEnumerable<Microsoft.Build.Framework.ILogger> loggers, System.Collections.Generic.IEnumerable<Microsoft.Build.Logging.ForwardingLoggerRecord> remoteLoggers, Microsoft.Build.Evaluation.ToolsetDefinitionLocations toolsetDefinitionLocations, int maxNodeCount, bool onlyLogCriticalEvents, bool loadProjectsReadOnly, bool reuseProjectRootElementCache) -> void
+ Microsoft.Build.Experimental.MSBuildClient
+-Microsoft.Build.Experimental.MSBuildClient.Execute(string commandLine, System.Threading.CancellationToken cancellationToken) -> Microsoft.Build.Experimental.MSBuildClientExitResult
+-Microsoft.Build.Experimental.MSBuildClient.MSBuildClient(string msbuildLocation) -> void
++Microsoft.Build.Experimental.MSBuildClient.Execute(System.Threading.CancellationToken cancellationToken) -> Microsoft.Build.Experimental.MSBuildClientExitResult
++Microsoft.Build.Experimental.MSBuildClient.MSBuildClient(string commandLine, string msbuildLocation) -> void
+ Microsoft.Build.Experimental.MSBuildClientExitResult
+ Microsoft.Build.Experimental.MSBuildClientExitResult.MSBuildAppExitTypeString.get -> string
+ Microsoft.Build.Experimental.MSBuildClientExitResult.MSBuildAppExitTypeString.set -> void
+@@ -15,5 +15,6 @@ Microsoft.Build.Experimental.MSBuildClientExitType.ServerBusy = 1 -> Microsoft.B
+ Microsoft.Build.Experimental.MSBuildClientExitType.Success = 0 -> Microsoft.Build.Experimental.MSBuildClientExitType
+ Microsoft.Build.Experimental.MSBuildClientExitType.Unexpected = 4 -> Microsoft.Build.Experimental.MSBuildClientExitType
+ Microsoft.Build.Experimental.OutOfProcServerNode
+-Microsoft.Build.Experimental.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction) -> void
++Microsoft.Build.Experimental.OutOfProcServerNode.BuildCallback
++Microsoft.Build.Experimental.OutOfProcServerNode.OutOfProcServerNode(Microsoft.Build.Experimental.OutOfProcServerNode.BuildCallback buildFunction) -> void
+ Microsoft.Build.Experimental.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
+diff --git a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+index da542899bb9..20875ae93b2 100644
+--- a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+@@ -1,7 +1,7 @@
+ Microsoft.Build.Evaluation.ProjectCollection.ProjectCollection(System.Collections.Generic.IDictionary<string, string> globalProperties, System.Collections.Generic.IEnumerable<Microsoft.Build.Framework.ILogger> loggers, System.Collections.Generic.IEnumerable<Microsoft.Build.Logging.ForwardingLoggerRecord> remoteLoggers, Microsoft.Build.Evaluation.ToolsetDefinitionLocations toolsetDefinitionLocations, int maxNodeCount, bool onlyLogCriticalEvents, bool loadProjectsReadOnly, bool reuseProjectRootElementCache) -> void
+ Microsoft.Build.Experimental.MSBuildClient
+-Microsoft.Build.Experimental.MSBuildClient.Execute(string commandLine, System.Threading.CancellationToken cancellationToken) -> Microsoft.Build.Experimental.MSBuildClientExitResult
+-Microsoft.Build.Experimental.MSBuildClient.MSBuildClient(string msbuildLocation) -> void
++Microsoft.Build.Experimental.MSBuildClient.Execute(System.Threading.CancellationToken cancellationToken) -> Microsoft.Build.Experimental.MSBuildClientExitResult
++Microsoft.Build.Experimental.MSBuildClient.MSBuildClient(string[] commandLine, string msbuildLocation) -> void
+ Microsoft.Build.Experimental.MSBuildClientExitResult
+ Microsoft.Build.Experimental.MSBuildClientExitResult.MSBuildAppExitTypeString.get -> string
+ Microsoft.Build.Experimental.MSBuildClientExitResult.MSBuildAppExitTypeString.set -> void
+@@ -15,5 +15,6 @@ Microsoft.Build.Experimental.MSBuildClientExitType.ServerBusy = 1 -> Microsoft.B
+ Microsoft.Build.Experimental.MSBuildClientExitType.Success = 0 -> Microsoft.Build.Experimental.MSBuildClientExitType
+ Microsoft.Build.Experimental.MSBuildClientExitType.Unexpected = 4 -> Microsoft.Build.Experimental.MSBuildClientExitType
+ Microsoft.Build.Experimental.OutOfProcServerNode
+-Microsoft.Build.Experimental.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction) -> void
++Microsoft.Build.Experimental.OutOfProcServerNode.BuildCallback
++Microsoft.Build.Experimental.OutOfProcServerNode.OutOfProcServerNode(Microsoft.Build.Experimental.OutOfProcServerNode.BuildCallback buildFunction) -> void
+ Microsoft.Build.Experimental.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
+diff --git a/src/MSBuild/MSBuildClientApp.cs b/src/MSBuild/MSBuildClientApp.cs
+index fb6a1fa4f02..b5187d198a1 100644
+--- a/src/MSBuild/MSBuildClientApp.cs
++++ b/src/MSBuild/MSBuildClientApp.cs
+@@ -46,9 +46,8 @@ CancellationToken cancellationToken
+ 
+             return Execute(
+                 commandLine,
+-                cancellationToken,
+-                msbuildLocation
+-            );
++                msbuildLocation,
++                cancellationToken);
+         }
+ 
+         /// <summary>
+@@ -57,9 +56,9 @@ CancellationToken cancellationToken
+         /// <param name="commandLine">The command line to process. The first argument
+         /// on the command line is assumed to be the name/path of the executable, and
+         /// is ignored.</param>
+-        /// <param name="cancellationToken">Cancellation token.</param>
+         /// <param name="msbuildLocation"> Full path to current MSBuild.exe if executable is MSBuild.exe,
+         /// or to version of MSBuild.dll found to be associated with the current process.</param>
++        /// <param name="cancellationToken">Cancellation token.</param>
+         /// <returns>A value of type <see cref="MSBuildApp.ExitType"/> that indicates whether the build succeeded,
+         /// or the manner in which it failed.</returns>
+         public static MSBuildApp.ExitType Execute(
+@@ -68,18 +67,11 @@ public static MSBuildApp.ExitType Execute(
+ #else
+             string[] commandLine,
+ #endif
+-            CancellationToken cancellationToken,
+-            string msbuildLocation
+-        )
++            string msbuildLocation,
++            CancellationToken cancellationToken)
+         {
+-            // MSBuild client orchestration.
+-#if !FEATURE_GET_COMMANDLINE
+-            string commandLineString = string.Join(" ", commandLine); 
+-#else
+-            string commandLineString = commandLine;
+-#endif
+-            MSBuildClient msbuildClient = new MSBuildClient(msbuildLocation); 
+-            MSBuildClientExitResult exitResult = msbuildClient.Execute(commandLineString, cancellationToken);
++            MSBuildClient msbuildClient = new MSBuildClient(commandLine, msbuildLocation); 
++            MSBuildClientExitResult exitResult = msbuildClient.Execute(cancellationToken);
+ 
+             if (exitResult.MSBuildClientExitType == MSBuildClientExitType.ServerBusy ||
+                 exitResult.MSBuildClientExitType == MSBuildClientExitType.ConnectionError)
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 373e4a58aa3..419713a18cf 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -2679,7 +2679,7 @@ private static void StartLocalNode(CommandLineSwitches commandLineSwitches, bool
+                 {
+                     // Since build function has to reuse code from *this* class and OutOfProcServerNode is in different assembly
+                     // we have to pass down xmake build invocation to avoid circular dependency
+-                    Func<string, (int exitCode, string exitType)> buildFunction = (commandLine) =>
++                    OutOfProcServerNode.BuildCallback buildFunction = (commandLine) =>
+                     {
+                         int exitCode;
+                         ExitType exitType;
+@@ -2690,13 +2690,7 @@ private static void StartLocalNode(CommandLineSwitches commandLineSwitches, bool
+                         }
+                         else
+                         {
+-                            exitType = Execute(
+-#if FEATURE_GET_COMMANDLINE
+-                                    commandLine
+-#else
+-                                    QuotingUtilities.SplitUnquoted(commandLine).ToArray()
+-#endif
+-                                );
++                            exitType = Execute(commandLine);
+                             exitCode = exitType == ExitType.Success ? 0 : 1;
+                         }
+                         exitCode = exitType == ExitType.Success ? 0 : 1;

@@ -1,0 +1,1164 @@
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+new file mode 100644
+index 00000000000..8f2d33a8d56
+--- /dev/null
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -0,0 +1,447 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++using System.IO.Pipes;
++using System.Threading;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.BackEnd.Client;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.Execution
++{
++    /// <summary>
++    /// This class is the public entry point for executing builds in msbuild server.
++    /// It processes command-line arguments and invokes the build engine.
++    /// </summary>
++    public sealed class MSBuildClient
++    {
++        /// <summary>
++        /// The build inherits all the environment variables from the client process.
++        /// This property allows to add extra environment variables or reset some of the existing ones.
++        /// </summary>
++        private readonly Dictionary<string, string> _serverEnvironmentVariables;
++
++        /// <summary>
++        /// Location of executable file to launch the server process. That should be either dotnet.exe or MSBuild.exe location.
++        /// </summary>
++        private readonly string _exeLocation;
++
++        /// <summary>
++        /// Location of dll file to launch the server process if needed. Empty if executable is msbuild.exe and not empty if dotnet.exe.
++        /// </summary>
++        private readonly string _dllLocation;
++
++        /// <summary>
++        /// The MSBuild client execution result.
++        /// </summary>
++        private readonly MSBuildClientExitResult _exitResult;
++
++        /// <summary>
++        /// Whether MSBuild server finished the build.
++        /// </summary>
++        private bool _buildFinished = false;
++
++        /// <summary>
++        /// Handshake between server and client.
++        /// </summary>
++        private readonly ServerNodeHandshake _handshake;
++
++        /// <summary>
++        /// The named pipe name for client-server communication.
++        /// </summary>
++        private readonly string _pipeName;
++
++        /// <summary>
++        /// The named pipe stream for client-server communication.
++        /// </summary>
++        private readonly NamedPipeClientStream _nodeStream;
++
++        /// <summary>
++        /// A way to cache a byte array when writing out packets
++        /// </summary>
++        private readonly MemoryStream _packetMemoryStream;
++
++        /// <summary>
++        /// A binary writer to help write into <see cref="_packetMemoryStream"/>
++        /// </summary>
++        private readonly BinaryWriter _binaryWriter;
++
++        /// <summary>
++        /// Public constructor with parameters.
++        /// </summary>
++        /// <param name="exeLocation">Location of executable file to launch the server process.
++        /// That should be either dotnet.exe or MSBuild.exe location.</param>
++        /// <param name="dllLocation">Location of dll file to launch the server process if needed.
++        /// Empty if executable is msbuild.exe and not empty if dotnet.exe.</param>
++        public MSBuildClient(string exeLocation, string dllLocation)
++        {
++            _serverEnvironmentVariables = new();
++            _exitResult = new();
++
++            // dll & exe locations
++            _exeLocation = exeLocation;
++            _dllLocation = dllLocation;
++
++            // Client <-> Server communication stream
++            _handshake = GetHandshake();
++            _pipeName = OutOfProcServerNode.GetPipeName(_handshake);
++            _nodeStream = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous
++#if FEATURE_PIPEOPTIONS_CURRENTUSERONLY
++                                                                         | PipeOptions.CurrentUserOnly
++#endif
++            );
++
++            _packetMemoryStream = new MemoryStream();
++            _binaryWriter = new BinaryWriter(_packetMemoryStream);
++        }
++
++        /// <summary>
++        /// Orchestrates the execution of the build on the server,
++        /// responsible for client-server communication.
++        /// </summary>
++        /// <param name="commandLine">The command line to process. The first argument
++        /// on the command line is assumed to be the name/path of the executable, and
++        /// is ignored.</param>
++        /// <param name="cancellationToken">Cancellation token.</param>
++        /// <returns>A value of type <see cref="MSBuildClientExitResult"/> that indicates whether the build succeeded,
++        /// or the manner in which it failed.</returns>
++        public MSBuildClientExitResult Execute(string commandLine, CancellationToken cancellationToken)
++        {
++            string serverRunningMutexName = $@"{ServerNamedMutex.RunningServerMutexNamePrefix}{_pipeName}";
++            string serverBusyMutexName = $@"{ServerNamedMutex.BusyServerMutexNamePrefix}{_pipeName}";
++
++            // Start server it if is not running.
++            bool serverIsAlreadyRunning = ServerNamedMutex.WasOpen(serverRunningMutexName);
++            if (!serverIsAlreadyRunning && !TryLaunchServer())
++            {
++                return _exitResult;
++            }
++
++            // Check that server is not busy.
++            var serverWasBusy = ServerNamedMutex.WasOpen(serverBusyMutexName);
++            if (serverWasBusy)
++            {
++                CommunicationsUtilities.Trace("Server is busy, falling back to former behavior.");
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
++                return _exitResult;
++            }
++
++            // Connect to server.
++            if (!TryConnectToServer(serverIsAlreadyRunning ? 1_000 : 20_000))
++            {
++                CommunicationsUtilities.Trace("Failure to connect to a server.");
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ConnectionError;
++                return _exitResult;
++            }
++
++            // Send build command.
++            // Let's send it outside the packet pump so that we easier and quicker deal with possible issues with connection to server.
++            if (!TrySendBuildCommand(commandLine))
++            {
++                CommunicationsUtilities.Trace("Failure to connect to a server.");
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ConnectionError;
++                return _exitResult;
++            }
++
++            try
++            {
++                // Start packet pump
++                using MSBuildClientPacketPump packetPump = new(_nodeStream);
++
++                packetPump.RegisterPacketHandler(NodePacketType.ServerNodeConsoleWrite, ServerNodeConsoleWrite.FactoryForDeserialization, packetPump);
++                packetPump.RegisterPacketHandler(NodePacketType.ServerNodeBuildResult, ServerNodeBuildResult.FactoryForDeserialization, packetPump);
++                packetPump.Start();
++
++                WaitHandle[] waitHandles =
++                {
++                    cancellationToken.WaitHandle,
++                    packetPump.PacketPumpErrorEvent,
++                    packetPump.PacketReceivedEvent
++                };
++
++                while (!_buildFinished)
++                {
++                    int index = WaitHandle.WaitAny(waitHandles);
++                    switch (index)
++                    {
++                        case 0:
++                            HandleCancellation();
++                            break;
++
++                        case 1:
++                            HandlePacketPumpError(packetPump);
++                            break;
++
++                        case 2:
++                            while (packetPump.ReceivedPacketsQueue.TryDequeue(out INodePacket? packet) &&
++                                   !_buildFinished &&
++                                   !cancellationToken.IsCancellationRequested)
++                            {
++                                if (packet != null)
++                                {
++                                    HandlePacket(packet);
++                                }
++                            }
++
++                            break;
++                    }
++                }
++            }
++            catch (Exception ex)
++            {
++                CommunicationsUtilities.Trace("MSBuild client error: problem during packet handling occurred: {0}.", ex);
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.Unexpected;
++            }
++
++            CommunicationsUtilities.Trace("Build finished.");
++            return _exitResult;
++        }
++
++        private void SendCancelCommand(NamedPipeClientStream nodeStream) => throw new NotImplementedException();
++
++        /// <summary>
++        /// Launches MSBuild server. 
++        /// </summary>
++        /// <returns> Whether MSBuild server was started successfully.</returns>
++        private bool TryLaunchServer()
++        {
++            string serverLaunchMutexName = $@"Global\server-launch-{_pipeName}";
++            using var serverLaunchMutex = ServerNamedMutex.OpenOrCreateMutex(serverLaunchMutexName, out bool mutexCreatedNew);
++            if (!mutexCreatedNew)
++            {
++                // Some other client process launching a server and setting a build request for it. Fallback to usual msbuild app build.
++                CommunicationsUtilities.Trace("Another process launching the msbuild server, falling back to former behavior.");
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ServerBusy;
++                return false;
++            }
++
++            string[] msBuildServerOptions = new string[] {
++                _dllLocation,
++                "/nologo",
++                "/nodemode:8"
++            };
++
++            try
++            {
++                Process msbuildProcess = LaunchNode(_exeLocation, string.Join(" ", msBuildServerOptions),  _serverEnvironmentVariables);
++                CommunicationsUtilities.Trace("Server is launched with PID: {0}", msbuildProcess.Id);
++            }
++            catch (Exception ex)
++            {
++                CommunicationsUtilities.Trace("Failed to launch the msbuild server: {0}", ex);
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.LaunchError;
++                return false;
++            }
++
++            return true;
++        }
++
++        private Process LaunchNode(string exeLocation, string msBuildServerArguments, Dictionary<string, string> serverEnvironmentVariables)
++        { 
++            ProcessStartInfo processStartInfo = new() 
++            {
++                FileName = exeLocation,
++                Arguments = msBuildServerArguments,
++                UseShellExecute = false
++            };
++
++            foreach (var entry in serverEnvironmentVariables)
++            {
++                processStartInfo.Environment[entry.Key] = entry.Value;
++            }
++
++            // We remove env to enable MSBuild Server that might be equal to 1, so we do not get an infinite recursion here.
++            processStartInfo.Environment[Traits.UseMSBuildServerEnvVarName] = "0";
++
++            processStartInfo.CreateNoWindow = true;
++            processStartInfo.UseShellExecute = false;
++
++            return Process.Start(processStartInfo) ?? throw new InvalidOperationException("MSBuild server node failed to launch.");
++        }
++
++        private bool TrySendBuildCommand(string commandLine)
++        {
++            try
++            {
++                ServerNodeBuildCommand buildCommand = GetServerNodeBuildCommand(commandLine);
++                WritePacket(_nodeStream, buildCommand);
++                CommunicationsUtilities.Trace("Build command send...");
++            }
++            catch (Exception ex)
++            {
++                CommunicationsUtilities.Trace("Failed to send build command to server: {0}", ex);
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ConnectionError;
++                return false;
++            }
++
++            return true;
++        }
++
++        private ServerNodeBuildCommand GetServerNodeBuildCommand(string commandLine)
++        {
++            Dictionary<string, string> envVars = new();
++
++            foreach (DictionaryEntry envVar in Environment.GetEnvironmentVariables())
++            {
++                envVars[(string)envVar.Key] = (envVar.Value as string) ?? string.Empty;
++            }
++
++            foreach (var pair in _serverEnvironmentVariables)
++            {
++                envVars[pair.Key] = pair.Value;
++            }
++
++            // We remove env variable used to invoke MSBuild server as that might be equal to 1, so we do not get an infinite recursion here. 
++            envVars[Traits.UseMSBuildServerEnvVarName] = "0";
++
++            return new ServerNodeBuildCommand(
++                        commandLine,
++                        startupDirectory: Directory.GetCurrentDirectory(),
++                        buildProcessEnvironment: envVars,
++                        CultureInfo.CurrentCulture,
++                        CultureInfo.CurrentUICulture);
++        }
++
++        private ServerNodeHandshake GetHandshake()
++        {
++            return new ServerNodeHandshake(CommunicationsUtilities.GetHandshakeOptions(taskHost: false, architectureFlagToSet: XMakeAttributes.GetCurrentMSBuildArchitecture()));
++        }
++
++        /// <summary>
++        /// Handle cancellation.
++        /// </summary>
++        private void HandleCancellation()
++        {
++            // TODO.
++            // Send cancellation command to server.
++            // SendCancelCommand(_nodeStream);
++
++            Console.WriteLine("MSBuild client cancelled.");
++            CommunicationsUtilities.Trace("MSBuild client cancelled.");
++            _exitResult.MSBuildClientExitType = MSBuildClientExitType.Cancelled;
++            _buildFinished = true;
++        }
++
++        /// <summary>
++        /// Handle packet pump error.
++        /// </summary>
++        private void HandlePacketPumpError(MSBuildClientPacketPump packetPump)
++        {
++            CommunicationsUtilities.Trace("MSBuild client error: packet pump unexpectedly shut down: {0}", packetPump.PacketPumpException);
++            throw packetPump.PacketPumpException ?? new Exception("Packet pump unexpectedly shut down");
++        }
++
++        /// <summary>
++        /// Dispatches the packet to the correct handler.
++        /// </summary>
++        private void HandlePacket(INodePacket packet)
++        {
++            switch (packet.Type)
++            {
++                case NodePacketType.ServerNodeConsoleWrite:
++                    HandleServerNodeConsoleWrite((ServerNodeConsoleWrite)packet);
++                    break;
++                case NodePacketType.ServerNodeBuildResult:
++                    HandleServerNodeBuildResult((ServerNodeBuildResult)packet);
++                    break;
++                default: throw new InvalidOperationException($"Unexpected packet type {packet.GetType().Name}");
++            }
++        }
++
++        private void HandleServerNodeConsoleWrite(ServerNodeConsoleWrite consoleWrite)
++        {
++            switch (consoleWrite.OutputType)
++            {
++                case ConsoleOutput.Standard:
++                    Console.Write(consoleWrite.Text);
++                    break;
++                case ConsoleOutput.Error:
++                    Console.Error.Write(consoleWrite.Text);
++                    break;
++                default:
++                    throw new InvalidOperationException($"Unexpected console output type {consoleWrite.OutputType}");
++            }
++        }
++
++        private void HandleServerNodeBuildResult(ServerNodeBuildResult response)
++        {
++            CommunicationsUtilities.Trace("Build response received: exit code {0}, exit type '{1}'", response.ExitCode, response.ExitType);
++            _exitResult.MSBuildClientExitType = MSBuildClientExitType.Success;
++            _exitResult.MSBuildAppExitTypeString = response.ExitType;
++            _buildFinished = true;
++        }
++
++        /// <summary>
++        /// Connects to MSBuild server.
++        /// </summary>
++        /// <returns> Whether the client connected to MSBuild server successfully.</returns>
++        private bool TryConnectToServer(int timeout)
++        {
++            try
++            {
++                _nodeStream.Connect(timeout);
++
++                int[] handshakeComponents = _handshake.RetrieveHandshakeComponents();
++                for (int i = 0; i < handshakeComponents.Length; i++)
++                {
++                    CommunicationsUtilities.Trace("Writing handshake part {0} ({1}) to pipe {2}", i, handshakeComponents[i], _pipeName);
++                    _nodeStream.WriteIntForHandshake(handshakeComponents[i]);
++                }
++
++                // This indicates that we have finished all the parts of our handshake; hopefully the endpoint has as well.
++                _nodeStream.WriteEndOfHandshakeSignal();
++
++                CommunicationsUtilities.Trace("Reading handshake from pipe {0}", _pipeName);
++
++#if NETCOREAPP2_1_OR_GREATER || MONO
++                _nodeStream.ReadEndOfHandshakeSignal(false, 1000); 
++#else
++                _nodeStream.ReadEndOfHandshakeSignal(false);
++#endif
++
++                CommunicationsUtilities.Trace("Successfully connected to pipe {0}...!", _pipeName);
++            }
++            catch (Exception ex)
++            {
++                CommunicationsUtilities.Trace("Failed to connect to server: {0}", ex);
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ConnectionError;
++                return false;
++            }
++
++            return true;
++        }
++
++        private void WritePacket(Stream nodeStream, INodePacket packet)
++        {
++            MemoryStream memoryStream = _packetMemoryStream;
++            memoryStream.SetLength(0);
++
++            ITranslator writeTranslator = BinaryTranslator.GetWriteTranslator(memoryStream);
++
++            // Write header
++            memoryStream.WriteByte((byte)packet.Type);
++
++            // Pad for packet length
++            _binaryWriter.Write(0);
++
++            // Reset the position in the write buffer.
++            packet.Translate(writeTranslator);
++
++            int packetStreamLength = (int)memoryStream.Position;
++
++            // Now write in the actual packet length
++            memoryStream.Position = 1;
++            _binaryWriter.Write(packetStreamLength - 5);
++
++            nodeStream.Write(memoryStream.GetBuffer(), 0, packetStreamLength);
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Client/MSBuildClientExitResult.cs b/src/Build/BackEnd/Client/MSBuildClientExitResult.cs
+new file mode 100644
+index 00000000000..648e755f002
+--- /dev/null
++++ b/src/Build/BackEnd/Client/MSBuildClientExitResult.cs
+@@ -0,0 +1,24 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++namespace Microsoft.Build.Execution
++{
++    /// <summary>
++    /// Enumeration of the various ways in which the MSBuildClient execution can exit.
++    /// </summary>
++    public sealed class MSBuildClientExitResult
++    {
++        /// <summary>
++        /// The MSBuild client exit type.
++        /// Covers different ways MSBuild client execution can finish.
++        /// Build errors are not included. The client could finish successfully and the build at the same time could result in a build error.
++        /// </summary>
++        public MSBuildClientExitType MSBuildClientExitType { get; set; }
++
++        /// <summary>
++        /// The build exit type. Possible values: MSBuildApp.ExitType serialized into a string.
++        /// This field is null if MSBuild client execution was not successful.
++        /// </summary>
++        public string? MSBuildAppExitTypeString { get; set; }
++    }
++}
+diff --git a/src/Build/BackEnd/Client/MSBuildClientExitType.cs b/src/Build/BackEnd/Client/MSBuildClientExitType.cs
+new file mode 100644
+index 00000000000..70bbc0113c8
+--- /dev/null
++++ b/src/Build/BackEnd/Client/MSBuildClientExitType.cs
+@@ -0,0 +1,33 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++namespace Microsoft.Build.Execution
++{
++    public enum MSBuildClientExitType
++    {
++        /// <summary>
++        /// The MSBuild client successfully processed the build request.
++        /// </summary>
++        Success,
++        /// <summary>
++        /// Server is busy.
++        /// </summary>
++        ServerBusy,
++        /// <summary>
++        /// Client was unable to connect to the server.
++        /// </summary>
++        ConnectionError,
++        /// <summary>
++        /// Client was unable to launch the server.
++        /// </summary>
++        LaunchError,
++        /// <summary>
++        /// The build stopped unexpectedly, for example,
++        /// because a named pipe between the server and the client was unexpectedly closed.
++        /// </summary>
++        Unexpected,
++        /// <summary>
++        /// The build was cancelled.
++        /// </summary>
++        Cancelled
++    }
++}
+diff --git a/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs b/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs
+new file mode 100644
+index 00000000000..c2402156971
+--- /dev/null
++++ b/src/Build/BackEnd/Client/MSBuildClientPacketPump.cs
+@@ -0,0 +1,302 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++using System.Buffers.Binary;
++using System.Collections.Concurrent;
++using System.IO;
++using System.Threading;
++using Microsoft.Build.Internal;
++using Microsoft.Build.Shared;
++#if !FEATURE_APM
++using System.Threading.Tasks;
++#endif
++
++namespace Microsoft.Build.BackEnd.Client
++{
++    internal sealed class MSBuildClientPacketPump : INodePacketHandler, INodePacketFactory, IDisposable
++    {
++        /// <summary>
++        /// The queue of packets we have received but which have not yet been processed.
++        /// </summary>
++        public ConcurrentQueue<INodePacket> ReceivedPacketsQueue { get; }
++
++        /// <summary>
++        /// Set when packet pump receive packets and put them to <see cref="ReceivedPacketsQueue"/>.
++        /// </summary>
++        public AutoResetEvent PacketReceivedEvent { get; }
++
++        /// <summary>
++        /// Set when the packet pump unexpectedly terminates (due to connection problems or because of deserialization issues).
++        /// </summary>
++        public ManualResetEvent PacketPumpErrorEvent { get; }
++
++        /// <summary>
++        /// Exception appeared when the packet pump unexpectedly terminates.
++        /// </summary>
++        public Exception? PacketPumpException { get; set; }
++
++        /// <summary>
++        /// Set when packet pump should shutdown.
++        /// </summary>
++        private readonly ManualResetEvent _packetPumpShutdownEvent;
++
++        /// <summary>
++        /// The packet factory.
++        /// </summary>
++        private readonly NodePacketFactory _packetFactory;
++
++        /// <summary>
++        /// The memory stream for a read buffer.
++        /// </summary>
++        private readonly MemoryStream _readBufferMemoryStream;
++
++        /// <summary>
++        /// The thread which runs the asynchronous packet pump
++        /// </summary>
++        private Thread? _packetPumpThread;
++
++        /// <summary>
++        /// The stream from where to read packets.
++        /// </summary>
++        private readonly Stream _stream;
++
++        /// <summary>
++        /// The binary translator for reading packets.
++        /// </summary>
++        readonly ITranslator _binaryReadTranslator;
++
++        public MSBuildClientPacketPump(Stream stream)
++        {
++            _stream = stream;
++            _packetFactory = new NodePacketFactory();
++
++            ReceivedPacketsQueue = new ConcurrentQueue<INodePacket>();
++            PacketReceivedEvent = new AutoResetEvent(false);
++            PacketPumpErrorEvent = new ManualResetEvent(false);
++            _packetPumpShutdownEvent = new ManualResetEvent(false);
++
++            _readBufferMemoryStream = new MemoryStream();
++            _binaryReadTranslator = BinaryTranslator.GetReadTranslator(_readBufferMemoryStream, InterningBinaryReader.CreateSharedBuffer());
++        }
++
++        #region INodePacketFactory Members
++
++        /// <summary>
++        /// Registers a packet handler.
++        /// </summary>
++        /// <param name="packetType">The packet type for which the handler should be registered.</param>
++        /// <param name="factory">The factory used to create packets.</param>
++        /// <param name="handler">The handler for the packets.</param>
++        public void RegisterPacketHandler(NodePacketType packetType, NodePacketFactoryMethod factory, INodePacketHandler handler)
++        {
++            _packetFactory.RegisterPacketHandler(packetType, factory, handler);
++        }
++
++        /// <summary>
++        /// Unregisters a packet handler.
++        /// </summary>
++        /// <param name="packetType">The type of packet for which the handler should be unregistered.</param>
++        public void UnregisterPacketHandler(NodePacketType packetType)
++        {
++            _packetFactory.UnregisterPacketHandler(packetType);
++        }
++
++        /// <summary>
++        /// Deserializes and routes a packer to the appropriate handler.
++        /// </summary>
++        /// <param name="nodeId">The node from which the packet was received.</param>
++        /// <param name="packetType">The packet type.</param>
++        /// <param name="translator">The translator to use as a source for packet data.</param>
++        public void DeserializeAndRoutePacket(int nodeId, NodePacketType packetType, ITranslator translator)
++        {
++            _packetFactory.DeserializeAndRoutePacket(nodeId, packetType, translator);
++        }
++
++        /// <summary>
++        /// Routes a packet to the appropriate handler.
++        /// </summary>
++        /// <param name="nodeId">The node id from which the packet was received.</param>
++        /// <param name="packet">The packet to route.</param>
++        public void RoutePacket(int nodeId, INodePacket packet)
++        {
++            _packetFactory.RoutePacket(nodeId, packet);
++        }
++
++        #endregion
++
++        #region INodePacketHandler Members
++
++        /// <summary>
++        /// Called when a packet has been received.
++        /// </summary>
++        /// <param name="node">The node from which the packet was received.</param>
++        /// <param name="packet">The packet.</param>
++        public void PacketReceived(int node, INodePacket packet)
++        {
++            ReceivedPacketsQueue.Enqueue(packet);
++            PacketReceivedEvent.Set();
++        }
++
++        #endregion
++
++        #region Packet Pump
++        /// <summary>
++        /// Initializes the packet pump thread.
++        /// </summary>
++        public void Start()
++        {
++            _packetPumpThread = new Thread(PacketPumpProc)
++            {
++                IsBackground = true,
++                Name = "MSBuild Client Packet Pump"
++            };
++            _packetPumpThread.Start();
++        }
++
++        /// <summary>
++        /// Stops the packet pump thread.
++        /// </summary>
++        public void Stop()
++        {
++            _packetPumpShutdownEvent.Set();
++            _packetPumpThread?.Join();
++        }
++
++        /// <summary>
++        /// This method handles the packet pump reading. It will terminate when the terminate event is
++        /// set.
++        /// </summary>
++        /// <remarks>
++        /// Instead of throwing an exception, puts it in <see cref="PacketPumpException"/> and raises event <see cref="PacketPumpErrorEvent"/>.
++        /// </remarks>
++        private void PacketPumpProc()
++        {
++            RunReadLoop(_stream, _packetPumpShutdownEvent);
++        }
++
++        private void RunReadLoop(Stream localStream, ManualResetEvent localPacketPumpShutdownEvent)
++        {
++            CommunicationsUtilities.Trace("Entering read loop.");
++
++            try
++            {
++                byte[] headerByte = new byte[5];
++#if FEATURE_APM
++                IAsyncResult result = localStream.BeginRead(headerByte, 0, headerByte.Length, null, null);
++#else
++                Task<int> readTask = CommunicationsUtilities.ReadAsync(localStream, headerByte, headerByte.Length);
++#endif
++
++                bool continueReading = true;
++                do
++                {
++                    // Ordering of the wait handles is important. The first signalled wait handle in the array 
++                    // will be returned by WaitAny if multiple wait handles are signalled. We prefer to have the
++                    // terminate event triggered so that we cannot get into a situation where packets are being
++                    // spammed to the client and it never gets an opportunity to shutdown.
++                    WaitHandle[] handles = new WaitHandle[] {
++                    localPacketPumpShutdownEvent,
++#if FEATURE_APM
++                    result.AsyncWaitHandle
++#else
++                    ((IAsyncResult)readTask).AsyncWaitHandle
++#endif
++                    };
++                    int waitId = WaitHandle.WaitAny(handles);
++                    switch (waitId)
++                    {
++                        case 0:
++                            // Fulfill the request for shutdown of the message pump.
++                            CommunicationsUtilities.Trace("Shutdown message pump thread.");
++                            continueReading = false;
++                            break;
++
++                        case 1:
++                            {
++                                // Client recieved a packet header. Read the rest of a package.
++                                int headerBytesRead = 0;
++#if FEATURE_APM
++                                headerBytesRead = localStream.EndRead(result);
++#else
++                                headerBytesRead = readTask.Result;
++#endif
++
++                                if ((headerBytesRead != headerByte.Length) && !localPacketPumpShutdownEvent.WaitOne(0))
++                                {
++                                    // Incomplete read. Abort.
++                                    if (headerBytesRead == 0)
++                                    {
++                                        ErrorUtilities.ThrowInternalError("Server disconnected abruptly");
++                                    }
++                                    else
++                                    {
++                                        ErrorUtilities.ThrowInternalError("Incomplete header read from server.  {0} of {1} bytes read", headerBytesRead, headerByte.Length);
++                                    }
++                                }
++
++                                NodePacketType packetType = (NodePacketType)Enum.ToObject(typeof(NodePacketType), headerByte[0]);
++
++                                int packetLength = BinaryPrimitives.ReadInt32LittleEndian(new Span<byte>(headerByte, 1, 4));
++                                int packetBytesRead = 0;
++
++                                _readBufferMemoryStream.Position = 0;
++                                _readBufferMemoryStream.SetLength(packetLength);
++                                byte[] packetData = _readBufferMemoryStream.GetBuffer();
++
++                                packetBytesRead = localStream.Read(packetData, 0, packetLength);
++                                
++                                if (packetBytesRead != packetLength)
++                                {
++                                    // Incomplete read.  Abort.
++                                    ErrorUtilities.ThrowInternalError("Incomplete header read from server. {0} of {1} bytes read", headerBytesRead, headerByte.Length);
++                                }
++
++                                try
++                                {
++                                    _packetFactory.DeserializeAndRoutePacket(0, packetType, _binaryReadTranslator);
++                                }
++                                catch
++                                {
++                                    // Error while deserializing or handling packet. Logging additional info.
++                                    CommunicationsUtilities.Trace("Packet factory failed to receive package. Exception while deserializing packet {0}.", packetType);
++                                    throw;
++                                }
++
++                                if (packetType == NodePacketType.ServerNodeBuildResult)
++                                {
++                                    continueReading = false;
++                                }
++                                else
++                                {
++                                    // Start reading the next package header.
++#if FEATURE_APM
++                                    result = localStream.BeginRead(headerByte, 0, headerByte.Length, null, null);
++#else
++                                readTask = CommunicationsUtilities.ReadAsync(localStream, headerByte, headerByte.Length);
++#endif
++                                }
++                            }
++                            break;
++
++                        default:
++                            ErrorUtilities.ThrowInternalError("WaitId {0} out of range.", waitId);
++                            break;
++                    }
++                }
++                while (continueReading);
++            }
++            catch (Exception ex)
++            {
++                CommunicationsUtilities.Trace("Exception occurred in the packet pump: {0}", ex);
++                PacketPumpException = ex;
++                PacketPumpErrorEvent.Set();
++            }
++
++            CommunicationsUtilities.Trace("Ending read loop.");
++        }
++        #endregion
++
++        public void Dispose() => Stop();
++    }
++}
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index e6889579a10..eb8edeec7dc 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -88,7 +88,7 @@ public NodeEngineShutdownReason Run(out Exception? shutdownException)
+             var handshake = new ServerNodeHandshake(
+                 CommunicationsUtilities.GetHandshakeOptions(taskHost: false, architectureFlagToSet: XMakeAttributes.GetCurrentMSBuildArchitecture()));
+ 
+-            string pipeName = NamedPipeUtil.GetPipeNameOrPath("MSBuildServer-" + handshake.ComputeHash());
++            string pipeName = GetPipeName(handshake);
+ 
+             string serverRunningMutexName = $@"{ServerNamedMutex.RunningServerMutexNamePrefix}{pipeName}";
+             _serverBusyMutexName = $@"{ServerNamedMutex.BusyServerMutexNamePrefix}{pipeName}";
+@@ -137,6 +137,8 @@ public NodeEngineShutdownReason Run(out Exception? shutdownException)
+ 
+         #endregion
+ 
++        internal static string GetPipeName(ServerNodeHandshake handshake) => NamedPipeUtil.GetPipeNameOrPath("MSBuildServer-" + handshake.ComputeHash());
++
+         #region INodePacketFactory Members
+ 
+         /// <summary>
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 0bdc0df6561..d14821f787f 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -1,4 +1,4 @@
+-<Project Sdk="Microsoft.NET.Sdk">
++﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <Import Project="..\Shared\FileSystemSources.proj" />
+   <Import Project="..\Shared\DebuggingSources.proj" />
+@@ -142,6 +142,10 @@
+     <Compile Include="BackEnd\BuildManager\BuildParameters.cs" />
+     <Compile Include="BackEnd\BuildManager\CacheSerialization.cs" />
+     <Compile Include="BackEnd\BuildManager\CacheAggregator.cs" />
++    <Compile Include="BackEnd\Client\MSBuildClientPacketPump.cs" />
++    <Compile Include="BackEnd\Client\MSBuildClientExitType.cs" />
++    <Compile Include="BackEnd\Client\MSBuildClientExitResult.cs" />
++    <Compile Include="BackEnd\Client\MSBuildClient.cs" />
+     <Compile Include="BackEnd\Components\Caching\ConfigCacheWithOverride.cs" />
+     <Compile Include="BackEnd\Components\Caching\ResultsCacheWithOverride.cs" />
+     <Compile Include="BackEnd\Components\ProjectCache\*.cs" />
+diff --git a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+index 6a1467598ac..b7e25f06956 100644
+--- a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+@@ -1,3 +1,19 @@
++Microsoft.Build.Execution.MSBuildClient
++Microsoft.Build.Execution.MSBuildClient.Execute(string commandLine, System.Threading.CancellationToken cancellationToken) -> Microsoft.Build.Execution.MSBuildClientExitResult
++Microsoft.Build.Execution.MSBuildClient.MSBuildClient(string exeLocation, string dllLocation) -> void
++Microsoft.Build.Execution.MSBuildClientExitResult
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildAppExitTypeString.get -> string
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildAppExitTypeString.set -> void
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildClientExitResult() -> void
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildClientExitType.get -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildClientExitType.set -> void
++Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.Cancelled = 5 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.ConnectionError = 2 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.LaunchError = 3 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.ServerBusy = 1 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.Success = 0 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.Unexpected = 4 -> Microsoft.Build.Execution.MSBuildClientExitType
+ Microsoft.Build.Execution.OutOfProcServerNode
+ Microsoft.Build.Execution.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction) -> void
+-Microsoft.Build.Execution.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
++Microsoft.Build.Execution.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
+\ No newline at end of file
+diff --git a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+index 6cdbdc2bcc1..b7e25f06956 100644
+--- a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+@@ -1,4 +1,19 @@
+-
++Microsoft.Build.Execution.MSBuildClient
++Microsoft.Build.Execution.MSBuildClient.Execute(string commandLine, System.Threading.CancellationToken cancellationToken) -> Microsoft.Build.Execution.MSBuildClientExitResult
++Microsoft.Build.Execution.MSBuildClient.MSBuildClient(string exeLocation, string dllLocation) -> void
++Microsoft.Build.Execution.MSBuildClientExitResult
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildAppExitTypeString.get -> string
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildAppExitTypeString.set -> void
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildClientExitResult() -> void
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildClientExitType.get -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitResult.MSBuildClientExitType.set -> void
++Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.Cancelled = 5 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.ConnectionError = 2 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.LaunchError = 3 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.ServerBusy = 1 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.Success = 0 -> Microsoft.Build.Execution.MSBuildClientExitType
++Microsoft.Build.Execution.MSBuildClientExitType.Unexpected = 4 -> Microsoft.Build.Execution.MSBuildClientExitType
+ Microsoft.Build.Execution.OutOfProcServerNode
+ Microsoft.Build.Execution.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction) -> void
+ Microsoft.Build.Execution.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
+\ No newline at end of file
+diff --git a/src/Framework/Traits.cs b/src/Framework/Traits.cs
+index cf60eb140c9..eb12d904b42 100644
+--- a/src/Framework/Traits.cs
++++ b/src/Framework/Traits.cs
+@@ -102,6 +102,11 @@ public Traits()
+         /// </summary>
+         public readonly int DictionaryBasedItemRemoveThreshold = ParseIntFromEnvironmentVariableOrDefault("MSBUILDDICTIONARYBASEDITEMREMOVETHRESHOLD", 100);
+ 
++        /// <summary>
++        /// Name of environment variables used to enable MSBuild server.
++        /// </summary>
++        public const string UseMSBuildServerEnvVarName = "MSBUILDUSESERVER";
++
+         public readonly bool DebugEngine = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MSBuildDebugEngine"));
+         public readonly bool DebugScheduler;
+         public readonly bool DebugNodeCommunication;
+diff --git a/src/MSBuild/MSBuild.csproj b/src/MSBuild/MSBuild.csproj
+index 9ea8cc2fcf8..958815d4673 100644
+--- a/src/MSBuild/MSBuild.csproj
++++ b/src/MSBuild/MSBuild.csproj
+@@ -174,6 +174,7 @@
+     <Compile Include="InitializationException.cs">
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+     </Compile>
++    <Compile Include="MSBuildClientApp.cs" />
+     <Compile Include="NodeEndpointOutOfProcTaskHost.cs" />
+     <Compile Include="LogMessagePacket.cs" />
+     <Compile Include="ProjectSchemaValidationHandler.cs">
+diff --git a/src/MSBuild/MSBuildClientApp.cs b/src/MSBuild/MSBuildClientApp.cs
+new file mode 100644
+index 00000000000..de83c3a10e3
+--- /dev/null
++++ b/src/MSBuild/MSBuildClientApp.cs
+@@ -0,0 +1,153 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++using Microsoft.Build.Execution;
++using Microsoft.Build.Shared;
++using System.Threading;
++
++#if RUNTIME_TYPE_NETCORE || MONO
++using System.IO;
++using System.Diagnostics;
++#endif
++
++namespace Microsoft.Build.CommandLine
++{
++    /// <summary>
++    /// This class implements client for MSBuild server. It
++    /// 1. starts the MSBuild server in a separate process if it does not yet exist.
++    /// 2. establishes a connection with MSBuild server and sends a build request.
++    /// 3. if server is busy, it falls back to old build behavior.
++    /// </summary>
++    internal static class MSBuildClientApp
++    {
++        /// <summary>
++        /// This is the entry point for the MSBuild client.
++        /// </summary>
++        /// <param name="commandLine">The command line to process. The first argument
++        /// on the command line is assumed to be the name/path of the executable, and
++        /// is ignored.</param>
++        /// <param name="cancellationToken">Cancellation token.</param>
++        /// <returns>A value of type <see cref="MSBuildApp.ExitType"/> that indicates whether the build succeeded,
++        /// or the manner in which it failed.</returns>
++        /// <remarks>
++        /// The locations of msbuild exe/dll and dotnet.exe would be automatically detected if called from dotnet or msbuild cli. Calling this function from other executables might not work.
++        /// </remarks>
++        public static MSBuildApp.ExitType Execute(
++#if FEATURE_GET_COMMANDLINE
++            string commandLine,
++#else
++            string[] commandLine,
++#endif
++            CancellationToken cancellationToken
++            )
++        {
++            string? exeLocation;
++            string? dllLocation;
++
++#if RUNTIME_TYPE_NETCORE || MONO
++            // Run the child process with the same host as the currently-running process.
++            // Mono automatically uses the current mono, to execute a managed assembly.
++            if (!NativeMethodsShared.IsMono)
++            {
++                // _exeFileLocation consists the msbuild dll instead.
++                dllLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
++                exeLocation = GetCurrentHost();
++            }
++            else
++            {
++                // _exeFileLocation consists the msbuild dll instead.
++                exeLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
++                dllLocation = String.Empty;
++            }
++#else
++            exeLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
++            dllLocation = String.Empty;
++#endif
++
++            return Execute(
++                commandLine,
++                cancellationToken,
++                exeLocation,
++                dllLocation
++            );
++        }
++
++        /// <summary>
++        /// This is the entry point for the MSBuild client.
++        /// </summary>
++        /// <param name="commandLine">The command line to process. The first argument
++        /// on the command line is assumed to be the name/path of the executable, and
++        /// is ignored.</param>
++        /// <param name="cancellationToken">Cancellation token.</param>
++        /// <param name="exeLocation">Location of executable file to launch the server process.
++        /// That should be either dotnet.exe or MSBuild.exe location.</param>
++        /// <param name="dllLocation">Location of dll file to launch the server process if needed.
++        /// Empty if executable is msbuild.exe and not empty if dotnet.exe.</param>
++        /// <returns>A value of type <see cref="MSBuildApp.ExitType"/> that indicates whether the build succeeded,
++        /// or the manner in which it failed.</returns>
++        public static MSBuildApp.ExitType Execute(
++#if FEATURE_GET_COMMANDLINE
++            string commandLine,
++#else
++            string[] commandLine,
++#endif
++            CancellationToken cancellationToken,
++            string exeLocation,
++            string dllLocation
++        )
++        {
++            // MSBuild client orchestration.
++#if !FEATURE_GET_COMMANDLINE
++            string commandLineString = string.Join(" ", commandLine); 
++#else
++            string commandLineString = commandLine;
++#endif
++            MSBuildClient msbuildClient = new MSBuildClient(exeLocation, dllLocation); 
++            MSBuildClientExitResult exitResult = msbuildClient.Execute(commandLineString, cancellationToken);
++
++            if (exitResult.MSBuildClientExitType == MSBuildClientExitType.ServerBusy ||
++                exitResult.MSBuildClientExitType == MSBuildClientExitType.ConnectionError)
++            {
++                // Server is busy, fallback to old behavior.
++                return MSBuildApp.Execute(commandLine);
++            }
++
++            if (exitResult.MSBuildClientExitType == MSBuildClientExitType.Success &&
++                Enum.TryParse(exitResult.MSBuildAppExitTypeString, out MSBuildApp.ExitType MSBuildAppExitType))
++            {
++                // The client successfully set up a build task for MSBuild server and received the result.
++                // (Which could be a failure as well). Return the received exit type. 
++                return MSBuildAppExitType;
++            }
++
++            return MSBuildApp.ExitType.MSBuildClientFailure;
++        }
++
++        // Copied from NodeProviderOutOfProcBase.cs
++#if RUNTIME_TYPE_NETCORE || MONO
++        private static string? CurrentHost;
++        private static string GetCurrentHost()
++        {
++            if (CurrentHost == null)
++            {
++                string dotnetExe = Path.Combine(FileUtilities.GetFolderAbove(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory, 2),
++                    NativeMethodsShared.IsWindows ? "dotnet.exe" : "dotnet");
++                if (File.Exists(dotnetExe))
++                {
++                    CurrentHost = dotnetExe;
++                }
++                else
++                {
++                    using (Process currentProcess = Process.GetCurrentProcess())
++                    {
++                        CurrentHost = currentProcess.MainModule?.FileName ?? throw new InvalidOperationException("Failed to retrieve process executable.");
++                    }
++                }
++            }
++
++            return CurrentHost;
++        }
++#endif
++    }
++}
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 83c62ace30a..129df900912 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -84,7 +84,12 @@ public enum ExitType
+             /// <summary>
+             /// A project cache failed unexpectedly.
+             /// </summary>
+-            ProjectCacheFailure
++            ProjectCacheFailure,
++            /// <summary>
++            /// The client for MSBuild server failed unexpectedly, for example,
++            /// because the server process died or hung.
++            /// </summary>
++            MSBuildClientFailure
+         }
+ 
+         /// <summary>
+@@ -216,14 +221,30 @@ string[] args
+                 DumpCounters(true /* initialize only */);
+             }
+ 
+-            // return 0 on success, non-zero on failure
+-            int exitCode = ((s_initialized && Execute(
++            int exitCode;
++            if (Environment.GetEnvironmentVariable(Traits.UseMSBuildServerEnvVarName) == "1")
++            {
++                // Use the client app to execute build in msbuild server. Opt-in feature.
++                exitCode = ((s_initialized && MSBuildClientApp.Execute(
++#if FEATURE_GET_COMMANDLINE
++                Environment.CommandLine,
++#else
++                ConstructArrayArg(args),
++#endif
++                s_buildCancellationSource.Token
++                ) == ExitType.Success) ? 0 : 1);
++            }
++            else
++            {
++                // return 0 on success, non-zero on failure
++                exitCode = ((s_initialized && Execute(
+ #if FEATURE_GET_COMMANDLINE
+                 Environment.CommandLine
+ #else
+                 ConstructArrayArg(args)
+ #endif
+-            ) == ExitType.Success) ? 0 : 1);
++                ) == ExitType.Success) ? 0 : 1);
++            }
+ 
+             if (Environment.GetEnvironmentVariable("MSBUILDDUMPPROCESSCOUNTERS") == "1")
+             {

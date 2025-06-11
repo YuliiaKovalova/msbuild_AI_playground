@@ -1,0 +1,623 @@
+diff --git a/documentation/specs/BuildCheck/BuildCheck.md b/documentation/specs/BuildCheck/BuildCheck.md
+index a4db495c6ae..69e542aa2e7 100644
+--- a/documentation/specs/BuildCheck/BuildCheck.md
++++ b/documentation/specs/BuildCheck/BuildCheck.md
+@@ -209,9 +209,8 @@ Option `EvaluationAnalysisScope` with following possible options will be availab
+ 
+ | EvaluationAnalysisScope (Solution Explorer)   | EditorConfig option      |  Behavior  | 
+ | ------------- | ------------- |   ------------- |
+-| ProjectOnly | `project` | Only the data from currently analyzed project will be sent to the analyzer. Imports will be discarded. | 
+-| ProjectWithImportsFromCurrentWorkTree | `current_imports` |  Only the data from currently analyzed project and imports from files under the entry project or solution will be sent to the analyzer. Other imports will be discarded. | 
+-| ProjectWithImportsWithoutSdks | `without_sdks` | Imports from SDKs will not be sent to the analyzer. Other imports will be sent. | 
++| ProjectFileOnly | `project_file` | Only the data from currently analyzed project will be sent to the analyzer. Imports will be discarded. | 
++| WorkTreeImports | `work_tree_imports` |  Only the data from currently analyzed project and imports from files not recognized to be in nuget cache or SDK install folder will be sent to the analyzer. Other imports will be discarded. |  
+ | ProjectWithAllImports | `all` | All data will be sent to the analyzer. | 
+ 
+ All rules of a single analyzer must have the `EvaluationAnalysisScope` configured to a same value. If any rule from the analyzer have the value configured differently - a warning will be issued during the build and analyzer will be deregistered.
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index cd819c32d26..d792e0c2c05 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -1404,10 +1404,7 @@ private void ConfigureKnownImmutableFolders()
+             ProjectInstance project = _requestEntry?.RequestConfiguration?.Project;
+             if (project != null)
+             {
+-                // example: C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2
+-                FileClassifier.Shared.RegisterImmutableDirectory(project.GetPropertyValue("FrameworkPathOverride")?.Trim());
+-                // example: C:\Program Files\dotnet\
+-                FileClassifier.Shared.RegisterImmutableDirectory(project.GetPropertyValue("NetCoreRoot")?.Trim());
++                FileClassifier.Shared.RegisterKnownImmutableLocations(project.GetPropertyValue);
+             }
+         }
+ 
+diff --git a/src/Build/BuildCheck/API/BuildAnalyzerConfiguration.cs b/src/Build/BuildCheck/API/BuildAnalyzerConfiguration.cs
+index 25492910718..8ff336ca295 100644
+--- a/src/Build/BuildCheck/API/BuildAnalyzerConfiguration.cs
++++ b/src/Build/BuildCheck/API/BuildAnalyzerConfiguration.cs
+@@ -21,7 +21,7 @@ public class BuildAnalyzerConfiguration
+     //  nor in the editorconfig configuration file.
+     public static BuildAnalyzerConfiguration Default { get; } = new()
+     {
+-        EvaluationAnalysisScope = BuildCheck.EvaluationAnalysisScope.ProjectOnly,
++        EvaluationAnalysisScope = BuildCheck.EvaluationAnalysisScope.ProjectFileOnly,
+         Severity = BuildAnalyzerResultSeverity.None
+     };
+ 
+@@ -84,14 +84,13 @@ public bool? IsEnabled {
+ 
+         switch (stringValue)
+         {
+-            case "project":
+-                return BuildCheck.EvaluationAnalysisScope.ProjectOnly;
+-            case "current_imports":
+-                return BuildCheck.EvaluationAnalysisScope.ProjectWithImportsFromCurrentWorkTree;
+-            case "without_sdks":
+-                return BuildCheck.EvaluationAnalysisScope.ProjectWithImportsWithoutSdks;
++            case "projectfile":
++            case "project_file":
++                return BuildCheck.EvaluationAnalysisScope.ProjectFileOnly;
++            case "work_tree_imports":
++                return BuildCheck.EvaluationAnalysisScope.WorkTreeImports;
+             case "all":
+-                return BuildCheck.EvaluationAnalysisScope.ProjectWithAllImports;
++                return BuildCheck.EvaluationAnalysisScope.All;
+             default:
+                 ThrowIncorrectValueException(BuildCheckConstants.scopeConfigurationKey, stringValue);
+                 break;
+diff --git a/src/Build/BuildCheck/API/EvaluationAnalysisScope.cs b/src/Build/BuildCheck/API/EvaluationAnalysisScope.cs
+index 39781649359..5068f3b1282 100644
+--- a/src/Build/BuildCheck/API/EvaluationAnalysisScope.cs
++++ b/src/Build/BuildCheck/API/EvaluationAnalysisScope.cs
+@@ -14,20 +14,16 @@ public enum EvaluationAnalysisScope
+     /// <summary>
+     /// Only the data from currently analyzed project will be sent to the analyzer. Imports will be discarded.
+     /// </summary>
+-    ProjectOnly,
++    ProjectFileOnly,
+ 
+     /// <summary>
+-    /// Only the data from currently analyzed project and imports from files under the entry project or solution will be sent to the analyzer. Other imports will be discarded.
++    /// Only the data from currently analyzed project and imports from files not recognized to be in nuget cache or SDK install folder will be sent to the analyzer. Other imports will be discarded.
++    /// The generated nuget.g.props, nuget.g.targets will be ignored as well.
+     /// </summary>
+-    ProjectWithImportsFromCurrentWorkTree,
+-
+-    /// <summary>
+-    /// Imports from SDKs will not be sent to the analyzer. Other imports will be sent.
+-    /// </summary>
+-    ProjectWithImportsWithoutSdks,
++    WorkTreeImports,
+ 
+     /// <summary>
+     /// All data will be sent to the analyzer.
+     /// </summary>
+-    ProjectWithAllImports,
++    All,
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/AnalysisScopeClassifier.cs b/src/Build/BuildCheck/Infrastructure/AnalysisScopeClassifier.cs
+new file mode 100644
+index 00000000000..82d1e67b289
+--- /dev/null
++++ b/src/Build/BuildCheck/Infrastructure/AnalysisScopeClassifier.cs
+@@ -0,0 +1,46 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using Microsoft.Build.Experimental.BuildCheck;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BuildCheck.Infrastructure;
++internal static class AnalysisScopeClassifier
++{
++    /// <summary>
++    /// Indicates whether given location is in the observed scope, based on currently built project path.
++    /// </summary>
++    /// <param name="scope"></param>
++    /// <param name="location"></param>
++    /// <param name="projectFileFullPath"></param>
++    /// <returns></returns>
++    /// <exception cref="ArgumentOutOfRangeException"></exception>
++    internal static bool IsActionInObservedScope(
++        EvaluationAnalysisScope scope,
++        IMsBuildElementLocation? location,
++        string projectFileFullPath)
++    {
++        switch (scope)
++        {
++            case EvaluationAnalysisScope.ProjectFileOnly:
++                return location != null && location.File == projectFileFullPath;
++            case EvaluationAnalysisScope.WorkTreeImports:
++                return
++                    location != null &&
++                    !FileClassifier.Shared.IsNonModifiable(location.File) &&
++                    !IsGeneratedNugetImport(location.File);
++            case EvaluationAnalysisScope.All:
++                return true;
++            default:
++                throw new ArgumentOutOfRangeException(nameof(scope), scope, null);
++        }
++    }
++
++    private static bool IsGeneratedNugetImport(string file)
++    {
++        return file.EndsWith("nuget.g.props", StringComparison.OrdinalIgnoreCase) ||
++               file.EndsWith("nuget.g.targets", StringComparison.OrdinalIgnoreCase);
++    }
++}
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 86c7e52f6b5..844ced7f2f0 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -326,8 +326,24 @@ private void SetupAnalyzersForNewProject(string projectFullPath, IAnalysisContex
+         public void ProcessEvaluationFinishedEventArgs(
+             IAnalysisContext analysisContext,
+             ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs)
+-            => _buildEventsProcessor
+-                .ProcessEvaluationFinishedEventArgs(analysisContext, evaluationFinishedEventArgs);
++        {
++            Dictionary<string, string>? propertiesLookup = null;
++            // The FileClassifier is normally initialized by executing build requests.
++            // However, if we are running in a main node that has no execution nodes - we need to initialize it here (from events).
++            if (!IsInProcNode)
++            {
++                propertiesLookup =
++                    BuildEventsProcessor.ExtractPropertiesLookup(evaluationFinishedEventArgs);
++                Func<string, string?> getPropertyValue = p =>
++                    propertiesLookup.TryGetValue(p, out string? value) ? value : null;
++
++                FileClassifier.Shared.RegisterFrameworkLocations(getPropertyValue);
++                FileClassifier.Shared.RegisterKnownImmutableLocations(getPropertyValue);
++            }
++
++            _buildEventsProcessor
++                .ProcessEvaluationFinishedEventArgs(analysisContext, evaluationFinishedEventArgs, propertiesLookup);
++        }
+ 
+         public void ProcessEnvironmentVariableReadEventArgs(IAnalysisContext analysisContext, EnvironmentVariableReadEventArgs projectEvaluationEventArgs)
+         {
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index 05134a3c8c1..10b4e2ce9ca 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -45,22 +45,33 @@ public TaskKey(BuildEventContext context)
+     /// </summary>
+     private readonly Dictionary<TaskKey, ExecutingTaskData> _tasksBeingExecuted = [];
+ 
+-    // This requires MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION set to 1
+-    internal void ProcessEvaluationFinishedEventArgs(
+-        IAnalysisContext analysisContext,
+-        ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs)
++    internal static Dictionary<string, string> ExtractPropertiesLookup(ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs)
+     {
+         Dictionary<string, string> propertiesLookup = new Dictionary<string, string>();
+         Internal.Utilities.EnumerateProperties(evaluationFinishedEventArgs.Properties, propertiesLookup,
+             static (dict, kvp) => dict.Add(kvp.Key, kvp.Value));
+ 
+-        EvaluatedPropertiesAnalysisData analysisData =
+-            new(evaluationFinishedEventArgs.ProjectFile!,
+-                evaluationFinishedEventArgs.BuildEventContext?.ProjectInstanceId,
+-                propertiesLookup,
+-                _evaluatedEnvironmentVariables);
++        return propertiesLookup;
++    }
+ 
+-        _buildCheckCentralContext.RunEvaluatedPropertiesActions(analysisData, analysisContext, ReportResult);
++    // This requires MSBUILDLOGPROPERTIESANDITEMSAFTEREVALUATION set to 1
++    internal void ProcessEvaluationFinishedEventArgs(
++        IAnalysisContext analysisContext,
++        ProjectEvaluationFinishedEventArgs evaluationFinishedEventArgs,
++        Dictionary<string, string>? propertiesLookup)
++    {
++        if (_buildCheckCentralContext.HasEvaluatedPropertiesActions)
++        {
++            propertiesLookup ??= ExtractPropertiesLookup(evaluationFinishedEventArgs);
++
++            EvaluatedPropertiesAnalysisData analysisData =
++                new(evaluationFinishedEventArgs.ProjectFile!,
++                    evaluationFinishedEventArgs.BuildEventContext?.ProjectInstanceId,
++                    propertiesLookup!,
++                    _evaluatedEnvironmentVariables);
++
++            _buildCheckCentralContext.RunEvaluatedPropertiesActions(analysisData, analysisContext, ReportResult);
++        }
+ 
+         if (_buildCheckCentralContext.HasParsedItemsActions)
+         {
+diff --git a/src/Build/CompatibilitySuppressions.xml b/src/Build/CompatibilitySuppressions.xml
+index 8f35441485b..ad32afc0a18 100644
+--- a/src/Build/CompatibilitySuppressions.xml
++++ b/src/Build/CompatibilitySuppressions.xml
+@@ -8,6 +8,34 @@
+     <Right>lib/net472/Microsoft.Build.dll</Right>
+     <IsBaselineSuppression>true</IsBaselineSuppression>
+   </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectOnly</Target>
++    <Left>lib/net472/Microsoft.Build.dll</Left>
++    <Right>lib/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithAllImports</Target>
++    <Left>lib/net472/Microsoft.Build.dll</Left>
++    <Right>lib/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithImportsFromCurrentWorkTree</Target>
++    <Left>lib/net472/Microsoft.Build.dll</Left>
++    <Right>lib/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithImportsWithoutSdks</Target>
++    <Left>lib/net472/Microsoft.Build.dll</Left>
++    <Right>lib/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
+   <Suppression>
+     <DiagnosticId>CP0002</DiagnosticId>
+     <Target>M:Microsoft.Build.Execution.BuildResult.get_BuildRequestDataFlags</Target>
+@@ -29,6 +57,34 @@
+     <Right>lib/net8.0/Microsoft.Build.dll</Right>
+     <IsBaselineSuppression>true</IsBaselineSuppression>
+   </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectOnly</Target>
++    <Left>lib/net8.0/Microsoft.Build.dll</Left>
++    <Right>lib/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithAllImports</Target>
++    <Left>lib/net8.0/Microsoft.Build.dll</Left>
++    <Right>lib/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithImportsFromCurrentWorkTree</Target>
++    <Left>lib/net8.0/Microsoft.Build.dll</Left>
++    <Right>lib/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithImportsWithoutSdks</Target>
++    <Left>lib/net8.0/Microsoft.Build.dll</Left>
++    <Right>lib/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
+   <Suppression>
+     <DiagnosticId>CP0002</DiagnosticId>
+     <Target>M:Microsoft.Build.Execution.BuildResult.get_BuildRequestDataFlags</Target>
+@@ -50,6 +106,34 @@
+     <Right>ref/net472/Microsoft.Build.dll</Right>
+     <IsBaselineSuppression>true</IsBaselineSuppression>
+   </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectOnly</Target>
++    <Left>ref/net472/Microsoft.Build.dll</Left>
++    <Right>ref/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithAllImports</Target>
++    <Left>ref/net472/Microsoft.Build.dll</Left>
++    <Right>ref/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithImportsFromCurrentWorkTree</Target>
++    <Left>ref/net472/Microsoft.Build.dll</Left>
++    <Right>ref/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithImportsWithoutSdks</Target>
++    <Left>ref/net472/Microsoft.Build.dll</Left>
++    <Right>ref/net472/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
+   <Suppression>
+     <DiagnosticId>CP0002</DiagnosticId>
+     <Target>M:Microsoft.Build.Execution.BuildResult.get_BuildRequestDataFlags</Target>
+@@ -71,6 +155,34 @@
+     <Right>ref/net8.0/Microsoft.Build.dll</Right>
+     <IsBaselineSuppression>true</IsBaselineSuppression>
+   </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectOnly</Target>
++    <Left>ref/net8.0/Microsoft.Build.dll</Left>
++    <Right>ref/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithAllImports</Target>
++    <Left>ref/net8.0/Microsoft.Build.dll</Left>
++    <Right>ref/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithImportsFromCurrentWorkTree</Target>
++    <Left>ref/net8.0/Microsoft.Build.dll</Left>
++    <Right>ref/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
++  <Suppression>
++    <DiagnosticId>CP0002</DiagnosticId>
++    <Target>F:Microsoft.Build.Experimental.BuildCheck.EvaluationAnalysisScope.ProjectWithImportsWithoutSdks</Target>
++    <Left>ref/net8.0/Microsoft.Build.dll</Left>
++    <Right>ref/net8.0/Microsoft.Build.dll</Right>
++    <IsBaselineSuppression>true</IsBaselineSuppression>
++  </Suppression>
+   <Suppression>
+     <DiagnosticId>CP0002</DiagnosticId>
+     <Target>M:Microsoft.Build.Execution.BuildResult.get_BuildRequestDataFlags</Target>
+diff --git a/src/Build/Definition/ToolsetReader.cs b/src/Build/Definition/ToolsetReader.cs
+index 0799d38db90..fdc817b930c 100644
+--- a/src/Build/Definition/ToolsetReader.cs
++++ b/src/Build/Definition/ToolsetReader.cs
+@@ -419,16 +419,8 @@ private void ReadEachToolset(
+ 
+                     Toolset toolset = ReadToolset(toolsVersion, globalProperties, initialPropertiesClone, accumulateProperties);
+ 
+-                    // Register toolset paths into list of immutable directories
+-                    // example: C:\Windows\Microsoft.NET\Framework
+-                    string frameworksPathPrefix32 = existingRootOrNull(initialPropertiesClone.GetProperty("MSBuildFrameworkToolsPath32")?.EvaluatedValue?.Trim());
+-                    FileClassifier.Shared.RegisterImmutableDirectory(frameworksPathPrefix32);
+-                    // example: C:\Windows\Microsoft.NET\Framework64
+-                    string frameworksPathPrefix64 = existingRootOrNull(initialPropertiesClone.GetProperty("MSBuildFrameworkToolsPath64")?.EvaluatedValue?.Trim());
+-                    FileClassifier.Shared.RegisterImmutableDirectory(frameworksPathPrefix64);
+-                    // example: C:\Windows\Microsoft.NET\FrameworkArm64
+-                    string frameworksPathPrefixArm64 = existingRootOrNull(initialPropertiesClone.GetProperty("MSBuildFrameworkToolsPathArm64")?.EvaluatedValue?.Trim());
+-                    FileClassifier.Shared.RegisterImmutableDirectory(frameworksPathPrefixArm64);
++                    FileClassifier.Shared.RegisterFrameworkLocations(p =>
++                        initialPropertiesClone.GetProperty(p)?.EvaluatedValue);
+ 
+                     if (toolset != null)
+                     {
+@@ -436,28 +428,6 @@ private void ReadEachToolset(
+                     }
+                 }
+             }
+-
+-            string existingRootOrNull(string path)
+-            {
+-                if (!string.IsNullOrEmpty(path))
+-                {
+-                    try
+-                    {
+-                        path = Directory.GetParent(FileUtilities.EnsureNoTrailingSlash(path))?.FullName;
+-
+-                        if (!Directory.Exists(path))
+-                        {
+-                            path = null;
+-                        }
+-                    }
+-                    catch
+-                    {
+-                        path = null;
+-                    }
+-                }
+-
+-                return path;
+-            }
+         }
+ 
+         /// <summary>
+diff --git a/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationEffectiveTests.cs b/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationEffectiveTests.cs
+index f604c043b62..df492de4261 100644
+--- a/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationEffectiveTests.cs
++++ b/src/BuildCheck.UnitTests/BuildAnalyzerConfigurationEffectiveTests.cs
+@@ -12,9 +12,9 @@ namespace Microsoft.Build.BuildCheck.UnitTests;
+ public class BuildAnalyzerConfigurationEffectiveTests
+ {
+     [Theory]
+-    [InlineData("ruleId", EvaluationAnalysisScope.ProjectOnly, BuildAnalyzerResultSeverity.Warning,  true)]
+-    [InlineData("ruleId2", EvaluationAnalysisScope.ProjectOnly, BuildAnalyzerResultSeverity.Warning,  true)]
+-    [InlineData("ruleId", EvaluationAnalysisScope.ProjectOnly, BuildAnalyzerResultSeverity.Error, false)]
++    [InlineData("ruleId", EvaluationAnalysisScope.ProjectFileOnly, BuildAnalyzerResultSeverity.Warning,  true)]
++    [InlineData("ruleId2", EvaluationAnalysisScope.ProjectFileOnly, BuildAnalyzerResultSeverity.Warning,  true)]
++    [InlineData("ruleId", EvaluationAnalysisScope.ProjectFileOnly, BuildAnalyzerResultSeverity.Error, false)]
+     public void IsSameConfigurationAsTest(
+         string secondRuleId,
+         EvaluationAnalysisScope secondScope,
+@@ -23,7 +23,7 @@ public void IsSameConfigurationAsTest(
+     {
+         BuildAnalyzerConfigurationEffective configuration1 = new BuildAnalyzerConfigurationEffective(
+                        ruleId: "ruleId",
+-                       evaluationAnalysisScope: EvaluationAnalysisScope.ProjectOnly,
++                       evaluationAnalysisScope: EvaluationAnalysisScope.ProjectFileOnly,
+                        severity: BuildAnalyzerResultSeverity.Warning);
+ 
+         BuildAnalyzerConfigurationEffective configuration2 = new BuildAnalyzerConfigurationEffective(
+@@ -43,7 +43,7 @@ public void BuildAnalyzerConfigurationInternal_Constructor_SeverityConfig(BuildA
+     {
+         BuildAnalyzerConfigurationEffective configuration = new BuildAnalyzerConfigurationEffective(
+                        ruleId: "ruleId",
+-                       evaluationAnalysisScope: EvaluationAnalysisScope.ProjectOnly,
++                       evaluationAnalysisScope: EvaluationAnalysisScope.ProjectFileOnly,
+                        severity: severity);
+ 
+         configuration.IsEnabled.ShouldBe(isEnabledExpected);
+@@ -56,7 +56,7 @@ public void BuildAnalyzerConfigurationInternal_Constructor_SeverityConfig_Fails(
+         {
+             new BuildAnalyzerConfigurationEffective(
+                         ruleId: "ruleId",
+-                        evaluationAnalysisScope: EvaluationAnalysisScope.ProjectOnly,
++                        evaluationAnalysisScope: EvaluationAnalysisScope.ProjectFileOnly,
+                         severity: BuildAnalyzerResultSeverity.Default);
+         });
+     }
+diff --git a/src/BuildCheck.UnitTests/BuildAnalyzerConfiguration_Test.cs b/src/BuildCheck.UnitTests/BuildAnalyzerConfiguration_Test.cs
+index a017df0f9c3..4f5274281fb 100644
+--- a/src/BuildCheck.UnitTests/BuildAnalyzerConfiguration_Test.cs
++++ b/src/BuildCheck.UnitTests/BuildAnalyzerConfiguration_Test.cs
+@@ -75,14 +75,13 @@ public void CreateBuildAnalyzerConfiguration_SeverityAndEnabledOrder(string para
+     }
+ 
+     [Theory]
+-    [InlineData("project", EvaluationAnalysisScope.ProjectOnly)]
+-    [InlineData("PROJECT", EvaluationAnalysisScope.ProjectOnly)]
+-    [InlineData("current_imports", EvaluationAnalysisScope.ProjectWithImportsFromCurrentWorkTree)]
+-    [InlineData("CURRENT_IMPORTS", EvaluationAnalysisScope.ProjectWithImportsFromCurrentWorkTree)]
+-    [InlineData("without_sdks", EvaluationAnalysisScope.ProjectWithImportsWithoutSdks)]
+-    [InlineData("WITHOUT_SDKS", EvaluationAnalysisScope.ProjectWithImportsWithoutSdks)]
+-    [InlineData("all", EvaluationAnalysisScope.ProjectWithAllImports)]
+-    [InlineData("ALL", EvaluationAnalysisScope.ProjectWithAllImports)]
++    [InlineData("project_file", EvaluationAnalysisScope.ProjectFileOnly)]
++    [InlineData("projectfile", EvaluationAnalysisScope.ProjectFileOnly)]
++    [InlineData("PROJECT_FILE", EvaluationAnalysisScope.ProjectFileOnly)]
++    [InlineData("work_tree_imports", EvaluationAnalysisScope.WorkTreeImports)]
++    [InlineData("WORK_TREE_IMPORTS", EvaluationAnalysisScope.WorkTreeImports)]
++    [InlineData("all", EvaluationAnalysisScope.All)]
++    [InlineData("ALL", EvaluationAnalysisScope.All)]
+     public void CreateBuildAnalyzerConfiguration_EvaluationAnalysisScope(string parameter, EvaluationAnalysisScope? expected)
+     {
+         var config = new Dictionary<string, string>()
+diff --git a/src/BuildCheck.UnitTests/ConfigurationProvider_Tests.cs b/src/BuildCheck.UnitTests/ConfigurationProvider_Tests.cs
+index 32f8554bc75..f38cdbb46fe 100644
+--- a/src/BuildCheck.UnitTests/ConfigurationProvider_Tests.cs
++++ b/src/BuildCheck.UnitTests/ConfigurationProvider_Tests.cs
+@@ -108,7 +108,7 @@ public void GetRuleIdConfiguration_ReturnsBuildRuleConfiguration()
+ 
+         [*.csproj]
+         build_check.rule_id.severity=error
+-        build_check.rule_id.scope=project
++        build_check.rule_id.scope=project_file
+         """);
+ 
+         var configurationProvider = new ConfigurationProvider();
+@@ -118,7 +118,7 @@ public void GetRuleIdConfiguration_ReturnsBuildRuleConfiguration()
+ 
+         buildConfig.IsEnabled.ShouldBe(true);
+         buildConfig.Severity.ShouldBe(BuildAnalyzerResultSeverity.Error);
+-        buildConfig.EvaluationAnalysisScope.ShouldBe(EvaluationAnalysisScope.ProjectOnly);
++        buildConfig.EvaluationAnalysisScope.ShouldBe(EvaluationAnalysisScope.ProjectFileOnly);
+     }
+ 
+     [Fact]
+diff --git a/src/Framework/FileClassifier.cs b/src/Framework/FileClassifier.cs
+index 966f51bd5c4..7884bde35af 100644
+--- a/src/Framework/FileClassifier.cs
++++ b/src/Framework/FileClassifier.cs
+@@ -193,17 +193,98 @@ public void RegisterImmutableDirectory(string? directory)
+             }
+         }
+ 
+-        private static string EnsureTrailingSlash(string fileSpec)
++        public void RegisterFrameworkLocations(Func<string, string?> getPropertyValue)
++        {
++            // Register toolset paths into list of immutable directories
++            // example: C:\Windows\Microsoft.NET\Framework
++            string? frameworksPathPrefix32 = GetExistingRootOrNull(getPropertyValue("MSBuildFrameworkToolsPath32")?.Trim());
++            RegisterImmutableDirectory(frameworksPathPrefix32);
++            // example: C:\Windows\Microsoft.NET\Framework64
++            string? frameworksPathPrefix64 = GetExistingRootOrNull(getPropertyValue("MSBuildFrameworkToolsPath64")?.Trim());
++            RegisterImmutableDirectory(frameworksPathPrefix64);
++            // example: C:\Windows\Microsoft.NET\FrameworkArm64
++            string? frameworksPathPrefixArm64 = GetExistingRootOrNull(getPropertyValue("MSBuildFrameworkToolsPathArm64")?.Trim());
++            RegisterImmutableDirectory(frameworksPathPrefixArm64);
++        }
++
++        public void RegisterKnownImmutableLocations(Func<string, string?> getPropertyValue)
++        {
++            // example: C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2
++            RegisterImmutableDirectory(getPropertyValue("FrameworkPathOverride")?.Trim());
++            // example: C:\Program Files\dotnet\
++            RegisterImmutableDirectory(getPropertyValue("NetCoreRoot")?.Trim());
++            // example: C:\Users\<username>\.nuget\packages\
++            RegisterImmutableDirectory(getPropertyValue("NuGetPackageFolders")?.Trim());
++        }
++
++        private static string? GetExistingRootOrNull(string? path)
+         {
+-            if (fileSpec.Length >= 1)
++            if (!string.IsNullOrEmpty(path))
+             {
+-                char lastChar = fileSpec[fileSpec.Length - 1];
+-                if (lastChar != Path.DirectorySeparatorChar && lastChar != Path.AltDirectorySeparatorChar)
++                try
++                {
++                    path = Directory.GetParent(EnsureNoTrailingSlash(path!))?.FullName;
++
++                    if (!Directory.Exists(path))
++                    {
++                        path = null;
++                    }
++                }
++                catch
+                 {
+-                    fileSpec += Path.DirectorySeparatorChar;
++                    path = null;
+                 }
+             }
+ 
++            return path;
++        }
++
++        /// <summary>
++        /// Ensures the path does not have a trailing slash.
++        /// </summary>
++        private static string EnsureNoTrailingSlash(string path)
++        {
++            path = FixFilePath(path);
++            if (EndsWithSlash(path))
++            {
++                path = path.Substring(0, path.Length - 1);
++            }
++
++            return path;
++        }
++
++        private static string FixFilePath(string path)
++        {
++            return string.IsNullOrEmpty(path) || Path.DirectorySeparatorChar == '\\' ? path : path.Replace('\\', '/'); // .Replace("//", "/");
++        }
++
++        /// <summary>
++        /// Indicates if the given file-spec ends with a slash.
++        /// </summary>
++        /// <param name="fileSpec">The file spec.</param>
++        /// <returns>true, if file-spec has trailing slash</returns>
++        private static bool EndsWithSlash(string fileSpec)
++        {
++            return (fileSpec.Length > 0) && IsSlash(fileSpec[fileSpec.Length - 1]);
++        }
++
++        /// <summary>
++        /// Indicates if the given character is a slash.
++        /// </summary>
++        /// <param name="c"></param>
++        /// <returns>true, if slash</returns>
++        private static bool IsSlash(char c)
++        {
++            return (c == Path.DirectorySeparatorChar) || (c == Path.AltDirectorySeparatorChar);
++        }
++
++        private static string EnsureTrailingSlash(string fileSpec)
++        {
++            if (fileSpec.Length >= 1 && !EndsWithSlash(fileSpec))
++            {
++                fileSpec += Path.DirectorySeparatorChar;
++            }
++
+             return fileSpec;
+         }
+ 

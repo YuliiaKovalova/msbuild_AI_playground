@@ -1,0 +1,131 @@
+{
+  "number": 3210,
+  "title": "Reduce GC pressure in InterningBinaryReader.ReadString()",
+  "body": "From trace when we open a .Net Core solution, we noticed that more than 10% virtual allocation was triggered by creating the StringBuilder in Microsoft.Build.InteringBinaryReader.ReadString()\r\n\r\nIt appears a part of msbuild code has already tried to share stringBuffer.  Can we do the same thing here?  It could reduce GC press in the design time build phase right after loading a solution.\r\n\r\nIf we count the phase right after loading solution, this code path contributes 26.8% of virtual allocations.  Although the memory allocation is temporary, it adds lot of GC pressure during that phase.",
+  "state": "CLOSED",
+  "createdAt": "2018-04-18T01:10:21Z",
+  "updatedAt": "2024-02-21T17:13:32Z",
+  "closedAt": "2021-03-02T11:55:43Z",
+  "author": {
+    "login": "lifengl"
+  },
+  "labels": [
+    "Area: Performance",
+    "CPS",
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": {
+    "title": "MSBuild 16.10"
+  },
+  "comments": {
+    "nodes": [
+      {
+        "body": "Traces shows this stack\r\n\r\n\\| \u00a0\u00a0\u00a0\u00a0+   microsoft.build.ni!InterningBinaryReader.ReadString\r\n--\r\n\\| \u00a0\u00a0\u00a0\u00a0\u00a0+   microsoft.build.ni!Microsoft.Build.BackEnd.NodePacketTranslator+NodePacketReadTranslator.Translate(System.String   ByRef)\r\n\r\nalone with a few other stacks:\r\n\r\nName\r\n--\r\n\\| \u00a0\u00a0\u00a0\\| \u00a0+   mscorlib.ni!BinaryWriter.Write\r\n\\| \u00a0\u00a0\u00a0\\|   \u00a0\u00a0+   microsoft.build.ni!Microsoft.Build.BackEnd.NodePacketTranslator+NodePacketWriteTranslator.Translate(System.String   ByRef)\r\n\r\n\r\n\\| \u00a0\u00a0\u00a0+ microsoft.build.ni!Microsoft.Build.BackEnd.NodeProviderOutOfProcBase+NodeContext.HeaderReadComplete(System.IAsyncResult)\r\n--\r\n\r\n\r\nName\r\n--\r\n\\| \u00a0\u00a0\u00a0\u00a0+ microsoft.build.ni!InterningBinaryReader.ReadString\r\n\\| \u00a0\u00a0\u00a0\u00a0\u00a0+ microsoft.build.framework.ni!ProjectStartedEventArgs.CreateFromStream\r\n\\| \u00a0\u00a0\u00a0\u00a0\u00a0+ microsoft.build.ni!Microsoft.Build.BackEnd.NodePacketTranslator+NodePacketReadTranslator.Translate(System.String ByRef)\r\n\r\nAre the major contributor to the LOH heap during the DT build time after loading a large solution.  That happens when the size of the solution is bigger to the point, that the solution configuration xml string becomes very bigger, so all build packet buffers are all beyond the threshold and pushed to the LOH.  There are also large amount of DT build for large solutions, and maybe multiple build nodes also contributes to this.  The code path above quickly allocates lots of memory, and due to LOH, they are not recycled until Gen2 GC.  This creates a huge memory pressure (in one dump, the LOH grow to 600M), and combine with other allocations, it causes VS to run out of memory.\r\n\r\n",
+        "createdAt": "2018-04-19T19:11:51Z",
+        "updatedAt": "2018-04-19T19:11:51Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "Looks like our `ReusableStringBuilder` isn't a great solution for this for a couple of reasons:\r\n\r\n* It's designed to keep only one buffer in its pool (probably not the end of the world here since I/O is serialized by the pipe)\r\n* It doesn't reuse the StringBuilder if its capacity has grown past 1024\r\n\r\nhttps://github.com/Microsoft/msbuild/blob/e8b480c373eadd9daa975c6e96e4dbbabcd9a4fe/src/Shared/ReuseableStringBuilder.cs#L226-L231\r\n\r\nThat number is obviously way too small if things were hitting the LOH. Do you have a picture of how big the solution configuration that entered the LOH was? I share the original concern about the pool mechanism keeping buffers that are way too big around forever since it's static.",
+        "createdAt": "2018-04-19T19:54:51Z",
+        "updatedAt": "2018-04-19T19:54:51Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Hmm, maybe the ThreadStatic approach in coreclr's StringBuilderCache would be good enough for us:\r\n\r\nhttps://github.com/dotnet/coreclr/blob/68f72dd2587c3365a9fe74d1991f93612c3bc62a/src/mscorlib/src/System/Text/StringBuilderCache.cs#L41\r\n\r\nThough I notice they use an even smaller size limit there.",
+        "createdAt": "2018-04-19T22:25:02Z",
+        "updatedAt": "2018-04-19T22:25:02Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Talking to @lifengl, it turns there is another source of large object heap assignments besides the StringBuilder: the buffers used to read from (and probably also write to) the named pipe streams:\r\n\r\nhttps://github.com/Microsoft/msbuild/blob/master/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs#L973-L982\r\n\r\nhttps://github.com/Microsoft/msbuild/blob/master/src/Build/BackEnd/Components/Communications/NodeProviderOutOfProcBase.cs#L759-L768\r\n\r\nOne option here would be to use a pool of buffers, with similar policies like the StringBuilder, but some differences:\r\n- if multiple requests come concurrently, then the pool will need to create new buffers\r\n- when buffers are returned, they can be discarded if another larger buffer is free in the pool\r\n\r\nBut the solution is highly dependent on the parallelism taking place there, which I am not very familiar with. There is certainly one instance per node, but I can't tell if its one thread processing the pipes for all nodes, one thread per node, or multiple threads per node.",
+        "createdAt": "2018-04-20T00:29:54Z",
+        "updatedAt": "2018-04-20T00:31:16Z",
+        "author": {
+          "login": "cdmihai"
+        }
+      },
+      {
+        "body": "So we've got a reused `byte[1000]` there. We could use [`System.Buffers.ArrayPool.Shared`](https://docs.microsoft.com/en-us/dotnet/api/system.buffers.arraypool-1.shared) to manage most of the problems you're asking about, but it doesn't solve the \"keeping a (needed) giant buffer around forever in a static cache, bloating memory footprint (but saving GC pressure)\" problem :(",
+        "createdAt": "2018-04-20T16:06:41Z",
+        "updatedAt": "2018-04-20T16:06:41Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "No, the core issue here is to reuse large buffer, not small ones.  When the size is below LOH trigger, it accounts less than 1% of total allocation during that phase (far less than Roslyn), so reusing small buffer will have not much impact to the performance.\r\n\r\nSent from my phone\r\n\r\nOn Apr 20, 2018, at 9:07 AM, Rainer Sigwald <notifications@github.com<mailto:notifications@github.com>> wrote:\r\n\r\n\r\nSo we've got a reused byte[1000] there. We could use System.Buffers.ArrayPool.Shared<https://nam03.safelinks.protection.outlook.com/?url=https%3A%2F%2Fdocs.microsoft.com%2Fen-us%2Fdotnet%2Fapi%2Fsystem.buffers.arraypool-1.shared&data=02%7C01%7C%7C443015d4fcf24cc83e6208d5a6d8c197%7C84df9e7fe9f640afb435aaaaaaaaaaaa%7C1%7C0%7C636598372238502013&sdata=QCn8ci1PQmlt%2Bcasn73ieTls5dgyVaDKtFp9VgdWhCg%3D&reserved=0> to manage most of the problems you're asking about, but it doesn't solve the \"keeping a (needed) giant buffer around forever in a static cache, bloating memory footprint (but saving GC pressure)\" problem :(\r\n\r\n\u2014\r\nYou are receiving this because you were mentioned.\r\nReply to this email directly, view it on GitHub<https://nam03.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2FMicrosoft%2Fmsbuild%2Fissues%2F3210%23issuecomment-383144291&data=02%7C01%7C%7C443015d4fcf24cc83e6208d5a6d8c197%7C84df9e7fe9f640afb435aaaaaaaaaaaa%7C1%7C0%7C636598372238502013&sdata=ot8B6me8eMDUKHd5%2FARQos5CxlXGq3D54W66C4vsmps%3D&reserved=0>, or mute the thread<https://nam03.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fnotifications%2Funsubscribe-auth%2FALGWwuN30H6PYbFaxrq75hX4t8XafbQ-ks5tqgebgaJpZM4TZRNj&data=02%7C01%7C%7C443015d4fcf24cc83e6208d5a6d8c197%7C84df9e7fe9f640afb435aaaaaaaaaaaa%7C1%7C0%7C636598372238502013&sdata=1ko%2FKHPouuSoMDWPBKisTW%2BWLZvBoAdpry9O46HHQs0%3D&reserved=0>.\r\n",
+        "createdAt": "2018-04-21T18:22:29Z",
+        "updatedAt": "2018-04-21T18:22:29Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "I am running into OOM exception with the Roslyn solution -\r\n\r\n>\tKERNELBASE.dll!RaiseException(unsigned long dwExceptionCode, unsigned long dwExceptionFlags, unsigned long nNumberOfArguments, const unsigned long * lpArguments) Line 922\tC\r\n \t[Managed to Native Transition]\t\r\n \tMicrosoft.Build.dll!Microsoft.Build.InterningBinaryReader.ReadString() Line 172\tC#\r\n \tMicrosoft.Build.Framework.dll!Microsoft.Build.Framework.ProjectStartedEventArgs.CreateFromStream(System.IO.BinaryReader reader, int version) Line 469\tC#\r\n \tMicrosoft.Build.dll!Microsoft.Build.Shared.LogMessagePacketBase.ReadFromStream(Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 369\tC#\r\n \tMicrosoft.Build.dll!Microsoft.Build.Shared.LogMessagePacketBase.Translate(Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 272\tC#\r\n \tMicrosoft.Build.dll!Microsoft.Build.BackEnd.LogMessagePacket.FactoryForDeserialization(Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 52\tC#\r\n \tMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodePacketFactory.PacketFactoryRecord.DeserializeAndRoutePacket(int nodeId, Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 108\tC#\r\n \tMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodePacketFactory.DeserializeAndRoutePacket(int nodeId, Microsoft.Build.BackEnd.NodePacketType packetType, Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 66\tC#\r\n \tMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodeManager.DeserializeAndRoutePacket(int nodeId, Microsoft.Build.BackEnd.NodePacketType packetType, Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 282\tC#\r\n \tMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodeProviderOutOfProcBase.NodeContext.ReadAndRoutePacket(Microsoft.Build.BackEnd.NodePacketType packetType, byte[] packetData, int packetLength) Line 1017\tC#\r\n \tMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodeProviderOutOfProcBase.NodeContext.BodyReadComplete(System.IAsyncResult result) Line 1071\tC#\r\n",
+        "createdAt": "2018-04-30T22:30:47Z",
+        "updatedAt": "2018-04-30T22:30:47Z",
+        "author": {
+          "login": "Mohit-Chakraborty"
+        }
+      },
+      {
+        "body": "It seems to be the DTBB logging setting made this issue worse in 15.7\r\n\r\nSent from my phone\r\n\r\nOn Apr 30, 2018, at 3:30 PM, Mohit Chakraborty <notifications@github.com<mailto:notifications@github.com>> wrote:\r\n\r\n\r\nI am running into OOM exception with the Roslyn solution -\r\n\r\nKERNELBASE.dll!RaiseException(unsigned long dwExceptionCode, unsigned long dwExceptionFlags, unsigned long nNumberOfArguments, const unsigned long * lpArguments) Line 922 C\r\n[Managed to Native Transition]\r\nMicrosoft.Build.dll!Microsoft.Build.InterningBinaryReader.ReadString() Line 172 C#\r\nMicrosoft.Build.Framework.dll!Microsoft.Build.Framework.ProjectStartedEventArgs.CreateFromStream(System.IO.BinaryReader reader, int version) Line 469 C#\r\nMicrosoft.Build.dll!Microsoft.Build.Shared.LogMessagePacketBase.ReadFromStream(Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 369 C#\r\nMicrosoft.Build.dll!Microsoft.Build.Shared.LogMessagePacketBase.Translate(Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 272 C#\r\nMicrosoft.Build.dll!Microsoft.Build.BackEnd.LogMessagePacket.FactoryForDeserialization(Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 52 C#\r\nMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodePacketFactory.PacketFactoryRecord.DeserializeAndRoutePacket(int nodeId, Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 108 C#\r\nMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodePacketFactory.DeserializeAndRoutePacket(int nodeId, Microsoft.Build.BackEnd.NodePacketType packetType, Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 66 C#\r\nMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodeManager.DeserializeAndRoutePacket(int nodeId, Microsoft.Build.BackEnd.NodePacketType packetType, Microsoft.Build.BackEnd.INodePacketTranslator translator) Line 282 C#\r\nMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodeProviderOutOfProcBase.NodeContext.ReadAndRoutePacket(Microsoft.Build.BackEnd.NodePacketType packetType, byte[] packetData, int packetLength) Line 1017 C#\r\nMicrosoft.Build.dll!Microsoft.Build.BackEnd.NodeProviderOutOfProcBase.NodeContext.BodyReadComplete(System.IAsyncResult result) Line 1071 C#\r\n\r\n\u2014\r\nYou are receiving this because you were mentioned.\r\nReply to this email directly, view it on GitHub<https://eur03.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2FMicrosoft%2Fmsbuild%2Fissues%2F3210%23issuecomment-385548287&data=02%7C01%7C%7C7b18072ecf3744e8f80608d5aeea0b60%7C84df9e7fe9f640afb435aaaaaaaaaaaa%7C1%7C0%7C636607242589761136&sdata=1%2FsmdLUVKrEBfBTEAXPbDwgjeUIiElDIHgVvTaKLIHM%3D&reserved=0>, or mute the thread<https://eur03.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fnotifications%2Funsubscribe-auth%2FALGWwiZ-31-z1fA0JCQzDpAnxP3LpTOlks5tt5ChgaJpZM4TZRNj&data=02%7C01%7C%7C7b18072ecf3744e8f80608d5aeea0b60%7C84df9e7fe9f640afb435aaaaaaaaaaaa%7C1%7C0%7C636607242589917388&sdata=aeQXEoENW%2FkZMhbZcF%2B5%2BlO5r9TEh1w0ahe9jeC7hHU%3D&reserved=0>.\r\n",
+        "createdAt": "2018-05-01T02:14:37Z",
+        "updatedAt": "2018-05-01T02:14:37Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "We noticed this issue leads the product to crash when we turn on diagnostic log.",
+        "createdAt": "2018-05-10T23:48:52Z",
+        "updatedAt": "2018-05-10T23:48:52Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "After thinking about it, I think the right way to hold and reuse a large buffer landing in LOH:\r\n\r\nwe should only use a weakReference to hold the large buffer we want to reuse/recycle, and convert it to a solid object when we need reuse it.\r\n\r\n1, The LOH buffer is only recycled during Gen2 GC, so we can expect to reuse a buffer for a long time during normal product phase.\r\n\r\n2, Technically, we don't really hold any extra memory, because Gen2 GC still can reclaim everything. We only reuse the memory currently wasted in the space.",
+        "createdAt": "2018-05-21T18:45:45Z",
+        "updatedAt": "2018-05-21T18:45:45Z",
+        "author": {
+          "login": "lifengl"
+        }
+      },
+      {
+        "body": "That's a really good idea! We may have to play some tricks with our Mono implementation, if I correctly recall some of our other weak-reference problems.",
+        "createdAt": "2018-05-21T18:53:04Z",
+        "updatedAt": "2018-05-21T18:53:04Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "I'm seeing a ton of allocations of ReusableStringBuilder here during evaluation:\r\nhttps://github.com/dotnet/msbuild/blob/a2c42ce9fc8d6fbd4a8cd600073803b8687c9341/src/Build/Evaluation/Expander.cs#L1148\r\n\r\nI'm noticing ReusableStringBuilder is a class and it's an overkill to allocate an instance every time. Could this be a struct or a static helper method?",
+        "createdAt": "2020-12-29T02:54:56Z",
+        "updatedAt": "2020-12-29T02:54:56Z",
+        "author": {
+          "login": "KirillOsenkov"
+        }
+      },
+      {
+        "body": "This one can be closed.\r\n\r\n- `ReuseableStringBuilder` is no longer used in `InterningBinaryReader` (optimized in #5663).\r\n- Excessive LOH allocations in `NodeProviderOutOfProcBase` are gone (optimized in #6023).\r\n- Evaluation/Expander is on track to remove `ReuseableStringBuilder` from hot paths (optimized in #6128).\r\n",
+        "createdAt": "2021-03-02T11:55:43Z",
+        "updatedAt": "2021-03-02T11:55:43Z",
+        "author": {
+          "login": "ladipro"
+        }
+      }
+    ]
+  }
+}

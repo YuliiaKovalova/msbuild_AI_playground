@@ -1,0 +1,223 @@
+diff --git a/src/Framework.UnitTests/Microsoft.Build.Framework.UnitTests.csproj b/src/Framework.UnitTests/Microsoft.Build.Framework.UnitTests.csproj
+index 0d39dc25f6e..83bcbfcf5c0 100644
+--- a/src/Framework.UnitTests/Microsoft.Build.Framework.UnitTests.csproj
++++ b/src/Framework.UnitTests/Microsoft.Build.Framework.UnitTests.csproj
+@@ -18,6 +18,7 @@
+   <ItemGroup>
+     <ProjectReference Include="..\Framework\Microsoft.Build.Framework.csproj" />
+     <ProjectReference Include="..\Xunit.NetCore.Extensions\Xunit.NetCore.Extensions.csproj" />
++    <ProjectReference Include="..\StringTools\StringTools.csproj" />
+   </ItemGroup>
+ 
+   <ItemGroup Condition="'$(TargetFrameworkIdentifier)' != '.NETFramework'">
+diff --git a/src/Shared/EscapingUtilities.cs b/src/Shared/EscapingUtilities.cs
+index a8d86f06c31..2f0082459b3 100644
+--- a/src/Shared/EscapingUtilities.cs
++++ b/src/Shared/EscapingUtilities.cs
+@@ -6,6 +6,8 @@
+ using System.Globalization;
+ using System.Text;
+ 
++using Microsoft.NET.StringTools;
++
+ namespace Microsoft.Build.Shared
+ {
+     /// <summary>
+@@ -181,7 +183,7 @@ private static string EscapeWithOptionalCaching(string unescapedString, bool cac
+                 return StringBuilderCache.GetStringAndRelease(escapedStringBuilder);
+             }
+ 
+-            string escapedString = OpportunisticIntern.StringBuilderToString(escapedStringBuilder);
++            string escapedString = Strings.WeakIntern(escapedStringBuilder.ToString());
+             StringBuilderCache.Release(escapedStringBuilder);
+ 
+             lock (s_unescapedToEscapedStrings)
+diff --git a/src/Shared/InterningBinaryReader.cs b/src/Shared/InterningBinaryReader.cs
+index 8eba40139be..40589a0becb 100644
+--- a/src/Shared/InterningBinaryReader.cs
++++ b/src/Shared/InterningBinaryReader.cs
+@@ -8,6 +8,8 @@
+ 
+ using ErrorUtilities = Microsoft.Build.Shared.ErrorUtilities;
+ 
++using Microsoft.NET.StringTools;
++
+ namespace Microsoft.Build
+ {
+     /// <summary>
+@@ -38,7 +40,7 @@ internal class InterningBinaryReader : BinaryReader
+         /// Comment about constructing.
+         /// </summary>
+         private InterningBinaryReader(Stream input, Buffer buffer)
+-            : base(input, buffer.Encoding)
++            : base(input, Encoding.UTF8)
+         {
+             if (input == null)
+             {
+@@ -46,7 +48,7 @@ private InterningBinaryReader(Stream input, Buffer buffer)
+             }
+ 
+             _buffer = buffer;
+-            _decoder = buffer.Encoding.GetDecoder();
++            _decoder = Encoding.UTF8.GetDecoder();
+         }
+ 
+         /// <summary>
+@@ -63,7 +65,7 @@ override public String ReadString()
+                 int n = 0;
+                 int stringLength;
+                 int readLength;
+-                int charsRead;
++                int charsRead = 0;
+ 
+                 // Length of the string in bytes, not chars
+                 stringLength = Read7BitEncodedInt();
+@@ -78,8 +80,7 @@ override public String ReadString()
+                 }
+ 
+                 char[] charBuffer = _buffer.CharBuffer;
+-
+-                StringBuilder sb = null;
++                char[] resultBuffer = null;
+                 do
+                 {
+                     readLength = ((stringLength - currPos) > MaxCharsBuffer) ? MaxCharsBuffer : (stringLength - currPos);
+@@ -104,6 +105,8 @@ override public String ReadString()
+                         {
+                             ErrorUtilities.ThrowInternalError("From calculating based on the memorystream, about to read n = {0}. length = {1}, rawPosition = {2}, readLength = {3}, stringLength = {4}, currPos = {5}.", n, length, rawPosition, readLength, stringLength, currPos);
+                         }
++
++                        memoryStream.Seek(n, SeekOrigin.Current);
+                     }
+ 
+                     if (rawBuffer == null)
+@@ -124,26 +127,20 @@ override public String ReadString()
+                         throw new EndOfStreamException();
+                     }
+ 
+-                    charsRead = _decoder.GetChars(rawBuffer, rawPosition, n, charBuffer, 0);
+-
+-                    memoryStream?.Seek(readLength, SeekOrigin.Current);
+-
+                     if (currPos == 0 && n == stringLength)
+                     {
+-                        return OpportunisticIntern.CharArrayToString(charBuffer, charsRead);
++                        charsRead = _decoder.GetChars(rawBuffer, rawPosition, n, charBuffer, 0);
++                        return Strings.WeakIntern(charBuffer.AsSpan(0, charsRead));
+                     }
+ 
+-                    if (sb == null)
+-                    {
+-                        sb = new StringBuilder(stringLength); // Actual string length in chars may be smaller.
+-                    }
++                    resultBuffer ??= new char[stringLength]; // Actual string length in chars may be smaller.
++                    charsRead += _decoder.GetChars(rawBuffer, rawPosition, n, resultBuffer, charsRead);
+ 
+-                    sb.Append(charBuffer, 0, charsRead);
+                     currPos += n;
+                 }
+                 while (currPos < stringLength);
+ 
+-                return OpportunisticIntern.StringBuilderToString(sb);
++                return Strings.WeakIntern(resultBuffer.AsSpan(0, charsRead));
+             }
+             catch (Exception e)
+             {
+@@ -186,9 +183,8 @@ private class Buffer : SharedReadBuffer
+             /// </summary>
+             internal Buffer()
+             {
+-                this.Encoding = new UTF8Encoding();
+                 this.CharBuffer = new char[MaxCharsBuffer];
+-                this.ByteBuffer = new byte[Encoding.GetMaxByteCount(MaxCharsBuffer)];
++                this.ByteBuffer = new byte[Encoding.UTF8.GetMaxByteCount(MaxCharsBuffer)];
+             }
+ 
+             /// <summary>
+@@ -208,15 +204,6 @@ internal byte[] ByteBuffer
+                 get;
+                 private set;
+             }
+-
+-            /// <summary>
+-            /// The encoding.
+-            /// </summary>
+-            internal UTF8Encoding Encoding
+-            {
+-                get;
+-                private set;
+-            }
+         }
+     }
+ 
+diff --git a/src/Shared/PropertyParser.cs b/src/Shared/PropertyParser.cs
+index 7ca92675832..e10f51efc8f 100644
+--- a/src/Shared/PropertyParser.cs
++++ b/src/Shared/PropertyParser.cs
+@@ -2,10 +2,10 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using System;
+-using System.Text;
+ using System.Collections.Generic;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
++using Microsoft.NET.StringTools;
+ 
+ #if BUILD_ENGINE
+ namespace Microsoft.Build.BackEnd
+@@ -146,8 +146,7 @@ internal static bool GetTableWithEscaping(TaskLoggingHelper log, string paramete
+                             // There was a property definition previous to this one.  Append the current string
+                             // to that previous value, using semicolon as a separator.
+                             string propertyValue = EscapingUtilities.Escape(propertyNameValueString.Trim());
+-                            finalPropertiesList[finalPropertiesList.Count - 1].Value.Append(';');
+-                            finalPropertiesList[finalPropertiesList.Count - 1].Value.Append(propertyValue);
++                            finalPropertiesList[finalPropertiesList.Count - 1].Value.Add(propertyValue);
+                         }
+                         else
+                         {
+@@ -163,9 +162,22 @@ internal static bool GetTableWithEscaping(TaskLoggingHelper log, string paramete
+                 // needs to pass onto the engine.
+                 log?.LogMessageFromText(parameterName, MessageImportance.Low);
+ 
++                using SpanBasedStringBuilder stringBuilder = Strings.GetSpanBasedStringBuilder();
+                 foreach (PropertyNameValuePair propertyNameValuePair in finalPropertiesList)
+                 {
+-                    string propertyValue = OpportunisticIntern.StringBuilderToString(propertyNameValuePair.Value);
++                    stringBuilder.Clear();
++                    bool needsSemicolon = false;
++                    foreach (string valueFragment in propertyNameValuePair.Value)
++                    {
++                        if (needsSemicolon)
++                        {
++                            stringBuilder.Append(";");
++                        }
++                        needsSemicolon = true;
++                        stringBuilder.Append(valueFragment);
++                    }
++
++                    string propertyValue = stringBuilder.ToString();
+                     finalPropertiesTable[propertyNameValuePair.Name] = propertyValue;
+                     log?.LogMessageFromText(
+                         $"  {propertyNameValuePair.Name}={propertyValue}",
+@@ -187,14 +199,17 @@ private class PropertyNameValuePair
+             internal string Name { get; }
+ 
+             /// <summary>
+-            /// Property value
++            /// Property value fragments. Join with semicolon to get the final value.
+             /// </summary>
+-            internal StringBuilder Value { get; }
++            internal List<string> Value { get; }
+ 
+             internal PropertyNameValuePair(string propertyName, string propertyValue)
+             {
+                 Name = propertyName;
+-                Value = new StringBuilder(propertyValue);
++                Value = new List<string>
++                {
++                    propertyValue
++                };
+             }
+         }
+     }

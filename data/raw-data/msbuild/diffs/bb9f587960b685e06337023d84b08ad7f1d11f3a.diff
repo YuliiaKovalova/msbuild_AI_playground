@@ -1,0 +1,520 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 4fb434a2d6f..7ffb491eee4 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -25,6 +25,7 @@
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Experimental;
+ using Microsoft.Build.Experimental.ProjectCache;
++using Microsoft.Build.FileAccesses;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Framework.Telemetry;
+ using Microsoft.Build.Graph;
+@@ -572,9 +573,12 @@ public void BeginBuild(BuildParameters parameters)
+ 
+                 InitializeCaches();
+ 
++                var fileAccessManager = ((IBuildComponentHost)this).GetComponent(BuildComponentType.FileAccessManager) as IFileAccessManager;
+                 _projectCacheService = new ProjectCacheService(
+                     this,
+                     loggingService,
++                    fileAccessManager,
++                    _configCache,
+                     _buildParameters.ProjectCacheDescriptor);
+ 
+                 _taskHostNodeManager = ((IBuildComponentHost)this).GetComponent(BuildComponentType.TaskHostNodeManager) as INodeManager;
+@@ -2371,6 +2375,38 @@ private void HandleResult(int node, BuildResult result)
+                 configuration.ProjectTargets ??= result.ProjectTargets;
+             }
+ 
++            // Only report results to the project cache services if it's the result for a build submission.
++            // Note that graph builds create a submission for each node in the graph, so each node in the graph will be
++            // handled here. This intentionally mirrors the behavior for cache requests, as it doesn't make sense to
++            // report for projects which aren't going to be requested. Ideally, *any* request could be handled, but that
++            // would require moving the cache service interactions to the Scheduler.
++            if (_buildSubmissions.TryGetValue(result.SubmissionId, out BuildSubmission buildSubmission))
++            {
++                // The result may be associated with the build submission due to it being the submission which
++                // caused the build, but not the actual request which was used with the build submission. Ensure
++                // only the actual submission's request is considered.
++                if (buildSubmission.BuildRequest != null
++                    && buildSubmission.BuildRequest.ConfigurationId == configuration.ConfigurationId
++                    && _projectCacheService.ShouldUseCache(configuration))
++                {
++                    BuildEventContext buildEventContext = _projectStartedEvents.TryGetValue(result.SubmissionId, out BuildEventArgs buildEventArgs)
++                        ? buildEventArgs.BuildEventContext
++                        : new BuildEventContext(result.SubmissionId, node, configuration.Project?.EvaluationId ?? BuildEventContext.InvalidEvaluationId, configuration.ConfigurationId, BuildEventContext.InvalidProjectContextId, BuildEventContext.InvalidTargetId, BuildEventContext.InvalidTaskId);
++                    try
++                    {
++                        _projectCacheService.HandleBuildResultAsync(configuration, result, buildEventContext, _executionCancellationTokenSource.Token).Wait();
++                    }
++                    catch (AggregateException ex) when (ex.InnerExceptions.All(inner => inner is OperationCanceledException))
++                    {
++                        // The build is being cancelled. Swallow any exceptions related specifically to cancellation.
++                    }
++                    catch (OperationCanceledException)
++                    {
++                        // The build is being cancelled. Swallow any exceptions related specifically to cancellation.
++                    }
++                }
++            }
++
+             IEnumerable<ScheduleResponse> response = _scheduler.ReportResult(node, result);
+             PerformSchedulingActions(response);
+         }
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+index 9d1cefe040d..54506dbc2a0 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+@@ -16,6 +16,7 @@
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Eventing;
+ using Microsoft.Build.Execution;
++using Microsoft.Build.FileAccesses;
+ using Microsoft.Build.FileSystem;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Graph;
+@@ -34,16 +35,25 @@ internal sealed class ProjectCacheService : IAsyncDisposable
+ 
+         private readonly BuildManager _buildManager;
+         private readonly ILoggingService _loggingService;
++        private readonly IFileAccessManager _fileAccessManager;
++        private readonly IConfigCache _configCache;
+ 
+         private readonly ProjectCacheDescriptor? _globalProjectCacheDescriptor;
+ 
+         private readonly ConcurrentDictionary<ProjectCacheDescriptor, Lazy<Task<ProjectCachePlugin>>> _projectCachePlugins = new(ProjectCacheDescriptorEqualityComparer.Instance);
+ 
++        // Helps to avoid excessive allocation since BuildRequestConfiguration doesn't expose global properties in a way the plugins can consume (PropertyDictionary<ProjectPropertyInstance> vs IReadOnlyDictionary<string, string>).
++        private readonly ConcurrentDictionary<BuildRequestConfiguration, IReadOnlyDictionary<string, string>> _globalPropertiesPerConfiguration = new();
++
+         private bool _isVsScenario;
+ 
+         private bool _isDisposed;
+ 
+-        private record struct ProjectCachePlugin(string Name, ProjectCachePluginBase? Instance, ExceptionDispatchInfo? InitializationException = null);
++        private record struct ProjectCachePlugin(
++            string Name,
++            ProjectCachePluginBase? Instance,
++            FileAccessManager.HandlerRegistration? HandlerRegistration,
++            ExceptionDispatchInfo? InitializationException = null);
+ 
+         /// <summary>
+         /// An instanatiable version of MSBuildFileSystemBase not overriding any methods,
+@@ -61,10 +71,14 @@ private DefaultMSBuildFileSystem()
+         public ProjectCacheService(
+             BuildManager buildManager,
+             ILoggingService loggingService,
++            IFileAccessManager fileAccessManager,
++            IConfigCache configCache,
+             ProjectCacheDescriptor? globalProjectCacheDescriptor)
+         {
+             _buildManager = buildManager;
+             _loggingService = loggingService;
++            _fileAccessManager = fileAccessManager;
++            _configCache = configCache;
+             _globalProjectCacheDescriptor = globalProjectCacheDescriptor;
+         }
+ 
+@@ -187,7 +201,7 @@ private async Task<ProjectCachePlugin> CreateAndInitializePluginAsync(
+                 }
+                 catch (Exception e)
+                 {
+-                    return new ProjectCachePlugin(pluginTypeName, Instance: null, ExceptionDispatchInfo.Capture(e));
++                    return new ProjectCachePlugin(pluginTypeName, Instance: null, HandlerRegistration: null, ExceptionDispatchInfo.Capture(e));
+                 }
+                 finally
+                 {
+@@ -218,11 +232,25 @@ await pluginInstance.BeginBuildAsync(
+                     ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheInitializationFailed");
+                 }
+ 
+-                return new ProjectCachePlugin(pluginTypeName, pluginInstance);
++                FileAccessManager.HandlerRegistration handlerRegistration = _fileAccessManager.RegisterHandlers(
++                    (buildRequest, fileAccessData) =>
++                    {
++                        // TODO: Filter out projects which do not configure this plugin
++                        FileAccessContext fileAccessContext = GetFileAccessContext(buildRequest);
++                        pluginInstance.HandleFileAccess(fileAccessContext, fileAccessData);
++                    },
++                    (buildRequest, processData) =>
++                    {
++                        // TODO: Filter out projects which do not configure this plugin
++                        FileAccessContext fileAccessContext = GetFileAccessContext(buildRequest);
++                        pluginInstance.HandleProcess(fileAccessContext, processData);
++                    });
++
++                return new ProjectCachePlugin(pluginTypeName, pluginInstance, handlerRegistration);
+             }
+             catch (Exception e)
+             {
+-                return new ProjectCachePlugin(pluginTypeName, Instance: null, ExceptionDispatchInfo.Capture(e));
++                return new ProjectCachePlugin(pluginTypeName, Instance: null, HandlerRegistration: null, ExceptionDispatchInfo.Capture(e));
+             }
+             finally
+             {
+@@ -230,6 +258,27 @@ await pluginInstance.BeginBuildAsync(
+             }
+         }
+ 
++        private FileAccessContext GetFileAccessContext(BuildRequest buildRequest)
++        {
++            BuildRequestConfiguration configuration = _configCache[buildRequest.ConfigurationId];
++            IReadOnlyDictionary<string, string> globalProperties = GetGlobalProperties(configuration);
++            return new FileAccessContext(configuration.ProjectFullPath, globalProperties, buildRequest.Targets);
++        }
++
++        private IReadOnlyDictionary<string, string> GetGlobalProperties(BuildRequestConfiguration configuration)
++            => _globalPropertiesPerConfiguration.GetOrAdd(
++                    configuration,
++                    static configuration =>
++                    {
++                        Dictionary<string, string> globalProperties = new(configuration.GlobalProperties.Count, StringComparer.OrdinalIgnoreCase);
++                        foreach (ProjectPropertyInstance property in configuration.GlobalProperties)
++                        {
++                            globalProperties.Add(property.Name, property.EvaluatedValue);
++                        }
++
++                        return globalProperties;
++                    });
++
+         private static ProjectCachePluginBase GetPluginInstanceFromType(Type pluginType)
+         {
+             try
+@@ -587,6 +636,79 @@ static IReadOnlyCollection<ProjectGraphEntryPoint> GenerateGraphEntryPointsFromS
+             }
+         }
+ 
++        public async Task HandleBuildResultAsync(
++            BuildRequestConfiguration requestConfiguration,
++            BuildResult buildResult,
++            BuildEventContext buildEventContext,
++            CancellationToken cancellationToken)
++        {
++            ErrorUtilities.VerifyThrowInternalNull(requestConfiguration.Project, nameof(requestConfiguration.Project));
++
++            if (_projectCachePlugins.IsEmpty)
++            {
++                return;
++            }
++
++            // Filter to plugins which apply to the project, if any
++            List<ProjectCacheDescriptor> projectCacheDescriptors = GetProjectCacheDescriptors(requestConfiguration.Project).ToList();
++            if (projectCacheDescriptors.Count == 0)
++            {
++                return;
++            }
++
++
++            IReadOnlyDictionary<string, string> globalProperties = GetGlobalProperties(requestConfiguration);
++
++            List<string> targets = buildResult.ResultsByTarget.Keys.ToList();
++            string? targetNames = string.Join(", ", targets);
++
++            FileAccessContext fileAccessContext = new(requestConfiguration.ProjectFullPath, globalProperties, targets);
++
++            var buildEventFileInfo = new BuildEventFileInfo(requestConfiguration.ProjectFullPath);
++            var pluginLogger = new LoggingServiceToPluginLoggerAdapter(
++                _loggingService,
++                buildEventContext,
++                buildEventFileInfo);
++
++            Task[] tasks = new Task[projectCacheDescriptors.Count];
++            int idx = 0;
++            foreach (ProjectCacheDescriptor projectCacheDescriptor in projectCacheDescriptors)
++            {
++                tasks[idx++] = Task.Run(
++                    async () =>
++                    {
++                        ProjectCachePlugin plugin = await _projectCachePlugins[projectCacheDescriptor].Value;
++
++                        // Rethrow any initialization exception.
++                        plugin.InitializationException?.Throw();
++
++                        ErrorUtilities.VerifyThrow(plugin.Instance != null, "Plugin '{0}' instance is null", plugin.Name);
++
++                        MSBuildEventSource.Log.ProjectCacheHandleBuildResultStart(plugin.Name, fileAccessContext.ProjectFullPath, targetNames);
++                        try
++                        {
++                            await plugin.Instance!.HandleProjectFinishedAsync(fileAccessContext, buildResult, pluginLogger, cancellationToken);
++                        }
++                        catch (Exception e) when (e is not ProjectCacheException)
++                        {
++                            HandlePluginException(e, nameof(ProjectCachePluginBase.HandleProjectFinishedAsync));
++                        }
++                        finally
++                        {
++                            MSBuildEventSource.Log.ProjectCacheHandleBuildResultStop(plugin.Name, fileAccessContext.ProjectFullPath, targetNames);
++                        }
++                    },
++                    cancellationToken);
++            }
++
++            await Task.WhenAll(tasks).ConfigureAwait(false);
++
++            if (pluginLogger.HasLoggedErrors)
++            {
++                ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheHandleBuildResultFailed", fileAccessContext.ProjectFullPath);
++            }
++        }
++
+         public async ValueTask DisposeAsync()
+         {
+             if (_isDisposed)
+@@ -624,6 +746,11 @@ public async ValueTask DisposeAsync()
+                         return;
+                     }
+ 
++                    if (plugin.HandlerRegistration.HasValue)
++                    {
++                        plugin.HandlerRegistration.Value.Dispose();
++                    }
++
+                     MSBuildEventSource.Log.ProjectCacheEndBuildStart(plugin.Name);
+                     try
+                     {
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 5a8f8640a74..564caf33095 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1902,6 +1902,9 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+   <data name="ProjectCacheShutdownFailed" xml:space="preserve">
+     <value>MSB4268: The project cache failed to shut down properly.</value>
+   </data>
++  <data name="ProjectCacheHandleBuildResultFailed" xml:space="preserve">
++    <value>MSB4269: The project cache failed while handling build result for the following project: {0}.</value>
++  </data>
+   <data name="NoProjectCachePluginFoundInAssembly" xml:space="preserve">
+     <value>MSB4270: No project cache plugins found in assembly "{0}". Expected one.</value>
+   </data>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 0f52b70e2b8..4df1c74126c 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: Mezipaměť projektu vyvolala neošetřenou výjimku z metody {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">Přístup do mezipaměti projektu pro „{0}“ (výchozí cíle).</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 363edd349b7..d6c171a3dfe 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: Der Projektcache hat über die Methode {0} eine unbehandelte Ausnahme ausgelöst.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">Projektcachetreffer für „{0}“ (Standardziele).</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index b614cd5d41a..21c0297c4b9 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: la caché del proyecto inició una excepción no controlada desde el método {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">Acierto de caché de proyecto para "{0}" (destinos predeterminados).</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index c38b649d037..4bd1e6f2989 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: le cache de projet a levé une exception non gérée à partir de la méthode {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">Le cache de projet a été atteint pour « {0} » (cibles par défaut).</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 4c4932631a8..3ff49b5aa8e 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: la cache del progetto ha generato un'eccezione non gestita dal metodo {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">Riscontro nella cache del progetto per "{0}" (destinazioni predefinite).</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 0ab12ba89e3..289deb0cc2e 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: プロジェクト キャッシュが {0} メソッドで処理されていない例外が返されました。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">"{0}" のプロジェクト キャッシュ ヒット (既定のターゲット)。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 8101d90c436..992147bfe58 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: 프로젝트 캐시는 {0} 메서드에서 처리되지 않은 예외를 발생시켰습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">"{0}"(기본 대상)에 대한 프로젝트 캐시 적중입니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 334e24ff11e..85c79075179 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: pamięć podręczna projektu zgłosiła nieobsługiwany wyjątek z metody {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">Trafienie pamięci podręcznej projektu dla „{0}” (domyślne elementy docelowe).</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 1231fa2b51b..b87e7d369d8 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: O cache do projeto lançou uma exceção sem tratamento do método {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">Acerto de cache do projeto para "{0}" (destinos padrão).</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 2858ea61d4b..065230c8537 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: в кэше проектов возникло необработанное исключение из метода {0}.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">Попадание в кэше проекта для "{0}" (целевые объекты по умолчанию).</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index dda58e54d67..6603883eff4 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: Proje önbelleği {0} yönteminden yakalanamayan özel durum oluşturdu.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">"{0}" (varsayılan hedefler) için proje önbelleği isabeti.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 8a2d41f5a59..19ef6bae0b4 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: 项目缓存从 {0} 方法引发了未经处理的异常。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">项目缓存命中 "{0}" (默认目标)。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 3bae314d441..6da2dfaa105 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -254,6 +254,11 @@
+         <target state="translated">MSB4273: 專案快取從 {0} 方法擲回未處理的例外狀況。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ProjectCacheHandleBuildResultFailed">
++        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+         <source>Project cache hit for "{0}" (default targets).</source>
+         <target state="translated">"{0}" 的專案快取命中 (預設目標)。</target>
+diff --git a/src/Framework/MSBuildEventSource.cs b/src/Framework/MSBuildEventSource.cs
+index 29e9e67abfb..a5dbe84a3ee 100644
+--- a/src/Framework/MSBuildEventSource.cs
++++ b/src/Framework/MSBuildEventSource.cs
+@@ -661,6 +661,18 @@ public void MSBuildServerBuildStop(string commandLine, int countOfConsoleMessage
+         {
+             WriteEvent(90, commandLine, countOfConsoleMessages, sumSizeOfConsoleMessages, clientExitType, serverExitType);
+         }
++
++        [Event(91, Keywords = Keywords.All)]
++        public void ProjectCacheHandleBuildResultStart(string pluginTypeName, string projectPath, string targets)
++        {
++            WriteEvent(91, pluginTypeName, projectPath, targets);
++        }
++
++        [Event(92, Keywords = Keywords.All)]
++        public void ProjectCacheHandleBuildResultStop(string pluginTypeName, string projectPath, string targets)
++        {
++            WriteEvent(92, pluginTypeName, projectPath, targets);
++        }
+         #endregion
+     }
+ }

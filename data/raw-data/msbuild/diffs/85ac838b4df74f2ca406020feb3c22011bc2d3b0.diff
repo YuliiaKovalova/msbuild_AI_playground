@@ -1,0 +1,316 @@
+diff --git a/src/Build.UnitTests/TelemetryTests.cs b/src/Build.UnitTests/TelemetryTests.cs
+index d62c003647f..8db9561a59a 100644
+--- a/src/Build.UnitTests/TelemetryTests.cs
++++ b/src/Build.UnitTests/TelemetryTests.cs
+@@ -6,6 +6,7 @@
+ using System.Linq;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
++using Microsoft.Build.Framework.Telemetry;
+ using Microsoft.Build.UnitTests;
+ using Shouldly;
+ using Xunit;
+@@ -165,5 +166,30 @@ public void WorkerNodeTelemetryCollection_CustomTargetsAndTasks()
+ 
+             workerNodeTelemetryData.TasksExecutionData.Keys.ShouldAllBe(k => !k.IsFromNugetCache);
+         }
++
++        [Fact]
++        public void Foo()
++        {
++            WorkerNodeTelemetryData wd = new WorkerNodeTelemetryData(
++                new Dictionary<TaskOrTargetTelemetryKey, TaskExecutionStats>()
++                {
++                    {
++                        new TaskOrTargetTelemetryKey("TaskA", false, true),
++                        new TaskExecutionStats(TimeSpan.FromSeconds(2), 5, 545)
++                    },
++                    {
++                        new TaskOrTargetTelemetryKey("TaskA", true, false),
++                        new TaskExecutionStats(TimeSpan.FromSeconds(254548), 6, 54545451)
++                    },
++                },
++                new Dictionary<TaskOrTargetTelemetryKey, bool>()
++                {
++                    { new TaskOrTargetTelemetryKey("TargetA", false, true, false), false },
++                    { new TaskOrTargetTelemetryKey("TargetA", true, true, false), false },
++                    { new TaskOrTargetTelemetryKey("TargetB", false, false, true), false }
++                });
++
++            var holder = TelemetryDataUtils.AsActivityDataHolder(wd);
++        }
+     }
+ }
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 947c7764de6..30026737b22 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -257,6 +257,11 @@ public class BuildManager : INodePacketHandler, IBuildComponentHost, IDisposable
+         /// </summary>
+         private BuildTelemetry? _buildTelemetry;
+ 
++        /// <summary>
++        /// Logger, that if instantiated - will receive and expose telemetry data from worker nodes.
++        /// </summary>
++        private InternalTelemetryConsumingLogger? _telemetryConsumingLogger;
++
+         private ProjectCacheService? _projectCacheService;
+ 
+         private bool _hasProjectCacheServiceInitializedVsScenario;
+@@ -1134,7 +1139,8 @@ private void EndBuildTelemetry()
+         {
+             OpenTelemetryManager.Instance.DefaultActivitySource?
+                 .StartActivity("Build")?
+-                .WithTags(_buildTelemetry!)
++                .WithTags(_buildTelemetry)
++                .WithTags(_telemetryConsumingLogger?.WorkerNodeTelemetryData.AsActivityDataHolder())
+                 .WithStartTime(_buildTelemetry!.InnerStartAt)
+                 .Dispose();
+             OpenTelemetryManager.Instance.ForceFlush();
+@@ -2986,10 +2992,10 @@ private ILoggingService CreateLoggingService(
+                     loggerSwitchParameters: null,
+                     verbosity: LoggerVerbosity.Quiet);
+ 
+-                ILogger internalTelemetryLogger =
++                _telemetryConsumingLogger =
+                     new InternalTelemetryConsumingLogger();
+ 
+-                ForwardingLoggerRecord[] forwardingLogger = { new ForwardingLoggerRecord(internalTelemetryLogger, forwardingLoggerDescription) };
++                ForwardingLoggerRecord[] forwardingLogger = { new ForwardingLoggerRecord(_telemetryConsumingLogger, forwardingLoggerDescription) };
+ 
+                 forwardingLoggers = forwardingLoggers?.Concat(forwardingLogger) ?? forwardingLogger;
+             }
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index eaf8eccce00..6c85f5cb0e4 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -174,6 +174,7 @@
+     <Compile Include="Instance\IPropertyElementWithLocation.cs" />
+     <Compile Include="Logging\BuildEventArgsExtensions.cs" />
+     <Compile Include="TelemetryInfra\ITelemetryForwarder.cs" />
++    <Compile Include="TelemetryInfra\TelemetryDataUtils.cs" />
+     <Compile Include="TelemetryInfra\TelemetryForwarderProvider.cs" />
+     <Compile Include="Utilities\ReaderWriterLockSlimExtensions.cs" />
+     <Compile Include="BackEnd\Node\ConsoleOutput.cs" />
+diff --git a/src/Build/TelemetryInfra/TelemetryDataUtils.cs b/src/Build/TelemetryInfra/TelemetryDataUtils.cs
+new file mode 100644
+index 00000000000..72395d72782
+--- /dev/null
++++ b/src/Build/TelemetryInfra/TelemetryDataUtils.cs
+@@ -0,0 +1,138 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Runtime.InteropServices;
++using System.Text.Json;
++using System.Text.Json.Serialization;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.Framework.Telemetry
++{
++    internal static class TelemetryDataUtils
++    {
++        public static IActivityTelemetryDataHolder? AsActivityDataHolder(this IWorkerNodeTelemetryData? telemetryData)
++        {
++            if (telemetryData == null)
++            {
++                return null;
++            }
++
++            List<TelemetryItem> telemetryItems = new(2);
++
++            telemetryItems.Add(new TelemetryItem("Tasks",
++                JsonSerializer.Serialize(telemetryData.TasksExecutionData, _serializerOptions), false));
++            telemetryItems.Add(new TelemetryItem("Targets",
++                JsonSerializer.Serialize(telemetryData.TargetsExecutionData, _serializerOptions), false));
++
++            return new NodeTelemetry(telemetryItems);
++        }
++
++        private static JsonSerializerOptions _serializerOptions = CreateSerializerOptions();
++
++        private static JsonSerializerOptions CreateSerializerOptions()
++        {
++            var opt = new JsonSerializerOptions
++            {
++                WriteIndented = true,
++                Converters =
++                {
++                    new TargetDataConverter(),
++                    new TaskDataConverter(),
++                },
++                // TypeInfoResolver = new PrivateConstructorContractResolver()
++            };
++
++            return opt;
++        }
++
++        private class TargetDataConverter : JsonConverter<Dictionary<TaskOrTargetTelemetryKey, bool>?>
++        {
++            public override Dictionary<TaskOrTargetTelemetryKey, bool>? Read(
++                ref Utf8JsonReader reader,
++                Type typeToConvert,
++                JsonSerializerOptions options)
++                =>
++                    throw new NotImplementedException("Reading is not supported");
++
++            public override void Write(
++                Utf8JsonWriter writer,
++                Dictionary<TaskOrTargetTelemetryKey, bool>? value,
++                JsonSerializerOptions options)
++            {
++                if (value == null)
++                {
++                    throw new NotSupportedException("TaskOrTargetTelemetryKey cannot be null in telemetry data");
++                }
++
++                // Following needed - as System.Text.Json doesn't support indexing dictionary by composite types
++
++                writer.WriteStartArray();
++
++                foreach (KeyValuePair<TaskOrTargetTelemetryKey, bool> valuePair in value)
++                {
++                    writer.WriteStartObject(valuePair.Key.IsCustom ? ActivityExtensions.GetHashed(valuePair.Key.Name) : valuePair.Key.Name);
++                    writer.WriteBoolean("WasExecuted", valuePair.Value);
++                    writer.WriteBoolean("IsCustom", valuePair.Key.IsCustom);
++                    writer.WriteBoolean("IsFromNuget", valuePair.Key.IsFromNugetCache);
++                    writer.WriteBoolean("IsMetaproj", valuePair.Key.IsFromMetaProject);
++                    writer.WriteEndObject();
++                }
++
++                writer.WriteEndArray();
++            }
++        }
++
++        private class TaskDataConverter : JsonConverter<Dictionary<TaskOrTargetTelemetryKey, TaskExecutionStats>?>
++        {
++            public override Dictionary<TaskOrTargetTelemetryKey, TaskExecutionStats>? Read(
++                ref Utf8JsonReader reader,
++                Type typeToConvert,
++                JsonSerializerOptions options)
++                =>
++                    throw new NotImplementedException("Reading is not supported");
++
++            public override void Write(
++                Utf8JsonWriter writer,
++                Dictionary<TaskOrTargetTelemetryKey, TaskExecutionStats>? value,
++                JsonSerializerOptions options)
++            {
++                if (value == null)
++                {
++                    throw new NotSupportedException("TaskOrTargetTelemetryKey cannot be null in telemetry data");
++                }
++
++                // Following needed - as System.Text.Json doesn't support indexing dictionary by composite types
++
++                writer.WriteStartArray();
++
++                foreach (KeyValuePair<TaskOrTargetTelemetryKey, TaskExecutionStats> valuePair in value)
++                {
++                    writer.WriteStartObject(valuePair.Key.IsCustom ? ActivityExtensions.GetHashed(valuePair.Key.Name) : valuePair.Key.Name);
++                    writer.WriteNumber("ExecTimeMs", valuePair.Value.CumulativeExecutionTime.TotalMilliseconds);
++                    writer.WriteNumber("ExecCnt", valuePair.Value.ExecutionsCount);
++                    writer.WriteNumber("MemKBs", valuePair.Value.TotalMemoryConsumption / 1024.0);
++                    writer.WriteBoolean("IsCustom", valuePair.Key.IsCustom);
++                    writer.WriteBoolean("IsFromNuget", valuePair.Key.IsFromNugetCache);
++                    writer.WriteEndObject();
++                }
++
++                writer.WriteEndArray();
++            }
++        }
++
++        private class NodeTelemetry : IActivityTelemetryDataHolder
++        {
++            private readonly IList<TelemetryItem> _items;
++
++            public NodeTelemetry(IList<TelemetryItem> items) => _items = items;
++
++            public IList<TelemetryItem> GetActivityProperties()
++                => _items;
++        }
++    }
++}
+diff --git a/src/Framework/Microsoft.Build.Framework.csproj b/src/Framework/Microsoft.Build.Framework.csproj
+index 95240faa44b..da61a612686 100644
+--- a/src/Framework/Microsoft.Build.Framework.csproj
++++ b/src/Framework/Microsoft.Build.Framework.csproj
+@@ -23,7 +23,7 @@
+     <PackageReference Include="System.Runtime.CompilerServices.Unsafe" />
+     <PackageReference Include="Microsoft.VisualStudio.Setup.Configuration.Interop" PrivateAssets="all" />
+     <Reference Include="System.Xaml" />
+-
++    <PackageReference Include="System.Text.Json" />
+     <!-- Telemetry in Framework-->
+     <PackageReference Include="Microsoft.VisualStudio.OpenTelemetry.Collector" PrivateAssets="all" />
+     <PackageReference Include="Microsoft.VisualStudio.OpenTelemetry.ClientExtensions" PrivateAssets="all" />
+diff --git a/src/Framework/Telemetry/ActivityExtensions.cs b/src/Framework/Telemetry/ActivityExtensions.cs
+index 91648067ae2..aa10b1a6615 100644
+--- a/src/Framework/Telemetry/ActivityExtensions.cs
++++ b/src/Framework/Telemetry/ActivityExtensions.cs
+@@ -17,9 +17,12 @@ internal static class ActivityExtensions
+         /// <summary>
+         /// Add tags to the activity from a <see cref="IActivityTelemetryDataHolder"/>.
+         /// </summary>
+-        public static Activity WithTags(this Activity activity, IActivityTelemetryDataHolder dataHolder)
++        public static Activity WithTags(this Activity activity, IActivityTelemetryDataHolder? dataHolder)
+         {
+-            activity.WithTags(dataHolder.GetActivityProperties());
++            if (dataHolder != null)
++            {
++                activity.WithTags(dataHolder.GetActivityProperties());
++            }
+             return activity;
+         }
+ 
+@@ -59,7 +62,7 @@ public static Activity WithStartTime(this Activity activity, DateTime? startTime
+         /// <summary>
+         /// Depending on the platform, hash the value using an available mechanism.
+         /// </summary>
+-        private static object GetHashed(object value)
++        internal static string GetHashed(object value)
+         {
+             return Sha256Hasher.Hash(value.ToString() ?? "");
+         }
+diff --git a/src/Framework/Telemetry/InternalTelemetryConsumingLogger.cs b/src/Framework/Telemetry/InternalTelemetryConsumingLogger.cs
+index 4584112e7ae..67305934852 100644
+--- a/src/Framework/Telemetry/InternalTelemetryConsumingLogger.cs
++++ b/src/Framework/Telemetry/InternalTelemetryConsumingLogger.cs
+@@ -23,6 +23,8 @@ public void Initialize(IEventSource eventSource)
+ 
+     private readonly WorkerNodeTelemetryData _workerNodeTelemetryData = new();
+ 
++    public IWorkerNodeTelemetryData WorkerNodeTelemetryData => _workerNodeTelemetryData;
++
+     private void EventSource5_WorkerNodeTelemetryLogged(object? sender, WorkerNodeTelemetryEventArgs e)
+     {
+         _workerNodeTelemetryData.Add(e.WorkerNodeTelemetryData);
+diff --git a/src/Framework/Telemetry/TaskExecutionStats.cs b/src/Framework/Telemetry/TaskExecutionStats.cs
+index 4442d9d27ca..f1da55e59a4 100644
+--- a/src/Framework/Telemetry/TaskExecutionStats.cs
++++ b/src/Framework/Telemetry/TaskExecutionStats.cs
+@@ -7,8 +7,19 @@ namespace Microsoft.Build.Framework;
+ 
+ internal class TaskExecutionStats(TimeSpan cumulativeExecutionTime, short executionsCount, long totalMemoryConsumption)
+ {
++    /// <summary>
++    /// Total execution time of the task in all nodes for all projects.
++    /// </summary>
+     public TimeSpan CumulativeExecutionTime { get; set; } = cumulativeExecutionTime;
++
++    /// <summary>
++    /// Total memory consumption (across all executions) in bytes.
++    /// </summary>
+     public long TotalMemoryConsumption { get; set; } = totalMemoryConsumption;
++
++    /// <summary>
++    /// Total number of execution of the tasks in all nodes for all projects.
++    /// </summary>
+     public short ExecutionsCount { get; set; } = executionsCount;
+ 
+     // We need custom Equals for easier assertations in tests

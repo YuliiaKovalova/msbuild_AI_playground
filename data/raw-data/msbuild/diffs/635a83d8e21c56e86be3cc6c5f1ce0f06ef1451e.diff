@@ -1,0 +1,384 @@
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index addc0b8858e..403e0baddca 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -179,6 +179,57 @@ public void UnusedEnvironmentVariablesDoNotAppearInBinaryLog()
+             }
+         }
+ 
++        [Fact]
++        public void AssemblyLoadsDuringTaskRunLogged()
++        {
++            using (TestEnvironment env = TestEnvironment.Create())
++            {
++                env.SetEnvironmentVariable("EnvVar1", "itsValue");
++                env.SetEnvironmentVariable("EnvVar2", "value2");
++                env.SetEnvironmentVariable("EnvVar3", "value3");
++                string contents = $"""
++                    <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Hello">
++                      <!-- This simple inline task displays "Hello, world!" -->
++                      <UsingTask
++                        TaskName="HelloWorld"
++                        TaskFactory="RoslynCodeTaskFactory"
++                        AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll" >
++                        <ParameterGroup />
++                        <Task> 
++                          <Using Namespace="System"/>
++                          <Using Namespace="System.IO"/>
++                          <Using Namespace="System.Reflection"/>
++                          <Code Type="Fragment" Language="cs">
++                    <![CDATA[
++                        // Display "Hello, world!"
++                        Log.LogMessage("Hello, world!");
++                    	//load assembly
++                    	var assemblies = AppDomain.CurrentDomain.GetAssemblies();
++                    	var diagAssembly = Assembly.LoadFrom(Path.Combine(Path.GetDirectoryName(assemblies[0].Location), "System.Diagnostics.Debug.dll"));
++                    	Log.LogMessage("Loaded: " + diagAssembly);
++                    ]]>
++                          </Code>
++                        </Task>
++                      </UsingTask>
++
++                    <Target Name="Hello">
++                      <HelloWorld />
++                    </Target>
++                    </Project>
++                    """;
++                TransientTestFolder logFolder = env.CreateFolder(createFolder: true);
++                TransientTestFile projectFile = env.CreateFile(logFolder, "myProj.proj", contents);
++                BinaryLogger logger = new();
++                logger.Parameters = _logFile;
++                RunnerUtilities.ExecMSBuild($"{projectFile.Path} -bl:{logger.Parameters}", out bool success);
++                success.ShouldBeTrue();
++                RunnerUtilities.ExecMSBuild($"{logger.Parameters} -flp:logfile={Path.Combine(logFolder.Path, "logFile.log")};verbosity=diagnostic", out success);
++                success.ShouldBeTrue();
++                string text = File.ReadAllText(Path.Combine(logFolder.Path, "logFile.log"));
++                text.ShouldContain("Assembly loaded during task run: System.Diagnostics.Debug");
++            }
++        }
++
+         [Fact]
+         public void BinaryLoggerShouldEmbedFilesViaTaskOutput()
+         {
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs b/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
+index a2559e01bf5..9585cded785 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/AssemblyLoadsTracker.cs
+@@ -5,7 +5,6 @@
+ using System;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Framework;
+-using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.BackEnd.Components.RequestBuilder
+ {
+@@ -17,6 +16,7 @@ internal class AssemblyLoadsTracker : IDisposable
+ 
+         public static IDisposable StartTracking(LoggingContext loggingContext)
+         {
++            // Debugger.Launch();
+             var tracker = new AssemblyLoadsTracker(loggingContext);
+             tracker.StartTracking();
+             return tracker;
+@@ -38,13 +38,14 @@ private void StopTracking()
+ 
+         private void CurrentDomainOnAssemblyLoad(object? sender, AssemblyLoadEventArgs args)
+         {
+-            // what about FormatResourceStringIgnoreCodeAndKeyword ??
+-            string? message = ResourceUtilities.GetResourceString("TaskAssemblyLoaded");
++            // Is it correct to get the resource within the args? Or should the caller pass it
++            // (former seems as better separation of concerns)
++            // string? message = ResourceUtilities.GetResourceString("TaskAssemblyLoaded");
+             string? assemblyName = args.LoadedAssembly.FullName;
+             string? assemblyPath = args.LoadedAssembly.Location;
+             Guid mvid = args.LoadedAssembly.ManifestModule.ModuleVersionId;
+ 
+-            AssemblyLoadBuildEventArgs buildArgs = new(assemblyName, assemblyPath, mvid, message);
++            AssemblyLoadBuildEventArgs buildArgs = new(assemblyName, assemblyPath, mvid, null);
+             buildArgs.BuildEventContext = _loggingContext.BuildEventContext;
+             _loggingContext.LogBuildEvent(buildArgs);
+         }
+diff --git a/src/Framework/AssemblyLoadBuildEventArgs.cs b/src/Framework/AssemblyLoadBuildEventArgs.cs
+index aace6c1e508..b2dfbd43bdd 100644
+--- a/src/Framework/AssemblyLoadBuildEventArgs.cs
++++ b/src/Framework/AssemblyLoadBuildEventArgs.cs
+@@ -5,10 +5,12 @@
+ #nullable disable
+ 
+ using System;
++using System.IO;
++using Microsoft.Build.Shared;
+ 
+ namespace Microsoft.Build.Framework
+ {
+-    [Serializable]
++    // [Serializable] TODO: this is likely not needed - custom serialization is happening
+     public class AssemblyLoadBuildEventArgs : BuildMessageEventArgs // or LazyFormattedBuildEventArgs?
+     {
+         public AssemblyLoadBuildEventArgs()
+@@ -22,7 +24,7 @@ public AssemblyLoadBuildEventArgs(
+             string helpKeyword = null,
+             string senderName = null,
+             MessageImportance importance = MessageImportance.Low)
+-            : base(message, helpKeyword, senderName, importance/*, DateTime.UtcNow, assemblyName, assemblyPath, mvid*/)
++            : base(message, helpKeyword, senderName, importance, DateTime.UtcNow, assemblyName, assemblyPath, mvid)
+         {
+             AssemblyName = assemblyName;
+             AssemblyPath = assemblyPath;
+@@ -32,5 +34,36 @@ public AssemblyLoadBuildEventArgs(
+         public string AssemblyName { get; private set; }
+         public string AssemblyPath { get; private set; }
+         public Guid MVID { get; private set; }
++
++        internal override void WriteToStream(BinaryWriter writer)
++        {
++            writer.WriteTimestamp(RawTimestamp);
++            writer.WriteOptionalBuildEventContext(BuildEventContext);
++            writer.WriteGuid(MVID);
++            writer.WriteOptionalString(AssemblyName);
++            writer.WriteOptionalString(AssemblyPath);
++        }
++
++        internal override void CreateFromStream(BinaryReader reader, int version)
++        {
++            RawTimestamp = reader.ReadTimestamp();
++            BuildEventContext = reader.ReadOptionalBuildEventContext();
++            MVID = reader.ReadGuid();
++            AssemblyName = reader.ReadString();
++            AssemblyPath = reader.ReadString();
++        }
++
++        public override string Message
++        {
++            get
++            {
++                if (RawMessage == null)
++                {
++                    RawMessage = FormatResourceStringIgnoreCodeAndKeyword("TaskAssemblyLoaded", AssemblyName, AssemblyPath, MVID.ToString());
++                }
++
++                return RawMessage;
++            }
++        }
+     }
+ }
+diff --git a/src/MSBuildTaskHost/MSBuildTaskHost.csproj b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+index 2eb61137bc5..0628e295bd9 100644
+--- a/src/MSBuildTaskHost/MSBuildTaskHost.csproj
++++ b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+@@ -43,9 +43,6 @@
+     <Compile Include="..\Framework\EnvironmentVariableReadEventArgs.cs">
+       <Link>EnvironmentVariableReadEventArgs.cs</Link>
+     </Compile>
+-    <Compile Include="..\Framework\AssemblyLoadBuildEventArgs.cs">
+-      <Link>AssemblyLoadBuildEventArgs.cs</Link>
+-    </Compile>
+     <Compile Include="..\Framework\BuildEnvironmentState.cs">
+       <Link>BuildEnvironmentState.cs</Link>
+     </Compile>
+diff --git a/src/Shared/BinaryReaderExtensions.cs b/src/Shared/BinaryReaderExtensions.cs
+index dbaad654b30..49d78eac202 100644
+--- a/src/Shared/BinaryReaderExtensions.cs
++++ b/src/Shared/BinaryReaderExtensions.cs
+@@ -75,5 +75,11 @@ public static BuildEventContext ReadBuildEventContext(this BinaryReader reader)
+             var buildEventContext = new BuildEventContext(submissionId, nodeId, evaluationId, projectInstanceId, projectContextId, targetId, taskId);
+             return buildEventContext;
+         }
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static unsafe Guid ReadGuid(this BinaryReader reader)
++        {
++            return new Guid(reader.ReadBytes(sizeof(Guid)));
++        }
+     }
+ }
+diff --git a/src/Shared/BinaryTranslator.cs b/src/Shared/BinaryTranslator.cs
+index a1e1f2b6a28..05abbdbab95 100644
+--- a/src/Shared/BinaryTranslator.cs
++++ b/src/Shared/BinaryTranslator.cs
+@@ -186,15 +186,6 @@ public void Translate(ref double value)
+                 value = _reader.ReadDouble();
+             }
+ 
+-            /// <summary>
+-            /// Translates a guid.
+-            /// </summary>
+-            /// <param name="value">The value to be translated.</param>
+-            public unsafe void Translate(ref Guid value)
+-            {
+-                value = new Guid(_reader.ReadBytes(sizeof(Guid)));
+-            }
+-
+             /// <summary>
+             /// Translates a string.
+             /// </summary>
+@@ -878,23 +869,6 @@ public void Translate(ref double value)
+                 _writer.Write(value);
+             }
+ 
+-            /// <summary>
+-            /// Translates a guid.
+-            /// </summary>
+-            /// <param name="value">The value to be translated.</param>
+-            public void Translate(ref Guid value)
+-            {
+-                Guid val = value;
+-                unsafe
+-                {
+-                    byte* ptr = (byte*)&val;
+-                    for (int i = 0; i < sizeof(Guid); i++, ptr++)
+-                    {
+-                        _writer.Write(*ptr);
+-                    }
+-                }
+-            }
+-
+             /// <summary>
+             /// Translates a string.
+             /// </summary>
+diff --git a/src/Shared/BinaryWriterExtensions.cs b/src/Shared/BinaryWriterExtensions.cs
+index ffc019dacba..a065dcc51d6 100644
+--- a/src/Shared/BinaryWriterExtensions.cs
++++ b/src/Shared/BinaryWriterExtensions.cs
+@@ -71,5 +71,19 @@ public static void WriteBuildEventContext(this BinaryWriter writer, BuildEventCo
+             writer.Write(context.ProjectInstanceId);
+             writer.Write(context.EvaluationId);
+         }
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        public static void WriteGuid(this BinaryWriter writer, Guid value)
++        {
++            Guid val = value;
++            unsafe
++            {
++                byte* ptr = (byte*)&val;
++                for (int i = 0; i < sizeof(Guid); i++, ptr++)
++                {
++                    writer.Write(*ptr);
++                }
++            }
++        }
+     }
+ }
+diff --git a/src/Shared/ITranslator.cs b/src/Shared/ITranslator.cs
+index 8576ebac216..3a507470744 100644
+--- a/src/Shared/ITranslator.cs
++++ b/src/Shared/ITranslator.cs
+@@ -152,12 +152,6 @@ BinaryWriter Writer
+         /// <param name="value">The value to be translated.</param>
+         void Translate(ref double value);
+ 
+-        /// <summary>
+-        /// Translates a guid.
+-        /// </summary>
+-        /// <param name="value">The value to be translated.</param>
+-        void Translate(ref Guid value);
+-
+         /// <summary>
+         /// Translates a string array.
+         /// </summary>
+diff --git a/src/Shared/LogMessagePacketBase.cs b/src/Shared/LogMessagePacketBase.cs
+index b8c5574edd7..6a9629f7a06 100644
+--- a/src/Shared/LogMessagePacketBase.cs
++++ b/src/Shared/LogMessagePacketBase.cs
+@@ -529,8 +529,8 @@ private BuildEventArgs GetBuildEventArgFromId()
+                 LoggingEventType.TaskCommandLineEvent => new TaskCommandLineEventArgs(null, null, MessageImportance.Normal),
+                 LoggingEventType.EnvironmentVariableReadEvent => new EnvironmentVariableReadEventArgs(),
+                 LoggingEventType.ResponseFileUsedEvent => new ResponseFileUsedEventArgs(null),
+-                LoggingEventType.AssemblyLoadEvent => new AssemblyLoadBuildEventArgs(),
+ #if !TASKHOST // MSBuildTaskHost is targeting Microsoft.Build.Framework.dll 3.5
++                LoggingEventType.AssemblyLoadEvent => new AssemblyLoadBuildEventArgs(),
+                 LoggingEventType.TaskParameterEvent => new TaskParameterEventArgs(0, null, null, true, default),
+                 LoggingEventType.ProjectEvaluationStartedEvent => new ProjectEvaluationStartedEventArgs(),
+                 LoggingEventType.ProjectEvaluationFinishedEvent => new ProjectEvaluationFinishedEventArgs(),
+@@ -595,6 +595,10 @@ private LoggingEventType GetLoggingEventId(BuildEventArgs eventArg)
+             {
+                 return LoggingEventType.Telemetry;
+             }
++            else if (eventType == typeof(AssemblyLoadBuildEventArgs))
++            {
++                return LoggingEventType.AssemblyLoadEvent;
++            }
+ #endif
+             else if (eventType == typeof(TargetStartedEventArgs))
+             {
+@@ -636,10 +640,6 @@ private LoggingEventType GetLoggingEventId(BuildEventArgs eventArg)
+             {
+                 return LoggingEventType.ResponseFileUsedEvent;
+             }
+-            else if (eventType == typeof(AssemblyLoadBuildEventArgs))
+-            {
+-                return LoggingEventType.AssemblyLoadEvent;
+-            }
+             else
+             {
+                 return LoggingEventType.CustomEvent;
+@@ -700,34 +700,12 @@ private void WriteEventToStream(BuildEventArgs buildEvent, LoggingEventType even
+                 case LoggingEventType.EnvironmentVariableReadEvent:
+                     WriteEnvironmentVariableReadEventArgs((EnvironmentVariableReadEventArgs)buildEvent, translator);
+                     break;
+-                case LoggingEventType.AssemblyLoadEvent:
+-                    WriteAssemblyLoadEventArgs((AssemblyLoadBuildEventArgs)buildEvent, translator);
+-                    break;
+                 default:
+                     ErrorUtilities.ThrowInternalError("Not Supported LoggingEventType {0}", eventType.ToString());
+                     break;
+             }
+         }
+ 
+-        /// <summary>
+-        /// Serializes AssemblyLoadBuildEventArgs Event argument to the stream. Does not work properly on TaskHosts due to BuildEventContext serialization not being
+-        /// enabled on TaskHosts..
+-        /// TODO: Is this possibly problematic??
+-        /// </summary>
+-        private void WriteAssemblyLoadEventArgs(AssemblyLoadBuildEventArgs assemblyLoadBuildEventArgs, ITranslator translator)
+-        {
+-            string assemblyName = assemblyLoadBuildEventArgs.AssemblyName;
+-            translator.Translate(ref assemblyName);
+-            string assemblyPath = assemblyLoadBuildEventArgs.AssemblyPath;
+-            translator.Translate(ref assemblyPath);
+-            Guid assemblyMvid = assemblyLoadBuildEventArgs.MVID;
+-            translator.Translate(ref assemblyMvid);
+-            BuildEventContext context = assemblyLoadBuildEventArgs.BuildEventContext;
+-#if !CLR2COMPATIBILITY
+-            translator.Translate(ref context);
+-#endif
+-        }
+-
+         /// <summary>
+         /// Serializes EnvironmentVariableRead Event argument to the stream. Does not work properly on TaskHosts due to BuildEventContext serialization not being
+         /// enabled on TaskHosts, but that shouldn't matter, as this should never be called from a TaskHost anyway.
+@@ -1095,33 +1073,10 @@ private BuildEventArgs ReadEventFromStream(LoggingEventType eventType, ITranslat
+                 LoggingEventType.ResponseFileUsedEvent => ReadResponseFileUsedEventFromStream(translator, message, helpKeyword, senderName),
+                 LoggingEventType.BuildWarningEvent => ReadBuildWarningEventFromStream(translator, message, helpKeyword, senderName),
+                 LoggingEventType.EnvironmentVariableReadEvent => ReadEnvironmentVariableReadEventFromStream(translator, message, helpKeyword, senderName),
+-                LoggingEventType.AssemblyLoadEvent => ReadAssemblyLoadEventFromStream(translator, message, helpKeyword, senderName),
+                 _ => null,
+             };
+         }
+ 
+-        /// <summary>
+-        /// Read and reconstruct an AssemblyLoadBuildEventArgs from the stream.
+-        /// TODO: Task host support?
+-        /// </summary>
+-        private AssemblyLoadBuildEventArgs ReadAssemblyLoadEventFromStream(ITranslator translator, string message, string helpKeyword, string senderName)
+-        {
+-            string assemblyName = null;
+-            translator.Translate(ref assemblyName);
+-            string assemblyPath = null;
+-            translator.Translate(ref assemblyPath);
+-            Guid assemblyMvid = Guid.Empty;
+-            translator.Translate(ref assemblyMvid);
+-            BuildEventContext context = null;
+-#if !CLR2COMPATIBILITY
+-            translator.Translate(ref context);
+-#endif
+-
+-            AssemblyLoadBuildEventArgs args = new(assemblyName, assemblyPath, assemblyMvid, message, helpKeyword, senderName);
+-            args.BuildEventContext = context;
+-            return args;
+-        }
+-
+         /// <summary>
+         /// Read and reconstruct an EnvironmentVariableReadEventArgs from the stream. This message should never be called from a TaskHost, so although the context translation does not work, that's ok.
+         /// </summary>

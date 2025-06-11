@@ -1,0 +1,190 @@
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index 3ef2120b037..2901298ed0a 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -67,6 +67,10 @@ public delegate (int exitCode, string exitType) BuildCallback(
+         /// </summary>
+         private Exception? _shutdownException = null;
+ 
++        /// <summary>
++        /// Indicate that cancel has been requested and initiated.
++        /// </summary>        
++        private bool _cancelRequested = false;
+         private string _serverBusyMutexName = default!;
+ 
+         public OutOfProcServerNode(BuildCallback buildFunction)
+@@ -312,7 +316,12 @@ private void HandleServerShutdownCommand(NodeBuildComplete buildComplete)
+             _shutdownEvent.Set();
+         }
+ 
+-        private static void HandleBuildCancel() => BuildManager.DefaultBuildManager.CancelAllSubmissions();
++        private void HandleBuildCancel()
++        {
++            CommunicationsUtilities.Trace("Received request to cancel build running on MSBuild Server. MSBuild server will shutdown.}");
++            _cancelRequested = true;
++            BuildManager.DefaultBuildManager.CancelAllSubmissions();
++        }
+ 
+         private void HandleServerNodeBuildCommandAsync(ServerNodeBuildCommand command)
+         {
+@@ -411,10 +420,10 @@ private void HandleServerNodeBuildCommand(ServerNodeBuildCommand command)
+             var response = new ServerNodeBuildResult(buildResult.exitCode, buildResult.exitType);
+             SendPacket(response);
+ 
+-            _shutdownReason = NodeEngineShutdownReason.BuildCompleteReuse;
++            // Shutdown server if cancel was requested. This is consistent with nodes behavior.
++            _shutdownReason = _cancelRequested ? NodeEngineShutdownReason.BuildComplete : NodeEngineShutdownReason.BuildCompleteReuse;
+             _shutdownEvent.Set();
+         }
+-
+         internal sealed class RedirectConsoleWriter : StringWriter
+         {
+             private readonly Action<string> _writeCallback;
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 34e2109ccac..f70e92bb9a0 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -993,9 +993,8 @@ private static void Console_CancelKeyPress(object sender, ConsoleCancelEventArgs
+                 return;
+             }
+ 
+-            s_buildCancellationSource.Cancel();
+-
+             Console.WriteLine(ResourceUtilities.GetResourceString("AbortingBuild"));
++            s_buildCancellationSource.Cancel();
+ 
+             // The OS takes a lock in
+             // kernel32.dll!_SetConsoleCtrlHandler, so if a task
+@@ -1006,31 +1005,42 @@ private static void Console_CancelKeyPress(object sender, ConsoleCancelEventArgs
+             // We're already on a threadpool thread anyway.
+             WaitCallback callback = delegate
+             {
+-                s_cancelComplete.Reset();
+-
+-                // If the build is already complete, just exit.
+-                if (s_buildComplete.WaitOne(0))
++                try 
+                 {
+-                    s_cancelComplete.Set();
+-                    return;
+-                }
++                    s_cancelComplete.Reset();
+ 
+-                // If the build has already started (or already finished), we will cancel it
+-                // If the build has not yet started, it will cancel itself, because
+-                // we set alreadyCalled=1
+-                bool hasBuildStarted;
+-                lock (s_buildLock)
+-                {
+-                    hasBuildStarted = s_hasBuildStarted;
+-                }
++                    // If the build is already complete, just exit.
++                    if (s_buildComplete.WaitOne(0))
++                    {
++                        s_cancelComplete.Set();
++                        return;
++                    }
+ 
+-                if (hasBuildStarted)
++                    // If the build has already started (or already finished), we will cancel it
++                    // If the build has not yet started, it will cancel itself, because
++                    // we set alreadyCalled=1
++                    bool hasBuildStarted;
++                    lock (s_buildLock)
++                    {
++                        hasBuildStarted = s_hasBuildStarted;
++                    }
++
++                    if (hasBuildStarted)
++                    {
++                        BuildManager.DefaultBuildManager.CancelAllSubmissions();
++                        s_buildComplete.WaitOne();
++                    }
++
++                    s_cancelComplete.Set(); // This will release our main Execute method so we can finally exit.
++                }
++                finally
+                 {
+-                    BuildManager.DefaultBuildManager.CancelAllSubmissions();
+-                    s_buildComplete.WaitOne();
++                    // Server node shall terminate after it received CancelKey press.
++                    if (s_isServerNode)
++                    {
++                        Environment.Exit(0); // the process can now be terminated as everything has already been gracefully cancelled.
++                    }
+                 }
+-
+-                s_cancelComplete.Set(); // This will release our main Execute method so we can finally exit.
+             };
+ 
+             ThreadPoolExtensions.QueueThreadPoolWorkItemWithCulture(callback, CultureInfo.CurrentCulture, CultureInfo.CurrentUICulture);
+diff --git a/src/Tasks.UnitTests/AssignCulture_Tests.cs b/src/Tasks.UnitTests/AssignCulture_Tests.cs
+index 33cdf7e7ad1..3ea88706f9c 100644
+--- a/src/Tasks.UnitTests/AssignCulture_Tests.cs
++++ b/src/Tasks.UnitTests/AssignCulture_Tests.cs
+@@ -259,5 +259,24 @@ public void AliasedCultures_SupportedOnNetCore(string culture)
+             Assert.Equal($"MyResource.{culture}.resx", t.AssignedFiles[0].ItemSpec);
+             Assert.Equal("MyResource.resx", t.CultureNeutralAssignedFiles[0].ItemSpec);
+         }
++
++        [Fact]
++        [SkipOnTargetFramework(TargetFrameworkMonikers.NetFramework, "Pseudoloc is special-cased in .NET relative to Framework.")]
++        public void Pseudolocales_CaseInsensitive()
++        {
++            string culture = "qps-Ploc";
++            AssignCulture t = new AssignCulture();
++            t.BuildEngine = new MockEngine();
++            ITaskItem i = new TaskItem($"MyResource.{culture}.resx");
++            t.Files = new ITaskItem[] { i };
++            t.Execute();
++
++            Assert.Single(t.AssignedFiles);
++            Assert.Single(t.CultureNeutralAssignedFiles);
++            Assert.Equal("true", t.AssignedFiles[0].GetMetadata("WithCulture"));
++            Assert.Equal(culture, t.AssignedFiles[0].GetMetadata("Culture"));
++            Assert.Equal($"MyResource.{culture}.resx", t.AssignedFiles[0].ItemSpec);
++            Assert.Equal("MyResource.resx", t.CultureNeutralAssignedFiles[0].ItemSpec);
++        }
+     }
+ }
+diff --git a/src/Tasks/CultureInfoCache.cs b/src/Tasks/CultureInfoCache.cs
+index dca043b7d3c..1a4786a6477 100644
+--- a/src/Tasks/CultureInfoCache.cs
++++ b/src/Tasks/CultureInfoCache.cs
+@@ -71,7 +71,7 @@ internal static bool IsValidCultureString(string name)
+                 catch
+                 {
+                     // Second attempt: try pseudolocales (see above)
+-                    return pseudoLocales.Contains(name);
++                    return pseudoLocales.Contains(name, StringComparer.OrdinalIgnoreCase);
+                 }
+             }
+ #endif
+diff --git a/src/Tasks/Microsoft.Common.CurrentVersion.targets b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+index 54bfe05740d..b5938447b1d 100644
+--- a/src/Tasks/Microsoft.Common.CurrentVersion.targets
++++ b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+@@ -1964,14 +1964,16 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+         <TargetPlatformMonikers Condition="'$(TargetPlatformMoniker)' == ''">None</TargetPlatformMonikers>
+         <AdditionalPropertiesFromProject>$(_AdditionalTargetFrameworkInfoProperties)</AdditionalPropertiesFromProject>
+ 
+-        <!-- Determine whether a project is "RID agnostic" for each TargetFramework.  "RID agnostic" means that global properties such as SelfContained and RuntimeIdentifier should
+-             not flow across project references.
+-
+-             Generally this value will come from the IsRidAgnostic property set by the .NET SDK.  If that's not set, then the fallback logic here will be that the project
+-             is RID agnostic if it doesn't have RuntimeIdentifier or RuntimeIdentifiers properties set. -->
++        <!-- Determine whether a project is "RID agnostic" for each TargetFramework.  "RID agnostic" means that global properties such as
++             SelfContained and RuntimeIdentifier should not flow across project references.  The IsRidAgnostic metadata value is consumed in the
++             _GetProjectReferenceTargetFrameworkProperties target, where those properties are added to a project's UndefineProperties if
++             IsRidAgnostic is set.
++        
++             Generally we set the IsRidAgnostic metadata based on the IsRidAgnostic property set by the .NET SDK.  If that's not set, then the
++             fallback logic here will be that the project is RID agnostic if it doesn't have RuntimeIdentifier or RuntimeIdentifiers properties set. -->
+         <IsRidAgnostic>$(IsRidAgnostic)</IsRidAgnostic>
+-        <IsRidAgnostic Condition=" '$(IsRidAgnostic)' == '' and '$(RuntimeIdentifier)' == '' and '$(RuntimeIdentifiers)' == '' ">true</IsRidAgnostic>
+-        <IsRidAgnostic Condition=" '$(IsRidAgnostic)' == ''">false</IsRidAgnostic>
++        <IsRidAgnostic Condition=" '%(IsRidAgnostic)' == '' and '$(RuntimeIdentifier)' == '' and '$(RuntimeIdentifiers)' == '' ">true</IsRidAgnostic>
++        <IsRidAgnostic Condition=" '%(IsRidAgnostic)' == ''">false</IsRidAgnostic>
+ 
+       </_TargetFrameworkInfo>
+     </ItemGroup>

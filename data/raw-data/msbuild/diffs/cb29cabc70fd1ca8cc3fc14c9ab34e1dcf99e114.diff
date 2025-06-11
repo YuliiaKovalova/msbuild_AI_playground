@@ -1,0 +1,142 @@
+diff --git a/src/Build.UnitTests/Graph/GraphTestingUtilities.cs b/src/Build.UnitTests/Graph/GraphTestingUtilities.cs
+index 65b1b86965c..97707a2f7c3 100644
+--- a/src/Build.UnitTests/Graph/GraphTestingUtilities.cs
++++ b/src/Build.UnitTests/Graph/GraphTestingUtilities.cs
+@@ -26,6 +26,14 @@ internal static class GraphTestingUtilities
+                                                                         <InnerBuildPropertyValues>{InnerBuildPropertiesName}</InnerBuildPropertyValues>
+                                                                         <{InnerBuildPropertiesName}>a;b</{InnerBuildPropertiesName}>
+                                                                      </PropertyGroup>";
++
++        public const string MultitargetingSpecificationPropertyGroupWithGeneratePackageOnBuild = $@"<PropertyGroup>
++                                                                                                  <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
++                                                                                                  <InnerBuildProperty>{InnerBuildPropertyName}</InnerBuildProperty>
++                                                                                                  <InnerBuildPropertyValues>{InnerBuildPropertiesName}</InnerBuildPropertyValues>
++                                                                                                  <{InnerBuildPropertiesName}>a;b</{InnerBuildPropertiesName}>
++                                                                                               </PropertyGroup>";
++
+         public const string HardCodedInnerBuildWithMultitargetingSpecification = $@"<PropertyGroup>
+                                                                         <InnerBuildProperty>{InnerBuildPropertyName}</InnerBuildProperty>
+                                                                         <InnerBuildPropertyValues>{InnerBuildPropertiesName}</InnerBuildPropertyValues>
+diff --git a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+index 7c278ef5d8e..18652f73ce6 100644
+--- a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
++++ b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+@@ -1299,6 +1299,23 @@ public void GetTargetsListProjectReferenceTargetsOrDefaultComplexPropagation()
+             }
+         }
+ 
++        [Fact]
++        public void EnsureReferencedMultitargetingNodeWithGeneratePackageOnBuildPropTargetListContainsBuild()
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                TransientTestFile entryProject = CreateProjectFile(env, 1, projectReferences: new[] { 2 }, extraContent: @$"
++<ItemGroup>
++    <ProjectReferenceTargets Include='Build' Targets='Build' />
++    <ProjectReferenceTargets Include='Build' Targets='OuterBuild' OuterBuild='true' />
++</ItemGroup>");
++                CreateProjectFile(env, 2, extraContent: MultitargetingSpecificationPropertyGroupWithGeneratePackageOnBuild);
++                var graph = new ProjectGraph(entryProject.Path);
++                IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetLists = graph.GetTargetLists(null);
++                targetLists[key: GetOuterBuild(graph, 2)].ShouldBe(expected: new[] { "OuterBuild", "Build" });
++            }
++        }
++
+         public static IEnumerable<object[]> Graphs
+         {
+             get
+diff --git a/src/Build/Graph/ProjectGraph.cs b/src/Build/Graph/ProjectGraph.cs
+index e8a6624faf2..f0e6e6b011d 100644
+--- a/src/Build/Graph/ProjectGraph.cs
++++ b/src/Build/Graph/ProjectGraph.cs
+@@ -636,18 +636,24 @@ public IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> GetTargetLis
+                 var targetsToPropagate = ProjectInterpretation.TargetsToPropagate.FromProjectAndEntryTargets(node.ProjectInstance, requestedTargets);
+ 
+                 // Queue the project references for visitation, if the edge hasn't already been traversed.
+-                foreach (var referenceNode in node.ProjectReferences)
++                foreach (ProjectGraphNode referenceNode in node.ProjectReferences)
+                 {
+-                    var applicableTargets = targetsToPropagate.GetApplicableTargetsForReference(referenceNode.ProjectInstance);
++                    ProjectInstance projectInstance = referenceNode.ProjectInstance;
++                    ImmutableList<string> applicableTargets = targetsToPropagate.GetApplicableTargetsForReference(projectInstance);
+ 
+                     if (applicableTargets.IsEmpty)
+                     {
+                         continue;
+                     }
+ 
+-                    var expandedTargets = ExpandDefaultTargets(
++                    if (ProjectInterpretation.IsOuterBuildWithGeneratePackageOnBuildPropertySetToTrue(projectInstance))
++                        {
++                        applicableTargets = applicableTargets.Add("Build");
++                    }
++
++                    ImmutableList<string> expandedTargets = ExpandDefaultTargets(
+                         applicableTargets,
+-                        referenceNode.ProjectInstance.DefaultTargets,
++                        projectInstance.DefaultTargets,
+                         Edges[(node, referenceNode)]);
+ 
+                     var projectReferenceEdge = new ProjectGraphBuildRequest(
+diff --git a/src/Build/Graph/ProjectInterpretation.cs b/src/Build/Graph/ProjectInterpretation.cs
+index bbd597033fb..741c9587738 100644
+--- a/src/Build/Graph/ProjectInterpretation.cs
++++ b/src/Build/Graph/ProjectInterpretation.cs
+@@ -151,8 +151,8 @@ internal static string GetInnerBuildPropertyValues(ProjectInstance project)
+ 
+         internal static ProjectType GetProjectType(ProjectInstance project)
+         {
+-            var isOuterBuild = String.IsNullOrWhiteSpace(GetInnerBuildPropertyValue(project)) && !String.IsNullOrWhiteSpace(GetInnerBuildPropertyValues(project));
+-            var isInnerBuild = !String.IsNullOrWhiteSpace(GetInnerBuildPropertyValue(project));
++            bool isOuterBuild = IsOuterBuild(project);
++            bool isInnerBuild = IsInnerBuild(project);
+ 
+             ErrorUtilities.VerifyThrow(!(isOuterBuild && isInnerBuild), $"A project cannot be an outer and inner build at the same time: ${project.FullPath}");
+ 
+@@ -163,6 +163,46 @@ internal static ProjectType GetProjectType(ProjectInstance project)
+                     : ProjectType.NonMultitargeting;
+         }
+ 
++        /// <summary>
++        /// Returns <c>true</c> iff the <paramref name="project"/> is an
++        /// outer build.
++        /// </summary>
++        /// <param name="project">The project to determine if it's an outer
++        /// build.</param>
++        /// <returns><c>true</c> iff the <paramref name="project"/> is an outer
++        /// build.</returns>
++        private static bool IsOuterBuild(ProjectInstance project)
++        {
++            return string.IsNullOrWhiteSpace(GetInnerBuildPropertyValue(project)) && !string.IsNullOrWhiteSpace(GetInnerBuildPropertyValues(project));
++        }
++
++        /// <summary>
++        /// Returns <c>true</c> iff the <paramref name="project"/> is an
++        /// inner build.
++        /// </summary>
++        /// <param name="project">The project to determine if it's an inner
++        /// build.</param>
++        /// <returns><c>true</c> iff the <paramref name="project"/> is an inner
++        /// build.</returns>
++        private static bool IsInnerBuild(ProjectInstance project)
++        {
++            return !string.IsNullOrWhiteSpace(GetInnerBuildPropertyValue(project));
++        }
++
++        /// <summary>
++        /// Return <c>true</c> iff the <paramref name="project"/> is an outer
++        /// build with the <c>GeneratePackageOnBuild</c> property set to <c>true</c>.
++        /// </summary>
++        /// <param name="project">The project to determine where it contains
++        /// a <c>GeneratePackageOnBuild</c> property that's set to <c>true</c>.</param>
++        /// <returns><c>true</c> iff the <paramref name="project"/> is an
++        /// outer build with the <c>GeneratePackageOnBuild</c>
++        /// property set to <c>true</c>.</returns>
++        public static bool IsOuterBuildWithGeneratePackageOnBuildPropertySetToTrue(ProjectInstance project)
++        {
++            return IsOuterBuild(project) && MSBuildStringIsTrue(project.GetPropertyValue("GeneratePackageOnBuild"));
++        }
++
+         /// <summary>
+         /// To avoid calling nuget at graph construction time, the graph is initially constructed with outer build nodes referencing inner build nodes.
+         /// However, at build time, for non root outer builds, the inner builds are NOT referenced by the outer build, but by the nodes referencing the

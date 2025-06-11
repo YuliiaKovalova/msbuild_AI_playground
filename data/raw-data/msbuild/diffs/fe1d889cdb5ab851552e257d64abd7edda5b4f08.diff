@@ -1,0 +1,199 @@
+diff --git a/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs b/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
+index b34ab8f726b..129619c677a 100644
+--- a/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
++++ b/src/Build/BuildCheck/API/IBuildCheckRegistrationContext.cs
+@@ -12,4 +12,6 @@ public interface IBuildCheckRegistrationContext
+     void RegisterParsedItemsAction(Action<BuildCheckDataContext<ParsedItemsAnalysisData>> parsedItemsAction);
+ 
+     void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction);
++
++    void RegisterBuildFinishedAction(Action<BuildCheckDataContext<BuildFinishedAnalysisData>> buildFinishedAction);
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+index 2b6b94aa2d5..5ebb3de9ded 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckBuildEventHandler.cs
+@@ -119,6 +119,8 @@ private void HandleEnvironmentVariableReadEvent(EnvironmentVariableReadEventArgs
+ 
+     private void HandleBuildFinishedEvent(BuildFinishedEventArgs eventArgs)
+     {
++        _buildCheckManager.ProcessBuildFinished(_analyzerContextFactory.CreateAnalysisContext(eventArgs.BuildEventContext!));
++
+         _stats.Merge(_buildCheckManager.CreateAnalyzerTracingStats(), (span1, span2) => span1 + span2);
+ 
+         LogAnalyzerStats(_analyzerContextFactory.CreateAnalysisContext(GetBuildEventContext(eventArgs)));
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index ca235fbd2f4..86311afe4b5 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -27,9 +27,10 @@ private record CallbackRegistry(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<TaskInvocationAnalysisData>>)> TaskInvocationActions,
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<PropertyReadData>>)> PropertyReadActions,
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<PropertyWriteData>>)> PropertyWriteActions,
+-        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ProjectProcessingDoneData>>)> ProjectProcessingDoneActions)
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<ProjectProcessingDoneData>>)> ProjectProcessingDoneActions,
++        List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<BuildFinishedAnalysisData>>)> BuildFinishedActions)
+     {
+-        public CallbackRegistry() : this([], [], [], [], [], []) { }
++        public CallbackRegistry() : this([], [], [], [], [], [], []) { }
+ 
+         internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
+         {
+@@ -38,6 +39,7 @@ internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
+             PropertyReadActions.RemoveAll(a => a.Item1 == analyzer);
+             PropertyWriteActions.RemoveAll(a => a.Item1 == analyzer);
+             ProjectProcessingDoneActions.RemoveAll(a => a.Item1 == analyzer);
++            BuildFinishedActions.RemoveAll(a => a.Item1 == analyzer);
+         }
+     }
+ 
+@@ -53,6 +55,7 @@ internal void DeregisterAnalyzer(BuildAnalyzerWrapper analyzer)
+     internal bool HasTaskInvocationActions => _globalCallbacks.TaskInvocationActions.Count > 0;
+     internal bool HasPropertyReadActions => _globalCallbacks.PropertyReadActions.Count > 0;
+     internal bool HasPropertyWriteActions => _globalCallbacks.PropertyWriteActions.Count > 0;
++    internal bool HasBuildFinishedActions => _globalCallbacks.BuildFinishedActions.Count > 0;
+ 
+     internal void RegisterEvaluatedPropertiesAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<EvaluatedPropertiesAnalysisData>> evaluatedPropertiesAction)
+         // Here we might want to communicate to node that props need to be sent.
+@@ -68,6 +71,9 @@ internal void RegisterTaskInvocationAction(BuildAnalyzerWrapper analyzer, Action
+     internal void RegisterPropertyReadAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<PropertyReadData>> propertyReadAction)
+         => RegisterAction(analyzer, propertyReadAction, _globalCallbacks.PropertyReadActions);
+ 
++    internal void RegisterBuildFinishedAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<BuildFinishedAnalysisData>> buildFinishedAction)
++        => RegisterAction(analyzer, buildFinishedAction, _globalCallbacks.BuildFinishedActions);
++
+     internal void RegisterPropertyWriteAction(BuildAnalyzerWrapper analyzer, Action<BuildCheckDataContext<PropertyWriteData>> propertyWriteAction)
+         => RegisterAction(analyzer, propertyWriteAction, _globalCallbacks.PropertyWriteActions);
+ 
+@@ -145,6 +151,14 @@ internal void RunProjectProcessingDoneActions(
+         => RunRegisteredActions(_globalCallbacks.ProjectProcessingDoneActions, projectProcessingDoneData,
+             analysisContext, resultHandler);
+ 
++    internal void RunBuildFinishedActions(
++        BuildFinishedAnalysisData buildFinishedAnalysisData,
++        IAnalysisContext analysisContext,
++        Action<BuildAnalyzerWrapper, IAnalysisContext, BuildAnalyzerConfigurationEffective[], BuildCheckResult>
++            resultHandler)
++        => RunRegisteredActions(_globalCallbacks.BuildFinishedActions, buildFinishedAnalysisData,
++            analysisContext, resultHandler);
++
+     private void RunRegisteredActions<T>(
+         List<(BuildAnalyzerWrapper, Action<BuildCheckDataContext<T>>)> registeredCallbacks,
+         T analysisData,
+@@ -157,7 +171,7 @@ private void RunRegisteredActions<T>(
+         foreach (var analyzerCallback in registeredCallbacks)
+         {
+             // Tracing - https://github.com/dotnet/msbuild/issues/9629 - we might want to account this entire block
+-            //  to the relevant analyzer (with BuildAnalyzerConfigurationEffectiveonly the currently accounted part as being the 'core-execution' subspan)
++            //  to the relevant analyzer (with BuildAnalyzerConfigurationEffective only the currently accounted part as being the 'core-execution' subspan)
+ 
+             BuildAnalyzerConfigurationEffective? commonConfig = analyzerCallback.Item1.CommonConfig;
+             BuildAnalyzerConfigurationEffective[] configPerRule;
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+index ca337bee24f..691d73bfd17 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckContext.cs
+@@ -21,4 +21,7 @@ public void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvoca
+     {
+         buildCheckCentralContext.RegisterTaskInvocationAction(analyzerWrapper, taskInvocationAction);
+     }
++
++    public void RegisterBuildFinishedAction(Action<BuildCheckDataContext<BuildFinishedAnalysisData>> buildFinishedAction)
++        => buildCheckCentralContext.RegisterBuildFinishedAction(analyzerWrapper, buildFinishedAction);
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 844ced7f2f0..118c205d7d1 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -364,6 +364,10 @@ public void ProcessTaskStartedEventArgs(
+             => _buildEventsProcessor
+                 .ProcessTaskStartedEventArgs(analysisContext, taskStartedEventArgs);
+ 
++        public void ProcessBuildFinished(IAnalysisContext analysisContext)
++            => _buildEventsProcessor.ProcessBuildDone(analysisContext);
++
++
+         public void ProcessTaskFinishedEventArgs(
+             IAnalysisContext analysisContext,
+             TaskFinishedEventArgs taskFinishedEventArgs)
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+index da4a62e145c..828f5c167a6 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildEventsProcessor.cs
+@@ -99,6 +99,17 @@ internal void ProcessEnvironmentVariableReadEventArgs(string envVarName, string
+         }
+     }
+ 
++    internal void ProcessBuildDone(IAnalysisContext analysisContext)
++    {
++        if (!_buildCheckCentralContext.HasBuildFinishedActions)
++        {
++            // No analyzer is interested in the event -> nothing to do.
++            return;
++        }
++
++        _buildCheckCentralContext.RunBuildFinishedActions(new BuildFinishedAnalysisData(), analysisContext, ReportResult);
++    }
++
+     internal void ProcessTaskStartedEventArgs(
+         IAnalysisContext analysisContext,
+         TaskStartedEventArgs taskStartedEventArgs)
+diff --git a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+index d3174b94ed0..b26fab27e2f 100644
+--- a/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/IBuildCheckManager.cs
+@@ -55,6 +55,9 @@ void ProcessTaskParameterEventArgs(
+         IAnalysisContext analysisContext,
+         TaskParameterEventArgs taskParameterEventArgs);
+ 
++    void ProcessBuildFinished(IAnalysisContext analysisContext);
++
++
+     void SetDataSource(BuildCheckDataSource buildCheckDataSource);
+ 
+     void ProcessAnalyzerAcquisition(AnalyzerAcquisitionData acquisitionData, IAnalysisContext analysisContext);
+diff --git a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+index 338a282cdcd..633bfdd8c44 100644
+--- a/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
++++ b/src/Build/BuildCheck/Infrastructure/NullBuildCheckManager.cs
+@@ -22,6 +22,10 @@ public void ProcessEvaluationFinishedEventArgs(
+     {
+     }
+ 
++    public void ProcessBuildFinished(IAnalysisContext analysisContext)
++    {
++    }
++
+     public void SetDataSource(BuildCheckDataSource buildCheckDataSource)
+     {
+     }
+diff --git a/src/Build/BuildCheck/OM/BuildFinishedAnalysisData.cs b/src/Build/BuildCheck/OM/BuildFinishedAnalysisData.cs
+new file mode 100644
+index 00000000000..bdebf343cf9
+--- /dev/null
++++ b/src/Build/BuildCheck/OM/BuildFinishedAnalysisData.cs
+@@ -0,0 +1,11 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.Build.Experimental.BuildCheck;
++
++/// <summary>
++/// BuildCheck data indicating end of the build.
++/// This is the last event that can be received from the BuildCheck infrastructure.
++/// </summary>
++public class BuildFinishedAnalysisData() : AnalysisData(string.Empty, null)
++{ }
+diff --git a/src/BuildCheck.UnitTests/MockBuildCheckRegistrationContext.cs b/src/BuildCheck.UnitTests/MockBuildCheckRegistrationContext.cs
+index 883bb0f188e..f4bfc5a00d5 100644
+--- a/src/BuildCheck.UnitTests/MockBuildCheckRegistrationContext.cs
++++ b/src/BuildCheck.UnitTests/MockBuildCheckRegistrationContext.cs
+@@ -22,6 +22,8 @@ public void RegisterEvaluatedPropertiesAction(Action<BuildCheckDataContext<Evalu
+         public void RegisterTaskInvocationAction(Action<BuildCheckDataContext<TaskInvocationAnalysisData>> taskInvocationAction)
+             => _taskInvocationAction += taskInvocationAction;
+ 
++        public void RegisterBuildFinishedAction(Action<BuildCheckDataContext<BuildFinishedAnalysisData>> buildFinishedAction) => throw new NotImplementedException();
++
+         public void TriggerTaskInvocationAction(TaskInvocationAnalysisData data)
+         {
+             if (_taskInvocationAction is not null)

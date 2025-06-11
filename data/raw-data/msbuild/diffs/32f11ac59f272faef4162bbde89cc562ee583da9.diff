@@ -1,0 +1,973 @@
+diff --git a/MSBuild.Dev.slnf b/MSBuild.Dev.slnf
+index 1157c36a866..4ae636a74a6 100644
+--- a/MSBuild.Dev.slnf
++++ b/MSBuild.Dev.slnf
+@@ -13,7 +13,8 @@
+       "src\\Tasks\\Microsoft.Build.Tasks.csproj",
+       "src\\Utilities.UnitTests\\Microsoft.Build.Utilities.UnitTests.csproj",
+       "src\\Utilities\\Microsoft.Build.Utilities.csproj",
+-      "src\\Xunit.NetCore.Extensions\\Xunit.NetCore.Extensions.csproj"
++      "src\\Xunit.NetCore.Extensions\\Xunit.NetCore.Extensions.csproj",
++      "src\\StringTools\\StringTools.csproj"
+     ]
+   }
+ }
+\ No newline at end of file
+diff --git a/src/Build.UnitTests/BackEnd/BinaryTranslator_Tests.cs b/src/Build.UnitTests/BackEnd/BinaryTranslator_Tests.cs
+index c2c2b91bde9..964a2ed9b62 100644
+--- a/src/Build.UnitTests/BackEnd/BinaryTranslator_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/BinaryTranslator_Tests.cs
+@@ -6,6 +6,7 @@
+ using System.Configuration.Assemblies;
+ using System.Globalization;
+ using System.IO;
++using System.Linq;
+ using System.Reflection;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Exceptions;
+@@ -266,6 +267,55 @@ public void TestSerializeBuildException_NestedWithStack()
+             Assert.True(TranslationHelpers.CompareExceptions(value, deserializedValue));
+         }
+ 
++        public static IEnumerable<object[]> GetBuildExceptionsAsTestData()
++            => BuildExceptionSerializationHelper.EnumerateBuildExceptionTypes().Select(t => new object[] { t });
++
++        [Theory]
++        [MemberData(nameof(GetBuildExceptionsAsTestData))]
++        public void TestSerializationOfBuildExceptions(Type exceptionType)
++        {
++            Exception e = (Exception)Activator.CreateInstance(exceptionType, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.CreateInstance | BindingFlags.Instance, null, new object[]{"msg", new GenericBuildTransferredException() }, System.Globalization.CultureInfo.CurrentCulture);
++            //Activator.CreateInstance(exceptionType, true);
++            Exception remote;
++            try
++            {
++                throw e;
++            }
++            catch (Exception exception)
++            {
++                remote = exception;
++            }
++
++            Assert.NotNull(remote);
++            TranslationHelpers.GetWriteTranslator().TranslateException(ref remote);
++
++            Exception deserializedValue = null;
++            TranslationHelpers.GetReadTranslator().TranslateException(ref deserializedValue);
++
++            Assert.True(TranslationHelpers.CompareExceptions(remote, deserializedValue, true), $"Exception type {exceptionType.FullName} not properly de/serialized");
++        }
++
++        [Fact]
++        public void TestInvalidProjectFileException_NestedWithStack()
++        {
++            Exception value = null;
++            try
++            {
++                throw new InvalidProjectFileException("sample message", new InternalErrorException("Another message"));
++            }
++            catch (Exception e)
++            {
++                value = e;
++            }
++
++            TranslationHelpers.GetWriteTranslator().TranslateException(ref value);
++
++            Exception deserializedValue = null;
++            TranslationHelpers.GetReadTranslator().TranslateException(ref deserializedValue);
++
++            Assert.True(TranslationHelpers.CompareExceptions(value, deserializedValue, true));
++        }
++
+         /// <summary>
+         /// Tests serializing an object with a default constructor.
+         /// </summary>
+diff --git a/src/Build.UnitTests/BackEnd/TranslationHelpers.cs b/src/Build.UnitTests/BackEnd/TranslationHelpers.cs
+index 60f073a0cf2..ce611929671 100644
+--- a/src/Build.UnitTests/BackEnd/TranslationHelpers.cs
++++ b/src/Build.UnitTests/BackEnd/TranslationHelpers.cs
+@@ -9,6 +9,7 @@
+ using System.Text;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Framework;
++using Xunit;
+ 
+ #nullable disable
+ 
+@@ -85,7 +86,7 @@ internal static bool CompareCollections<T>(ICollection<T> left, ICollection<T> r
+         /// <summary>
+         /// Compares two exceptions.
+         /// </summary>
+-        internal static bool CompareExceptions(Exception left, Exception right)
++        internal static bool CompareExceptions(Exception left, Exception right, bool detailed = false)
+         {
+             if (ReferenceEquals(left, right))
+             {
+@@ -107,7 +108,54 @@ internal static bool CompareExceptions(Exception left, Exception right)
+                 return false;
+             }
+ 
+-            return CompareExceptions(left.InnerException, right.InnerException);
++            if (!CompareExceptions(left.InnerException, right.InnerException, detailed))
++            {
++                return false;
++            }
++
++            if (detailed)
++            {
++                if (left.GetType() != right.GetType())
++                {
++                    return false;
++                }
++
++                foreach (var prop in left.GetType().GetProperties())
++                {
++                    if (!IsSimpleType(prop.PropertyType))
++                    {
++                        continue;
++                    }
++
++                    object leftProp = prop.GetValue(left, null);
++                    object rightProp = prop.GetValue(right, null);
++
++                    if (leftProp == null && rightProp != null)
++                    {
++                        return false;
++                    }
++
++                    if (leftProp != null && !prop.GetValue(left, null).Equals(prop.GetValue(right, null)))
++                    {
++                        return false;
++                    }
++                }
++            }
++
++            return true;
++        }
++
++        internal static bool IsSimpleType(Type type)
++        {
++            // Nullables
++            if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>))
++            {
++                return IsSimpleType(type.GetGenericArguments()[0]);
++            }
++            return type.IsPrimitive
++                   || type.IsEnum
++                   || type == typeof(string)
++                   || type == typeof(decimal);
+         }
+ 
+         internal static string GetPropertiesString(IEnumerable properties)
+diff --git a/src/Build/Errors/InvalidProjectFileException.cs b/src/Build/Errors/InvalidProjectFileException.cs
+index ff6e47dc437..7168cd5fa58 100644
+--- a/src/Build/Errors/InvalidProjectFileException.cs
++++ b/src/Build/Errors/InvalidProjectFileException.cs
+@@ -3,7 +3,6 @@
+ 
+ using System;
+ using System.Runtime.Serialization;
+-using Microsoft.Build.BackEnd;
+ using System.Collections.Generic;
+ #if FEATURE_SECURITY_PERMISSIONS
+ using System.Security.Permissions;
+@@ -23,7 +22,9 @@ namespace Microsoft.Build.Exceptions
+     // promise to never change the type's fields i.e. the type is immutable; adding new fields in the next version of the type
+     // without following certain special FX guidelines, can break both forward and backward compatibility
+     [Serializable]
+-    public sealed class InvalidProjectFileException : BuildExceptionBase
++    // WARNING: Intentionally deriving from Microsoft.Build.Internal.BuildExceptionBase and not Microsoft.Build.Backend.BuildExceptionBase
++    //  as due to nuget.exe limitations this cannot depend on Microsoft.Build.Framework assembly
++    public sealed class InvalidProjectFileException : Microsoft.Build.Internal.BuildExceptionBase
+     {
+         #region Basic constructors
+ 
+diff --git a/src/Build/Instance/HostObjectException.cs b/src/Build/Instance/HostObjectException.cs
+index 521223aabb5..2386966f8ca 100644
+--- a/src/Build/Instance/HostObjectException.cs
++++ b/src/Build/Instance/HostObjectException.cs
+@@ -59,12 +59,7 @@ internal HostObjectException(
+         }
+ 
+         // Do not remove - used by BuildExceptionSerializationHelper
+-        private static HostObjectException CreateFromRemote(string message, Exception innerException)
+-        {
+-            return new HostObjectException(message, innerException, true /* calledFromDeserialization */);
+-        }
+-
+-        private HostObjectException(string message, Exception innerException, bool calledFromDeserialization)
++        private HostObjectException(string message, Exception innerException)
+             : base(
+                 message,
+                 innerException)
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index bce1d719cc1..0595ee91ac4 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -697,6 +697,9 @@
+       <Link>Errors\ErrorUtilities.cs</Link>
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+     </Compile>
++    <Compile Include="..\Framework\BuildException\BuildExceptionBase.cs">
++      <Link>Errors\BuildExceptionBase.cs</Link>
++    </Compile>
+     <Compile Include="..\Shared\EscapingUtilities.cs">
+       <Link>SharedUtilities\EscapingUtilities.cs</Link>
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+diff --git a/src/Build/Xml/ProjectXmlUtilities.cs b/src/Build/Xml/ProjectXmlUtilities.cs
+index 966fb665d60..edaf0779692 100644
+--- a/src/Build/Xml/ProjectXmlUtilities.cs
++++ b/src/Build/Xml/ProjectXmlUtilities.cs
+@@ -5,7 +5,6 @@
+ using System.Collections.Generic;
+ using System.IO;
+ using System.Xml;
+-using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Construction;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+diff --git a/src/Framework/BinaryTranslator.cs b/src/Framework/BinaryTranslator.cs
+index 826f2f0694e..1507ab9a664 100644
+--- a/src/Framework/BinaryTranslator.cs
++++ b/src/Framework/BinaryTranslator.cs
+@@ -487,7 +487,7 @@ public void TranslateException(ref Exception value)
+                     return;
+                 }
+ 
+-                value = BuildExceptionBase.ReadExceptionFromTranslator(this);
++                value = BuildExceptionSerializationHelper.ReadExceptionFromTranslator(this);
+             }
+ 
+ 
+@@ -1121,7 +1121,7 @@ public void TranslateException(ref Exception value)
+                     return;
+                 }
+ 
+-                BuildExceptionBase.WriteExceptionToTranslator(this, value);
++                BuildExceptionSerializationHelper.WriteExceptionToTranslator(this, value);
+             }
+ 
+             /// <summary>
+diff --git a/src/Framework/BuildException.cs b/src/Framework/BuildException.cs
+deleted file mode 100644
+index 18978d8ef14..00000000000
+--- a/src/Framework/BuildException.cs
++++ /dev/null
+@@ -1,234 +0,0 @@
+-// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-using System.Collections.Generic;
+-using System.Diagnostics;
+-using System.IO;
+-using System.Linq;
+-using System.Reflection;
+-using System.Runtime.Serialization;
+-using Microsoft.Build.Shared;
+-
+-namespace Microsoft.Build.BackEnd
+-{
+-    internal static class BuildExceptionSerializationHelper
+-    {
+-        private static readonly Dictionary<string, Func<string, Exception?, BuildExceptionBase>> s_exceptionFactories = FetchExceptionsConstructors();
+-
+-        private static readonly Func<string, Exception?, BuildExceptionBase> s_defaultFactory =
+-            (message, innerException) => new GenericBuildTransferredException(message, innerException);
+-
+-        private static Dictionary<string, Func<string, Exception?, BuildExceptionBase>> FetchExceptionsConstructors()
+-        {
+-            var exceptionFactories = new Dictionary<string, Func<string, Exception?, BuildExceptionBase>>();
+-
+-            foreach (Type exceptionType in AppDomain.CurrentDomain.GetAssemblies().SelectMany(s => s.GetTypes()).Where(myType => myType.IsClass && !myType.IsAbstract && myType.IsSubclassOf(typeof(BuildExceptionBase))))
+-            {
+-                MethodInfo? methodInfo = exceptionType.GetMethod(
+-                    "CreateFromRemote",
+-                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+-                    null,
+-                    new[] { typeof(string), typeof(Exception) },
+-                    null);
+-
+-                if (methodInfo != null)
+-                {
+-                    string key = GetExceptionSerializationKey(exceptionType);
+-                    var value = (Func<string, Exception?, BuildExceptionBase>) Delegate.CreateDelegate(typeof(Func<string, Exception?, BuildExceptionBase>), methodInfo);
+-
+-                    exceptionFactories[key] = value;
+-                    continue;
+-                }
+-
+-                ConstructorInfo? ctorInfo = exceptionType.GetConstructor(
+-                    BindingFlags.CreateInstance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+-                    null,
+-                    new[] { typeof(string), typeof(Exception) },
+-                    null);
+-
+-                if (ctorInfo != null)
+-                {
+-                    string key = GetExceptionSerializationKey(exceptionType);
+-                    Func<string, Exception?, BuildExceptionBase> value = (message, innerException) =>
+-                            (BuildExceptionBase)ctorInfo.Invoke(new object?[] { message, innerException });
+-
+-                    exceptionFactories[key] = value;
+-                }
+-            }
+-
+-            return exceptionFactories;
+-        }
+-
+-        internal static string GetExceptionSerializationKey(Type exceptionType)
+-        {
+-            return exceptionType.FullName ?? exceptionType.ToString();
+-        }
+-
+-        internal static Func<string, Exception?, BuildExceptionBase> CreateExceptionFactory(string serializationType)
+-        {
+-            Func<string, Exception?, BuildExceptionBase>? factory;
+-            if (!s_exceptionFactories.TryGetValue(serializationType, out factory))
+-            {
+-                factory = s_defaultFactory;
+-            }
+-
+-            return factory;
+-        }
+-    }
+-
+-    public abstract class BuildExceptionBase : Exception
+-    {
+-        private string? _remoteTypeName;
+-        private string? _remoteStackTrace;
+-
+-        protected BuildExceptionBase()
+-            : base()
+-        { }
+-
+-        protected BuildExceptionBase(string message)
+-            : base(message)
+-        { }
+-
+-        protected BuildExceptionBase(
+-            string message,
+-            Exception? inner)
+-            : base(message, inner)
+-        { }
+-
+-        // This is needed as soon as we allow opt out of the non-BinaryFormatter serialization
+-        protected BuildExceptionBase(SerializationInfo info, StreamingContext context)
+-            : base(info, context)
+-        { }
+-
+-        public override string? StackTrace => string.IsNullOrEmpty(_remoteStackTrace) ? base.StackTrace : _remoteStackTrace;
+-
+-        public override string ToString() => string.IsNullOrEmpty(_remoteTypeName) ? base.ToString() : $"{_remoteTypeName}->{base.ToString()}";
+-
+-        protected virtual void InitializeCustomState(IDictionary<string, string?>? customKeyedSerializedData)
+-        { /* This is it. Override for exceptions with custom state */ }
+-
+-        protected virtual IDictionary<string, string?>? FlushCustomState()
+-        {
+-            /* This is it. Override for exceptions with custom state */
+-            return null;
+-        }
+-
+-        private void InitializeFromRemoteState(
+-            string remoteTypeName,
+-            string? remoteStackTrace,
+-            string? source,
+-            string? helpLink,
+-            int hresult,
+-            IDictionary<string, string?>? customKeyedSerializedData)
+-        {
+-            _remoteTypeName = remoteTypeName;
+-            _remoteStackTrace = remoteStackTrace;
+-            base.Source = source;
+-            base.HelpLink = helpLink;
+-            base.HResult = hresult;
+-            if (customKeyedSerializedData != null)
+-            {
+-                InitializeCustomState(customKeyedSerializedData);
+-            }
+-        }
+-
+-        internal static void WriteExceptionToTranslator(ITranslator translator, Exception exception)
+-        {
+-            BinaryWriter writer = translator.Writer;
+-            writer.Write(exception.InnerException != null);
+-            if (exception.InnerException != null)
+-            {
+-                WriteExceptionToTranslator(translator, exception.InnerException);
+-            }
+-
+-            writer.Write(BuildExceptionSerializationHelper.GetExceptionSerializationKey(exception.GetType()));
+-            writer.Write(exception.Message);
+-            writer.WriteOptionalString(exception.StackTrace);
+-            writer.WriteOptionalString(exception.Source);
+-            writer.WriteOptionalString(exception.HelpLink);
+-            // HResult is completely protected up till net4.5
+-#if NET || NET45_OR_GREATER
+-            writer.Write((byte)1);
+-            writer.Write(exception.HResult);
+-#else
+-            writer.Write((byte)0);
+-#endif
+-
+-            IDictionary<string, string?>? customKeyedSerializedData = (exception as BuildExceptionBase)?.FlushCustomState();
+-            if (customKeyedSerializedData == null)
+-            {
+-                writer.Write((byte)0);
+-            }
+-            else
+-            {
+-                writer.Write((byte)1);
+-                writer.Write(customKeyedSerializedData.Count);
+-                foreach (var pair in customKeyedSerializedData)
+-                {
+-                    writer.Write(pair.Key);
+-                    writer.WriteOptionalString(pair.Value);
+-                }
+-            }
+-
+-            Debug.Assert((exception.Data?.Count ?? 0) == 0,
+-                "Exception Data is not supported in BuildTransferredException");
+-        }
+-
+-        internal static Exception ReadExceptionFromTranslator(ITranslator translator)
+-        {
+-            BinaryReader reader = translator.Reader;
+-            Exception? innerException = null;
+-            if (reader.ReadBoolean())
+-            {
+-                innerException = ReadExceptionFromTranslator(translator);
+-            }
+-
+-            string serializationType = reader.ReadString();
+-            string message = reader.ReadString();
+-            string? deserializedStackTrace = reader.ReadOptionalString();
+-            string? source = reader.ReadOptionalString();
+-            string? helpLink = reader.ReadOptionalString();
+-            int hResult = reader.ReadOptionalInt32();
+-
+-            IDictionary<string, string?>? customKeyedSerializedData = null;
+-            if (reader.ReadByte() == 1)
+-            {
+-                int count = reader.ReadInt32();
+-                customKeyedSerializedData = new Dictionary<string, string?>(count, StringComparer.CurrentCulture);
+-
+-                for (int i = 0; i < count; i++)
+-                {
+-                    customKeyedSerializedData[reader.ReadString()] = reader.ReadOptionalString();
+-                }
+-            }
+-
+-            Exception exception = BuildExceptionSerializationHelper.CreateExceptionFactory(serializationType)(message, innerException);
+-
+-            if (exception is BuildExceptionBase buildException)
+-            {
+-                buildException.InitializeFromRemoteState(
+-                    serializationType,
+-                    deserializedStackTrace,
+-                    source,
+-                    helpLink,
+-                    hResult,
+-                    customKeyedSerializedData);
+-            }
+-
+-            return exception;
+-        }
+-    }
+-
+-    /// <summary>
+-    /// A catch-all type for remote exceptions that we don't know how to deserialize.
+-    /// </summary>
+-    internal sealed class GenericBuildTransferredException : BuildExceptionBase
+-    {
+-        internal GenericBuildTransferredException(
+-            string message,
+-            Exception? inner)
+-            : base(message, inner)
+-        { }
+-    }
+-}
+diff --git a/src/Framework/BuildException/BuildExceptionBase.cs b/src/Framework/BuildException/BuildExceptionBase.cs
+new file mode 100644
+index 00000000000..521914e5d10
+--- /dev/null
++++ b/src/Framework/BuildException/BuildExceptionBase.cs
+@@ -0,0 +1,67 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Runtime.Serialization;
++#if !MSBUILD_FRAMEWORK && !TASKHOST
++using Microsoft.Build.BackEnd;
++
++namespace Microsoft.Build.Internal;
++#else
++namespace Microsoft.Build.BackEnd;
++#endif
++
++public abstract class BuildExceptionBase : Exception
++{
++    private string? _remoteTypeName;
++    private string? _remoteStackTrace;
++
++    protected BuildExceptionBase()
++        : base()
++    { }
++
++    protected BuildExceptionBase(string message)
++        : base(message)
++    { }
++
++    protected BuildExceptionBase(
++        string message,
++        Exception? inner)
++        : base(message, inner)
++    { }
++
++    // This is needed as soon as we allow opt out of the non-BinaryFormatter serialization
++    protected BuildExceptionBase(SerializationInfo info, StreamingContext context)
++        : base(info, context)
++    { }
++
++    public override string? StackTrace => string.IsNullOrEmpty(_remoteStackTrace) ? base.StackTrace : _remoteStackTrace;
++
++    public override string ToString() => string.IsNullOrEmpty(_remoteTypeName) ? base.ToString() : $"{_remoteTypeName}->{base.ToString()}";
++
++    protected virtual void InitializeCustomState(IDictionary<string, string?>? customKeyedSerializedData)
++    { /* This is it. Override for exceptions with custom state */ }
++
++    protected virtual IDictionary<string, string?>? FlushCustomState()
++    {
++        /* This is it. Override for exceptions with custom state */
++        return null;
++    }
++
++    // Do not remove - accessed via reflection
++    //  we cannot use strong typed method, as InvalidProjectFileException needs to be independent on the base in Microsoft.Build.Framework
++    //  (that's given by the legacy need of nuget.exe to call SolutionFile utils from Microsoft.Build without proper loading Microsoft.Build.Framework)
++    private void InitializeFromRemoteState(BuildExceptionRemoteState remoteState)
++    {
++        _remoteTypeName = remoteState.RemoteTypeName;
++        _remoteStackTrace = remoteState.RemoteStackTrace;
++        base.Source = remoteState.Source;
++        base.HelpLink = remoteState.HelpLink;
++        base.HResult = remoteState.HResult;
++        if (remoteState.Source != null)
++        {
++            InitializeCustomState(remoteState.CustomKeyedSerializedData);
++        }
++    }
++}
+diff --git a/src/Framework/BuildException/BuildExceptionRemoteState.cs b/src/Framework/BuildException/BuildExceptionRemoteState.cs
+new file mode 100644
+index 00000000000..5fb590fc99c
+--- /dev/null
++++ b/src/Framework/BuildException/BuildExceptionRemoteState.cs
+@@ -0,0 +1,35 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System.Collections.Generic;
++
++namespace Microsoft.Build.BackEnd;
++
++/// <summary>
++/// Remote exception internal data serving as the source for the exception deserialization.
++/// </summary>
++internal class BuildExceptionRemoteState
++{
++    public BuildExceptionRemoteState(
++        string remoteTypeName,
++        string? remoteStackTrace,
++        string? source,
++        string? helpLink,
++        int hResult,
++        IDictionary<string, string?>? customKeyedSerializedData)
++    {
++        RemoteTypeName = remoteTypeName;
++        RemoteStackTrace = remoteStackTrace;
++        Source = source;
++        HelpLink = helpLink;
++        HResult = hResult;
++        CustomKeyedSerializedData = customKeyedSerializedData;
++    }
++
++    public string RemoteTypeName { get; init; }
++    public string? RemoteStackTrace { get; init; }
++    public string? Source { get; init; }
++    public string? HelpLink { get; init; }
++    public int HResult { get; init; }
++    public IDictionary<string, string?>? CustomKeyedSerializedData { get; init; }
++}
+diff --git a/src/Framework/BuildException/BuildExceptionSerializationHelper.cs b/src/Framework/BuildException/BuildExceptionSerializationHelper.cs
+new file mode 100644
+index 00000000000..d68aa851846
+--- /dev/null
++++ b/src/Framework/BuildException/BuildExceptionSerializationHelper.cs
+@@ -0,0 +1,273 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.IO;
++using System.Linq;
++using System.Reflection;
++using Microsoft.Build.Shared;
++
++namespace Microsoft.Build.BackEnd
++{
++    internal static class BuildExceptionSerializationHelper
++    {
++        private class BuildExceptionConstructionCallbacks
++        {
++            public BuildExceptionConstructionCallbacks(
++                Func<string, Exception?, Exception> factory,
++                Action<Exception, BuildExceptionRemoteState> instnaceInitializer,
++                Func<Exception, IDictionary<string, string?>?> remoteStateExtractor)
++            {
++                Factory = factory;
++                InstnaceInitializer = instnaceInitializer;
++                RemoteStateExtractor = remoteStateExtractor;
++            }
++
++            internal Func<string, Exception?, Exception> Factory { get; }
++            internal Action<Exception, BuildExceptionRemoteState> InstnaceInitializer { get; }
++            internal Func<Exception, IDictionary<string, string?>?> RemoteStateExtractor { get; }
++        }
++
++        private static readonly Dictionary<string, BuildExceptionConstructionCallbacks> s_exceptionFactories = FetchExceptionsConstructors();
++
++        private static readonly BuildExceptionConstructionCallbacks s_defaultFactory =
++            new BuildExceptionConstructionCallbacks(
++                (message, innerException) => new GenericBuildTransferredException(message, innerException),
++                GetInstanceInitializer(typeof(GenericBuildTransferredException))!,
++                _ => null);
++
++        private static Action<Exception, BuildExceptionRemoteState>? GetInstanceInitializer(Type exceptionType)
++        {
++            while (!exceptionType.Name.Equals(nameof(BuildExceptionBase)) && exceptionType.BaseType != null)
++            {
++                exceptionType = exceptionType.BaseType!;
++            }
++
++            MethodInfo? methodInfo = exceptionType.GetMethod(
++                "InitializeFromRemoteState",
++                BindingFlags.Instance | BindingFlags.NonPublic,
++                null,
++                new[] { typeof(BuildExceptionRemoteState) },
++                null);
++
++            if (methodInfo != null)
++            {
++                // Not possible - contravariance not supported. We'd need to use Expression trees and compile them.
++                // return
++                //    (Action<Exception, BuildExceptionRemoteState>)
++                //    Delegate.CreateDelegate(typeof(Action<Exception, BuildExceptionRemoteState>), null, methodInfo);
++
++                return (exception, remoteState) => methodInfo.Invoke(exception, new object[] { remoteState });
++            }
++
++            return null;
++        }
++
++        private static Func<Exception, IDictionary<string, string?>?>? GetRemoteStateExtractor(Type exceptionType)
++        {
++            MethodInfo? methodInfo = exceptionType.GetMethod(
++                "FlushCustomState",
++                BindingFlags.Instance | BindingFlags.NonPublic,
++                null,
++                Type.EmptyTypes,
++                null);
++
++            if (methodInfo != null)
++            {
++                // Not possible - contravariance not supported. We'd need to use Expression trees and compile them.
++                // return
++                //    (Func<Exception, IDictionary<string, string?>?>)
++                //    Delegate.CreateDelegate(typeof(Func<BuildExceptionBase, IDictionary<string, string?>?>), null,
++                //        methodInfo);
++
++                return (exception) => (IDictionary<string, string?>?)methodInfo.Invoke(exception, null);
++            }
++
++            return null;
++        }
++
++        internal static bool IsSupportedExceptionType(Type type)
++        {
++            return type.IsClass &&
++                   !type.IsAbstract &&
++                   type.IsSubclassOf(typeof(Exception)) &&
++                   (type.IsSubclassOf(typeof(BuildExceptionBase)) ||
++                    // This is to support InvalidProjectFileException which is cannot be a subclass of BuildExceptionBase from Microsoft.Build.Framework
++                    type.BaseType!.Name.Equals(nameof(BuildExceptionBase)));
++        }
++
++        internal static IEnumerable<Type> EnumerateBuildExceptionTypes()
++            => AppDomain
++                .CurrentDomain
++                .GetAssemblies()
++                .SelectMany(s => s.GetTypes())
++                .Where(IsSupportedExceptionType);
++
++        private static Dictionary<string, BuildExceptionConstructionCallbacks> FetchExceptionsConstructors()
++        {
++            var exceptionFactories = new Dictionary<string, BuildExceptionConstructionCallbacks>();
++
++            foreach (Type exceptionType in EnumerateBuildExceptionTypes())
++            {
++                Func<Exception, IDictionary<string, string?>?>? remoteStateExtractor =
++                    GetRemoteStateExtractor(exceptionType);
++
++                // First try to find a static method CreateFromRemote
++                //   - to be used when exception has custom constructor logic (e.g. altering messages)
++                Func<string, Exception?, Exception>? factory = null;
++                bool hasFactory = false;
++                MethodInfo? methodInfo = exceptionType.GetMethod(
++                    "CreateFromRemote",
++                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
++                    null,
++                    new[] { typeof(string), typeof(Exception) },
++                    null);
++
++                if (methodInfo != null)
++                {
++                    factory = (Func<string, Exception?, Exception>)Delegate.CreateDelegate(
++                        typeof(Func<string, Exception?, Exception>), methodInfo);
++                }
++                else
++                {
++                    // Then fallback to a constructor with (string, Exception) signature
++                    ConstructorInfo? ctorInfo = exceptionType.GetConstructor(
++                        BindingFlags.CreateInstance | BindingFlags.Public | BindingFlags.NonPublic |
++                        BindingFlags.Instance,
++                        null,
++                        new[] { typeof(string), typeof(Exception) },
++                        null);
++
++                    if (ctorInfo != null)
++                    {
++                        factory = (message, innerException) =>
++                            (Exception)ctorInfo.Invoke(new object?[] { message, innerException });
++                    }
++                }
++
++                // Lastly we need to have 'InitializeFromRemoteState' method
++                if (factory != null)
++                {
++                    Action<Exception, BuildExceptionRemoteState>? instanceInitializer =
++                        GetInstanceInitializer(exceptionType);
++                    if (instanceInitializer != null)
++                    {
++                        exceptionFactories.Add(GetExceptionSerializationKey(exceptionType),
++                            new BuildExceptionConstructionCallbacks(factory, instanceInitializer, remoteStateExtractor!));
++                        hasFactory = true;
++                    }
++                }
++
++                if (!hasFactory)
++                {
++                    Debug.Fail($"Unable to find a factory for exception type {exceptionType.FullName}");
++                }
++            }
++
++            return exceptionFactories;
++        }
++
++        internal static string GetExceptionSerializationKey(Type exceptionType)
++        {
++            return exceptionType.FullName ?? exceptionType.ToString();
++        }
++
++        private static BuildExceptionConstructionCallbacks CreateExceptionFactory(string serializationType)
++        {
++            BuildExceptionConstructionCallbacks? factory;
++            if (!s_exceptionFactories.TryGetValue(serializationType, out factory))
++            {
++                factory = s_defaultFactory;
++            }
++
++            return factory;
++        }
++
++        internal static void WriteExceptionToTranslator(ITranslator translator, Exception exception)
++        {
++            BinaryWriter writer = translator.Writer;
++            writer.Write(exception.InnerException != null);
++            if (exception.InnerException != null)
++            {
++                WriteExceptionToTranslator(translator, exception.InnerException);
++            }
++
++            string serializationType = GetExceptionSerializationKey(exception.GetType());
++            writer.Write(serializationType);
++            writer.Write(exception.Message);
++            writer.WriteOptionalString(exception.StackTrace);
++            writer.WriteOptionalString(exception.Source);
++            writer.WriteOptionalString(exception.HelpLink);
++            // HResult is completely protected up till net4.5
++#if NET || NET45_OR_GREATER
++            int? hresult = exception.HResult;
++#else
++            int? hresult = null;
++#endif
++            writer.WriteOptionalInt32(hresult);
++
++            IDictionary<string, string?>? customKeyedSerializedData = CreateExceptionFactory(serializationType).RemoteStateExtractor(exception);
++            if (customKeyedSerializedData == null)
++            {
++                writer.Write((byte)0);
++            }
++            else
++            {
++                writer.Write((byte)1);
++                writer.Write(customKeyedSerializedData.Count);
++                foreach (var pair in customKeyedSerializedData)
++                {
++                    writer.Write(pair.Key);
++                    writer.WriteOptionalString(pair.Value);
++                }
++            }
++
++            Debug.Assert((exception.Data?.Count ?? 0) == 0,
++                "Exception Data is not supported in BuildTransferredException");
++        }
++
++        internal static Exception ReadExceptionFromTranslator(ITranslator translator)
++        {
++            BinaryReader reader = translator.Reader;
++            Exception? innerException = null;
++            if (reader.ReadBoolean())
++            {
++                innerException = ReadExceptionFromTranslator(translator);
++            }
++
++            string serializationType = reader.ReadString();
++            string message = reader.ReadString();
++            string? deserializedStackTrace = reader.ReadOptionalString();
++            string? source = reader.ReadOptionalString();
++            string? helpLink = reader.ReadOptionalString();
++            int hResult = reader.ReadOptionalInt32();
++
++            IDictionary<string, string?>? customKeyedSerializedData = null;
++            if (reader.ReadByte() == 1)
++            {
++                int count = reader.ReadInt32();
++                customKeyedSerializedData = new Dictionary<string, string?>(count, StringComparer.CurrentCulture);
++
++                for (int i = 0; i < count; i++)
++                {
++                    customKeyedSerializedData[reader.ReadString()] = reader.ReadOptionalString();
++                }
++            }
++
++            BuildExceptionConstructionCallbacks constructionCallbacks = CreateExceptionFactory(serializationType);
++
++            Exception exception = constructionCallbacks.Factory(message, innerException);
++            constructionCallbacks.InstnaceInitializer(exception, new BuildExceptionRemoteState(
++                serializationType,
++                deserializedStackTrace,
++                source,
++                helpLink,
++                hResult,
++                customKeyedSerializedData));
++
++            return exception;
++        }
++    }
++}
+diff --git a/src/Framework/BuildException/GenericBuildTransferredException.cs b/src/Framework/BuildException/GenericBuildTransferredException.cs
+new file mode 100644
+index 00000000000..bcb6331c315
+--- /dev/null
++++ b/src/Framework/BuildException/GenericBuildTransferredException.cs
+@@ -0,0 +1,22 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.BackEnd;
++
++/// <summary>
++/// A catch-all type for remote exceptions that we don't know how to deserialize.
++/// </summary>
++internal sealed class GenericBuildTransferredException : BuildExceptionBase
++{
++    public GenericBuildTransferredException()
++        : base()
++    { }
++
++    internal GenericBuildTransferredException(
++        string message,
++        Exception? inner)
++        : base(message, inner)
++    { }
++}
+diff --git a/src/Framework/Microsoft.Build.Framework.csproj b/src/Framework/Microsoft.Build.Framework.csproj
+index f74a7047925..a1e1ec68dc2 100644
+--- a/src/Framework/Microsoft.Build.Framework.csproj
++++ b/src/Framework/Microsoft.Build.Framework.csproj
+@@ -9,6 +9,7 @@
+     <IncludeSatelliteOutputInPack>false</IncludeSatelliteOutputInPack>
+     <ApplyNgenOptimization Condition="'$(TargetFramework)' == '$(FullFrameworkTFM)'">full</ApplyNgenOptimization>
+     <EnablePackageValidation>true</EnablePackageValidation>
++    <DefineConstants>$(DefineConstants);MSBUILD_FRAMEWORK</DefineConstants>
+   </PropertyGroup>
+ 
+   <ItemGroup>
+diff --git a/src/MSBuildTaskHost/MSBuildTaskHost.csproj b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+index 12755888731..3886775fcec 100644
+--- a/src/MSBuildTaskHost/MSBuildTaskHost.csproj
++++ b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+@@ -144,8 +144,17 @@
+     <Compile Include="..\Framework\BinaryTranslator.cs">
+       <Link>BinaryTranslator.cs</Link>
+     </Compile>
+-    <Compile Include="..\Framework\BuildException.cs">
+-      <Link>BuildException.cs</Link>
++    <Compile Include="..\Framework\BuildException\BuildExceptionBase.cs">
++      <Link>BuildExceptionBase.cs</Link>
++    </Compile>
++    <Compile Include="..\Framework\BuildException\BuildExceptionRemoteState.cs">
++      <Link>BuildExceptionRemoteState.cs</Link>
++    </Compile>
++    <Compile Include="..\Framework\BuildException\BuildExceptionSerializationHelper.cs">
++      <Link>BuildExceptionSerializationHelper.cs</Link>
++    </Compile>
++    <Compile Include="..\Framework\BuildException\GenericBuildTransferredException.cs">
++      <Link>GenericBuildTransferredException.cs</Link>
+     </Compile>
+     <Compile Include="..\Shared\NodeShutdown.cs">
+       <Link>NodeShutdown.cs</Link>
+diff --git a/src/Shared/BinaryWriterExtensions.cs b/src/Shared/BinaryWriterExtensions.cs
+index ad6b579570c..211e91f3edc 100644
+--- a/src/Shared/BinaryWriterExtensions.cs
++++ b/src/Shared/BinaryWriterExtensions.cs
+@@ -26,6 +26,22 @@ public static void WriteOptionalString(this BinaryWriter writer, string? value)
+             }
+         }
+ 
++#if !TASKHOST
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++#endif
++        public static void WriteOptionalInt32(this BinaryWriter writer, int? value)
++        {
++            if (value == null)
++            {
++                writer.Write((byte)0);
++            }
++            else
++            {
++                writer.Write((byte)1);
++                writer.Write(value.Value);
++            }
++        }
++
+ #if !TASKHOST
+         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+ #endif

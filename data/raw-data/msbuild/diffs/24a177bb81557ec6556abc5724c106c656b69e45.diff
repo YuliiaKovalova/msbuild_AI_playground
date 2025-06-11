@@ -1,0 +1,665 @@
+diff --git a/src/Framework/ChangeWaves.cs b/src/Framework/ChangeWaves.cs
+index 2af7392c4d2..7fd1ce1afd7 100644
+--- a/src/Framework/ChangeWaves.cs
++++ b/src/Framework/ChangeWaves.cs
+@@ -27,7 +27,8 @@ internal class ChangeWaves
+         internal static readonly Version Wave17_2 = new Version(17, 2);
+         internal static readonly Version Wave17_4 = new Version(17, 4);
+         internal static readonly Version Wave17_6 = new Version(17, 6);
+-        internal static readonly Version[] AllWaves = { Wave17_2, Wave17_4, Wave17_6 };
++        internal static readonly Version Wave17_7 = new Version(17, 7);
++        internal static readonly Version[] AllWaves = { Wave17_2, Wave17_4, Wave17_6, Wave17_7 };
+ 
+         /// <summary>
+         /// Special value indicating that all features behind all Change Waves should be enabled.
+diff --git a/src/Shared/Constants.cs b/src/Shared/Constants.cs
+index 76d42a328f6..a3bb2212586 100644
+--- a/src/Shared/Constants.cs
++++ b/src/Shared/Constants.cs
+@@ -188,6 +188,9 @@ internal static class ItemMetadataNames
+         internal const string subType = "SubType";
+         internal const string executableExtension = "ExecutableExtension";
+         internal const string embedInteropTypes = "EmbedInteropTypes";
++        internal const string frameworkReferenceName = "FrameworkReferenceName";
++        internal const string assemblyVersion = "AssemblyVersion";
++        internal const string publicKeyToken = "PublicKeyToken";
+ 
+         /// <summary>
+         /// The output path for a given item.
+diff --git a/src/Tasks.UnitTests/AssemblyDependency/Miscellaneous.cs b/src/Tasks.UnitTests/AssemblyDependency/Miscellaneous.cs
+index d8a3e63f4e9..8b69c4083af 100644
+--- a/src/Tasks.UnitTests/AssemblyDependency/Miscellaneous.cs
++++ b/src/Tasks.UnitTests/AssemblyDependency/Miscellaneous.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections;
++using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.IO;
+ using System.Linq;
+@@ -11,13 +12,14 @@
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Tasks;
+-using Microsoft.Build.UnitTests.Shared;
++using Microsoft.Build.Tasks.AssemblyDependency;
+ using Microsoft.Build.Utilities;
+ using Microsoft.Win32;
+ using Shouldly;
+ using Xunit;
+ using Xunit.Abstractions;
+ using Xunit.NetCore.Extensions;
++using FrameworkNameVersioning = System.Runtime.Versioning.FrameworkName;
+ using SystemProcessorArchitecture = System.Reflection.ProcessorArchitecture;
+ 
+ #nullable disable
+@@ -8564,5 +8566,56 @@ private static void GenerateRedistAndProfileXmlLocations(string fullRedistConten
+ 
+             File.WriteAllText(profileRedistList, profileListContents);
+         }
++
++        [Fact]
++        public void SDKReferencesAreResolvedWithoutIO()
++        {
++            InitializeRARwithMockEngine(_output, out MockEngine mockEngine, out ResolveAssemblyReference rar);
++
++            string refPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
++
++            TaskItem item = new TaskItem(refPath);
++            item.SetMetadata("ExternallyResolved", "true");
++
++            item.SetMetadata("FrameworkReferenceName", "Microsoft.NETCore.App");
++            item.SetMetadata("FrameworkReferenceVersion", "8.0.0");
++
++            item.SetMetadata("AssemblyVersion", "8.1.2.3");
++            item.SetMetadata("PublicKeyToken", "b03f5f7f11d50a3a");
++
++            rar.Assemblies = new ITaskItem[] { item };
++            rar.SearchPaths = new string[]
++            {
++                "{CandidateAssemblyFiles}",
++                "{HintPathFromItem}",
++                "{TargetFrameworkDirectory}",
++                "{RawFileName}",
++            };
++            rar.WarnOrErrorOnTargetArchitectureMismatch = "Warning";
++
++            // Execute RAR and assert that we receive no I/O callbacks because the task gets what it needs from item metadata.
++            rar.Execute(
++                _ => throw new ShouldAssertException("Unexpected FileExists callback"),
++                directoryExists,
++                getDirectories,
++                _ => throw new ShouldAssertException("Unexpected GetAssemblyName callback"),
++                (string path, ConcurrentDictionary<string, AssemblyMetadata> assemblyMetadataCache, out AssemblyNameExtension[] dependencies, out string[] scatterFiles, out FrameworkNameVersioning frameworkName)
++                  => throw new ShouldAssertException("Unexpected GetAssemblyMetadata callback"),
++#if FEATURE_WIN32_REGISTRY
++                getRegistrySubKeyNames,
++                getRegistrySubKeyDefaultValue,
++#endif
++                _ => throw new ShouldAssertException("Unexpected GetLastWriteTime callback"),
++                getRuntimeVersion,
++#if FEATURE_WIN32_REGISTRY
++                openBaseKey,
++#endif
++                checkIfAssemblyIsInGac,
++                isWinMDFile,
++                readMachineTypeFromPEHeader).ShouldBeTrue();
++
++            rar.ResolvedFiles.Length.ShouldBe(1);
++            rar.ResolvedFiles[0].ItemSpec.ShouldBe(refPath);
++        }
+     }
+ }
+diff --git a/src/Tasks.UnitTests/HintPathResolver_Tests.cs b/src/Tasks.UnitTests/HintPathResolver_Tests.cs
+index 800a3d7cb1a..599a5750961 100644
+--- a/src/Tasks.UnitTests/HintPathResolver_Tests.cs
++++ b/src/Tasks.UnitTests/HintPathResolver_Tests.cs
+@@ -78,6 +78,7 @@ private bool ResolveHintPath(string hintPath)
+                 sdkName: "",
+                 rawFileNameCandidate: "FakeSystem.Net.Http",
+                 isPrimaryProjectReference: true,
++                isImmutableFrameworkReference: false,
+                 wantSpecificVersion: false,
+                 executableExtensions: new string[] { ".winmd", ".dll", ".exe" },
+                 hintPath: hintPath,
+diff --git a/src/Tasks/AssemblyDependency/AssemblyFoldersExResolver.cs b/src/Tasks/AssemblyDependency/AssemblyFoldersExResolver.cs
+index 7aabd28ea93..51df4d81cad 100644
+--- a/src/Tasks/AssemblyDependency/AssemblyFoldersExResolver.cs
++++ b/src/Tasks/AssemblyDependency/AssemblyFoldersExResolver.cs
+@@ -183,26 +183,13 @@ private void LazyInitialize()
+             }
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assemblyname of the reference.</param>
+-        /// <param name="sdkName">The sdkname of the reference.</param>
+-        /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">The item's hintpath value.</param>
+-        /// <param name="assemblyFolderKey">Like "hklm\Vendor RegKey" as provided to a reference by the &lt;AssemblyFolderKey&gt; on the reference in the project.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/AssemblyDependency/AssemblyFoldersFromConfig/AssemblyFoldersFromConfigResolver.cs b/src/Tasks/AssemblyDependency/AssemblyFoldersFromConfig/AssemblyFoldersFromConfigResolver.cs
+index 00fbece8e58..2268765cfbf 100644
+--- a/src/Tasks/AssemblyDependency/AssemblyFoldersFromConfig/AssemblyFoldersFromConfigResolver.cs
++++ b/src/Tasks/AssemblyDependency/AssemblyFoldersFromConfig/AssemblyFoldersFromConfigResolver.cs
+@@ -151,26 +151,13 @@ private void LazyInitialize()
+             }
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assemblyname of the reference.</param>
+-        /// <param name="sdkName">Not used by this type.</param>
+-        /// <param name="rawFileNameCandidate">Not used by this type.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">Not used by this type.</param>
+-        /// <param name="assemblyFolderKey">Not used by this type.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/AssemblyDependency/AssemblyFoldersResolver.cs b/src/Tasks/AssemblyDependency/AssemblyFoldersResolver.cs
+index 998e8abf552..9d1d89e75ab 100644
+--- a/src/Tasks/AssemblyDependency/AssemblyFoldersResolver.cs
++++ b/src/Tasks/AssemblyDependency/AssemblyFoldersResolver.cs
+@@ -27,26 +27,13 @@ public AssemblyFoldersResolver(string searchPathElement, GetAssemblyName getAsse
+         {
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assemblyname of the reference.</param>
+-        /// <param name="sdkName">The sdk name of the reference.</param>
+-        /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">The item's hintpath value.</param>
+-        /// <param name="assemblyFolderKey">Like "hklm\Vendor RegKey" as provided to a reference by the &lt;AssemblyFolderKey&gt; on the reference in the project.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/AssemblyDependency/AssemblyResolution.cs b/src/Tasks/AssemblyDependency/AssemblyResolution.cs
+index 2653a30a416..0d6ba23d997 100644
+--- a/src/Tasks/AssemblyDependency/AssemblyResolution.cs
++++ b/src/Tasks/AssemblyDependency/AssemblyResolution.cs
+@@ -34,6 +34,7 @@ internal static class AssemblyResolution
+         /// <param name="sdkName"></param>
+         /// <param name="rawFileNameCandidate">The file name to match if {RawFileName} is seen. (May be null).</param>
+         /// <param name="isPrimaryProjectReference">True if this is a primary reference directly from the project file.</param>
++        /// <param name="isImmutableFrameworkReference">True if <paramref name="rawFileNameCandidate"/> is immutable and guaranteed to exist.</param>
+         /// <param name="wantSpecificVersion"></param>
+         /// <param name="executableExtensions">The filename extension of the assembly. Must be this or its no match.</param>
+         /// <param name="hintPath">This reference's hintpath</param>
+@@ -48,6 +49,7 @@ internal static string ResolveReference(
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+@@ -79,6 +81,7 @@ internal static string ResolveReference(
+                             sdkName,
+                             rawFileNameCandidate,
+                             isPrimaryProjectReference,
++                            isImmutableFrameworkReference,
+                             wantSpecificVersion,
+                             executableExtensions,
+                             hintPath,
+diff --git a/src/Tasks/AssemblyDependency/CandidateAssemblyFilesResolver.cs b/src/Tasks/AssemblyDependency/CandidateAssemblyFilesResolver.cs
+index 352b3e463a3..328bb6984a2 100644
+--- a/src/Tasks/AssemblyDependency/CandidateAssemblyFilesResolver.cs
++++ b/src/Tasks/AssemblyDependency/CandidateAssemblyFilesResolver.cs
+@@ -36,26 +36,13 @@ public CandidateAssemblyFilesResolver(string[] candidateAssemblyFiles, string se
+             _candidateAssemblyFiles = candidateAssemblyFiles;
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assemblyname of the reference.</param>
+-        /// <param name="sdkName"></param>
+-        /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">The item's hintpath value.</param>
+-        /// <param name="assemblyFolderKey">Like "hklm\Vendor RegKey" as provided to a reference by the &lt;AssemblyFolderKey&gt; on the reference in the project.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/AssemblyDependency/DirectoryResolver.cs b/src/Tasks/AssemblyDependency/DirectoryResolver.cs
+index be0fe39554d..fedf7c18e38 100644
+--- a/src/Tasks/AssemblyDependency/DirectoryResolver.cs
++++ b/src/Tasks/AssemblyDependency/DirectoryResolver.cs
+@@ -22,26 +22,13 @@ public DirectoryResolver(string searchPathElement, GetAssemblyName getAssemblyNa
+         {
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assemblyname of the reference.</param>
+-        /// <param name="sdkName"></param>
+-        /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">The item's hintpath value.</param>
+-        /// <param name="assemblyFolderKey">Like "hklm\Vendor RegKey" as provided to a reference by the &lt;AssemblyFolderKey&gt; on the reference in the project.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/AssemblyDependency/FrameworkPathResolver.cs b/src/Tasks/AssemblyDependency/FrameworkPathResolver.cs
+index d51805918d3..cd57aa7d6b5 100644
+--- a/src/Tasks/AssemblyDependency/FrameworkPathResolver.cs
++++ b/src/Tasks/AssemblyDependency/FrameworkPathResolver.cs
+@@ -30,26 +30,13 @@ public FrameworkPathResolver(string[] frameworkPaths, InstalledAssemblies instal
+             _installedAssemblies = installedAssemblies;
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assemblyname of the reference.</param>
+-        /// <param name="sdkName"></param>
+-        /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">The item's hintpath value.</param>
+-        /// <param name="assemblyFolderKey">Like "hklm\Vendor RegKey" as provided to a reference by the &lt;AssemblyFolderKey&gt; on the reference in the project.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/AssemblyDependency/GacResolver.cs b/src/Tasks/AssemblyDependency/GacResolver.cs
+index ac47511c1dc..bf416cc56ed 100644
+--- a/src/Tasks/AssemblyDependency/GacResolver.cs
++++ b/src/Tasks/AssemblyDependency/GacResolver.cs
+@@ -35,26 +35,13 @@ public GacResolver(System.Reflection.ProcessorArchitecture targetProcessorArchit
+             _getAssemblyPathInGac = getAssemblyPathInGac;
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assembly name object of the assembly.</param>
+-        /// <param name="sdkName"></param>
+-        /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">The item's hintpath value.</param>
+-        /// <param name="assemblyFolderKey">Like "hklm\Vendor RegKey" as provided to a reference by the &lt;AssemblyFolderKey&gt; on the reference in the project.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/AssemblyDependency/HintPathResolver.cs b/src/Tasks/AssemblyDependency/HintPathResolver.cs
+index 1ae57169ce7..96a3b920491 100644
+--- a/src/Tasks/AssemblyDependency/HintPathResolver.cs
++++ b/src/Tasks/AssemblyDependency/HintPathResolver.cs
+@@ -23,26 +23,13 @@ public HintPathResolver(string searchPathElement, GetAssemblyName getAssemblyNam
+         {
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assemblyname of the reference.</param>
+-        /// <param name="sdkName"></param>
+-        /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">The item's hintpath value.</param>
+-        /// <param name="assemblyFolderKey">Like "hklm\Vendor RegKey" as provided to a reference by the &lt;AssemblyFolderKey&gt; on the reference in the project.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/AssemblyDependency/RawFilenameResolver.cs b/src/Tasks/AssemblyDependency/RawFilenameResolver.cs
+index 5273445e3f8..72f1afb79a2 100644
+--- a/src/Tasks/AssemblyDependency/RawFilenameResolver.cs
++++ b/src/Tasks/AssemblyDependency/RawFilenameResolver.cs
+@@ -23,26 +23,13 @@ public RawFilenameResolver(string searchPathElement, GetAssemblyName getAssembly
+         {
+         }
+ 
+-        /// <summary>
+-        /// Resolve a reference to a specific file name.
+-        /// </summary>
+-        /// <param name="assemblyName">The assemblyname of the reference.</param>
+-        /// <param name="sdkName"></param>
+-        /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+-        /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
+-        /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+-        /// <param name="executableExtensions">Allowed executable extensions.</param>
+-        /// <param name="hintPath">The item's hintpath value.</param>
+-        /// <param name="assemblyFolderKey">Like "hklm\Vendor RegKey" as provided to a reference by the &lt;AssemblyFolderKey&gt; on the reference in the project.</param>
+-        /// <param name="assembliesConsideredAndRejected">Receives the list of locations that this function tried to find the assembly. May be "null".</param>
+-        /// <param name="foundPath">The path where the file was found.</param>
+-        /// <param name="userRequestedSpecificFile">Whether or not the user wanted a specific file (for example, HintPath is a request for a specific file)</param>
+-        /// <returns>True if the file was resolved.</returns>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+@@ -57,7 +44,7 @@ public override bool Resolve(
+             if (rawFileNameCandidate != null)
+             {
+                 // {RawFileName} was passed in.
+-                if (fileExists(rawFileNameCandidate))
++                if (isImmutableFrameworkReference || fileExists(rawFileNameCandidate))
+                 {
+                     userRequestedSpecificFile = true;
+                     foundPath = rawFileNameCandidate;
+diff --git a/src/Tasks/AssemblyDependency/ReferenceTable.cs b/src/Tasks/AssemblyDependency/ReferenceTable.cs
+index 4272a5e149e..692b0c8e302 100644
+--- a/src/Tasks/AssemblyDependency/ReferenceTable.cs
++++ b/src/Tasks/AssemblyDependency/ReferenceTable.cs
+@@ -40,6 +40,11 @@ internal sealed class ReferenceTable
+         /// </summary>
+         private readonly HashSet<string> _externallyResolvedPrimaryReferences = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+ 
++        /// <summary>
++        /// The keys are normalized full paths of primary references resolved by an external entity to RAR and considered immutable, the values are assembly names or null if not known.
++        /// </summary>
++        private readonly Dictionary<string, AssemblyNameExtension> _externallyResolvedImmutableFiles = new Dictionary<string, AssemblyNameExtension>(StringComparer.OrdinalIgnoreCase);
++
+         /// <summary>The table of remapped assemblies. Used for Unification.</summary>
+         private IEnumerable<DependentAssembly> _remappedAssemblies = Enumerable.Empty<DependentAssembly>();
+ 
+@@ -823,6 +828,29 @@ private static void TryGetAssemblyNameComponent(string fusionName, string compon
+             }
+         }
+ 
++        /// <summary>
++        /// Tries to create an <see cref="AssemblyNameExtension"/> out of a primary reference metadata.
++        /// </summary>
++        private static AssemblyNameExtension GetAssemblyNameFromItemMetadata(ITaskItem item)
++        {
++            string version = item.GetMetadata(ItemMetadataNames.assemblyVersion);
++            if (string.IsNullOrEmpty(version))
++            {
++                return null;
++            }
++
++            string publicKeyToken = item.GetMetadata(ItemMetadataNames.publicKeyToken);
++            if (string.IsNullOrEmpty(publicKeyToken))
++            {
++                return null;
++            }
++
++            string name = Path.GetFileNameWithoutExtension(item.ItemSpec);
++
++            AssemblyName assemblyName = new AssemblyName($"{name}, Version={version}, Culture=neutral, PublicKeyToken={publicKeyToken}");
++            return new AssemblyNameExtension(assemblyName);
++        }
++
+         /// <summary>
+         /// Given an item that refers to a file name, make it a primary reference.
+         /// </summary>
+@@ -1225,6 +1253,17 @@ private void ResolveReference(
+             string rawFileNameCandidate,
+             Reference reference)
+         {
++            bool isImmutableFrameworkReference = false;
++            if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_7))
++            {
++                // For a path to be an immutable reference, it must be externally resolved and has a FrameworkReferenceName defined.
++                if (assemblyName == null && !string.IsNullOrEmpty(rawFileNameCandidate) && reference.IsPrimary && reference.ExternallyResolved)
++                {
++                    string frameworkReferenceName = reference.PrimarySourceItem.GetMetadata(ItemMetadataNames.frameworkReferenceName);
++                    isImmutableFrameworkReference = !string.IsNullOrEmpty(frameworkReferenceName);
++                }
++            }
++
+             // Now, resolve this reference.
+             string resolvedPath = null;
+             string resolvedSearchPath = String.Empty;
+@@ -1272,6 +1311,7 @@ private void ResolveReference(
+                     reference.SDKName,
+                     rawFileNameCandidate,
+                     reference.IsPrimary,
++                    isImmutableFrameworkReference,
+                     reference.WantSpecificVersion,
+                     reference.GetExecutableExtensions(_allowedAssemblyExtensions),
+                     reference.HintPath,
+@@ -1291,7 +1331,13 @@ private void ResolveReference(
+             // If the path was resolved, then specify the full path on the reference.
+             if (resolvedPath != null)
+             {
+-                reference.FullPath = FileUtilities.NormalizePath(resolvedPath);
++                resolvedPath = FileUtilities.NormalizePath(resolvedPath);
++                if (isImmutableFrameworkReference)
++                {
++                    _externallyResolvedImmutableFiles[resolvedPath] = GetAssemblyNameFromItemMetadata(reference.PrimarySourceItem);
++                }
++                reference.FullPath = resolvedPath;
++
+                 reference.ResolvedSearchPath = resolvedSearchPath;
+                 reference.UserRequestedSpecificFile = userRequestedSpecificFile;
+             }
+@@ -3156,5 +3202,28 @@ internal bool MarkReferencesForExclusion(Dictionary<string, string> exclusionLis
+ 
+             return anyMarkedReference;
+         }
++
++        /// <summary>
++        /// Returns true if the full path passed in <paramref name="path"/> represents a file that came from an external trusted
++        /// entity and is guaranteed to be immutable.
++        /// </summary>
++        /// <param name="path">The path to check.</param>
++        /// <returns>True if known to be immutable, false otherwise.</returns>
++        internal bool IsImmutableFile(string path)
++        {
++            return _externallyResolvedImmutableFiles.ContainsKey(path);
++        }
++
++        /// <summary>
++        /// Returns the assembly name of a file if the file came from an external trusted entity and is considered immutable.
++        /// </summary>
++        /// <param name="path">The file path.</param>
++        /// <returns>Assembly name or null if not known.</returns>
++        internal AssemblyNameExtension GetImmutableFileAssemblyName(string path)
++        {
++            return _externallyResolvedImmutableFiles.TryGetValue(path, out AssemblyNameExtension assemblyNameExtension)
++                ? assemblyNameExtension
++                : null;
++        }
+     }
+ }
+diff --git a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+index afdde42ef14..26883c8e376 100644
+--- a/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
++++ b/src/Tasks/AssemblyDependency/ResolveAssemblyReference.cs
+@@ -2295,13 +2295,34 @@ internal bool Execute(
+                     _cache.SetInstalledAssemblyInformation(installedAssemblyTableInfo);
+ 
+                     // Cache delegates.
+-                    getAssemblyName = _cache.CacheDelegate(getAssemblyName);
+                     getAssemblyMetadata = _cache.CacheDelegate(getAssemblyMetadata);
+                     fileExists = _cache.CacheDelegate();
+                     directoryExists = _cache.CacheDelegate(directoryExists);
+                     getDirectories = _cache.CacheDelegate(getDirectories);
+                     getRuntimeVersion = _cache.CacheDelegate(getRuntimeVersion);
+ 
++                    ReferenceTable dependencyTable = null;
++
++                    // Wrap the GetLastWriteTime callback with a check for SDK/immutable files.
++                    _cache.SetGetLastWriteTime(path =>
++                    {
++                        if (dependencyTable?.IsImmutableFile(path) == true)
++                        {
++                            // We don't want to perform I/O to see what the actual timestamp on disk is so we return a fixed made up value.
++                            // Note that this value makes the file exist per the check in SystemState.FileTimestampIndicatesFileExists.
++                            return DateTime.MaxValue;
++                        }
++                        return getLastWriteTime(path);
++                    });
++
++                    // Wrap the GetAssemblyName callback with a check for SDK/immutable files.
++                    GetAssemblyName originalGetAssemblyName = getAssemblyName;
++                    getAssemblyName = _cache.CacheDelegate(path =>
++                    {
++                        AssemblyNameExtension assemblyName = dependencyTable?.GetImmutableFileAssemblyName(path);
++                        return assemblyName ?? originalGetAssemblyName(path);
++                    });
++
+                     _projectTargetFramework = FrameworkVersionFromString(_projectTargetFrameworkAsString);
+ 
+                     // Filter out all Assemblies that have SubType!='', or higher framework
+@@ -2330,7 +2351,7 @@ internal bool Execute(
+                             : null;
+ 
+                     // Start the table of dependencies with all of the primary references.
+-                    ReferenceTable dependencyTable = new ReferenceTable(
++                    dependencyTable = new ReferenceTable(
+                         BuildEngine,
+                         _findDependencies,
+                         _findSatellites,
+diff --git a/src/Tasks/AssemblyDependency/Resolver.cs b/src/Tasks/AssemblyDependency/Resolver.cs
+index b854a4015e5..667493a611d 100644
+--- a/src/Tasks/AssemblyDependency/Resolver.cs
++++ b/src/Tasks/AssemblyDependency/Resolver.cs
+@@ -72,6 +72,7 @@ protected Resolver(string searchPathElement, GetAssemblyName getAssemblyName, Fi
+         /// <param name="sdkName">The name of the sdk to resolve.</param>
+         /// <param name="rawFileNameCandidate">The reference's 'include' treated as a raw file name.</param>
+         /// <param name="isPrimaryProjectReference">Whether or not this reference was directly from the project file (and therefore not a dependency)</param>
++        /// <param name="isImmutableFrameworkReference">True if <paramref name="rawFileNameCandidate"/> is guaranteed to exist on disk and never change.</param>
+         /// <param name="wantSpecificVersion">Whether an exact version match is requested.</param>
+         /// <param name="executableExtensions">Allowed executable extensions.</param>
+         /// <param name="hintPath">The item's hintpath value.</param>
+@@ -85,6 +86,7 @@ public abstract bool Resolve(
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,
+diff --git a/src/Tasks/InstalledSDKResolver.cs b/src/Tasks/InstalledSDKResolver.cs
+index 101d5b29dc2..9fd40f7963e 100644
+--- a/src/Tasks/InstalledSDKResolver.cs
++++ b/src/Tasks/InstalledSDKResolver.cs
+@@ -30,14 +30,13 @@ public InstalledSDKResolver(Dictionary<string, ITaskItem> resolvedSDKs, string s
+             _resolvedSDKs = resolvedSDKs;
+         }
+ 
+-        /// <summary>
+-        /// Resolve references which are found in a specific SDK
+-        /// </summary>
++        /// <inheritdoc/>
+         public override bool Resolve(
+             AssemblyNameExtension assemblyName,
+             string sdkName,
+             string rawFileNameCandidate,
+             bool isPrimaryProjectReference,
++            bool isImmutableFrameworkReference,
+             bool wantSpecificVersion,
+             string[] executableExtensions,
+             string hintPath,

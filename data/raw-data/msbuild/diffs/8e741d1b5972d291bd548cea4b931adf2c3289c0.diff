@@ -1,0 +1,3040 @@
+diff --git a/documentation/wiki/ChangeWaves.md b/documentation/wiki/ChangeWaves.md
+index b5ec4e3736b..66b119cd485 100644
+--- a/documentation/wiki/ChangeWaves.md
++++ b/documentation/wiki/ChangeWaves.md
+@@ -27,7 +27,7 @@ The opt-out comes in the form of setting the environment variable `MSBuildDisabl
+ - [Error when a property expansion in a condition has whitespace](https://github.com/dotnet/msbuild/pull/5672)
+ - [Allow Custom CopyToOutputDirectory Location With TargetPath](https://github.com/dotnet/msbuild/pull/6237)
+ - [Allow users that have certain special characters in their username to build successfully when using exec](https://github.com/dotnet/msbuild/pull/6223)
+-- [Fail restore operations when there is no `Restore` target or an SDK is unresolveable](https://github.com/dotnet/msbuild/pull/6312)
++- [Fail restore operations when an SDK is unresolveable](https://github.com/dotnet/msbuild/pull/6430)
+ ### 17.0
+ 
+ ## Change Waves No Longer In Rotation
+diff --git a/ref/Microsoft.Build/net/Microsoft.Build.cs b/ref/Microsoft.Build/net/Microsoft.Build.cs
+index 0c3ab22d801..d59f83ba636 100644
+--- a/ref/Microsoft.Build/net/Microsoft.Build.cs
++++ b/ref/Microsoft.Build/net/Microsoft.Build.cs
+@@ -1048,8 +1048,7 @@ public enum BuildRequestDataFlags
+         SkipNonexistentTargets = 16,
+         ProvideSubsetOfStateAfterBuild = 32,
+         IgnoreMissingEmptyAndInvalidImports = 64,
+-        SkipNonexistentNonEntryTargets = 128,
+-        FailOnUnresolvedSdk = 256,
++        FailOnUnresolvedSdk = 128,
+     }
+     public partial class BuildResult
+     {
+diff --git a/ref/Microsoft.Build/netstandard/Microsoft.Build.cs b/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
+index 9dc716a4007..ab3acb3d087 100644
+--- a/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
++++ b/ref/Microsoft.Build/netstandard/Microsoft.Build.cs
+@@ -1043,8 +1043,7 @@ public enum BuildRequestDataFlags
+         SkipNonexistentTargets = 16,
+         ProvideSubsetOfStateAfterBuild = 32,
+         IgnoreMissingEmptyAndInvalidImports = 64,
+-        SkipNonexistentNonEntryTargets = 128,
+-        FailOnUnresolvedSdk = 256,
++        FailOnUnresolvedSdk = 128,
+     }
+     public partial class BuildResult
+     {
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index 3dd4465ed3a..d7e2b9b5d4b 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -1,7 +1,12 @@
+ ﻿using System;
++using System.Collections.Generic;
+ using System.Text;
++
+ using Microsoft.Build.BackEnd.Logging;
++using Microsoft.Build.Execution;
++using Microsoft.Build.Framework;
+ using Microsoft.Build.Logging;
++
+ using Shouldly;
+ using Xunit;
+ using Xunit.Abstractions;
+@@ -155,6 +160,49 @@ public void BinaryLoggerShouldNotThrowWhenMetadataCannotBeExpanded()
+             ObjectModelHelpers.BuildProjectExpectSuccess(project, binaryLogger);
+         }
+ 
++        /// <summary>
++        /// Regression test for https://github.com/dotnet/msbuild/issues/6323.
++        /// </summary>
++        /// <remarks>
++        /// This isn't strictly a binlog test, but it fits here because
++        /// all log event types will be used when the binlog is attached.
++        /// </remarks>
++        [Fact]
++        public void MessagesCanBeLoggedWhenProjectsAreCached()
++        {
++            using var env = TestEnvironment.Create();
++
++            env.SetEnvironmentVariable("MSBUILDDEBUGFORCECACHING", "1");
++
++            using var buildManager = new BuildManager();
++
++            var binaryLogger = new BinaryLogger
++            {
++                Parameters = $"LogFile={_logFile}"
++            };
++
++            // To trigger #6323, there must be at least two project instances.
++            var referenceProject = _env.CreateTestProjectWithFiles("reference.proj", @"
++         <Project>
++            <Target Name='Target2'>
++               <Exec Command='echo a'/>
++            </Target>
++         </Project>");
++
++            var entryProject = _env.CreateTestProjectWithFiles("entry.proj", $@"
++         <Project>
++            <Target Name='BuildSelf'>
++               <Message Text='MessageOutputText'/>
++               <MSBuild Projects='{referenceProject.ProjectFile}' Targets='Target2' />
++               <MSBuild Projects='{referenceProject.ProjectFile}' Targets='Target2' /><!-- yes, again. That way it's a cached result -->
++            </Target>
++         </Project>");
++
++            buildManager.Build(new BuildParameters() { Loggers = new ILogger[] { binaryLogger } },
++                new BuildRequestData(entryProject.ProjectFile, new Dictionary<string, string>(), null, new string[] { "BuildSelf" }, null))
++                .OverallResult.ShouldBe(BuildResultCode.Success);
++        }
++
+ 
+         public void Dispose()
+         {
+diff --git a/src/Build.UnitTests/Evaluation/Expander_Tests.cs b/src/Build.UnitTests/Evaluation/Expander_Tests.cs
+index 76dd7380d59..71d15858f3c 100644
+--- a/src/Build.UnitTests/Evaluation/Expander_Tests.cs
++++ b/src/Build.UnitTests/Evaluation/Expander_Tests.cs
+@@ -2010,13 +2010,16 @@ public void PropertyFunctionNullArgument()
+         public void PropertyFunctionNullReturn()
+         {
+             PropertyDictionary<ProjectPropertyInstance> pg = new PropertyDictionary<ProjectPropertyInstance>();
+-            pg.Set(ProjectPropertyInstance.Create("SomeStuff", "This IS SOME STUff"));
+ 
+             Expander<ProjectPropertyInstance, ProjectItemInstance> expander = new Expander<ProjectPropertyInstance, ProjectItemInstance>(pg, FileSystems.Default);
+ 
+-            string result = expander.ExpandIntoStringLeaveEscaped("$([System.Convert]::ChangeType(,$(SomeStuff.GetType())))", ExpanderOptions.ExpandProperties, MockElementLocation.Instance);
+-
++            // The null-returning function is the only thing in the expression.
++            string result = expander.ExpandIntoStringLeaveEscaped("$([System.Environment]::GetEnvironmentVariable(`_NonExistentVar`))", ExpanderOptions.ExpandProperties, MockElementLocation.Instance);
+             Assert.Equal("", result);
++
++            // The result of the null-returning function is concatenated with a non-empty string.
++            result = expander.ExpandIntoStringLeaveEscaped("prefix_$([System.Environment]::GetEnvironmentVariable(`_NonExistentVar`))", ExpanderOptions.ExpandProperties, MockElementLocation.Instance);
++            Assert.Equal("prefix_", result);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/BuildManager/BuildRequestData.cs b/src/Build/BackEnd/BuildManager/BuildRequestData.cs
+index 673ee5f0fdf..6f3a29a5765 100644
+--- a/src/Build/BackEnd/BuildManager/BuildRequestData.cs
++++ b/src/Build/BackEnd/BuildManager/BuildRequestData.cs
+@@ -76,20 +76,12 @@ public enum BuildRequestDataFlags
+         /// </summary>
+         IgnoreMissingEmptyAndInvalidImports = 1 << 6,
+ 
+-        /// <summary>
+-        /// When this flag is present, non entry target(s) in the build request will be skipped if those targets
+-        /// are not defined in the Project to build. The build will still fail if an entry target does not exist.
+-        /// This only applies to this build request (if another target calls the "missing target" at any other point
+-        /// this will still result in an error).
+-        /// </summary>
+-        SkipNonexistentNonEntryTargets = 1 << 7,
+-
+         /// <summary>
+         /// When this flag is present, an unresolved MSBuild project SDK will fail the build.  This flag is used to
+         /// change the <see cref="IgnoreMissingEmptyAndInvalidImports" /> behavior to still fail when an SDK is missing
+         /// because those are more fatal.
+         /// </summary>
+-        FailOnUnresolvedSdk = 1 << 8,
++        FailOnUnresolvedSdk = 1 << 7,
+     }
+ 
+     /// <summary>
+diff --git a/src/Build/BackEnd/Components/Logging/NodeLoggingContext.cs b/src/Build/BackEnd/Components/Logging/NodeLoggingContext.cs
+index 05c5ae53708..0b55b80359a 100644
+--- a/src/Build/BackEnd/Components/Logging/NodeLoggingContext.cs
++++ b/src/Build/BackEnd/Components/Logging/NodeLoggingContext.cs
+@@ -69,7 +69,13 @@ internal ProjectLoggingContext LogProjectStarted(BuildRequestEntry requestEntry)
+         internal ProjectLoggingContext LogProjectStarted(BuildRequest request, BuildRequestConfiguration configuration)
+         {
+             ErrorUtilities.VerifyThrow(this.IsValid, "Build not started.");
+-            return new ProjectLoggingContext(this, request, configuration.ProjectFullPath, configuration.ToolsVersion, request.ParentBuildEventContext, configuration.Project?.EvaluationId ?? BuildEventContext.InvalidEvaluationId);
++
++            // If we can retrieve the evaluationId from the project, do so. Don't if it's not available or
++            // if we'd have to retrieve it from the cache in order to access it.
++            // Order is important here because the Project getter will throw if IsCached.
++            int evaluationId = (configuration != null && !configuration.IsCached && configuration.Project != null) ? configuration.Project.EvaluationId : BuildEventContext.InvalidEvaluationId;
++
++            return new ProjectLoggingContext(this, request, configuration.ProjectFullPath, configuration.ToolsVersion, request.ParentBuildEventContext, evaluationId);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
+index 617fea73b47..21bdf35cb01 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
+@@ -143,24 +143,15 @@ public async Task<BuildResult> BuildTargets(ProjectLoggingContext loggingContext
+             foreach (string targetName in targetNames)
+             {
+                 var targetExists = _projectInstance.Targets.TryGetValue(targetName, out ProjectTargetInstance targetInstance);
+-                
+-                if (!targetExists)
++                if (!targetExists && entry.Request.BuildRequestDataFlags.HasFlag(BuildRequestDataFlags.SkipNonexistentTargets))
+                 {
+-                    // Ignore the missing target if:
+-                    //  SkipNonexistentTargets is set
+-                    //  -or-
+-                    //  SkipNonexistentNonEntryTargets and the target is is not a top level target
+-                    if (entry.Request.BuildRequestDataFlags.HasFlag(BuildRequestDataFlags.SkipNonexistentTargets)
+-                        || entry.Request.BuildRequestDataFlags.HasFlag(BuildRequestDataFlags.SkipNonexistentNonEntryTargets) && !entry.Request.Targets.Contains(targetName))
+-                    {
+-                        _projectLoggingContext.LogComment(Framework.MessageImportance.Low,
+-                            "TargetSkippedWhenSkipNonexistentTargets", targetName);
+-
+-                        continue;
+-                    }
++                    _projectLoggingContext.LogComment(Framework.MessageImportance.Low,
++                        "TargetSkippedWhenSkipNonexistentTargets", targetName);
++                }
++                else
++                {
++                    targets.Add(new TargetSpecification(targetName, targetExists ? targetInstance.Location : _projectInstance.ProjectFileLocation));
+                 }
+-
+-                targets.Add(new TargetSpecification(targetName, targetExists ? targetInstance.Location : _projectInstance.ProjectFileLocation));
+             }
+ 
+             // Push targets onto the stack.  This method will reverse their push order so that they
+diff --git a/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs b/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
+index 659066306cc..a72435698c9 100644
+--- a/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
++++ b/src/Build/BackEnd/Shared/BuildRequestConfiguration.cs
+@@ -470,7 +470,6 @@ internal void LoadProjectIntoConfiguration(
+                 {
+                     projectLoadSettings |= ProjectLoadSettings.FailOnUnresolvedSdk;
+                 }
+-
+                 return new ProjectInstance(
+                     ProjectFullPath,
+                     globalProperties,
+diff --git a/src/Build/Evaluation/Evaluator.cs b/src/Build/Evaluation/Evaluator.cs
+index c675c1108e8..d47f970c517 100644
+--- a/src/Build/Evaluation/Evaluator.cs
++++ b/src/Build/Evaluation/Evaluator.cs
+@@ -1785,8 +1785,7 @@ static string EvaluateProperty(string value, IElementLocation location,
+ 
+                 if (!sdkResult.Success)
+                 {
+-                    // Ignore the missing import if IgnoreMissingImports is set unless FailOnUnresolvedSdk is also set
+-                    if (_loadSettings.HasFlag(ProjectLoadSettings.IgnoreMissingImports) && !_loadSettings.HasFlag(ProjectLoadSettings.FailOnUnresolvedSdk))
++                    if (_loadSettings.HasFlag(ProjectLoadSettings.IgnoreMissingImports) && (!ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave16_10) || !_loadSettings.HasFlag(ProjectLoadSettings.FailOnUnresolvedSdk)))
+                     {
+                         ProjectImportedEventArgs eventArgs = new ProjectImportedEventArgs(
+                             importElement.Location.Line,
+diff --git a/src/Build/Evaluation/Expander.cs b/src/Build/Evaluation/Expander.cs
+index 5fa15be5d91..80ddea0b0c2 100644
+--- a/src/Build/Evaluation/Expander.cs
++++ b/src/Build/Evaluation/Expander.cs
+@@ -1200,19 +1200,22 @@ internal static object ExpandPropertiesLeaveTypedAndEscaped(
+                             propertyValue = LookupProperty(properties, expression, propertyStartIndex + 2, propertyEndIndex - 1, elementLocation, usedUninitializedProperties);
+                         }
+ 
+-                        if (IsTruncationEnabled(options) && propertyValue != null)
++                        if (propertyValue != null)
+                         {
+-                            var value = propertyValue.ToString();
+-                            if (value.Length > CharacterLimitPerExpansion)
++                            if (IsTruncationEnabled(options))
+                             {
+-                                propertyValue = value.Substring(0, CharacterLimitPerExpansion - 3) + "...";
++                                var value = propertyValue.ToString();
++                                if (value.Length > CharacterLimitPerExpansion)
++                                {
++                                    propertyValue = value.Substring(0, CharacterLimitPerExpansion - 3) + "...";
++                                }
+                             }
+-                        }
+ 
+-                        // Record our result, and advance
+-                        // our sourceIndex pointer to the character just after the closing
+-                        // parenthesis.
+-                        results.Add(propertyValue);
++                            // Record our result, and advance
++                            // our sourceIndex pointer to the character just after the closing
++                            // parenthesis.
++                            results.Add(propertyValue);
++                        }
+                         sourceIndex = propertyEndIndex + 1;
+                     }
+ 
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index a005bbc5a4e..f223fa5d580 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="cs" original="../Strings.resx">
+     <body>
+@@ -140,7 +140,7 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">Načítá se následující modul plug-in mezipaměti projektu:
++        <target state="translated">Načítá se následující modul plug-in mezipaměti projektu:
+     {0}</target>
+         <note />
+       </trans-unit>
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: Mezipaměť projektu vyvolala neošetřenou výjimku z metody {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">Úloha {0} požadovala tento počet jader: {1}. Získala tento počet jader: {2}. Teď používá celkem tento počet jader: {3}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">Úloha {0} uvolnila tento počet jader: {1}. Teď používá celkem tento počet jader: {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">Úloha {0} požádala o uvolnění určitého počtu jader ({1}), když jich používala pouze {2}. Teď používá celkem tento počet jader: {3}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 91850b56a54..14323a1cb89 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="de" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"Folgendes Projektcache-Plug-In wird geladen:
+-    {0}"</target>
++        <target state="translated">Folgendes Projektcache-Plug-In wird geladen:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: Der Projektcache hat über die Methode {0} eine unbehandelte Ausnahme ausgelöst.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">Die Aufgabe "{0}" hat {1} Kerne angefordert und {2} Kerne erhalten und belegt jetzt insgesamt {3} Kerne.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">Die Aufgabe "{0}" hat {1} Kerne freigegeben und belegt jetzt insgesamt {2} Kerne.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">Die Aufgabe "{0}" hat die Freigabe von {1} Kernen angefordert, während sie nur {2} Kerne verwendet, und belegt jetzt insgesamt {3} Kerne.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index 8e6962329b5..3ada5cb3c4a 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="es" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"Cargando el complemento de caché de proyectos siguiente:
+-    {0} "</target>
++        <target state="translated">Cargando el complemento de caché de proyectos siguiente:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -191,7 +191,7 @@
+       </trans-unit>
+       <trans-unit id="OM_MatchOnMetadataIsRestrictedToReferencedItems">
+         <source>Only item types may be referenced when removing with MatchOnMetadata.</source>
+-        <target state="translated">Solo se puede hacer referencia a los objetos de tipo elemento al quitar con MatchOnMetadata</target>
++        <target state="translated">Solo se puede hacer referencia a los tipos de elemento al quitar con MatchOnMetadata.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="OM_MatchOnMetadataOnlyApplicableToRemoveItems">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: la caché del proyecto inició una excepción no controlada desde el método {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">La tarea "{0}" solicitó {1} núcleos, adquirió {2} núcleos y ahora retiene un total de {3} núcleos.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">La tarea "{0}" liberó {1} núcleos y ahora retiene un total de {2} núcleos.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">La tarea "{0}" solicitó liberar {1} núcleos y retenía solo {2} y ahora retiene un total de {3} núcleos.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index b5ee6552148..90105ef4478 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="fr" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"Chargement du plug-in de cache de projet suivant :
+-    {0}"</target>
++        <target state="translated">Chargement du plug-in de cache de projet suivant:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">La tâche "{0}" a demandé {1} cœurs et a obtenu {2} cœurs. Elle détient désormais {3} cœurs au total.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">La tâche "{0}" a libéré {1} cœur. Elle détient désormais {2} cœurs au total.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">La tâche "{0}" a demandé à libérer {1} cœurs alors qu'elle n'en détient que {2}. Elle détient désormais {3} cœurs au total.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index dd24c5f953f..6711613ae06 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="it" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"Caricamento del plug-in seguente della cache del progetto:
+-    {0}"</target>
++        <target state="translated">Caricamento del plug-in seguente della cache del progetto:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: la cache del progetto ha generato un'eccezione non gestita dal metodo {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">L'attività "{0}" ha richiesto {1} core, ha acquisito {2} core e ora contiene {3} core in totale.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">L'attività "{0}" ha rilasciato {1} core e ora contiene {2} core in totale.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">L'attività "{0}" ha chiesto il rilascio di {1} core contenendone solo {2} e ora contiene {3} core in totale.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 9bb48532bc8..aa758e3a206 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ja" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"次のプロジェクト キャッシュ プラグインを読み込んでいます。
+-    {0}"</target>
++        <target state="translated">次のプロジェクト キャッシュ プラグインを読み込んでいます。
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: プロジェクト キャッシュが {0} メソッドで処理されていない例外が返されました。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">タスク "{0}" では、{1} 個のコアを要求し、{2} 個のコアを取得したため、現在合計 {3} 個のコアを保持しています。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">タスク "{0}" では、{1} 個のコアを解放したため、現在合計 {2} 個のコアを保持しています。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">タスク "{0}" では、{2} 個のコアのみを保持したまま {1} 個のコアを解放するよう要求したため、現在合計 {3} 個のコアを保持しています。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 5d7d4163bd2..af1e71f0f9a 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ko" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"다음 프로젝트 캐시 플러그 인을 로드하는 중:
+-    {0}"</target>
++        <target state="translated">다음 프로젝트 캐시 플러그 인을 로드하는 중:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: 프로젝트 캐시는 {0} 메서드에서 처리되지 않은 예외를 발생시켰습니다.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">"{0}" 작업에서 코어 {1}개를 요청했고 코어 {2}개를 획득했으며 지금 총 {3}개의 코어를 보유하고 있습니다.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">"{0}" 작업에서 코어 {1}개를 해제했고 지금 총 {2}개의 코어를 보유하고 있습니다.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">"{0}" 작업에서 코어 {2}개만 보유하고 있는 동안 코어 {1}개를 해제하도록 요청했고 지금 총 {3}개의 코어를 보유하고 있습니다.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 1d00d687697..791c924d51e 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="pl" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">„Ładowanie następującej wtyczki pamięci podręcznej projektu:
+-    {0}”</target>
++        <target state="translated">Ładowanie następującej wtyczki pamięci podręcznej projektu: 
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: pamięć podręczna projektu zgłosiła nieobsługiwany wyjątek z metody {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">Zadanie „{0}” żądało {1} rdzeni, uzyskało {2} i teraz jego łączna liczba rdzeni to {3}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">Zadanie „{0}” zwolniło rdzenie ({1}) i teraz jego łączna liczba rdzeni to {2}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">Zadanie „{0}” poproszono o zwolnienie {1} rdzeni, gdy miało tylko {2}. Teraz jego łączna liczba rdzeni to {3}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 423af0d4199..a3c9bafe4a3 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="pt-BR" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"Carregando o seguinte plug-in de cache do projeto:
+-    {0}"</target>
++        <target state="translated">Carregando o seguinte plug-in do projeto:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: O cache do projeto lançou uma exceção sem tratamento do método {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">A tarefa "{0}" solicitou {1} núcleos, adquiriu {2} núcleos e agora contém {3} núcleos no total.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">A tarefa "{0}" liberou {1} núcleos e agora contém {2} núcleos no total.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">A tarefa "{0}" solicitou a liberação de {1} núcleos enquanto continha somente {2} e agora contém {3} núcleos no total.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 2381c6ed244..ea7ac3894a8 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ru" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"Идет загрузка следующего подключаемого модуля кэша проектов:
+-    {0}"</target>
++        <target state="translated">Идет загрузка следующего подключаемого модуля кэша проектов:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: в кэше проектов возникло необработанное исключение из метода {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">Задача "{0}" запросила указанное число ядер ({1}) и получила указанное число ядер ({2}). Теперь общее число ядер, которыми располагает задача, равно {3}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">Задача "{0}" освободила указанное число ядер ({1}). Теперь общее число ядер, которыми располагает задача, равно {2}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">Задача "{0}" запросила освобождение указанного числа ядер ({1}) с текущим числом ядер {2}. Теперь общее число ядер, которыми располагает задача, равно {3}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 51c4e1c7d52..095ce39a05d 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="tr" original="../Strings.resx">
+     <body>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"Şu proje önbelleği eklentisi yükleniyor:
+-    {0}"</target>
++        <target state="translated">Şu proje önbelleği eklentisi yükleniyor:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: Proje önbelleği {0} yönteminden yakalanamayan özel durum oluşturdu.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">"{0}" görevi {1} çekirdek istedi, {2} çekirdek aldı ve şu anda toplam {3} çekirdek tutuyor.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">"{0}" görevi {1} çekirdeği serbest bıraktı. Şu anda toplam {2} çekirdek tutuyor.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">"{0}" görevi yalnızca {2} tutarken {1} çekirdeği serbest bırakmak istedi. Şu anda toplam {3} çekirdek tutuyor.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 2bf484357b9..b976c8e4d9d 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANS" original="../Strings.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.resx">
+     <body>
+       <trans-unit id="AmbiguousTaskParameterError">
+         <source>MSB4001: The "{0}" task has more than one parameter called "{1}".</source>
+@@ -140,7 +140,7 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">“正在加载以下项目缓存插件:
++        <target state="translated">正在加载以下项目缓存插件: 
+     {0}”</target>
+         <note />
+       </trans-unit>
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: 项目缓存从 {0} 方法引发了未经处理的异常。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">任务“{0}”请求了 {1} 个核心，已获取 {2} 个核心，现总共包含 {3} 个核心。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">任务“{0}”发布了 {1} 个核心，现总共包含 {2} 个核心。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">任务“{0}”要求在仅保留 {2} 时发布 {1} 个核心，它现总共包含 {3} 个核心。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index f4f05481636..ddebd381fbe 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANT" original="../Strings.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.resx">
+     <body>
+       <trans-unit id="AmbiguousTaskParameterError">
+         <source>MSB4001: The "{0}" task has more than one parameter called "{1}".</source>
+@@ -140,8 +140,8 @@
+       <trans-unit id="LoadingProjectCachePlugin">
+         <source>Loading the following project cache plugin:
+     {0}</source>
+-        <target state="needs-review-translation">"正在載入下列專案快取外掛程式:
+-    {0}"</target>
++        <target state="translated">正在載入下列專案快取外掛程式:
++    {0}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="LogLoggerVerbosity">
+@@ -221,7 +221,7 @@
+       </trans-unit>
+       <trans-unit id="ProjectCacheException">
+         <source>MSB4273: The project cache threw an unhandled exception from the {0} method.</source>
+-        <target state="new">MSB4273: The project cache threw an unhandled exception from the {0} method.</target>
++        <target state="translated">MSB4273: 專案快取從 {0} 方法擲回未處理的例外狀況。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheInitializationFailed">
+@@ -305,17 +305,17 @@
+       </trans-unit>
+       <trans-unit id="TaskAcquiredCores">
+         <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <target state="translated">工作 "{0}" 已要求 {1} 個核心、已取得 {2} 個核心，現在共保留 {3} 個核心。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCores">
+         <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
+-        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <target state="translated">工作 "{0}" 已發行 {1} 個核心，現在共保留 {2} 個核心。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReleasedCoresWarning">
+         <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
+-        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <target state="translated">工作 "{0}" 要求在僅保留 {2} 個核心的情況下發行 {1} 個核心，現在共保留 {3} 個核心。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+diff --git a/src/Build/Utilities/NuGetFrameworkWrapper.cs b/src/Build/Utilities/NuGetFrameworkWrapper.cs
+index 373a024e26c..3bb52fd3d73 100644
+--- a/src/Build/Utilities/NuGetFrameworkWrapper.cs
++++ b/src/Build/Utilities/NuGetFrameworkWrapper.cs
+@@ -32,11 +32,7 @@ public NuGetFrameworkWrapper()
+                 BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory;
+             try
+             {
+-#if FEATURE_ASSEMBLYLOADCONTEXT
+-                var NuGetAssembly = Assembly.LoadFrom(Path.Combine(assemblyDirectory, "NuGet.Frameworks.dll"));
+-#else
+                 var NuGetAssembly = Assembly.LoadFile(Path.Combine(assemblyDirectory, "NuGet.Frameworks.dll"));
+-#endif
+                 var NuGetFramework = NuGetAssembly.GetType("NuGet.Frameworks.NuGetFramework");
+                 var NuGetFrameworkCompatibilityProvider = NuGetAssembly.GetType("NuGet.Frameworks.CompatibilityProvider");
+                 var NuGetFrameworkDefaultCompatibilityProvider = NuGetAssembly.GetType("NuGet.Frameworks.DefaultCompatibilityProvider");
+diff --git a/src/Deprecated/Conversion/Resources/xlf/Strings.zh-Hans.xlf b/src/Deprecated/Conversion/Resources/xlf/Strings.zh-Hans.xlf
+index 9be41b54168..4134008b926 100644
+--- a/src/Deprecated/Conversion/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Deprecated/Conversion/Resources/xlf/Strings.zh-Hans.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANS" original="../Strings.resx" build-num="-1522637684">
++  <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.resx" build-num="-1522637684">
+     <header>
+       <count-group name="BlackBox wordcount">
+         <count count-type="x-wordCount">231</count>
+diff --git a/src/Deprecated/Conversion/Resources/xlf/Strings.zh-Hant.xlf b/src/Deprecated/Conversion/Resources/xlf/Strings.zh-Hant.xlf
+index 6c6a6ffd474..c5ae79dc07c 100644
+--- a/src/Deprecated/Conversion/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Deprecated/Conversion/Resources/xlf/Strings.zh-Hant.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANT" original="../Strings.resx" build-num="-1522637684">
++  <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.resx" build-num="-1522637684">
+     <header>
+       <count-group name="BlackBox wordcount">
+         <count count-type="x-wordCount">231</count>
+diff --git a/src/Deprecated/Engine/Resources/xlf/Strings.zh-Hans.xlf b/src/Deprecated/Engine/Resources/xlf/Strings.zh-Hans.xlf
+index dbc31774594..031b8bc6e53 100644
+--- a/src/Deprecated/Engine/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Deprecated/Engine/Resources/xlf/Strings.zh-Hans.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANS" original="../Strings.resx" build-num="-1944534404">
++  <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.resx" build-num="-1944534404">
+     <header>
+       <count-group name="BlackBox wordcount">
+         <count count-type="x-wordCount">4013</count>
+diff --git a/src/Deprecated/Engine/Resources/xlf/Strings.zh-Hant.xlf b/src/Deprecated/Engine/Resources/xlf/Strings.zh-Hant.xlf
+index b90dd842476..52c6f2222ec 100644
+--- a/src/Deprecated/Engine/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Deprecated/Engine/Resources/xlf/Strings.zh-Hant.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANT" original="../Strings.resx" build-num="-1944534404">
++  <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.resx" build-num="-1944534404">
+     <header>
+       <count-group name="BlackBox wordcount">
+         <count count-type="x-wordCount">4013</count>
+diff --git a/src/MSBuild.UnitTests/Microsoft.Build.CommandLine.UnitTests.csproj b/src/MSBuild.UnitTests/Microsoft.Build.CommandLine.UnitTests.csproj
+index d84158d112e..be9203b581a 100644
+--- a/src/MSBuild.UnitTests/Microsoft.Build.CommandLine.UnitTests.csproj
++++ b/src/MSBuild.UnitTests/Microsoft.Build.CommandLine.UnitTests.csproj
+@@ -74,10 +74,4 @@
+     <Service Include="{82a7f48d-3b50-4b1e-b82e-3ada8210c358}" />
+   </ItemGroup>
+ 
+-  <Target Name="CreateTaskDir" AfterTargets="Build" Condition="'$(TargetFrameworkIdentifier)' != ''">
+-    <ItemGroup>
+-      <OutputAssemblyList Include="$(TargetDir)Microsoft.Build.CommandLine.UnitTests.dll" />
+-    </ItemGroup>
+-    <Copy SourceFiles="@(OutputAssemblyList)" DestinationFolder="$(TargetDir)Task" />
+-  </Target>
+ </Project>
+diff --git a/src/MSBuild.UnitTests/XMake_Tests.cs b/src/MSBuild.UnitTests/XMake_Tests.cs
+index 1513d20e3f9..c5809755219 100644
+--- a/src/MSBuild.UnitTests/XMake_Tests.cs
++++ b/src/MSBuild.UnitTests/XMake_Tests.cs
+@@ -19,7 +19,6 @@
+ using Shouldly;
+ using System.IO.Compression;
+ using System.Reflection;
+-using Microsoft.Build.Utilities;
+ 
+ namespace Microsoft.Build.UnitTests
+ {
+@@ -2128,105 +2127,6 @@ public void RestoreFailsOnUnresolvedSdk()
+             logContents.ShouldContain("error MSB4236: The SDK 'UnresolvedSdk' specified could not be found.");
+         }
+ 
+-        /// <summary>
+-        /// When specifying /t:restore under an old changewave, do not fail when an SDK can't be resolved.
+-        /// Previous behavior was to try and continue anyway but then "restore" would succeed and build workflows continue on.
+-        /// </summary>
+-        [Fact]
+-        public void RestorePassesOnUnresolvedSdkUnderChangewave()
+-        {
+-            string projectContents = ObjectModelHelpers.CleanupFileContents(
+-$@"<Project>
+-  <Sdk Name=""UnresolvedSdk"" />
+-  <Target Name=""Restore"">
+-    <Message Text=""Restore target ran"" />
+-  </Target>
+-</Project>");
+-
+-            using TestEnvironment env = Microsoft.Build.UnitTests.TestEnvironment.Create();
+-
+-            string logContents = ExecuteMSBuildExeExpectSuccess(projectContents,
+-                envsToCreate: new Dictionary<string, string>() { ["MSBUILDDISABLEFEATURESFROMVERSION"]=ChangeWaves.Wave16_10.ToString() },
+-                arguments: " /t:restore");
+-
+-            logContents.ShouldNotContain("MSB4236");
+-        }
+-
+-
+-        /// <summary>
+-        /// Verifies a non-existent target doesn't fail restore as long as its not considered an entry target, in this case Restore.
+-        /// </summary>
+-        [Fact]
+-        public void RestoreSkipsNonExistentNonEntryTargets()
+-        {
+-            string restoreFirstProps = $"{Guid.NewGuid():N}.props";
+-
+-            string projectContents = ObjectModelHelpers.CleanupFileContents(
+-$@"<Project DefaultTargets=""Build"" InitialTargets=""TargetThatComesFromRestore"">
+-  <PropertyGroup>
+-    <RestoreFirstProps>{restoreFirstProps}</RestoreFirstProps>
+-  </PropertyGroup>
+-  
+-  <Import Project=""$(RestoreFirstProps)"" />
+-  <Target Name=""Restore"">
+-    <Message Text=""Restore target ran"" />
+-    <ItemGroup>
+-      <Lines Include=""&lt;Project&gt;&lt;Target Name=&quot;TargetThatComesFromRestore&quot;&gt;&lt;Message Text=&quot;Initial target ran&quot; /&gt;&lt;/Target&gt;&lt;/Project&gt;"" />
+-    </ItemGroup>
+-    
+-    <WriteLinesToFile File=""$(RestoreFirstProps)"" Lines=""@(Lines)"" Overwrite=""true"" />
+-  </Target>
+-
+-  <Target Name=""Build"">
+-    <Message Text=""Build target ran&quot;"" />
+-  </Target>
+-</Project>");
+-
+-            string logContents = ExecuteMSBuildExeExpectSuccess(projectContents, arguments: "/restore");
+-
+-            logContents.ShouldContain("Restore target ran");
+-            logContents.ShouldContain("Build target ran");
+-            logContents.ShouldContain("Initial target ran");
+-        }
+-
+-        /// <summary>
+-        /// Verifies restore will fail if the entry target doesn't exist, in this case Restore.
+-        /// </summary>
+-        [Fact]
+-        public void RestoreFailsWhenEntryTargetIsNonExistent()
+-        {
+-            string projectContents = ObjectModelHelpers.CleanupFileContents(
+-@"<Project DefaultTargets=""Build"">
+-  <Target Name=""Build"">
+-    <Message Text=""Build target ran&quot;"" />
+-  </Target>
+-</Project>");
+-
+-            string logContents = ExecuteMSBuildExeExpectFailure(projectContents, arguments: "/t:restore");
+-            
+-            logContents.ShouldContain("error MSB4057: The target \"Restore\" does not exist in the project.");
+-        }
+-
+-        /// <summary>
+-        /// Verifies restore will not fail if the entry target doesn't exist, when changewave applied.
+-        /// </summary>
+-        [Fact]
+-        public void RestorePassesWhenEntryTargetIsNonExistentUnderChangewave()
+-        {
+-            string projectContents = ObjectModelHelpers.CleanupFileContents(
+-@"<Project DefaultTargets=""Build"">
+-  <Target Name=""Build"">
+-    <Message Text=""Build target ran&quot;"" />
+-  </Target>
+-</Project>");
+-
+-            string logContents = ExecuteMSBuildExeExpectSuccess(projectContents,
+-                envsToCreate: new Dictionary<string, string>() { ["MSBUILDDISABLEFEATURESFROMVERSION"] = ChangeWaves.Wave16_10.ToString() },
+-                arguments: "/t:restore");
+-
+-            logContents.ShouldNotContain("MSB4057");
+-        }
+-
+         /// <summary>
+         /// Verifies restore will run InitialTargets.
+         /// </summary>
+@@ -2238,11 +2138,9 @@ public void RestoreRunsInitialTargets()
+   <Target Name=""InitialTarget"">
+     <Message Text=""InitialTarget target ran&quot;"" />
+   </Target>
+-
+   <Target Name=""Restore"">
+     <Message Text=""Restore target ran&quot;"" />
+   </Target>
+-
+   <Target Name=""Build"">
+     <Message Text=""Build target ran&quot;"" />
+   </Target>
+@@ -2383,8 +2281,7 @@ public void EndToEndWarnAsErrors()
+ 
+ #if FEATURE_ASSEMBLYLOADCONTEXT
+         /// <summary>
+-        /// Ensure that tasks get loaded into their own <see cref="System.Runtime.Loader.AssemblyLoadContext"/>
+-        /// if they are in a directory other than the MSBuild directory.
++        /// Ensure that tasks get loaded into their own <see cref="System.Runtime.Loader.AssemblyLoadContext"/>.
+         /// </summary>
+         /// <remarks>
+         /// When loading a task from a test assembly in a test within that assembly, the assembly is already loaded
+@@ -2394,10 +2291,7 @@ public void EndToEndWarnAsErrors()
+         [Fact]
+         public void TasksGetAssemblyLoadContexts()
+         {
+-            string customTaskPath = Path.Combine(
+-                Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),
+-                "Task",
+-                Path.GetFileName(Assembly.GetExecutingAssembly().Location));
++            string customTaskPath = Assembly.GetExecutingAssembly().Location;
+ 
+             string projectContents = $@"<Project ToolsVersion=`msbuilddefaulttoolsversion` xmlns=`msbuildnamespace`>
+   <UsingTask TaskName=`ValidateAssemblyLoadContext` AssemblyFile=`{customTaskPath}` />
+@@ -2409,6 +2303,7 @@ public void TasksGetAssemblyLoadContexts()
+ 
+             ExecuteMSBuildExeExpectSuccess(projectContents);
+         }
++
+ #endif
+ 
+         private string CopyMSBuild()
+@@ -2500,7 +2395,7 @@ private string ExecuteMSBuildExeExpectFailure(string projectContents, IDictionar
+                 bool success;
+ 
+                 string output = RunnerUtilities.ExecMSBuild($"\"{testProject.ProjectFile}\" {String.Join(" ", arguments)}", out success, _output);
+-                
++
+                 return (success, output);
+             }
+         }
+diff --git a/src/MSBuild/Resources/xlf/Strings.cs.xlf b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+index e68433da7b6..d1ce644a52e 100644
+--- a/src/MSBuild/Resources/xlf/Strings.cs.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.cs.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="cs" original="../Strings.resx">
+     <body>
+@@ -945,7 +945,7 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
++        <target state="translated">  -detailedSummary[:True|False]
+                      Při dokončení sestavení zobrazí podrobné informace
+                      o sestavených konfiguracích a způsobu jejich
+                      naplánování do uzlů.
+@@ -967,7 +967,7 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: Podrobná souhrnná hodnota není platná. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1565,7 +1565,7 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                      Serializuje všechny události sestavení do komprimovaného
+                      binárního souboru. Tento soubor se standardně nachází
+                      v aktuálním adresáři a má název msbuild.binlog. Binární
+@@ -1582,7 +1582,6 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+                      importovaných projektů a cílových souborů zjištěných
+                      při sestavování. Toto chování řídí volitelný parametr
+                      ProjectImports:
+-
+                       ProjectImports=None     - Neshromažďovat importované
+                                                 projekty
+                       ProjectImports=Embed    - Vložit importované projekty
+@@ -1592,27 +1591,23 @@ Copyright (C) Microsoft Corporation. Všechna práva vyhrazena.
+                                                 kde output je stejný název
+                                                 jako název souboru binárního
+                                                 protokolu
+-
+                      Výchozí nastavení pro ProjectImports je Embed.
+                      Poznámka: Protokolovací nástroj neshromažďuje zdrojové
+                      soubory nepatřící pod MSBuild, jako .cs, .cpp atd.
+-
+-                     Soubor .binlog se dá „znovu přehrát“ tak, že se předá
++                     Soubor .binlog se dá znovu přehrát“ tak, že se předá
+                      souboru msbuild.exe jako argument místo projektu/řešení.
+                      Jiné protokolovací nástroje obdrží informace obsažené
+                      v souboru protokolu, jako by šlo o původní sestavení.
+                      Více o binárním protokolu a jeho použití si můžete
+                      přečíst na stránce:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
+-
++                     https://aka.ms/msbuild/binlog
+                      Příklady:
+                        -bl
+                        -bl:output.binlog
+                        -bl:output.binlog;ProjectImports=None
+                        -bl:output.binlog;ProjectImports=ZipFile
+-                       -bl:..\..\custom.binlog
+-                       -binaryLogger
+-    </target>
++                       -bl:..\\..\\custom.binlog
++                       -binaryLogger    </target>
+         <note>
+       LOCALIZATION: The following should not be localized:
+       1) "msbuild"
+diff --git a/src/MSBuild/Resources/xlf/Strings.de.xlf b/src/MSBuild/Resources/xlf/Strings.de.xlf
+index a819eed6078..8284308c137 100644
+--- a/src/MSBuild/Resources/xlf/Strings.de.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.de.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="de" original="../Strings.resx">
+     <body>
+@@ -937,7 +937,7 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
++        <target state="translated">  -detailedSummary[:True|False]
+                      Zeigt am Ende der Erstellung detaillierte Informationen
+                      zu den erstellten Konfigurationen an und enthält eine Erläuterung, wie sie
+                      in Knoten geplant wurden.
+@@ -959,7 +959,7 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: Der detaillierte Zusammenfassungswert ist ungültig. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1557,10 +1557,10 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                      Serialisiert alle Buildereignisse in eine komprimierte Binärdatei.
+                      Standardmäßig befindet sich die Datei im aktuellen Verzeichnis und hat den Namen
+-                     "msbuild.binlog". Das binäre Protokoll ist eine detaillierte Beschreibung
++                     „msbuild.binlog“. Das binäre Protokoll ist eine detaillierte Beschreibung
+                      des Buildprozesses, der später zum Rekonstruieren von
+                      Textprotokollen dient und der von anderen Analysetools verwendet wird. Detaillierte
+                      Textprotokolle auf Diagnoseebene sind in der Regel 10–20-mal so groß wie
+@@ -1572,25 +1572,25 @@ Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.
+                      Projekte und Zieldateien. Der optionale Schalter
+                      ProjectImports steuert dieses Verhalten:
+ 
+-                      ProjectImports=None:      Projektimporte nicht
++                      ProjectImports=None:      – Projektimporte nicht
+                                                 erfassen
+-                      ProjectImports=Embed:     Projektimporte in die
++                      ProjectImports=Embed:     – Projektimporte in die
+                                                 Protokolldatei einbetten
+-                      ProjectImports=ZipFile:   Projektdateien in
++                      ProjectImports=ZipFile:   – Projektdateien in
+                                                 output.projectimports.zip
+-                                                speichern, wobei "output" dem Namen
++                                                speichern, wobei „output“ dem Namen
+                                                 der binären Protokolldatei entspricht.
+ 
+-                     Die Standardeinstellung für "ProjectImports" ist "Embed".
++                     Die Standardeinstellung für „ProjectImports“ ist „Embed“.
+                      Hinweis: Die Protokollierung erfasst nur MSBuild-Quelldateien.
+                      Andere Dateien wie etwa CS, CPP usw. werden nicht erfasst.
+ 
+-                     Eine BINLOG-Datei kann wiedergegeben werden, indem sie an
+-                     "msbuild.exe" als Argument und nicht als Projekt/Projektmappe übergeben wird.
++                     Eine BINLOG-Datei kann „wiedergegeben“ werden, indem sie an
++                     „msbuild.exe“ als Argument und nicht als Projekt/Lösung übergeben wird.
+                      Andere Protokollierungen erhalten die Informationen, die
+                      wie beim ursprünglichen Buildvorgang in der Protokolldatei enthalten sind.
+                      Weitere Informationen zu binären Protokollen und ihrer Verwendung erhalten Sie unter:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     https://aka.ms/msbuild/binlog
+ 
+                      Beispiele:
+                        -bl
+diff --git a/src/MSBuild/Resources/xlf/Strings.es.xlf b/src/MSBuild/Resources/xlf/Strings.es.xlf
+index cfa400ae22b..4b0ad7be159 100644
+--- a/src/MSBuild/Resources/xlf/Strings.es.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.es.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="es" original="../Strings.resx">
+     <body>
+@@ -946,7 +946,7 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
++        <target state="translated">  -detailedSummary[:True|False]
+                      Muestra información detallada al final de la compilación
+                      sobre las configuraciones compiladas y el modo en que
+                      se programaron en los nodos.
+@@ -968,7 +968,7 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: El valor de resumen detallado no es válido. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1566,23 +1566,19 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+-                     Serializa todos los eventos de compilación en un archivo
+-                     binario comprimido. De manera predeterminada,
+-                     el archivo se encuentra en el directorio actual y tiene
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++                     Serializa todos los eventos de compilación en un archivo                     binario comprimido.
++ De manera predeterminada, el archivo se encuentra en el directorio actual y tiene
+                      el nombre "msbuild.binlog". El registro binario es una
+                      descripción detallada del proceso de compilación que
+                      se puede utilizar más adelante para reconstruir registros
+-                     de texto y que otras herramientas de análisis pueden
+-                     emplear. Un registro binario suele ser de 10 a 20 veces
+-                     más pequeño que el registro de nivel de diagnóstico de
+-                     texto más detallado, pero contiene más información
+-                     (Forma corta: -bl).
++                     de texto y que otras herramientas de análisis pueden emplear. Un registro binario suele ser de 10 a 20 veces
++                     más pequeño que el registro de nivel de diagnóstico de texto más detallado, pero contiene más información
++                    (Forma corta: -bl).
+ 
+                      De manera predeterminada, el registrador binario recopila
+                      el texto de origen de los archivos del proyecto, incluidos
+-                     todos los proyectos y archivos de destino importados
+-                     que se encuentren durante la compilación. El modificador
++                     todos los proyectos y archivos de destino importados que se encuentren durante la compilación. El modificador
+                      opcional ProjectImports controla este comportamiento:
+ 
+                       ProjectImports=None     - No recopilar importaciones
+@@ -1594,27 +1590,25 @@ Copyright (C) Microsoft Corporation. Todos los derechos reservados.
+                                                 donde "salida" es el mismo nombre que
+                                                 el del archivo de registro binario.
+ 
+-                     La configuración predeterminada de ProjectImports es
+-                     Embed.
++                     La configuración predeterminada de ProjectImports es Embed.
+                      Nota: El registrador no recopila archivos de código fuente
+                      que no sean de MSBuild, como .cs, .cpp, etc.
+ 
+                      Un archivo .binlog se puede "reproducir" pasándolo a
+-                     msbuild.exe como argumento en lugar de proyecto o
+-                     solución. Otros registradores recibirán la información
++                     msbuild.exe como argumento en lugar de proyecto o                     solución.
++ Otros registradores recibirán la información
+                      que contiene el archivo de registro como si se estuviera
+-                     ejecutando la compilación original. Encontrará más
+-                     información sobre el registro binario y su uso en:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     ejecutando la compilación original. Encontrará más información sobre el registro binario y su uso en:
++                     https://aka.ms/msbuild/binlog
+ 
+                      Ejemplos:
+                        -bl
+                        -bl:output.binlog
+                        -bl:output.binlog;ProjectImports=None
+-                       -bl:output.binlog;ProjectImports=ZipFile
++                      -bl:output.binlog;ProjectImports=ZipFile
+                        -bl:..\..\custom.binlog
+-                       -binaryLogger
+-    </target>
++                     -binaryLogger
++   </target>
+         <note>
+       LOCALIZATION: The following should not be localized:
+       1) "msbuild"
+diff --git a/src/MSBuild/Resources/xlf/Strings.fr.xlf b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+index 3b03ab5cec3..6c40786a49a 100644
+--- a/src/MSBuild/Resources/xlf/Strings.fr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.fr.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="fr" original="../Strings.resx">
+     <body>
+@@ -938,7 +938,7 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
++        <target state="translated">  -detailedSummary[:True|False]
+                      À la fin de la build, affiche des informations détaillées
+                      sur les configurations générées et la façon dont elles
+                      étaient planifiées sur les nœuds.
+@@ -960,7 +960,7 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: une valeur de résumé détaillée n’est pas valide. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1559,20 +1559,28 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                      Sérialise tous les événements de build dans un fichier binaire compressé.
+                      Par défaut, le fichier se trouve dans le répertoire actif et se nomme
+                      "msbuild.binlog". Le journal binaire est une description détaillée
+                      du processus de génération, qui peut servir plus tard à reconstruire
+                      les journaux texte et être utilisé par d'autres outils d'analyse. Un journal binaire
+-                     est généralement 10 à 20 fois plus petit que le journal
++                     est généralement
++10 à 20
++fois plus petit que le journal
+                      de diagnostic de type texte le plus détaillé, mais il contient plus d'informations.
+-                     (Forme abrégée : -bl)
++                     (Forme abrégée
++: -bl)
++
+ 
+                      Le journaliseur binaire par défaut collecte le texte source
++
+                      des fichiers projet, notamment tous les projets importés et les
++
+                      fichiers cibles rencontrés pendant la build. Le commutateur
+-                     ProjectImports facultatif contrôle ce comportement :
++
++                     ProjectImports facultatif contrôle ce comportement
++:
+ 
+                       ProjectImports=None     - Ne collecte pas les importations
+                                                 du projet.
+@@ -1584,24 +1592,33 @@ Copyright (C) Microsoft Corporation. Tous droits réservés.
+                                                 le fichier journal binaire.
+ 
+                      Le paramètre par défaut de ProjectImports est Embed.
+-                     Remarque : Le journaliseur ne collecte pas les
++                     Remarque
++: Le journaliseur ne collecte pas les
++
+                      fichiers sources non MSBuild tels que .cs, .cpp etc.
+ 
++
+                      Vous pouvez "lire" un fichier .binlog en le passant à
++
+                      msbuild.exe en tant qu'argument plutôt qu'en tant que projet/solution.
++
+                      D'autres enregistreurs d'événements reçoivent les informations
++
+                      contenues dans le fichier journal comme si la build d'origine était en cours de création.
+-                     Pour plus d'informations sur le journal binaire et ses usages, consultez :
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
+ 
+-                     Exemples :
++                     Pour plus d'informations sur le journal binaire et ses usages, consultez
++:
++                    https://aka.ms/msbuild/binlog
++
++                     Exemples
++:
++
+                        -bl
++
+                        -bl:output.binlog
++
+                        -bl:output.binlog;ProjectImports=None
+-                       -bl:output.binlog;ProjectImports=ZipFile
+-                       -bl:..\..\custom.binlog
+-                       -binaryLogger
+-    </target>
++                       -bl:output.binlog;ProjectImports=ZipFile                       -bl:..\..\custom.binlog                       -binaryLogger    </target>
+         <note>
+       LOCALIZATION: The following should not be localized:
+       1) "msbuild"
+diff --git a/src/MSBuild/Resources/xlf/Strings.it.xlf b/src/MSBuild/Resources/xlf/Strings.it.xlf
+index cef39369d45..6ebbdf7964f 100644
+--- a/src/MSBuild/Resources/xlf/Strings.it.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.it.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="it" original="../Strings.resx">
+     <body>
+@@ -958,9 +958,9 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
+-                     Visualizza informazioni dettagliate al termine della
+-                     compilazione relative alle configurazioni compilate e alla
++        <target state="translated">  -detailedSummary[:True|False]
++                     Al termine della compilazione visualizza informazioni
++                     dettagliate sulle configurazioni compilate e sulla
+                      relativa modalità di pianificazione nei nodi. Forma breve:
+                      -ds.
+     </target>
+@@ -980,7 +980,7 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: il valore del riepilogo dettagliato non è valido. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1580,48 +1580,42 @@ Copyright (C) Microsoft Corporation. Tutti i diritti sono riservati.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+-                     Serializza tutti gli eventi di compilazione in un file
+-                     binario compresso. Per impostazione predefinita, il file
+-                     si trova nella directory corrente e si chiama
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++                     Serializza tutti gli eventi di compilazione in un file binario compresso.
++                     Per impostazione predefinita, il file csi trova nella directory corrente e si chiama
+                      "msbuild.binlog". Il log binario è una descrizione
+                      dettagliata del processo di compilazione utilizzabile in
+-                     seguito per ricostruire i log di testo e viene usato da
+-                     altri strumenti di analisi. Un log binario è in genere
++                     seguito per ricostruire i log di testo e viene usato da altri strumenti di analisi. Un log binario è in genere
+                      10-20 volte più piccolo del più dettagliato log di testo
+                      di livello diagnostico, ma contiene maggiori informazioni.
+-                     Forma breve: -bl.
+-                     Per impostazione predefinita, il logger binario raccoglie
+-                     il testo di origine di file di progetto, inclusi tutti i
+-                     progetti importati e i file di destinazione rilevati
+-                     durante la compilazione. L'opzione facoltativa
++                     (Froma breve: -bl)
++
++                     Per impostazione predefinita, il logger binario raccoglie il testo di origine di
++                     file di progetto, inclusi tutti i
++                     progetti importati e i file di destinazione rilevati durante la compilazione. L'opzione facoltativa
+                      ProjectImports controlla questo comportamento:
+ 
+-                      ProjectImports=None    - Non viene eseguita la raccolta
+-                                               delle importazioni del progetto.
+-                      ProjectImports=Embed   - Le importazioni del progetto
+-                                               vengono incorporate nel file
+-                                               di log.
+-                      ProjectImports=ZipFile - I file del progetto vengono
+-                                               salvati in 
+-                                               output.projectimports.zip
+-                                               dove output corrisponde allo
+-                                               stesso nome del file di log
+-                                               binario.
++                      ProjectImports=None     - Non viene eseguita la raccolta
++                                                delle importazioni del progetto.
++                      ProjectImports=Embed    - Le importazioni del progetto vengono incorporate nel
++                                                file di log.
++                      ProjectImports=ZipFile  - I file del progetto vengono salvati in
++                                                output.projectimports.zip
++                                                dove output corrisponde allo
++                                                as stesso nome del file di log binario.
+ 
+                      L'impostazione predefinita di ProjectImports è Embed.
+-                     Nota: il logger non raccoglie i file di origine non
+-                     MSBuild, ad esempio quelli con estensione cs, cpp
+-                     e così via.
++                     Nota: il logger non raccoglie i file di origine non-MSBuild,
++                     ad esempio quelli con estensione .cs, .cpp e così via.
++
+                      È possibile riprodurre un file con estensione binlog
+-                     passandolo a msbuild.exe come argomento invece di un
+-                     progetto o di una soluzione. Altri logger riceveranno le
+-                     informazioni contenute nel file di log come se fosse in
+-                     corso la compilazione originale. Per maggiori informazioni
+-                     sul file di log e su come usarlo, vedere:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     passandolo a msbuild.exe come argomento invece di un progetto o di una soluzione.
++                     Altri logger riceveranno le
++                     informazioni contenute nel file di log come se fosse in corso la compilazione originale.
++                     Per maggiori informazioni sul file di log e su come usarlo, vedere:
++                     https://aka.ms/msbuild/binlog
+ 
+-                     Esempi: 
++                     Esempi:
+                        -bl
+                        -bl:output.binlog
+                        -bl:output.binlog;ProjectImports=None
+diff --git a/src/MSBuild/Resources/xlf/Strings.ja.xlf b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+index 74c81572c46..089b3db5c9e 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ja.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ja.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ja" original="../Strings.resx">
+     <body>
+@@ -937,8 +937,8 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
+-                    ビルドの最後に、ビルド構成と、ノードに対して
++        <target state="translated">  -detailedSummary[:True|False]
++                     ビルドの最後に、ビルドした構成と、ノードに対して
+                     どのようにスケジュールされたかについて、
+                     詳細情報が表示されます。
+                     (短い形式: -ds)
+@@ -959,7 +959,7 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: 詳細な概要値が無効です。 {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1557,7 +1557,7 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                      すべてのビルド イベントを圧縮バイナリ ファイルにシリアル化します。
+                      既定では、このファイルは "msbuild.binlog" という名前で
+                      現在のディレクトリに置かれます。バイナリ ログはビルド プロセスの
+@@ -1590,7 +1590,7 @@ Copyright (C) Microsoft Corporation.All rights reserved.
+                      他のロガーは、オリジナルのビルドが行われたときのように、
+                      ログ ファイルに含まれる情報を受け取ることができます。
+                      バイナリ ログとその使用法の詳細については、以下をお読みください。
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     https://aka.ms/msbuild/binlog
+ 
+                      例:
+                        -bl
+diff --git a/src/MSBuild/Resources/xlf/Strings.ko.xlf b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+index 7860d7a0b71..2d320eb0ef0 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ko.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ko.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ko" original="../Strings.resx">
+     <body>
+@@ -937,11 +937,11 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
+-                     빌드 마지막에 구성 상태 및
+-                     노드에 대한 해당 구성의 예약 상태와 관련한
+-                     자세한 정보를 표시합니다.
+-                     (약식: -ds)
++        <target state="translated">  -detailedSummary[:True|False]
++                     빌드가 끝날 때 자세한 정보 표시
++                     구성 및 노드 예약 방법에 대해
++                     설명합니다.
++                     (Short form: -ds)
+     </target>
+         <note>
+       LOCALIZATION: "detailedSummary", "True" and "False" should not be localized.
+@@ -959,7 +959,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: 자세한 요약 값이 잘못되었습니다. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1557,7 +1557,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                      모든 빌드 이벤트를 압축된 이진 파일로 직렬화합니다.
+                      기본적으로 이 파일은 현재 디렉터리에 있으며 이름은
+                      "msbuild.binlog"입니다. 이진 로그는 빌드 프로세스를
+@@ -1590,7 +1590,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+ 		     발생하고 있는 것처럼 로그 파일에 포함된 정보를 받게 됩니다.
+                      이진 로그 및 해당 사용법에 대한 자세한 내용은
+                      다음 위치에서 확인할 수 있습니다.
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     https://aka.ms/msbuild/binlog
+ 
+                      예:
+                        -bl
+diff --git a/src/MSBuild/Resources/xlf/Strings.pl.xlf b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+index 1c89191640d..c14e0ffa53d 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pl.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pl.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="pl" original="../Strings.resx">
+     <body>
+@@ -950,11 +950,11 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
+-                     Powoduje wyświetlenie na zakończenie kompilacji
+-                     szczegółowych informacji o utworzonych konfiguracjach
+-                     i ich planowanym wykorzystaniu węzłów.
+-                     (Krótka wersja: -ds)
++        <target state="translated">  -detailedSummary
++                     Pokazuje szczegółowe informacje na zakończenie kompilacji
++                     o utworzonych konfiguracjach i jak zostały one
++                     zaplanowane dla węzłów.
++                     (Krótka forma: -ds)
+     </target>
+         <note>
+       LOCALIZATION: "detailedSummary", "True" and "False" should not be localized.
+@@ -972,7 +972,7 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: wartość szczegółowego podsumowania jest nieprawidłowa. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1570,27 +1570,27 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]wyjście.binlog[;ProjectImports={None,Embed,ZipFile}]]
+-                     Serializuje wszystkie zdarzenia kompilacji do skompresowanego pliku
+-                     binarnego. Domyślnie plik znajduje się w bieżącym katalogu i ma
+-                     nazwę „msbuild.binlog”. Dziennik binarny to szczegółowy opis procesu
+-                     kompilacji, którego można później użyć do odtworzenia dzienników
+-                     tekstowych i wykorzystać w innych narzędziach do analizy. Dziennik
+-                     binarny jest zwykle 10–20 razy mniejszy od najbardziej szczegółowych
+-                     tekstowych dzienników na poziomie diagnostycznym, ale zawiera
+-                     więcej informacji. (Krótka forma: -bl)
++        <target state="translated">  -binaryLogger[:[LogFile=]wyjście.binlog[;ProjectImports={None,Embed,ZipFile}]]
++                     Serializuje wszystkie zdarzenia kompilacji do skompresowanego pliku binarnego.
++                     Domyślnie plik znajduje się w bieżącym katalogu i ma nazwę
++                     „msbuild.binlog”. Dziennik binarny to szczegółowy opis procesu
++                     kompilacji, którego można później użyć do odtworzenia
++dzienników                     tekstowych i wykorzystać w innych narzędziach do analizy. Dziennik binarny
++                     jest zwykle 10–20 razy mniejszy od najbardziej szczegółowych
++                     tekstowych dzienników na poziomie diagnostycznym, ale zawiera więcej informacji.
++                     (Krótka forma: -bl)
+ 
+-                     Rejestrator binarny domyślnie zbiera tekst źródłowy plików
+-                     projektu, w tym wszystkie zaimportowane projekty i pliki
++                     Rejestrator binarny domyślnie zbiera tekst źródłowy
++                     plików projektu, w tym wszystkie zaimportowane projekty i pliki
+                      docelowe napotkane podczas kompilowania. Tym zachowaniem
+                      steruje opcjonalny przełącznik ProjectImports:
+ 
+                       ProjectImports=None     — Nie zbieraj importów
+                                                 projektu.
+-                      ProjectImports=Embed    — Osadź importy projektu
+-                                                w pliku dziennika.
++                      ProjectImports=Embed    — Osadź importy projektu w
++                                                pliku dziennika.
+                       ProjectImports=ZipFile  — Zapisz pliki projektu w pliku
+-                                                wyjście.projectimports.zip,
++                                                output.projectimports.zip,
+                                                 gdzie wyjście to ciąg podany
+                                                 dla nazwy pliku dziennika binarnego.
+ 
+@@ -1602,15 +1602,15 @@ Copyright (C) Microsoft Corporation. Wszelkie prawa zastrzeżone.
+                      msbuild.exe jako argument zamiast projektu/rozwiązania.
+                      Inne rejestratory otrzymają informacje zawarte w pliku
+                      dziennika tak, jak podczas wykonywania pierwotnej kompilacji.
+-                     Więcej informacji o dzienniku binarnym i jego zastosowaniach:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     Więcej informacji o dzienniku binarnym i jego zastosowaniach można uzyskać na stronie:
++                     https://aka.ms/msbuild/binlog
+ 
+                      Przykłady:
+                        -bl
+-                       -bl:wyjście.binlog
+-                       -bl:wyjście.binlog;ProjectImports=None
+-                       -bl:wyjście.binlog;ProjectImports=ZipFile
+-                       -bl:..\..\niestandardowy.binlog
++                       -bl:output.binlog
++                       -bl:output.binlog;ProjectImports=None
++                       -bl:output.binlog;ProjectImports=ZipFile
++                       -bl:..\..\custom.binlog
+                        -binaryLogger
+     </target>
+         <note>
+diff --git a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+index 351d62f1568..751fc9b422d 100644
+--- a/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.pt-BR.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="pt-BR" original="../Strings.resx">
+     <body>
+@@ -938,10 +938,10 @@ isoladamente.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
+-                     Mostra informações detalhadas ao final do build
+-                     sobre as configurações compiladas e o modo como elas foram
+-                     agendadas para nós. 
++        <target state="translated">  -detailedSummary[:True|False]
++                     Mostra informações detalhadas no final da compilação
++                     sobre as configurações compiladas e como elas foram
++                     agendadas para os nós.
+                      (Forma abreviada: -ds)
+     </target>
+         <note>
+@@ -960,7 +960,7 @@ isoladamente.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: O valor do resumo detalhado é inválido. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -970,7 +970,7 @@ isoladamente.
+       </trans-unit>
+       <trans-unit id="InvalidGraphBuildValue">
+         <source>MSBUILD : error MSB1057: Graph build value is not valid.</source>
+-        <target state="translated">MSBUILD : error MSB1057: o valor de build do grafo não é válido.</target>
++        <target state="translated">MSBUILD : error MSB1057: O valor de build do gráfico não é válido.</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1057: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1558,40 +1558,40 @@ isoladamente.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+-                     Serializa todos os eventos de build para um arquivo binário compactado.
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++                     Serializa todos os eventos da compilação em um arquivo binário compactado.
+                      Por padrão, o arquivo está no diretório atual e é chamado de
+-                     "msbuild.binlog". O log binário é uma descrição detalhada 
+-                     do processo de build que pode mais tarde ser usado para reconstruir
+-                     logs de texto e ser usado por outras ferramentas de análise. Um log binário
+-                     normalmente é 10 a 20 vezes menor que a maioria dos logs de nível
+-                     de diagnóstico de texto mais detalhado, mas contém mais informações.
++                     "msbuild.binlog". O log binário é uma descrição detalhada
++                     do processo de compilação que pode mais tarde ser usado para reconstruir
++                     logs de texto e usados por outras ferramentas de análise. Um log binário
++                     normalmente é 10 a 20x menor do que os log de nível
++                     de diagnóstico do texto mais detalhado, mas contém mais informações.
+                      (Forma abreviada: -bl)
+ 
+-                     O agente binário por padrão coleta o texto fonte dos
++                     O agente binário, por padrão, coleta o texto fonte dos
+                      arquivos de projeto, incluindo todos os projetos importados e arquivos
+-                     de destino encontrados durante o build. A opção
+-                     ProjectImports opcional controla esse comportamento:
++                     de destino encontrados durante a compilação. A opção
++                     ProjectImports opcional controla este comportamento:
+ 
+-                      ProjectImports=None     – Não coletar as importações 
++                      ProjectImports=None     - Não coletar as importações
+                                                 do projeto.
+-                      ProjectImports=Embed    – Inserir as importações do projeto
+-                                                no arquivo de log.
+-                      ProjectImports=ZipFile  – Salvar os arquivos de projeto no 
+-                                                output.projectimports.zip,
++                      ProjectImports=Embed    - Inserir as importações do projeto no
++                                                arquivo de log.
++                      ProjectImports=ZipFile  - Salvar os arquivos de projeto em
++                                                output.projectimports.zip
+                                                 em que a saída tem o mesmo nome que o
+                                                 nome do arquivo de log binário.
+ 
+                      A configuração padrão para ProjectImports é Embed.
+-                     Nota: o agente não coleta arquivos de origem não MSBuild,
+-                     como .cs, .cpp etc.
++                     Observação: o agente não coleta arquivos de origem não MSBuild
++                     tais como .cs, .cpp etc.
+ 
+-                     Um arquivo .binlog pode ser "reproduzido novamente" passando-o para
+-                     msbuild.exe como um argumento, em vez de como um projeto/solução.
+-                     Outros agentes receberão as informações contidas no arquivo de log
+-                     como se o build original estivesse acontecendo.
++                     Um arquivo .binlog pode ser "reproduzido novamente", passando-o para
++                     msbuild.exe como um argumento em vez de um projeto/solução.
++                     Outros agentes receberão as informações contidas
++                     no arquivo de log como se a compilação original estivesse acontecendo.
+                      Você pode ler mais sobre o log binário e seus usos em:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     https://aka.ms/msbuild/binlog
+ 
+                      Exemplos:
+                        -bl
+@@ -1707,4 +1707,4 @@ projeto precisar                                                   
+       </trans-unit>
+     </body>
+   </file>
+-</xliff>
+\ No newline at end of file
++</xliff>
+diff --git a/src/MSBuild/Resources/xlf/Strings.ru.xlf b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+index e74451f9138..75212bac50f 100644
+--- a/src/MSBuild/Resources/xlf/Strings.ru.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.ru.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ru" original="../Strings.resx">
+     <body>
+@@ -937,7 +937,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
++        <target state="translated">  -detailedSummary[:True|False]
+                      Показывает в конце сборки подробные сведения
+                      о созданных конфигурациях и графике их передачи
+                      на узлы.
+@@ -959,7 +959,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: значение подробной сводки недопустимо. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1559,40 +1559,40 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                      Сериализует все события сборки в сжатый двоичный файл.
+                      По умолчанию файл находится в текущем каталоге и называется
+                      "msbuild.binlog". Двоичный журнал включает подробное описание
+                      процесса сборки, которое затем можно использовать для воссоздания
+                      текстовых журналов. Он также может использоваться другими средствами анализа. Двоичный журнал
+-                     обычно в 10–20 раз меньше самого подробного текстового
++                     обычно в 10–20 раз меньше самого подробного текстового
+                      журнала уровня диагностики, но содержит больше информации.
+                      (Краткая форма: -bl)
+ 
+                      Средство ведения двоичного журнала по умолчанию собирает исходный текст
+                      файлов проекта, включая все импортированные проекты и целевые
+                      файлы, найденные во время сборки. Дополнительный
+-                     параметр ProjectImports управляет этим поведением.
++                     параметр ProjectImports управляет этим поведением:
+ 
+-                      ProjectImports=None — не собирать импортированные файлы
++                      ProjectImports=None     — не собирать импортированные файлы
+                                                 проекта.
+-                      ProjectImports=Embed — внедрять импортированные файлы проекта в
++                      ProjectImports=Embed    — внедрять импортированные файлы проекта в
+                                                 файл журнала.
+-                      ProjectImports=ZipFile — сохранять файлы проекта в
+-                                                &lt;вывод&gt;.projectimports.zip,
+-                                                где &lt;вывод&gt; — это то же имя,
++                      ProjectImports=ZipFile  — сохранять файлы проекта в
++                                                вывод.projectimports.zip,
++                                                где вывод — это то же имя,
+                                                 что и у двоичного файла журнала.
+ 
+-                     Значение по умолчанию для ProjectImports — Embed.
+-                     Примечание. Средство ведения журнала не собирает исходные файлы
+-                     не от MSBuild, например с расширениями CS, CPP и др.
++                     Значение по умолчанию для ProjectImports — Embed.
++                     Примечание. Средство ведения журнала не собирает исходные файлы, не от MSBuild,
++                     например с расширениями CS, CPP и др.
+ 
+                      BINLOG-файл можно "воспроизвести", передав его в
+                      msbuild.exe в качестве аргумента вместо проекта или решения.
+                      Другие средства ведения журнала получат содержащиеся
+                      в файле журнала сведения, как если бы происходила собственно сборка.
+                      Дополнительные сведения о двоичных журналах и их использовании:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     https://aka.ms/msbuild/binlog
+ 
+                      Примеры:
+                        -bl
+diff --git a/src/MSBuild/Resources/xlf/Strings.tr.xlf b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+index 6a7f4524732..f8ed2f2d849 100644
+--- a/src/MSBuild/Resources/xlf/Strings.tr.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.tr.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="tr" original="../Strings.resx">
+     <body>
+@@ -941,10 +941,10 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
++        <target state="translated">  -detailedSummary[:True|False]
+                      Derleme sonunda, derlenen yapılandırmalar ve
+                      bu yapılandırmaların düğümlere nasıl zamanlandıkları
+-                     hakkında ayrıntılı bilgi içerir.
++                     ile ilgili ayrıntılı bilgileri gösterir.
+                      (Kısa biçim: -ds)
+     </target>
+         <note>
+@@ -963,7 +963,7 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: Ayrıntılı özet değeri geçerli değil. {0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1561,7 +1561,7 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                      Tüm derleme olaylarını sıkıştırılmış bir ikili dosyada seri hale getirir.
+                      Varsayılan olarak, dosya geçerli dizinde bulunur ve "msbuild.binlog"
+                      olarak adlandırılır. Daha sonra metin günlüklerini yeniden
+@@ -1594,7 +1594,7 @@ Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+                      Diğer günlükçüler, günlük dosyasındaki bilgileri özgün
+                      derleme gerçekleşiyormuş gibi alır.
+                      İkili günlük ve kullanımı hakkında daha fazla bilgiyi aşağıdaki adreste bulabilirsiniz:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     https://aka.ms/msbuild/binlog
+ 
+                      Örnekler:
+                        -bl
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+index 31ae8aa1aa5..bf57d51080e 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hans.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANS" original="../Strings.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.resx">
+     <body>
+       <trans-unit id="AmbiguousProjectError">
+         <source>MSBUILD : error MSB1011: Specify which project or solution file to use because this folder contains more than one project or solution file.</source>
+@@ -937,10 +937,10 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedSummary
++        <target state="translated">  -detailedSummary
+                     在生成的结尾显示有关
+-                    所生成的配置以及如何向节点安排
+-                    这些配置的详细信息。
++                    所生成配置的详细信息，以及如何向节点安排
++                    这些配置。
+                     (缩写: -ds)
+     </target>
+         <note>
+@@ -959,7 +959,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: 详细汇总值无效。{0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1557,7 +1557,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                      将所有生成事件序列化为压缩的二进制文件。
+                      默认情况下该文件位于当前目录并且名为 "msbuild.binlog"。
+                      二进制日志是生成过程的详细描述，
+@@ -1571,27 +1571,26 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                      包括生成期间所有导入的
+                      项目和目标文件。可选的
+                      ProjectImports 开关控制此行为:
+-                     
+ 
+                       ProjectImports=None     - 不收集项目
+                                                 导入项。
+-                      ProjectImports=Embed    - 在日志文件中
+-                                                嵌入项目导入项。
+-                      ProjectImports=ZipFile  - 将项目文件保存到
+-                                                output.projectimports.zip，
++                     ProjectImports=Embed    - 在日志文件中
++                                                 嵌入项目导入项。
++                    ProjectImports=ZipFile  - 将项目文件保存到
++                                              output.projectimports.zip，
+                                                 其中输出的名称
+                                                 与二进制日志文件名称相同。
+ 
+-                     ProjectImports 的默认设置为 Embed。
+-                     注意: 记录器不会收集非 MSBuild 源文件，
+-                     例如 .cs、.cpp 等。
++                    ProjectImports 的默认设置为 Embed。
++                    注意: 记录器不会收集非 MSBuild 源文件，
++                    例如 .cs、.cpp 等。
+ 
+                      可将 .binlog 文件以参数(而不是项目/解决方案)的形式传递给
+-                     msbuild.exe 对其进行“播放”。
++                   msbuild.exe 对其进行“播放”。
+                      其他记录器将接收日志文件中的信息，
+-                     就像原始的生成正在发生一样。
+-                     你可以通过以下网址阅读有关二进制文件及其用法的详细信息:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                    就像原始的生成正在发生一样。
++                    你可以通过以下网址阅读有关二进制文件及其用法的详细信息:
++                    https://aka.ms/msbuild/binlog
+ 
+                      示例:
+                        -bl
+@@ -1600,7 +1599,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                        -bl:output.binlog;ProjectImports=ZipFile
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+-    </target>
++</target>
+         <note>
+       LOCALIZATION: The following should not be localized:
+       1) "msbuild"
+diff --git a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+index 29e1a1b55d8..066da1aa35f 100644
+--- a/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/MSBuild/Resources/xlf/Strings.zh-Hant.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANT" original="../Strings.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.resx">
+     <body>
+       <trans-unit id="AmbiguousProjectError">
+         <source>MSBUILD : error MSB1011: Specify which project or solution file to use because this folder contains more than one project or solution file.</source>
+@@ -937,7 +937,7 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+                      scheduled to nodes.
+                      (Short form: -ds)
+     </source>
+-        <target state="needs-review-translation">  -detailedsummary
++        <target state="translated">  -detailedSummary[:True|False]
+                      在建置結束時顯示詳細資訊，
+                      內容為建置的組態，
+                      以及將組態排程到節點的方式。
+@@ -959,7 +959,7 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+       </trans-unit>
+       <trans-unit id="InvalidDetailedSummaryValue">
+         <source>MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</source>
+-        <target state="new">MSBUILD : error MSB1061: Detailed summary value is not valid. {0}</target>
++        <target state="translated">MSBUILD : error MSB1061: 詳細摘要值無效。{0}</target>
+         <note>
+       {StrBegin="MSBUILD : error MSB1061: "}
+       UE: This message does not need in-line parameters because the exception takes care of displaying the invalid arg.
+@@ -1557,10 +1557,10 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+                        -bl:..\..\custom.binlog
+                        -binaryLogger
+     </source>
+-        <target state="needs-review-translation">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
++        <target state="translated">  -binaryLogger[:[LogFile=]output.binlog[;ProjectImports={None,Embed,ZipFile}]]
+                     將所有建置事件序列化成壓縮的二進位檔案。
+-                     根據預設，此檔案存放在目前的目錄下，
+-                     並會命名為 "msbuild.binlog"。此二進位記錄檔是
++                     根據預設，此檔案存放在目前的目錄下，並會命名為
++                     「msbuild.binlog」。此二進位記錄檔是
+                      建置程序的詳細描述，之後可用於重建文字記錄，
+                      以及供其他分析工具使用。二進位記錄檔
+                      的大小通常會比大部分的詳細文字
+@@ -1569,7 +1569,7 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+ 
+                      根據預設，二進位記錄器會收集專案檔的
+                      原始程式文字，包括在建置期間遇到的
+-                     匯入專案及目標檔案。選擇性的 ProjectImports 參數
++                     所有匯入專案及目標檔案。選擇性的 ProjectImports 參數
+                      會控制此行為:
+ 
+                       ProjectImports=None     - 不收集專案
+@@ -1590,7 +1590,7 @@ Copyright (C) Microsoft Corporation. 著作權所有，並保留一切權利。
+                      其他記錄器會收到記錄檔中包含的資訊，
+                      就如同原始組建發生時的情況。
+                      若要深入閱讀二進位記錄檔及其使用方式，請前往:
+-                     https://github.com/Microsoft/msbuild/wiki/Binary-Log
++                     https://aka.ms/msbuild/binlog
+ 
+                      範例:
+                        -bl
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index b86c58acce1..09a0f38eaf3 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -1440,31 +1440,19 @@ private static (BuildResultCode result, Exception exception) ExecuteRestore(stri
+             restoreGlobalProperties["MSBuildRestoreSessionId"] = Guid.NewGuid().ToString("D");
+ 
+             // Create a new request with a Restore target only and specify:
+-            BuildRequestDataFlags flags;
+-
+-            if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave16_10))
+-            {
+-                flags =   BuildRequestDataFlags.ClearCachesAfterBuild                // ensure the projects will be reloaded from disk for subsequent builds
+-                        | BuildRequestDataFlags.SkipNonexistentNonEntryTargets       // ignore missing non-entry targets since Restore does not require that all targets
+-                                                                                     // exist, only top-level ones like Restore itself
+-                        | BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports  // ignore imports that don't exist, are empty, or are invalid because restore might
+-                                                                                     // make available an import that doesn't exist yet and the <Import /> might be missing a condition.
+-                        | BuildRequestDataFlags.FailOnUnresolvedSdk;                 // still fail in the case when an MSBuild project SDK can't be resolved since this is fatal and should
+-                                                                                     // fail the build.
+-            }
+-            else
+-            {
+-                // pre-16.10 flags allowed `-restore` to pass when there was no `Restore` target
+-                flags = BuildRequestDataFlags.ClearCachesAfterBuild | BuildRequestDataFlags.SkipNonexistentTargets | BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports;
+-            }
+-
++            //  - BuildRequestDataFlags.ClearCachesAfterBuild to ensure the projects will be reloaded from disk for subsequent builds
++            //  - BuildRequestDataFlags.SkipNonexistentTargets to ignore missing targets since Restore does not require that all targets exist
++            //  - BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports to ignore imports that don't exist, are empty, or are invalid because restore might
++            //     make available an import that doesn't exist yet and the <Import /> might be missing a condition.
++            //  - BuildRequestDataFlags.FailOnUnresolvedSdk to still fail in the case when an MSBuild project SDK can't be resolved since this is fatal and should
++            //     fail the build.
+             BuildRequestData restoreRequest = new BuildRequestData(
+                 projectFile,
+                 restoreGlobalProperties,
+                 toolsVersion,
+                 targetsToBuild: new[] { MSBuildConstants.RestoreTargetName },
+                 hostServices: null,
+-                flags);
++                flags: BuildRequestDataFlags.ClearCachesAfterBuild | BuildRequestDataFlags.SkipNonexistentTargets | BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports | BuildRequestDataFlags.FailOnUnresolvedSdk);
+ 
+             return ExecuteBuild(buildManager, restoreRequest);
+         }
+diff --git a/src/Shared/CoreCLRAssemblyLoader.cs b/src/Shared/CoreCLRAssemblyLoader.cs
+index 385c5c878e8..14cd04a244d 100644
+--- a/src/Shared/CoreCLRAssemblyLoader.cs
++++ b/src/Shared/CoreCLRAssemblyLoader.cs
+@@ -23,15 +23,8 @@ internal sealed class CoreClrAssemblyLoader
+ 
+         private bool _resolvingHandlerHookedUp = false;
+ 
+-        private static readonly string _msbuildDirPath;
+         private static readonly Version _currentAssemblyVersion = new Version(Microsoft.Build.Shared.MSBuildConstants.CurrentAssemblyVersion);
+ 
+-        static CoreClrAssemblyLoader()
+-        {
+-            _msbuildDirPath = FileUtilities.NormalizePath(typeof(CoreClrAssemblyLoader).Assembly.Location);
+-            _msbuildDirPath = Path.GetDirectoryName(_msbuildDirPath);
+-        }
+-
+         public void AddDependencyLocation(string fullPath)
+         {
+             if (fullPath == null)
+@@ -59,12 +52,7 @@ public Assembly LoadFromPath(string fullPath)
+             // folders in a NuGet package).
+             fullPath = FileUtilities.NormalizePath(fullPath);
+ 
+-            // If the requested load comes from the same directory as MSBuild, assume that
+-            // the load is part of the platform, and load it using the Default ALC.
+-            string assemblyDir = Path.GetDirectoryName(fullPath);
+-
+-            if (Traits.Instance.EscapeHatches.UseSingleLoadContext ||
+-                FileUtilities.ComparePathsNoThrow(assemblyDir, _msbuildDirPath, string.Empty))
++            if (Traits.Instance.EscapeHatches.UseSingleLoadContext)
+             {
+                 return LoadUsingLegacyDefaultContext(fullPath);
+             }
+diff --git a/src/Shared/Resources/xlf/Strings.shared.zh-Hans.xlf b/src/Shared/Resources/xlf/Strings.shared.zh-Hans.xlf
+index 6f4bbec1431..248af5346b3 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.zh-Hans.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.zh-Hans.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANS" original="../Strings.shared.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.shared.resx">
+     <body>
+       <trans-unit id="BuildAborted">
+         <source>MSB4188: Build was canceled.</source>
+diff --git a/src/Shared/Resources/xlf/Strings.shared.zh-Hant.xlf b/src/Shared/Resources/xlf/Strings.shared.zh-Hant.xlf
+index b4cd2e2d549..dccd588bfc1 100644
+--- a/src/Shared/Resources/xlf/Strings.shared.zh-Hant.xlf
++++ b/src/Shared/Resources/xlf/Strings.shared.zh-Hant.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANT" original="../Strings.shared.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.shared.resx">
+     <body>
+       <trans-unit id="BuildAborted">
+         <source>MSB4188: Build was canceled.</source>
+diff --git a/src/Tasks/ManifestUtil/Resources/xlf/Strings.ManifestUtilities.zh-Hans.xlf b/src/Tasks/ManifestUtil/Resources/xlf/Strings.ManifestUtilities.zh-Hans.xlf
+index da31d6c6870..3c85e336dcc 100644
+--- a/src/Tasks/ManifestUtil/Resources/xlf/Strings.ManifestUtilities.zh-Hans.xlf
++++ b/src/Tasks/ManifestUtil/Resources/xlf/Strings.ManifestUtilities.zh-Hans.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANS" original="../Strings.ManifestUtilities.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.ManifestUtilities.resx">
+     <body>
+       <trans-unit id="ComImporter.LocalServerNotSupported">
+         <source>Out of process servers are not supported</source>
+diff --git a/src/Tasks/ManifestUtil/Resources/xlf/Strings.ManifestUtilities.zh-Hant.xlf b/src/Tasks/ManifestUtil/Resources/xlf/Strings.ManifestUtilities.zh-Hant.xlf
+index 66e11016717..a0726f458b3 100644
+--- a/src/Tasks/ManifestUtil/Resources/xlf/Strings.ManifestUtilities.zh-Hant.xlf
++++ b/src/Tasks/ManifestUtil/Resources/xlf/Strings.ManifestUtilities.zh-Hant.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANT" original="../Strings.ManifestUtilities.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.ManifestUtilities.resx">
+     <body>
+       <trans-unit id="ComImporter.LocalServerNotSupported">
+         <source>Out of process servers are not supported</source>
+diff --git a/src/Tasks/Microsoft.CSharp.CurrentVersion.targets b/src/Tasks/Microsoft.CSharp.CurrentVersion.targets
+index f5955642de1..0246dd8beda 100644
+--- a/src/Tasks/Microsoft.CSharp.CurrentVersion.targets
++++ b/src/Tasks/Microsoft.CSharp.CurrentVersion.targets
+@@ -190,7 +190,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                  @(CustomAdditionalCompileOutputs)"
+         Condition="'@(Page)' != '' Or '@(ApplicationDefinition)' != ''"
+         Returns=""
+-        DependsOnTargets="$(CoreCompileDependsOn)"
++        DependsOnTargets="$(CoreCompileDependsOn);GenerateMSBuildEditorConfigFile"
+     >
+        <!-- These two compiler warnings are raised when a reference is bound to a different version
+              than specified in the assembly reference version number.  MSBuild raises the same warning in this case,
+@@ -239,6 +239,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+               AddModules="@(AddModules)"
+               AdditionalFiles="@(AdditionalFiles)"
+               AllowUnsafeBlocks="$(AllowUnsafeBlocks)"
++              AnalyzerConfigFiles="@(EditorConfigFiles)"
+               Analyzers="@(Analyzer)"
+               ApplicationConfiguration="$(AppConfigForCompiler)"
+               BaseAddress="$(BaseAddress)"
+diff --git a/src/Tasks/Microsoft.VisualBasic.CurrentVersion.targets b/src/Tasks/Microsoft.VisualBasic.CurrentVersion.targets
+index 512fa288efc..45f937a1389 100644
+--- a/src/Tasks/Microsoft.VisualBasic.CurrentVersion.targets
++++ b/src/Tasks/Microsoft.VisualBasic.CurrentVersion.targets
+@@ -191,7 +191,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+                  $(NonExistentFile);
+                  @(CustomAdditionalCompileOutputs)"
+         Returns=""
+-        DependsOnTargets="$(CoreCompileDependsOn)"
++        DependsOnTargets="$(CoreCompileDependsOn);GenerateMSBuildEditorConfigFile"
+         Condition="'@(Page)' != '' Or '@(ApplicationDefinition)' != ''"
+     >
+         <PropertyGroup>
+@@ -232,6 +232,8 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+               AdditionalLibPaths="$(AdditionalLibPaths)"
+               AddModules="@(AddModules)"
+               AdditionalFiles="@(AdditionalFiles)"
++              AnalyzerConfigFiles="@(EditorConfigFiles)"
++              Analyzers="@(Analyzer)"
+               BaseAddress="$(BaseAddress)"
+               CodeAnalysisRuleSet="$(ResolvedCodeAnalysisRuleSet)"
+               CodePage="$(CodePage)"
+@@ -277,6 +279,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+               RootNamespace="$(RootNamespace)"
+               PdbFile="$(PdbFile)"
+               SdkPath="$(FrameworkPathOverride)"
++              SkipAnalyzers="$(_SkipAnalyzers)"
+               Sources="@(Compile)"
+               SubsystemVersion="$(SubsystemVersion)"
+               TargetCompactFramework="$(TargetCompactFramework)"
+diff --git a/src/Tasks/Resources/xlf/Strings.cs.xlf b/src/Tasks/Resources/xlf/Strings.cs.xlf
+index 35da63a960a..47e2693228e 100644
+--- a/src/Tasks/Resources/xlf/Strings.cs.xlf
++++ b/src/Tasks/Resources/xlf/Strings.cs.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="cs" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">Hodnota parametru „{0}“ se nemohla převést na odvozený typ „{1}“. Hodnota se zpracuje jako řetězec. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: Hodnota parametru „{0}“ se nemohla převést na „{1}“. {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">Nepovedlo se odvodit typ parametru „{0}“, protože typ atributu je neznámý. Hodnota se zpracuje jako řetězec.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Pro typ odvození se našlo víc konstruktorů atributů.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: Typ „{0}“ ne nenašel.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.de.xlf b/src/Tasks/Resources/xlf/Strings.de.xlf
+index 6c21e3d0602..2764a459b17 100644
+--- a/src/Tasks/Resources/xlf/Strings.de.xlf
++++ b/src/Tasks/Resources/xlf/Strings.de.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="de" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">Der Wert für den Parameter "{0}" konnte nicht in den abgeleiteten Typ "{1}" konvertiert werden. Der Wert wird als Zeichenfolge behandelt. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: Der Parameterwert "{0}" konnte nicht in "{1}" konvertiert werden. {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">Der Typ des Parameters "{0}" konnte nicht rückgeschlossen werden, da der Attributtyp unbekannt ist. Der Wert wird als Zeichenfolge behandelt.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Für den Typ "Rückschließen" wurden mehrere Attribut-Konstruktoren gefunden.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: Der Typ "{0}" wurde nicht gefunden.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.es.xlf b/src/Tasks/Resources/xlf/Strings.es.xlf
+index 3b174607b9e..abce121ff65 100644
+--- a/src/Tasks/Resources/xlf/Strings.es.xlf
++++ b/src/Tasks/Resources/xlf/Strings.es.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="es" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">No se pudo convertir el valor del parámetro "{0}" al tipo deducido "{1}". El valor se tratará como una cadena. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: el valor de parámetro "{0}" no se pudo convertir en "{1}". {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">No se puede inferir el tipo de parámetro "{0}" porque el tipo de atributo es desconocido. El valor se tratará como una cadena.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Se encontraron varios constructores de atributos para la inferencia de tipos.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: no se encontró el tipo "{0}".</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.fr.xlf b/src/Tasks/Resources/xlf/Strings.fr.xlf
+index 446990d0219..5796f3152fc 100644
+--- a/src/Tasks/Resources/xlf/Strings.fr.xlf
++++ b/src/Tasks/Resources/xlf/Strings.fr.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="fr" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">Impossible de convertir la valeur du paramètre « {0} » en type différé « {1} ». La valeur est traitée comme une chaîne. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: la valeur du paramètre « {0} » ne peut pas être convertie en « {1} ». {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">Impossible d’inférer le type de paramètre « {0} », car le type d’attribut est inconnu. La valeur sera considérée comme une chaîne.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Plusieurs constructeurs d’attributs ont été trouvées pour l’inférence de type.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: le type « {0} » est introuvable.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.it.xlf b/src/Tasks/Resources/xlf/Strings.it.xlf
+index 46ca3855406..50aa55dd16b 100644
+--- a/src/Tasks/Resources/xlf/Strings.it.xlf
++++ b/src/Tasks/Resources/xlf/Strings.it.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="it" original="../Strings.resx">
+     <body>
+@@ -511,7 +511,7 @@
+       </trans-unit>
+       <trans-unit id="General.StateFileAlreadyPresent">
+         <source>MSB3667: There is already a file at "{0}". If you are trying to create a precomputed cache, ensure that you are building a single project that depends on your assemblies rather than building your assemblies themselves. If you are running the ResolveAssemblyReference task normally, do not set the "AssemblyInformationCacheOutputPath" parameter of the ResolveAssemblyReference task.</source>
+-        <target state="new">MSB3667: There is already a file at "{0}". If you are trying to create a precomputed cache, ensure that you are building a single project that depends on your assemblies rather than building your assemblies themselves. If you are running the ResolveAssemblyReference task normally, do not set the "AssemblyInformationCacheOutputPath" parameter of the ResolveAssemblyReference task.</target>
++        <target state="translated">MSB3667: alla posizione "{0}" esiste già un file. Se si prova a creare una cache precalcolata, assicurarsi di compilare un singolo progetto che dipende dagli assembly invece di compilare gli assembly stessi. Se si esegue normalmente l'attività ResolveAssemblyReference, non impostare il parametro "AssemblyInformationCacheOutputPath" dell'attività ResolveAssemblyReference.</target>
+         <note>{StrBegin="MSB3667: "}</note>
+       </trans-unit>
+       <trans-unit id="General.UndefineProperties">
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">Impossibile convertire il valore del parametro "{0}" nel tipo inferito "{1}". Il valore sarà trattato come una stringa. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: Il valore "{0}" del parametro non può essere convertito in "{1}". {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">Non è stato possibile inferire il tipo di parametro "{0}" perché il tipo di attributo è sconosciuto. Il valore sarà trattto come una stringa.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Sono stati trovati più costruttori di attributi per il tipo di inferenza.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: Il tipo "{0}" non è stato trovato.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.ja.xlf b/src/Tasks/Resources/xlf/Strings.ja.xlf
+index eb5aeb1b065..bf0e88d55ed 100644
+--- a/src/Tasks/Resources/xlf/Strings.ja.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ja.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ja" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">パラメーター "{0}" の値を推定型 "{1}" に変換できませんでした。この値は文字列として扱われます。{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: パラメーター値 "{0}" を "{1}" に変換できませんでした。{2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">属性の型が不明なため、パラメーター "{0}" の型を推測できませんでした。値は文字列として扱われます。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">推論型に対して複数の属性のコンストラクターが見つかりました。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: 型 "{0}" は見つかりませんでした。</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.ko.xlf b/src/Tasks/Resources/xlf/Strings.ko.xlf
+index 6d49d15e1e8..0ffa4a11df8 100644
+--- a/src/Tasks/Resources/xlf/Strings.ko.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ko.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ko" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">매개 변수 "{0}"의 값을 유추된 유형 "{1}"(으)로 변환할 수 없습니다. 값이 문자열로 처리됩니다. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: 매개 변수 값 "{0}"(을)를 "{1}"(으)로 변환할 수 없습니다. {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">특성 유형을 알 수 없기 때문에 매개 변수 "{0}" 유형을 유추할 수 없습니다. 값이 문자열로 처리됩니다.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">유형 유추를 위해 여러 특성 생성자가 발견됨</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: "{0}" 형식을 찾을 수 없습니다.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.pl.xlf b/src/Tasks/Resources/xlf/Strings.pl.xlf
+index fb568f16651..0b07372babf 100644
+--- a/src/Tasks/Resources/xlf/Strings.pl.xlf
++++ b/src/Tasks/Resources/xlf/Strings.pl.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="pl" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">Nie można przekonwertować wartości parametru „{0}” na wywnioskowany typ „{1}. Wartość będzie traktowana jako ciąg. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: nie można przekonwertować wartości parametru „{0}” na „{1}”. {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">Nie można wywnioskować typu parametru „{0}”, ponieważ typ atrybutu jest nieznany. Wartość będzie traktowana jako ciąg.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Znaleziono wiele konstruktorów atrybutów w przypadku wnioskowania typu.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: nie znaleziono typu „{0}”.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.pt-BR.xlf b/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
+index 6e17e48ecc3..bff033eca29 100644
+--- a/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="pt-BR" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">Não foi possível converter o valor do parâmetro "{0}" no tipo inferido "{1}". O valor será tratado como uma cadeia de caracteres. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: não foi possível converter o valor de parâmetro "{0}" em "{1}". {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">Não foi possível deduzir o tipo de parâmetro "{0}" porque o tipo de atributo é desconhecido. O valor será tratado como uma cadeia de caracteres.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Foram encontrados vários construtores de atributos para a inferência de tipo.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: O tipo "{0}" não foi encontrado.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.ru.xlf b/src/Tasks/Resources/xlf/Strings.ru.xlf
+index ef92dc744b6..0319146c12b 100644
+--- a/src/Tasks/Resources/xlf/Strings.ru.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ru.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ru" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">Не удалось преобразовать значение параметра "{0}" в выведенный тип "{1}". Значение будет рассматриваться как строка. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: не удалось преобразовать значение параметра "{0}" в "{1}". {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">Не удалось вывести тип параметра "{0}", так как тип атрибута неизвестен. Значение будет рассматриваться как строка.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Для вывода типа обнаружено несколько конструкторов атрибутов.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: тип "{0}" не найден.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.tr.xlf b/src/Tasks/Resources/xlf/Strings.tr.xlf
+index 582179e717c..d0d3f932959 100644
+--- a/src/Tasks/Resources/xlf/Strings.tr.xlf
++++ b/src/Tasks/Resources/xlf/Strings.tr.xlf
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="tr" original="../Strings.resx">
+     <body>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">"{0}" parametresinin değeri "{1}" çıkarsanan türe dönüştürülemedi. Değer bir dize olarak değerlendirilecek. {2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: parametre değeri "{0}", "{1}" değerine dönüştürülemedi. {2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">Öznitelik türü bilinmediği için "{0}" parametresinin türü çıkarılamadı. Değer bir dizge olarak değerlendirilecektir.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">Tür çıkarımı için birden çok öznitelik oluşturucusu bulundu.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: "{0}" türü bulunamadı.</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf b/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
+index 2d73459db6d..74e83975e40 100644
+--- a/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANS" original="../Strings.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.resx">
+     <body>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+@@ -511,7 +511,7 @@
+       </trans-unit>
+       <trans-unit id="General.StateFileAlreadyPresent">
+         <source>MSB3667: There is already a file at "{0}". If you are trying to create a precomputed cache, ensure that you are building a single project that depends on your assemblies rather than building your assemblies themselves. If you are running the ResolveAssemblyReference task normally, do not set the "AssemblyInformationCacheOutputPath" parameter of the ResolveAssemblyReference task.</source>
+-        <target state="new">MSB3667: There is already a file at "{0}". If you are trying to create a precomputed cache, ensure that you are building a single project that depends on your assemblies rather than building your assemblies themselves. If you are running the ResolveAssemblyReference task normally, do not set the "AssemblyInformationCacheOutputPath" parameter of the ResolveAssemblyReference task.</target>
++        <target state="translated">MSB3667: “{0}”处已存在文件。若要尝试创建预计算缓存，请务必生成单个依赖于程序集的项目，而不是生成程序集本身。如果在正常运行 ResolveAssemblyReference 任务，请不要设置 ResolveAssemblyReference 任务的 "AssemblyInformationCacheOutputPath" 参数。</target>
+         <note>{StrBegin="MSB3667: "}</note>
+       </trans-unit>
+       <trans-unit id="General.UndefineProperties">
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">无法将参数 "{0}" 的值转换为推断类型 "{1}"。该值将被视作字符串。{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: 参数值 "{0}" 无法转换为 "{1}"。{2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">由于属性类型未知，无法推断参数 "{0}" 的类型。该值将被视作字符串。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">为类型推理找到了多个特性构造函数。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: 未找到类型 "{0}"。</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf b/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
+index 6d37bf3ca7d..337211ec03f 100644
+--- a/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANT" original="../Strings.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.resx">
+     <body>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+@@ -2557,27 +2557,27 @@
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertToInferredType">
+         <source>Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</source>
+-        <target state="new">Could not convert the value for parameter "{0}" to the inferred type "{1}". The value will be treated as a string. {2}</target>
++        <target state="translated">無法將參數 "{0}" 的值轉換為推斷的類型 "{1}"。 該值將被視為字串。{2}</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotConvertValue">
+         <source>MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</source>
+-        <target state="new">MSB3716: The parameter value "{0}" could not be converted to "{1}". {2}</target>
++        <target state="translated">MSB3716: 無法將參數值 "{0}" 轉換為 "{1}"。{2}</target>
+         <note>{StrBegin="MSB3716: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.CouldNotInferParameterType">
+         <source>Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</source>
+-        <target state="new">Could not infer the type of parameter "{0}" because the attribute type is unknown. The value will be treated as a string.</target>
++        <target state="translated">由於屬性類型未知，因此無法推斷 "{0}" 的參數類型。該值將被視為字串。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.MultipleConstructorsFound">
+         <source>Multiple attribute constructors were found for type inferencing.</source>
+-        <target state="new">Multiple attribute constructors were found for type inferencing.</target>
++        <target state="translated">找到類型推斷的多屬性建構函式。</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="WriteCodeFragment.ParameterTypeNotFound">
+         <source>MSB3715: The type "{0}" was not found.</source>
+-        <target state="new">MSB3715: The type "{0}" was not found.</target>
++        <target state="translated">MSB3715: 無法找到 "{0}" 類型。</target>
+         <note>{StrBegin="MSB3715: "}</note>
+       </trans-unit>
+       <trans-unit id="WriteLinesToFile.ErrorOrWarning">
+diff --git a/src/Utilities/Resources/xlf/Strings.zh-Hans.xlf b/src/Utilities/Resources/xlf/Strings.zh-Hans.xlf
+index 6d0c99772eb..fce9024bbde 100644
+--- a/src/Utilities/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Utilities/Resources/xlf/Strings.zh-Hans.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANS" original="../Strings.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.resx">
+     <body>
+       <trans-unit id="General.InvalidToolSwitch">
+         <source>MSB6001: Invalid command line switch for "{0}". {1}</source>
+diff --git a/src/Utilities/Resources/xlf/Strings.zh-Hant.xlf b/src/Utilities/Resources/xlf/Strings.zh-Hant.xlf
+index 334b50fd622..7466d06bfc8 100644
+--- a/src/Utilities/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Utilities/Resources/xlf/Strings.zh-Hant.xlf
+@@ -1,6 +1,6 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+-  <file datatype="xml" source-language="en" target-language="zh-HANT" original="../Strings.resx">
++  <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.resx">
+     <body>
+       <trans-unit id="General.InvalidToolSwitch">
+         <source>MSB6001: Invalid command line switch for "{0}". {1}</source>

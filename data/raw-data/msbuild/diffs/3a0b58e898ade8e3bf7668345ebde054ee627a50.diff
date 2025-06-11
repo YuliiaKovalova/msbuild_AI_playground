@@ -1,0 +1,483 @@
+diff --git a/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs b/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
+index eae0afe3751..fdaf722b36c 100644
+--- a/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/BuildManager_Tests.cs
+@@ -4211,15 +4211,17 @@ public void GraphBuildInvalid()
+         {
+             string project1 = _env.CreateFile(".proj").Path;
+             string project2 = _env.CreateFile(".proj").Path;
++            string project3 = _env.CreateFile(".proj").Path;
+ 
+             File.WriteAllText(project1, CleanupFileContents($@"
+ <Project>
+   <ItemGroup>
+     <ProjectReferenceTargets Include='Build' Targets='Build' />
+     <ProjectReference Include='{project2}' />
++    <ProjectReference Include='{project3}' />
+   </ItemGroup>
+   <Target Name='Build'>
+-    <MsBuild Projects='{project2}' Targets='Build' />
++    <MsBuild Projects='@(ProjectReference)' Targets='Build' />
+   </Target>
+ </Project>
+ "));
+@@ -4227,14 +4229,22 @@ public void GraphBuildInvalid()
+ <Project>
+   <WellThisIsntValid>
+ </Project>
++"));
++            File.WriteAllText(project3, CleanupFileContents(@"
++<Project>
++  <WellThisIsntValid>
++</Project>
+ "));
+ 
+             var data = new GraphBuildRequestData(new ProjectGraphEntryPoint(project1), Array.Empty<string>());
+ 
+             GraphBuildResult result = _buildManager.Build(_parameters, data);
+-            result.OverallResult.ShouldBe(BuildResultCode.Failure);
+-            result.Exception.ShouldBeOfType<InvalidProjectFileException>()
+-                .ProjectFile.ShouldBe(project2);
++            result.ShouldHaveFailed();
++
++            AggregateException aggException = result.Exception.ShouldBeOfType<AggregateException>();
++            aggException.InnerExceptions.Count.ShouldBe(2);
++            aggException.InnerExceptions[0].ShouldBeOfType<InvalidProjectFileException>().ProjectFile.ShouldBeOneOf(project2, project3);
++            aggException.InnerExceptions[1].ShouldBeOfType<InvalidProjectFileException>().ProjectFile.ShouldBeOneOf(project2, project3);
+         }
+ 
+         [Fact]
+diff --git a/src/Build.UnitTests/Graph/ParallelWorkSet_Tests.cs b/src/Build.UnitTests/Graph/ParallelWorkSet_Tests.cs
+index f4251fcde21..4c61ad03d02 100644
+--- a/src/Build.UnitTests/Graph/ParallelWorkSet_Tests.cs
++++ b/src/Build.UnitTests/Graph/ParallelWorkSet_Tests.cs
+@@ -1,7 +1,6 @@
+ ﻿using System;
+ using System.Collections.Generic;
+ using System.Threading;
+-using Microsoft.Build.Shared;
+ using Microsoft.Build.UnitTests;
+ using Shouldly;
+ using Xunit;
+@@ -19,7 +18,7 @@ private class ParallelWorkSetTestCase
+ 
+             internal Dictionary<string, string> ExpectedCompletedWork =
+                 new Dictionary<string, string>(StringComparer.Ordinal);
+-            internal bool ShouldExpectException { get; set; }
++            internal int NumExpectedExceptions { get; set; }
+         }
+ 
+         private struct WorkItem
+@@ -55,7 +54,7 @@ public void GivenExceptionsOnCompletionThread_CompletesAndThrowsException()
+                         WorkFunc = () => throw new Exception()
+                     }
+                 },
+-                ShouldExpectException = true
++                NumExpectedExceptions = 3
+             });
+         }
+ 
+@@ -83,7 +82,7 @@ public void GivenExceptionsOnWorkerThread_CompletesAndThrowsExceptions()
+                         WorkFunc = () => throw new Exception()
+                     }
+                 },
+-                ShouldExpectException = true
++                NumExpectedExceptions = 3
+             });
+         }
+ 
+@@ -236,15 +235,33 @@ private void TestParallelWorkSet(ParallelWorkSetTestCase tt)
+         {
+             _workSet = new ParallelWorkSet<string, string>(tt.DegreeOfParallelism, StringComparer.Ordinal, CancellationToken.None);
+ 
++            List<Exception> observedExceptions = new();
++
+             foreach (WorkItem workItem in tt.WorkItemsToAdd)
+             {
+-                _workSet.AddWork(workItem.Key, workItem.WorkFunc);
++                _workSet.AddWork(
++                    workItem.Key,
++                    () =>
++                    {
++                        try
++                        {
++                            return workItem.WorkFunc();
++                        }
++                        catch (Exception ex)
++                        {
++                            lock (observedExceptions)
++                            {
++                                observedExceptions.Add(ex);
++                            }
++
++                            throw;
++                        }
++                    });
+             }
+ 
+-            if (tt.ShouldExpectException)
++            if (tt.NumExpectedExceptions > 0)
+             {
+-                Should.Throw<Exception>(() => _workSet.WaitForAllWorkAndComplete());
+-
++                Should.Throw<AggregateException>(() => _workSet.WaitForAllWorkAndComplete()).InnerExceptions.ShouldBe(observedExceptions);
+                 return;
+             }
+ 
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 265cdc09e68..606d1008930 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -1723,19 +1723,35 @@ private void WaitForAllLoggingServiceEventsToBeProcessed()
+         /// </summary>
+         private void HandleSubmissionException(GraphBuildSubmission submission, Exception ex)
+         {
+-            if (ex is InvalidProjectFileException projectException)
++            if (ex is AggregateException ae)
+             {
+-                if (!projectException.HasBeenLogged)
++                // If there's exactly 1, just flatten it
++                if (ae.InnerExceptions.Count == 1)
+                 {
+-                    BuildEventContext buildEventContext = new BuildEventContext(submission.SubmissionId, 1, BuildEventContext.InvalidProjectInstanceId, BuildEventContext.InvalidProjectContextId, BuildEventContext.InvalidTargetId, BuildEventContext.InvalidTaskId);
+-                    ((IBuildComponentHost)this).LoggingService.LogInvalidProjectFileError(buildEventContext, projectException);
+-                    projectException.HasBeenLogged = true;
++                    ex = ae.InnerExceptions[0];
++                }
++                else
++                {
++                    // Log each InvalidProjectFileException encountered during ProjectGraph creation
++                    foreach (Exception innerException in ae.InnerExceptions)
++                    {
++                        if (innerException is InvalidProjectFileException innerProjectException)
++                        {
++                            LogInvalidProjectFileError(innerProjectException);
++                        }
++                    }
+                 }
+             }
+ 
+-            ex = ex is AggregateException ae && ae.InnerExceptions.Count == 1
+-                ? ae.InnerExceptions.First()
+-                : ex;
++            if (ex is InvalidProjectFileException projectException)
++            {
++                LogInvalidProjectFileError(projectException);
++            }
++
++            if (ex is CircularDependencyException)
++            {
++                LogInvalidProjectFileError(new InvalidProjectFileException(ex.Message, ex));
++            }
+ 
+             lock (_syncLock)
+             {
+@@ -1747,6 +1763,16 @@ private void HandleSubmissionException(GraphBuildSubmission submission, Exceptio
+                 _overallBuildSuccess = false;
+                 CheckSubmissionCompletenessAndRemove(submission);
+             }
++
++            void LogInvalidProjectFileError(InvalidProjectFileException projectException)
++            {
++                if (!projectException.HasBeenLogged)
++                {
++                    BuildEventContext buildEventContext = new BuildEventContext(submission.SubmissionId, 1, BuildEventContext.InvalidProjectInstanceId, BuildEventContext.InvalidProjectContextId, BuildEventContext.InvalidTargetId, BuildEventContext.InvalidTaskId);
++                    ((IBuildComponentHost)this).LoggingService.LogInvalidProjectFileError(buildEventContext, projectException);
++                    projectException.HasBeenLogged = true;
++                }
++            }
+         }
+ 
+         private static void AddBuildRequestToSubmission(BuildSubmission submission, int configurationId, int projectContextId = BuildEventContext.InvalidProjectContextId)
+@@ -1876,127 +1902,84 @@ private bool IsInvalidProjectOrIORelatedException(Exception e)
+ 
+         private void ExecuteGraphBuildScheduler(GraphBuildSubmission submission)
+         {
+-            try
++            if (_shuttingDown)
+             {
+-                if (_shuttingDown)
+-                {
+-                    throw new BuildAbortedException();
+-                }
++                throw new BuildAbortedException();
++            }
+ 
+-                var projectGraph = submission.BuildRequestData.ProjectGraph;
+-                if (projectGraph == null)
+-                {
+-                    projectGraph = new ProjectGraph(
+-                        submission.BuildRequestData.ProjectGraphEntryPoints,
+-                        ProjectCollection.GlobalProjectCollection,
+-                        (path, properties, collection) =>
++            var projectGraph = submission.BuildRequestData.ProjectGraph;
++            if (projectGraph == null)
++            {
++                projectGraph = new ProjectGraph(
++                    submission.BuildRequestData.ProjectGraphEntryPoints,
++                    ProjectCollection.GlobalProjectCollection,
++                    (path, properties, collection) =>
++                    {
++                        ProjectLoadSettings projectLoadSettings = _buildParameters.ProjectLoadSettings;
++                        if (submission.BuildRequestData.Flags.HasFlag(BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports))
+                         {
+-                            ProjectLoadSettings projectLoadSettings = _buildParameters.ProjectLoadSettings;
+-                            if (submission.BuildRequestData.Flags.HasFlag(BuildRequestDataFlags.IgnoreMissingEmptyAndInvalidImports))
+-                            {
+-                                projectLoadSettings |= ProjectLoadSettings.IgnoreMissingImports | ProjectLoadSettings.IgnoreInvalidImports | ProjectLoadSettings.IgnoreEmptyImports;
+-                            }
++                            projectLoadSettings |= ProjectLoadSettings.IgnoreMissingImports | ProjectLoadSettings.IgnoreInvalidImports | ProjectLoadSettings.IgnoreEmptyImports;
++                        }
+ 
+-                            if (submission.BuildRequestData.Flags.HasFlag(BuildRequestDataFlags.FailOnUnresolvedSdk))
+-                            {
+-                                projectLoadSettings |= ProjectLoadSettings.FailOnUnresolvedSdk;
+-                            }
++                        if (submission.BuildRequestData.Flags.HasFlag(BuildRequestDataFlags.FailOnUnresolvedSdk))
++                        {
++                            projectLoadSettings |= ProjectLoadSettings.FailOnUnresolvedSdk;
++                        }
+ 
+-                            return new ProjectInstance(
+-                                path,
+-                                properties,
+-                                null,
+-                                _buildParameters,
+-                                ((IBuildComponentHost)this).LoggingService,
+-                                new BuildEventContext(
+-                                    submission.SubmissionId,
+-                                    _buildParameters.NodeId,
+-                                    BuildEventContext.InvalidEvaluationId,
+-                                    BuildEventContext.InvalidProjectInstanceId,
+-                                    BuildEventContext.InvalidProjectContextId,
+-                                    BuildEventContext.InvalidTargetId,
+-                                    BuildEventContext.InvalidTaskId),
+-                                SdkResolverService,
++                        return new ProjectInstance(
++                            path,
++                            properties,
++                            null,
++                            _buildParameters,
++                            ((IBuildComponentHost)this).LoggingService,
++                            new BuildEventContext(
+                                 submission.SubmissionId,
+-                                projectLoadSettings);
+-                        });
+-                }
++                                _buildParameters.NodeId,
++                                BuildEventContext.InvalidEvaluationId,
++                                BuildEventContext.InvalidProjectInstanceId,
++                                BuildEventContext.InvalidProjectContextId,
++                                BuildEventContext.InvalidTargetId,
++                                BuildEventContext.InvalidTaskId),
++                            SdkResolverService,
++                            submission.SubmissionId,
++                            projectLoadSettings);
++                    });
++            }
+ 
+-                LogMessage(
+-                    ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword(
+-                        "StaticGraphConstructionMetrics",
+-                        Math.Round(projectGraph.ConstructionMetrics.ConstructionTime.TotalSeconds, 3),
+-                        projectGraph.ConstructionMetrics.NodeCount,
+-                        projectGraph.ConstructionMetrics.EdgeCount));
++            LogMessage(
++                ResourceUtilities.FormatResourceStringIgnoreCodeAndKeyword(
++                    "StaticGraphConstructionMetrics",
++                    Math.Round(projectGraph.ConstructionMetrics.ConstructionTime.TotalSeconds, 3),
++                    projectGraph.ConstructionMetrics.NodeCount,
++                    projectGraph.ConstructionMetrics.EdgeCount));
+ 
+-                Dictionary<ProjectGraphNode, BuildResult> resultsPerNode = null;
++            Dictionary<ProjectGraphNode, BuildResult> resultsPerNode = null;
+ 
+-                if (submission.BuildRequestData.GraphBuildOptions.Build)
+-                {
+-                    var cacheServiceTask = Task.Run(() => SearchAndInitializeProjectCachePluginFromGraph(projectGraph));
+-                    var targetListTask = projectGraph.GetTargetLists(submission.BuildRequestData.TargetNames);
++            if (submission.BuildRequestData.GraphBuildOptions.Build)
++            {
++                var cacheServiceTask = Task.Run(() => SearchAndInitializeProjectCachePluginFromGraph(projectGraph));
++                var targetListTask = projectGraph.GetTargetLists(submission.BuildRequestData.TargetNames);
+ 
+-                    DumpGraph(projectGraph, targetListTask);
++                DumpGraph(projectGraph, targetListTask);
+ 
+-                    using DisposablePluginService cacheService = cacheServiceTask.Result;
++                using DisposablePluginService cacheService = cacheServiceTask.Result;
+ 
+-                    resultsPerNode = BuildGraph(projectGraph, targetListTask, submission.BuildRequestData);
+-                }
+-                else
+-                {
+-                    DumpGraph(projectGraph);
+-                }
+-
+-                ErrorUtilities.VerifyThrow(
+-                    submission.BuildResult?.Exception == null,
+-                    "Exceptions only get set when the graph submission gets completed with an exception in OnThreadException. That should not happen during graph builds.");
+-
+-                // The overall submission is complete, so report it as complete
+-                ReportResultsToSubmission(
+-                    new GraphBuildResult(
+-                        submission.SubmissionId,
+-                        new ReadOnlyDictionary<ProjectGraphNode, BuildResult>(resultsPerNode ?? new Dictionary<ProjectGraphNode, BuildResult>())));
++                resultsPerNode = BuildGraph(projectGraph, targetListTask, submission.BuildRequestData);
+             }
+-            catch (CircularDependencyException ex)
++            else
+             {
+-                BuildEventContext projectBuildEventContext = new BuildEventContext(submission.SubmissionId, 1, BuildEventContext.InvalidProjectInstanceId, BuildEventContext.InvalidProjectContextId, BuildEventContext.InvalidTargetId, BuildEventContext.InvalidTaskId);
+-                ((IBuildComponentHost)this).LoggingService.LogInvalidProjectFileError(projectBuildEventContext, new InvalidProjectFileException(ex.Message, ex));
+-
+-                ReportResultsToSubmission(new GraphBuildResult(submission.SubmissionId, circularDependency: true));
++                DumpGraph(projectGraph);
+             }
+-            catch (Exception ex) when (IsInvalidProjectOrIORelatedException(ex))
+-            {
+-                // ProjectGraph throws an aggregate exception with InvalidProjectFileException inside when evaluation fails
+-                if (ex is AggregateException aggregateException && aggregateException.InnerExceptions.All(innerException => innerException is InvalidProjectFileException))
+-                {
+-                    // Log each InvalidProjectFileException encountered during ProjectGraph creation
+-                    foreach (Exception innerException in aggregateException.InnerExceptions)
+-                    {
+-                        var projectException = (InvalidProjectFileException) innerException;
+-                        if (!projectException.HasBeenLogged)
+-                        {
+-                            BuildEventContext projectBuildEventContext = new BuildEventContext(submission.SubmissionId, 1, BuildEventContext.InvalidProjectInstanceId, BuildEventContext.InvalidProjectContextId, BuildEventContext.InvalidTargetId, BuildEventContext.InvalidTaskId);
+-                            ((IBuildComponentHost)this).LoggingService.LogInvalidProjectFileError(projectBuildEventContext, projectException);
+-                            projectException.HasBeenLogged = true;
+-                        }
+-                    }
+-                }
+-                else
+-                {
+-                    // Arbitrarily just choose the first entry point project's path
+-                    string projectFile = submission.BuildRequestData.ProjectGraph?.EntryPointNodes.First().ProjectInstance.FullPath
+-                        ?? submission.BuildRequestData.ProjectGraphEntryPoints?.First().ProjectFile;
+-                    BuildEventContext buildEventContext = new BuildEventContext(submission.SubmissionId, 1, BuildEventContext.InvalidProjectInstanceId, BuildEventContext.InvalidProjectContextId, BuildEventContext.InvalidTargetId, BuildEventContext.InvalidTaskId);
+-                    ((IBuildComponentHost)this).LoggingService.LogFatalBuildError(buildEventContext, ex, new BuildEventFileInfo(projectFile));
+-                }
+ 
+-                ReportResultsToSubmission(new GraphBuildResult(submission.SubmissionId, ex));
++            ErrorUtilities.VerifyThrow(
++                submission.BuildResult?.Exception == null,
++                "Exceptions only get set when the graph submission gets completed with an exception in OnThreadException. That should not happen during graph builds.");
+ 
+-                lock (_syncLock)
+-                {
+-                    _overallBuildSuccess = false;
+-                }
+-            }
++            // The overall submission is complete, so report it as complete
++            ReportResultsToSubmission(
++                new GraphBuildResult(
++                    submission.SubmissionId,
++                    new ReadOnlyDictionary<ProjectGraphNode, BuildResult>(resultsPerNode ?? new Dictionary<ProjectGraphNode, BuildResult>())));
+ 
+             static void DumpGraph(ProjectGraph graph, IReadOnlyDictionary<ProjectGraphNode, ImmutableList<string>> targetList = null)
+             {
+diff --git a/src/Build/Graph/GraphBuildResult.cs b/src/Build/Graph/GraphBuildResult.cs
+index a37dd86dd1f..8ed172972e0 100644
+--- a/src/Build/Graph/GraphBuildResult.cs
++++ b/src/Build/Graph/GraphBuildResult.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Execution;
+ 
+ #nullable disable
+@@ -22,17 +23,6 @@ internal GraphBuildResult(int submissionId, IReadOnlyDictionary<ProjectGraphNode
+             ResultsByNode = resultsByNode;
+         }
+ 
+-        /// <summary>
+-        /// Constructor creates a build result indicating a circular dependency was created.
+-        /// </summary>
+-        /// <param name="submissionId">The id of the build submission.</param>
+-        /// <param name="circularDependency">Set to true if a circular dependency was detected.</param>
+-        internal GraphBuildResult(int submissionId, bool circularDependency)
+-        {
+-            SubmissionId = submissionId;
+-            CircularDependency = circularDependency;
+-        }
+-
+         /// <summary>
+         /// Constructs a graph build result with an exception
+         /// </summary>
+@@ -52,7 +42,7 @@ internal GraphBuildResult(int submissionId, Exception exception)
+         /// <summary>
+         /// Returns a flag indicating if a circular dependency was detected.
+         /// </summary>
+-        public bool CircularDependency { get; }
++        public bool CircularDependency => Exception is CircularDependencyException;
+ 
+         /// <summary>
+         /// Returns the exception generated while this result was run, if any.
+@@ -66,7 +56,7 @@ public BuildResultCode OverallResult
+         {
+             get
+             {
+-                if (Exception != null || CircularDependency)
++                if (Exception != null)
+                 {
+                     return BuildResultCode.Failure;
+                 }
+diff --git a/src/Build/Graph/ParallelWorkSet.cs b/src/Build/Graph/ParallelWorkSet.cs
+index 15010e607b6..922d29fd39f 100644
+--- a/src/Build/Graph/ParallelWorkSet.cs
++++ b/src/Build/Graph/ParallelWorkSet.cs
+@@ -37,6 +37,8 @@ internal class ParallelWorkSet<TKey, TResult>
+ 
+         private readonly List<Task> _tasks;
+ 
++        private readonly List<Exception> _exceptions = new List<Exception>(0);
++
+         /// <summary>
+         /// Retrieves all completed work items.
+         /// </summary>
+@@ -56,6 +58,11 @@ internal Dictionary<TKey, TResult> CompletedWork
+                     }
+                 }
+ 
++                if (_exceptions.Count > 0)
++                {
++                    throw new AggregateException(_exceptions);
++                }
++
+                 return completedWork;
+             }
+         }
+@@ -138,7 +145,12 @@ internal void WaitForAllWorkAndComplete()
+ 
+             // Release one thread that will release all the threads when all the elements are processed.
+             _semaphore.Release();
+-            Task.WhenAll(_tasks.ToArray()).GetAwaiter().GetResult();
++            Task.WaitAll(_tasks.ToArray());
++
++            if (_exceptions.Count > 0)
++            {
++                throw new AggregateException(_exceptions);
++            }
+         }
+ 
+         private Task CreateProcessorItemTask()
+@@ -179,7 +191,14 @@ private void ExecuteWorkItem()
+             {
+                 try
+                 {
+-                    TResult _ = workItem.Value;
++                    _ = workItem.Value;
++                }
++                catch (Exception ex)
++                {
++                    lock (_exceptions)
++                    {
++                        _exceptions.Add(ex);
++                    }
+                 }
+                 finally
+                 {

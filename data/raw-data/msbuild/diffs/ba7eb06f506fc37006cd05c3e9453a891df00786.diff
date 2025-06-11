@@ -1,0 +1,331 @@
+diff --git a/src/Build.UnitTests/Graph/IsolateProjects_Tests.cs b/src/Build.UnitTests/Graph/IsolateProjects_Tests.cs
+index 47577ab4e66..951b546a3b4 100644
+--- a/src/Build.UnitTests/Graph/IsolateProjects_Tests.cs
++++ b/src/Build.UnitTests/Graph/IsolateProjects_Tests.cs
+@@ -15,7 +15,7 @@
+ 
+ namespace Microsoft.Build.Experimental.Graph.UnitTests
+ {
+-    public class IsolateProjectsTests
++    public class IsolateProjectsTests : IDisposable
+     {
+         private readonly string _project = @"
+                 <Project DefaultTargets='BuildSelf'>
+@@ -123,12 +123,39 @@ public class IsolateProjectsTests
+                 </Project>";
+ 
+         private readonly ITestOutputHelper _testOutput;
++        private TestEnvironment _env;
++        private BuildParameters _buildParametersPrototype;
+ 
+         public IsolateProjectsTests(ITestOutputHelper testOutput)
+         {
+             _testOutput = testOutput;
++            _env = TestEnvironment.Create(_testOutput);
++
++            if (NativeMethodsShared.IsOSX)
++            {
++                // OSX links /var into /private, which makes Path.GetTempPath() to return "/var..." but Directory.GetCurrentDirectory to return "/private/var..."
++                // this discrepancy fails the msbuild undeclared reference enforcements due to failed path equality checks
++                _env.SetTempPath(Path.Combine(Directory.GetCurrentDirectory(), Guid.NewGuid().ToString("N")), deleteTempDirectory:true);
++            }
++
++            // todo investigate why out of proc builds fail on macos https://github.com/Microsoft/msbuild/issues/3915
++            var disableInProcNode = !NativeMethodsShared.IsOSX;
++
++            _buildParametersPrototype = new BuildParameters
++            {
++                EnableNodeReuse = false,
++                IsolateProjects = true,
++                DisableInProcNode = disableInProcNode
++            };
++        }
++
++        public void Dispose()
++        {
++            _env.Dispose();
+         }
+ 
++        
++
+         [Theory]
+         [InlineData(BuildResultCode.Success, new string[] { })]
+         [InlineData(BuildResultCode.Success, new[] {"BuildSelf"})]
+@@ -352,93 +379,98 @@ private void AssertBuild(
+             Func<string, string> projectReferenceModifier = null,
+             Func<string, string> msbuildOnDeclaredReferenceModifier = null)
+         {
+-            using (var env = TestEnvironment.Create())
+-            using (var buildManager = new BuildManager())
++            var rootProjectFile = _env.CreateFile().Path;
++            var declaredReferenceFile = _env.CreateFile().Path;
++            var undeclaredReferenceFile = _env.CreateFile().Path;
++
++            var projectContents = string.Format(
++                _project.Cleanup(),
++                projectReferenceModifier?.Invoke(declaredReferenceFile) ?? declaredReferenceFile,
++                msbuildOnDeclaredReferenceModifier?.Invoke(declaredReferenceFile) ?? declaredReferenceFile,
++                undeclaredReferenceFile,
++                addContinueOnError
++                    ? "ContinueOnError='WarnAndContinue'"
++                    : string.Empty,
++                excludeReferencesFromConstraints
++                    ? $"{declaredReferenceFile};{undeclaredReferenceFile}"
++                    : string.Empty)
++                .Cleanup();
++
++            File.WriteAllText(rootProjectFile, projectContents);
++            File.WriteAllText(declaredReferenceFile, _declaredReference);
++            File.WriteAllText(undeclaredReferenceFile, _undeclaredReference);
++
++            var buildParameters = _buildParametersPrototype.Clone();
++            buildParameters.IsolateProjects = isolateProjects;
++
++            using (var buildManagerSession = new Helpers.BuildManagerSession(_env, buildParameters))
+             {
+-                if (NativeMethodsShared.IsOSX)
++                if (buildDeclaredReference)
+                 {
+-                    // OSX links /var into /private, which makes Path.GetTempPath() to return "/var..." but Directory.GetCurrentDirectory to return "/private/var..."
+-                    // this discrepancy fails the msbuild undeclared reference enforcements due to failed path equality checks
+-                    env.SetTempPath(Path.Combine(Directory.GetCurrentDirectory(), Guid.NewGuid().ToString("N")), deleteTempDirectory:true);
++                    buildManagerSession.BuildProjectFile(declaredReferenceFile, new[] {"DeclaredReferenceTarget"})
++                        .OverallResult.ShouldBe(BuildResultCode.Success);
+                 }
+ 
+-                var rootProjectFile = env.CreateFile().Path;
+-                var declaredReferenceFile = env.CreateFile().Path;
+-                var undeclaredReferenceFile = env.CreateFile().Path;
+-
+-                var projectContents = string.Format(
+-                    _project.Cleanup(),
+-                    projectReferenceModifier?.Invoke(declaredReferenceFile) ?? declaredReferenceFile,
+-                    msbuildOnDeclaredReferenceModifier?.Invoke(declaredReferenceFile) ?? declaredReferenceFile,
+-                    undeclaredReferenceFile,
+-                    addContinueOnError
+-                        ? "ContinueOnError='WarnAndContinue'"
+-                        : string.Empty,
+-                    excludeReferencesFromConstraints
+-                        ? $"{declaredReferenceFile};{undeclaredReferenceFile}"
+-                        : string.Empty)
+-                    .Cleanup();
+-
+-                File.WriteAllText(rootProjectFile, projectContents);
+-                File.WriteAllText(declaredReferenceFile, _declaredReference);
+-                File.WriteAllText(undeclaredReferenceFile, _undeclaredReference);
+-
+-                var logger = new MockLogger(_testOutput);
+-
+-                // todo investigate why out of proc builds fail on macos https://github.com/Microsoft/msbuild/issues/3915
+-                var disableInProcNode = !NativeMethodsShared.IsOSX;
+-
+-                var buildParameters = new BuildParameters
++                if (buildUndeclaredReference)
+                 {
+-                    IsolateProjects = isolateProjects,
+-                    Loggers = new ILogger[] {logger},
+-                    EnableNodeReuse = false,
+-                    DisableInProcNode = disableInProcNode
+-                };
++                    buildManagerSession.BuildProjectFile(undeclaredReferenceFile, new[] {"UndeclaredReferenceTarget"})
++                        .OverallResult.ShouldBe(BuildResultCode.Success);
++                }
+ 
+-                var rootRequest = new BuildRequestData(
+-                    rootProjectFile,
+-                    new Dictionary<string, string>(),
+-                    MSBuildConstants.CurrentToolsVersion,
+-                    targets,
+-                    null);
++                var result = buildManagerSession.BuildProjectFile(rootProjectFile, targets);
+ 
+-                try
+-                {
+-                    buildManager.BeginBuild(buildParameters);
++                assert(result, buildManagerSession.Logger);
++            }
++        }
+ 
+-                    if (buildDeclaredReference)
+-                    {
+-                        buildManager.BuildRequest(
+-                            new BuildRequestData(
+-                                declaredReferenceFile,
+-                                new Dictionary<string, string>(),
+-                                MSBuildConstants.CurrentToolsVersion,
+-                                new[] {"DeclaredReferenceTarget"},
+-                                null))
+-                            .OverallResult.ShouldBe(BuildResultCode.Success);
+-                    }
++        [Fact]
++        public void SkippedTargetsShouldNotTriggerCacheMissEnforcement()
++        {
++            var referenceFile = _env.CreateFile(
++                "reference",
++                @"
++<Project DefaultTargets=`DefaultTarget` InitialTargets=`InitialTarget`>
+ 
+-                    if (buildUndeclaredReference)
+-                    {
+-                        buildManager.BuildRequest(
+-                            new BuildRequestData(
+-                                undeclaredReferenceFile,
+-                                new Dictionary<string, string>(),
+-                                MSBuildConstants.CurrentToolsVersion,
+-                                new[] {"UndeclaredReferenceTarget"},
+-                                null))
+-                            .OverallResult.ShouldBe(BuildResultCode.Success);
+-                    }
++  <Target Name=`A` Condition=`true == false`/>
+ 
+-                    var result = buildManager.BuildRequest(rootRequest);
++  <Target Name=`DefaultTarget` Condition=`true == false`/>
+ 
+-                    assert(result, logger);
+-                }
+-                finally
+-                {
+-                    buildManager.EndBuild();
+-                }
++  <Target Name=`InitialTarget` Condition=`true == false`/>
++
++</Project>
++".Cleanup()).Path;
++
++            var projectFile = _env.CreateFile(
++                "proj",
++                $@"
++<Project DefaultTargets=`Build`>
++
++  <ItemGroup>
++    <ProjectReference Include=`{referenceFile}` />
++  </ItemGroup>
++
++  <Target Name=`Build`>
++    <MSBuild Projects=`@(ProjectReference)` Targets=`A` />
++    <MSBuild Projects=`@(ProjectReference)` />
++  </Target>
++
++</Project>
++".Cleanup()).Path;
++
++            _buildParametersPrototype.IsolateProjects.ShouldBeTrue();
++
++            using (var buildManagerSession = new Helpers.BuildManagerSession(_env, _buildParametersPrototype))
++            {
++                // seed caches with results from the reference
++                buildManagerSession.BuildProjectFile(referenceFile).OverallResult.ShouldBe(BuildResultCode.Success);
++                buildManagerSession.BuildProjectFile(referenceFile, new []{"A"}).OverallResult.ShouldBe(BuildResultCode.Success);
++
++                buildManagerSession.BuildProjectFile(projectFile).OverallResult.ShouldBe(BuildResultCode.Success);
++
++                buildManagerSession.Logger.WarningCount.ShouldBe(0);
++                buildManagerSession.Logger.ErrorCount.ShouldBe(0);
++                // twice for the initial target, once for A, once for DefaultTarget
++                buildManagerSession.Logger.AssertMessageCount("Previously built successfully", 4);
+             }
+         }
+     }
+diff --git a/src/Shared/UnitTests/ObjectModelHelpers.cs b/src/Shared/UnitTests/ObjectModelHelpers.cs
+index 6bc7ec24cc4..6e9d8d4fa9e 100644
+--- a/src/Shared/UnitTests/ObjectModelHelpers.cs
++++ b/src/Shared/UnitTests/ObjectModelHelpers.cs
+@@ -1881,5 +1881,56 @@ public int GetHashCode(ElementLocation obj)
+                 return obj.Line.GetHashCode() ^ obj.Column.GetHashCode() ^ obj.File.GetHashCode();
+             }
+         }
++
++        internal class BuildManagerSession : IDisposable
++        {
++            private readonly TestEnvironment _env;
++            private readonly BuildManager _buildManager;
++
++            public MockLogger Logger { get; set; }
++
++
++            public BuildManagerSession(
++                TestEnvironment env,
++                BuildParameters buildParametersPrototype = null,
++                bool enableNodeReuse = false,
++                bool shutdownInProcNode = true)
++            {
++                _env = env;
++
++                Logger = new MockLogger(_env.Output);
++                var loggers = new[] {Logger};
++
++                var actualBuildParameters = buildParametersPrototype?.Clone() ?? new BuildParameters();
++
++                actualBuildParameters.Loggers = actualBuildParameters.Loggers == null
++                    ? loggers
++                    : actualBuildParameters.Loggers.Concat(loggers).ToArray();
++
++                actualBuildParameters.ShutdownInProcNodeOnBuildFinish = shutdownInProcNode;
++                actualBuildParameters.EnableNodeReuse = enableNodeReuse;
++
++                _buildManager = new BuildManager();
++                _buildManager.BeginBuild(actualBuildParameters);
++            }
++
++            public BuildResult BuildProjectFile(string projectFile, string[] entryTargets = null)
++            {
++                var buildResult = _buildManager.BuildRequest(
++                    new BuildRequestData(projectFile,
++                        new Dictionary<string, string>(),
++                        MSBuildConstants.CurrentToolsVersion,
++                        entryTargets ?? new string[0],
++                        null));
++
++                return buildResult;
++            }
++
++            public void Dispose()
++            {
++                _buildManager.EndBuild();
++                _buildManager.Dispose();
++            }
++        }
+     }
+ }
+diff --git a/src/Shared/UnitTests/TestEnvironment.cs b/src/Shared/UnitTests/TestEnvironment.cs
+index 65a7cf1a687..939fce406b6 100644
+--- a/src/Shared/UnitTests/TestEnvironment.cs
++++ b/src/Shared/UnitTests/TestEnvironment.cs
+@@ -32,7 +32,7 @@ public partial class TestEnvironment : IDisposable
+         /// </summary>
+         private readonly List<TransientTestState> _variants = new List<TransientTestState>();
+ 
+-        private readonly ITestOutputHelper _output;
++        public ITestOutputHelper Output { get; }
+ 
+         private readonly Lazy<TransientTestFolder> _defaultTestDirectory;
+ 
+@@ -55,7 +55,7 @@ public static TestEnvironment Create(ITestOutputHelper output = null, bool ignor
+ 
+         private TestEnvironment(ITestOutputHelper output)
+         {
+-            _output = output;
++            Output = output;
+             _defaultTestDirectory = new Lazy<TransientTestFolder>(() => CreateFolder());
+             SetDefaultInvariant();
+         }
+@@ -86,7 +86,7 @@ private void Cleanup()
+ 
+                 // Assert invariants
+                 foreach (var item in _invariants)
+-                    item.AssertInvariant(_output);
++                    item.AssertInvariant(Output);
+             }
+         }
+ 
+@@ -294,8 +294,8 @@ public TransientPrintLineDebugger CreatePrintLineDebugger(CommonWriterType write
+         /// Will not work for out of proc nodes since the output writer does not reach into those
+         public TransientPrintLineDebugger CreatePrintLineDebuggerWithTestOutputHelper()
+         {
+-            ErrorUtilities.VerifyThrowInternalNull(_output, nameof(_output));
+-            return WithTransientTestState(new TransientPrintLineDebugger(this, OutPutHelperWriter(_output)));
++            ErrorUtilities.VerifyThrowInternalNull(Output, nameof(Output));
++            return WithTransientTestState(new TransientPrintLineDebugger(this, OutPutHelperWriter(Output)));
+ 
+             CommonWriterType OutPutHelperWriter(ITestOutputHelper output)
+             {

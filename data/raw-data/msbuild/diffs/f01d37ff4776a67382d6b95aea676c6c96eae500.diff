@@ -1,0 +1,148 @@
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+index 310dc29b0f6..8ccd53c4edc 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckCentralContext.cs
+@@ -15,8 +15,11 @@ internal sealed class BuildCheckCentralContext
+ {
+     private readonly IConfigurationProvider _configurationProvider;
+ 
+-    internal BuildCheckCentralContext(IConfigurationProvider configurationProvider)
+-        => _configurationProvider = configurationProvider;
++    public BuildCheckCentralContext(IConfigurationProvider configurationProvider, Action<ICheckContext> removeThrottledChecks)
++    {
++        _configurationProvider = configurationProvider;
++        _removeThrottledChecks = removeThrottledChecks;
++    }
+ 
+     private record CallbackRegistry(
+         List<(CheckWrapper, Action<BuildCheckDataContext<EvaluatedPropertiesCheckData>>)> EvaluatedPropertiesActions,
+@@ -46,6 +49,7 @@ internal void DeregisterCheck(CheckWrapper check)
+ 
+     // In a future we can have callbacks per project as well
+     private readonly CallbackRegistry _globalCallbacks = new();
++    private Action<ICheckContext> _removeThrottledChecks;
+ 
+     // This we can potentially use to subscribe for receiving evaluated props in the
+     //  build event args. However - this needs to be done early on, when checks might not be known yet
+@@ -216,5 +220,7 @@ private void RunRegisteredActions<T>(
+ 
+             checkCallback.Item2(context);
+         }
++
++        _removeThrottledChecks(checkContext);
+     }
+ }
+diff --git a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+index 56c62235728..49bb53dadcc 100644
+--- a/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
++++ b/src/Build/BuildCheck/Infrastructure/BuildCheckManagerProvider.cs
+@@ -75,7 +75,7 @@ internal BuildCheckManager()
+         {
+             _checkRegistry = new List<CheckFactoryContext>();
+             _acquisitionModule = new BuildCheckAcquisitionModule();
+-            _buildCheckCentralContext = new(_configurationProvider);
++            _buildCheckCentralContext = new(_configurationProvider, RemoveThrottledChecks);
+             _buildEventsProcessor = new(_buildCheckCentralContext);
+         }
+ 
+@@ -214,7 +214,7 @@ internal void RegisterCustomCheck(
+                             }
+                         }
+                     }
+-                    RemoveChecks(invalidChecksToRemove, checkContext);
++                    RemoveInvalidChecks(invalidChecksToRemove, checkContext);
+                 }
+             }
+         }
+@@ -315,24 +315,39 @@ private void SetupChecksForNewProject(string projectFullPath, ICheckContext chec
+                 }
+             }
+ 
+-            RemoveChecks(invalidChecksToRemove, checkContext);
++            RemoveInvalidChecks(invalidChecksToRemove, checkContext);
+ 
+             stopwatch.Stop();
+             _tracingReporter.AddNewProjectStats(stopwatch.Elapsed);
+         }
+ 
+-        private void RemoveChecks(List<CheckFactoryContext> checksToRemove, ICheckContext checkContext)
++        private void RemoveInvalidChecks(List<CheckFactoryContext> checksToRemove, ICheckContext checkContext)
+         {
+-            checksToRemove.ForEach(c =>
++            foreach (var checkToRemove in checksToRemove)
+             {
+-                _checkRegistry.Remove(c);
+-                checkContext.DispatchAsCommentFromText(MessageImportance.High, $"Dismounting check '{c.FriendlyName}'");
+-            });
+-            foreach (var checkToRemove in checksToRemove.Select(a => a.MaterializedCheck).Where(a => a != null))
++                checkContext.DispatchAsCommentFromText(MessageImportance.High, $"Dismounting check '{checkToRemove.FriendlyName}'");
++                RemoveCheck(checkToRemove);
++            }
++        }
++
++        public void RemoveThrottledChecks(ICheckContext checkContext)
++        {
++            foreach (var checkToRemove in _checkRegistry.FindAll(c => c.MaterializedCheck?.IsThrottled ?? false))
++            {
++                checkContext.DispatchAsCommentFromText(MessageImportance.Normal, $"Dismounting check '{checkToRemove.FriendlyName}'. The check has exceeded the maximum number of results allowed. Any additional results will not be displayed.");
++                RemoveCheck(checkToRemove);
++            }
++        }
++
++        private void RemoveCheck(CheckFactoryContext checkToRemove)
++        {
++            _checkRegistry.Remove(checkToRemove);
++            
++            if (checkToRemove.MaterializedCheck is not null)
+             {
+-                _buildCheckCentralContext.DeregisterCheck(checkToRemove!);
+-                _tracingReporter.AddCheckStats(checkToRemove!.Check.FriendlyName, checkToRemove.Elapsed);
+-                checkToRemove.Check.Dispose();
++                _buildCheckCentralContext.DeregisterCheck(checkToRemove.MaterializedCheck);
++                _tracingReporter.AddCheckStats(checkToRemove.MaterializedCheck.Check.FriendlyName, checkToRemove.MaterializedCheck.Elapsed);
++                checkToRemove.MaterializedCheck.Check.Dispose();
+             }
+         }
+ 
+diff --git a/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs b/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
+index 48aba457728..5bf47566449 100644
+--- a/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
++++ b/src/Build/BuildCheck/Infrastructure/CheckWrapper.cs
+@@ -28,6 +28,11 @@ internal sealed class CheckWrapper
+     /// </summary>
+     private int _reportsCount = 0;
+ 
++    /// <summary>
++    /// Flags that this check should no more used and be deregistered.
++    /// </summary>
++    public bool IsThrottled = false;
++
+     /// <summary>
+     /// Whether to limit number of reports for the Check.
+     /// </summary>
+@@ -39,6 +44,7 @@ public CheckWrapper(Check check)
+     }
+ 
+     internal Check Check { get; }
++
+     private bool _areStatsInitialized = false;
+ 
+     // Let's optimize for the scenario where users have a single .editorconfig file that applies to the whole solution.
+@@ -72,15 +78,9 @@ internal void ReportResult(BuildCheckResult result, ICheckContext checkContext,
+     {
+         if (_limitReportsNumber)
+         {
+-            if (_reportsCount > MaxReportsNumberPerRule)
+-            {
+-                return;
+-            }
+-
+-            if (_reportsCount == MaxReportsNumberPerRule)
++            if (_reportsCount >= MaxReportsNumberPerRule)
+             {
+-                checkContext.DispatchAsCommentFromText(MessageImportance.Normal, $"The check '{Check.FriendlyName}' has exceeded the maximum number of results allowed. Any additional results will not be displayed.");
+-                _reportsCount++;
++                IsThrottled = true;
+                 return;
+             }
+         }

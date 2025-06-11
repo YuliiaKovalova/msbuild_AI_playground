@@ -1,0 +1,2128 @@
+diff --git a/src/MSBuild/MSBuild/Microsoft.Build.CommonTypes.xsd b/src/MSBuild/MSBuild/Microsoft.Build.CommonTypes.xsd
+index 186e3c18a53..83b48d2558c 100644
+--- a/src/MSBuild/MSBuild/Microsoft.Build.CommonTypes.xsd
++++ b/src/MSBuild/MSBuild/Microsoft.Build.CommonTypes.xsd
+@@ -1869,6 +1869,7 @@ elementFormDefault="qualified">
+     <xs:element name="LangVersion" type="msb:StringPropertyType" substitutionGroup="msb:Property"/>
+     <xs:element name="VBRuntime" type="msb:StringPropertyType" substitutionGroup="msb:Property"/>
+     <xs:element name="Prefer32Bit" type="msb:StringPropertyType" substitutionGroup="msb:Property"/>
++    <xs:element name="PreferNativeArm64" type="msb:StringPropertyType" substitutionGroup="msb:Property"/>
+     <xs:element name="HighEntropyVA" type="msb:StringPropertyType" substitutionGroup="msb:Property"/>
+     <xs:element name="LinkIncremental" type="msb:StringPropertyType" substitutionGroup="msb:Property"/>
+     <xs:element name="ManifestCertificateThumbprint" type="msb:StringPropertyType" substitutionGroup="msb:Property"/>
+diff --git a/src/Tasks.UnitTests/AddToWin32Manifest_Tests.cs b/src/Tasks.UnitTests/AddToWin32Manifest_Tests.cs
+new file mode 100644
+index 00000000000..2de044bbddd
+--- /dev/null
++++ b/src/Tasks.UnitTests/AddToWin32Manifest_Tests.cs
+@@ -0,0 +1,194 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++using System.Runtime.InteropServices;
++using System.Runtime.Versioning;
++using System.Xml;
++using Microsoft.Build.Evaluation;
++using Microsoft.Build.UnitTests;
++using Microsoft.Build.Utilities;
++using Shouldly;
++using Xunit;
++using Xunit.Abstractions;
++
++namespace Microsoft.Build.Tasks.UnitTests
++{
++    public class AddToWin32Manifest_Tests
++    {
++        private static string TestAssetsRootPath { get; } = Path.Combine(
++            Path.GetDirectoryName(typeof(AddToWin32Manifest_Tests).Assembly.Location) ?? AppContext.BaseDirectory,
++            "TestResources",
++            "Manifests");
++
++        private readonly ITestOutputHelper _testOutput;
++
++        public AddToWin32Manifest_Tests(ITestOutputHelper testOutput) => _testOutput = testOutput;
++
++        [Theory]
++        [InlineData("testManifestWithInvalidSupportedArchs.manifest", false)]
++        [InlineData("testManifestWithApplicationDefined.manifest", true)]
++        [InlineData("testManifestSavesTheCurrentNodesPositions.manifest", true)]
++        [InlineData("testManifestNoPrefixes.manifest", true)]
++        [InlineData(null, true)]
++        public void ManifestPopulationCheck(string manifestName, bool expectedResult)
++        {
++            AddToWin32Manifest task = new AddToWin32Manifest()
++            {
++                BuildEngine = new MockEngine(_testOutput)
++            };
++
++            using (TestEnvironment env = TestEnvironment.Create())
++            {
++                var tempOutput = env.CreateFolder().Path;
++                task.OutputDirectory = tempOutput;
++                task.SupportedArchitectures = "amd64 arm64";
++                if (!string.IsNullOrEmpty(manifestName))
++                {
++                    task.ApplicationManifest = new TaskItem(Path.Combine(TestAssetsRootPath, manifestName));
++                }
++
++                var result = task.Execute();
++
++                result.ShouldBe(expectedResult);
++
++                if (result)
++                {
++                    string generatedManifest = task.ManifestPath;
++                    string expectedManifest = Path.Combine(TestAssetsRootPath, $"{manifestName ?? "default.win32manifest"}_expected");
++
++                    XmlDocument expectedDoc = new XmlDocument();
++                    XmlDocument actualDoc = new XmlDocument();
++
++                    expectedDoc.Load(expectedManifest);
++                    actualDoc.Load(generatedManifest);
++
++                    expectedDoc.OuterXml.ShouldBe(actualDoc.OuterXml);
++                    expectedDoc.InnerXml.ShouldBe(actualDoc.InnerXml);
++                }
++            }
++        }
++
++        [SupportedOSPlatform("windows")]
++        [WindowsOnlyTheory]
++        [InlineData(null, true)]
++        [InlineData("buildIn.manifest", true)]
++        [InlineData("testManifestWithValidSupportedArchs.manifest", true)]
++        public void E2EScenarioTests(string manifestName, bool expectedResult)
++        {
++            using (TestEnvironment env = TestEnvironment.Create())
++            {
++                var outputPath = env.CreateFolder().Path;
++                string projectContent = @$"
++                <Project DefaultTargets=""Build"">
++                    <Import Project=""$(MSBuildBinPath)\Microsoft.Common.props"" />
++
++                    <PropertyGroup>
++                        <Platform>AnyCPU</Platform>
++                        <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
++                        <OutputType>Library</OutputType>
++                        <PreferNativeArm64>true</PreferNativeArm64>
++                        <Prefer32Bit>false</Prefer32Bit>
++                        {(!string.IsNullOrEmpty(manifestName) ? $"<ApplicationManifest>{manifestName}</ApplicationManifest>" : "")}
++                        <IntermediateOutputPath>{outputPath}</IntermediateOutputPath>
++                    </PropertyGroup>
++
++                    <Target Name=""Build""/>
++                    <Import Project=""$(MSBuildBinPath)\Microsoft.CSharp.targets"" />
++
++                </Project>
++                ";
++
++                var projectFolder = env.CreateFolder();
++                var projectFile = env.CreateFile(projectFolder, "test.csproj", projectContent).Path;
++
++                // copy application manifest
++                if (!string.IsNullOrEmpty(manifestName))
++                {
++                    File.Copy(Path.Combine(TestAssetsRootPath, manifestName), Path.Combine(projectFolder.Path, manifestName));
++                }
++
++                Project project = ObjectModelHelpers.LoadProjectFileInTempProjectDirectory(projectFile, touchProject: false);
++
++                bool result = project.Build(new MockLogger(_testOutput));
++                result.ShouldBe(expectedResult);
++
++                // #2 - represents the name for native resource (Win 32 resource), #24 - the type (Manifest) 
++                byte[]? actualManifestBytes = AssemblyNativeResourceManager.GetResourceFromExecutable(Path.Combine(outputPath, "test.dll"), "#2", "#24");
++
++                // check manifest content
++                if (actualManifestBytes != null)
++                {
++                    string expectedManifest = Path.Combine(TestAssetsRootPath, $"{manifestName ?? "default.win32manifest"}_expected");
++
++                    XmlDocument expectedDoc = new XmlDocument();
++                    XmlDocument actualDoc = new XmlDocument();
++
++                    expectedDoc.Load(expectedManifest);
++                    using (MemoryStream stream = new MemoryStream(actualManifestBytes))
++                    {
++                        actualDoc.Load(stream);
++                    }
++
++                    NormalizeLineEndings(expectedDoc.OuterXml).ShouldBe(NormalizeLineEndings(actualDoc.OuterXml));
++                    NormalizeLineEndings(expectedDoc.InnerText).ShouldBe(NormalizeLineEndings(actualDoc.InnerText));
++                }
++            }
++
++            static string NormalizeLineEndings(string input) => input.Replace("\r\n", "\n").Replace("\r", "\n");
++        }
++
++        [SupportedOSPlatform("windows")]
++        internal sealed class AssemblyNativeResourceManager
++        {
++            public enum LoadLibraryFlags : uint { LOAD_LIBRARY_AS_DATAFILE = 2 };
++
++            [DllImport("Kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
++            public static extern IntPtr LoadLibrary(string lpFileName, IntPtr hReservedNull, LoadLibraryFlags dwFlags);
++
++            [DllImport("kernel32.dll", SetLastError = true)]
++            public static extern IntPtr FindResource(IntPtr hModule, string lpName, string lpType);
++
++            [DllImport("kernel32.dll", SetLastError = true)]
++            public static extern IntPtr LoadResource(IntPtr hModule, IntPtr hResInfo);
++
++            [DllImport("kernel32.dll", SetLastError = true)]
++            public static extern IntPtr LockResource(IntPtr hResData);
++
++            [DllImport("kernel32.dll", SetLastError = true)]
++            public static extern uint SizeofResource(IntPtr hModule, IntPtr hResInfo);
++
++            public static byte[]? GetResourceFromExecutable(string assembly, string lpName, string lpType)
++            {
++                IntPtr hModule = LoadLibrary(assembly, IntPtr.Zero, LoadLibraryFlags.LOAD_LIBRARY_AS_DATAFILE);
++                try
++                {
++                    if (hModule != IntPtr.Zero)
++                    {
++                        IntPtr hResource = FindResource(hModule, lpName, lpType);
++                        if (hResource != IntPtr.Zero)
++                        {
++                            uint resSize = SizeofResource(hModule, hResource);
++                            IntPtr resData = LoadResource(hModule, hResource);
++                            if (resData != IntPtr.Zero)
++                            {
++                                byte[] uiBytes = new byte[resSize];
++                                IntPtr ipMemorySource = LockResource(resData);
++                                Marshal.Copy(ipMemorySource, uiBytes, 0, (int)resSize);
++
++                                return uiBytes;
++                            }
++                        }
++                    }
++                }
++                finally
++                {
++                    NativeMethodsShared.FreeLibrary(hModule);
++                }
++
++                return null;
++            }
++        }
++    }
++}
+diff --git a/src/Tasks.UnitTests/MSBuildInternalMessage_Tests.cs b/src/Tasks.UnitTests/MSBuildInternalMessage_Tests.cs
+new file mode 100644
+index 00000000000..c03a9e2cde1
+--- /dev/null
++++ b/src/Tasks.UnitTests/MSBuildInternalMessage_Tests.cs
+@@ -0,0 +1,63 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using Microsoft.Build.Evaluation;
++using Microsoft.Build.Shared;
++using Microsoft.Build.UnitTests;
++using Shouldly;
++using Xunit;
++using Xunit.Abstractions;
++
++namespace Microsoft.Build.Tasks.UnitTests
++{
++    public class MSBuildInternalMessage_Tests
++    {
++        private readonly ITestOutputHelper _testOutput;
++
++        public MSBuildInternalMessage_Tests(ITestOutputHelper testOutput) => _testOutput = testOutput;
++
++        [Theory]
++        [InlineData(true, true, "CommonTarget.Prefer32BitAndPreferNativeArm64Enabled", false)]
++        [InlineData(false, false, "CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled", true, new[] { "Release" })]
++        public void E2EScenarioTests(bool prefer32, bool isPlatformAnyCpu, string expectedResourceName, bool isNetWarningExpected, string[]? formatArgs = null)
++        {
++            using (TestEnvironment env = TestEnvironment.Create())
++            {
++                var outputPath = env.CreateFolder().Path;
++                string projectContent = @$"
++                <Project DefaultTargets=""Build"">
++                    <Import Project=""$(MSBuildBinPath)\Microsoft.Common.props"" />
++
++                    <PropertyGroup>
++                        <Platform>{(isPlatformAnyCpu ? "AnyCPU" : "Release")}</Platform>
++                        <OutputType>Library</OutputType>
++                        <PreferNativeArm64>true</PreferNativeArm64>
++                        <Prefer32Bit>{(prefer32 ? "true" : "false")}</Prefer32Bit>
++                    </PropertyGroup>
++
++                    <Target Name=""Build""/>
++                    <Import Project=""$(MSBuildBinPath)\Microsoft.CSharp.targets"" />
++
++                </Project>
++                ";
++
++                var projectFile = env.CreateFile(env.CreateFolder(), "test.csproj", projectContent).Path;
++                Project project = ObjectModelHelpers.LoadProjectFileInTempProjectDirectory(projectFile, touchProject: false);
++
++                string expectedBuildMessage = ResourceUtilities.FormatResourceStringStripCodeAndKeyword(expectedResourceName, formatArgs);
++                MockLogger logger = new MockLogger(_testOutput);
++
++                project.Build(logger);
++
++                if (isNetWarningExpected)
++                {
++                    logger.Warnings[0].RawMessage.ShouldBe(expectedBuildMessage);
++                }
++                else
++                {
++                    logger.Errors[0].RawMessage.ShouldBe(expectedBuildMessage);
++                }
++            }
++        }
++    }
++}
+diff --git a/src/Tasks.UnitTests/Microsoft.Build.Tasks.UnitTests.csproj b/src/Tasks.UnitTests/Microsoft.Build.Tasks.UnitTests.csproj
+index 2c1fca47574..81b5048f0f7 100644
+--- a/src/Tasks.UnitTests/Microsoft.Build.Tasks.UnitTests.csproj
++++ b/src/Tasks.UnitTests/Microsoft.Build.Tasks.UnitTests.csproj
+@@ -152,6 +152,9 @@
+     <None Update="TestResources\lorem.bin">
+       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+     </None>
++    <None Update="TestResources\Manifests\*">
++      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
++    </None>
+     <None Update="TestResources\mycert.pfx">
+       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+     </None>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/buildIn.manifest b/src/Tasks.UnitTests/TestResources/Manifests/buildIn.manifest
+new file mode 100644
+index 00000000000..c8f1c0d76c7
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/buildIn.manifest
+@@ -0,0 +1,69 @@
++﻿<?xml version="1.0" encoding="utf-8"?>
++<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
++    <assemblyIdentity version="1.0.0.0" name="MyApplication.app" />
++    <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
++        <security>
++            <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
++                <!-- UAC Manifest Options
++             If you want to change the Windows User Account Control level replace the 
++             requestedExecutionLevel node with one of the following.
++
++        <requestedExecutionLevel  level="asInvoker" uiAccess="false" />
++        <requestedExecutionLevel  level="requireAdministrator" uiAccess="false" />
++        <requestedExecutionLevel  level="highestAvailable" uiAccess="false" />
++
++            Specifying requestedExecutionLevel element will disable file and registry virtualization. 
++            Remove this element if your application requires this virtualization for backwards
++            compatibility.
++        -->
++                <requestedExecutionLevel level="asInvoker" uiAccess="false" />
++            </requestedPrivileges>
++        </security>
++    </trustInfo>
++    <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
++        <application>
++            <!-- A list of the Windows versions that this application has been tested on
++           and is designed to work with. Uncomment the appropriate elements
++           and Windows will automatically select the most compatible environment. -->
++            <!-- Windows Vista -->
++            <!--<supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}" />-->
++            <!-- Windows 7 -->
++            <!--<supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" />-->
++            <!-- Windows 8 -->
++            <!--<supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" />-->
++            <!-- Windows 8.1 -->
++            <!--<supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" />-->
++            <!-- Windows 10 -->
++            <!--<supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />-->
++        </application>
++    </compatibility>
++    <!-- Indicates that the application is DPI-aware and will not be automatically scaled by Windows at higher
++       DPIs. Windows Presentation Foundation (WPF) applications are automatically DPI-aware and do not need 
++       to opt in. Windows Forms applications targeting .NET Framework 4.6 that opt into this setting, should 
++       also set the 'EnableWindowsFormsHighDpiAutoResizing' setting to 'true' in their app.config. 
++       
++       Makes the application long-path aware. See https://docs.microsoft.com/windows/win32/fileio/maximum-file-path-limitation -->
++    <!--
++  <application xmlns="urn:schemas-microsoft-com:asm.v3">
++    <windowsSettings>
++      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
++      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
++    </windowsSettings>
++  </application>
++  -->
++    <!-- Enable themes for Windows common controls and dialogs (Windows XP and later) -->
++    <!--
++  <dependency>
++    <dependentAssembly>
++      <assemblyIdentity
++          type="win32"
++          name="Microsoft.Windows.Common-Controls"
++          version="6.0.0.0"
++          processorArchitecture="*"
++          publicKeyToken="6595b64144ccf1df"
++          language="*"
++        />
++    </dependentAssembly>
++  </dependency>
++  -->
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/buildIn.manifest_expected b/src/Tasks.UnitTests/TestResources/Manifests/buildIn.manifest_expected
+new file mode 100644
+index 00000000000..08194699912
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/buildIn.manifest_expected
+@@ -0,0 +1,72 @@
++﻿<?xml version="1.0" encoding="utf-8"?>
++<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
++    <assemblyIdentity version="1.0.0.0" name="MyApplication.app" />
++    <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
++        <security>
++            <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
++                <!-- UAC Manifest Options
++             If you want to change the Windows User Account Control level replace the 
++             requestedExecutionLevel node with one of the following.
++
++        <requestedExecutionLevel  level="asInvoker" uiAccess="false" />
++        <requestedExecutionLevel  level="requireAdministrator" uiAccess="false" />
++        <requestedExecutionLevel  level="highestAvailable" uiAccess="false" />
++
++            Specifying requestedExecutionLevel element will disable file and registry virtualization. 
++            Remove this element if your application requires this virtualization for backwards
++            compatibility.
++        -->
++                <requestedExecutionLevel level="asInvoker" uiAccess="false" />
++            </requestedPrivileges>
++        </security>
++    </trustInfo>
++    <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
++        <application>
++            <!-- A list of the Windows versions that this application has been tested on
++           and is designed to work with. Uncomment the appropriate elements
++           and Windows will automatically select the most compatible environment. -->
++            <!-- Windows Vista -->
++            <!--<supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}" />-->
++            <!-- Windows 7 -->
++            <!--<supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" />-->
++            <!-- Windows 8 -->
++            <!--<supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" />-->
++            <!-- Windows 8.1 -->
++            <!--<supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" />-->
++            <!-- Windows 10 -->
++            <!--<supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />-->
++            <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++                <supportedArchitectures>amd64 arm64</supportedArchitectures>
++            </asmv3:windowsSettings>
++        </application>
++    </compatibility>
++    <!-- Indicates that the application is DPI-aware and will not be automatically scaled by Windows at higher
++       DPIs. Windows Presentation Foundation (WPF) applications are automatically DPI-aware and do not need 
++       to opt in. Windows Forms applications targeting .NET Framework 4.6 that opt into this setting, should 
++       also set the 'EnableWindowsFormsHighDpiAutoResizing' setting to 'true' in their app.config. 
++       
++       Makes the application long-path aware. See https://docs.microsoft.com/windows/win32/fileio/maximum-file-path-limitation -->
++    <!--
++  <application xmlns="urn:schemas-microsoft-com:asm.v3">
++    <windowsSettings>
++      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
++      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
++    </windowsSettings>
++  </application>
++  -->
++    <!-- Enable themes for Windows common controls and dialogs (Windows XP and later) -->
++    <!--
++  <dependency>
++    <dependentAssembly>
++      <assemblyIdentity
++          type="win32"
++          name="Microsoft.Windows.Common-Controls"
++          version="6.0.0.0"
++          processorArchitecture="*"
++          publicKeyToken="6595b64144ccf1df"
++          language="*"
++        />
++    </dependentAssembly>
++  </dependency>
++  -->
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/default.win32manifest_expected b/src/Tasks.UnitTests/TestResources/Manifests/default.win32manifest_expected
+new file mode 100644
+index 00000000000..d48062a4e72
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/default.win32manifest_expected
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <assemblyIdentity version="1.0.0.0" name="MyApplication.app"/>
++  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
++    <security>
++      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
++        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
++      </requestedPrivileges>
++    </security>
++  </trustInfo>
++  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++      <supportedArchitectures>amd64 arm64</supportedArchitectures>
++    </asmv3:windowsSettings>
++  </asmv3:application>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestNoPrefixes.manifest b/src/Tasks.UnitTests/TestResources/Manifests/testManifestNoPrefixes.manifest
+new file mode 100644
+index 00000000000..70349317bc2
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestNoPrefixes.manifest
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++    <application xmlns="urn:schemas-microsoft-com:asm.v3">
++        <windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++            <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
++            <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
++        </windowsSettings>
++    </application>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestNoPrefixes.manifest_expected b/src/Tasks.UnitTests/TestResources/Manifests/testManifestNoPrefixes.manifest_expected
+new file mode 100644
+index 00000000000..3c8e87cc046
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestNoPrefixes.manifest_expected
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++    <application xmlns="urn:schemas-microsoft-com:asm.v3">
++        <windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++            <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
++            <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
++            <supportedArchitectures>amd64 arm64</supportedArchitectures>
++        </windowsSettings>
++    </application>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestSavesTheCurrentNodesPositions.manifest b/src/Tasks.UnitTests/TestResources/Manifests/testManifestSavesTheCurrentNodesPositions.manifest
+new file mode 100644
+index 00000000000..4c722f2df60
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestSavesTheCurrentNodesPositions.manifest
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++    </asmv3:windowsSettings>
++  </asmv3:application>
++  <testNode>
++    <nestedTest>test</nestedTest>   
++  </testNode>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestSavesTheCurrentNodesPositions.manifest_expected b/src/Tasks.UnitTests/TestResources/Manifests/testManifestSavesTheCurrentNodesPositions.manifest_expected
+new file mode 100644
+index 00000000000..5213064fcba
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestSavesTheCurrentNodesPositions.manifest_expected
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++    <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++        <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++            <supportedArchitectures>amd64 arm64</supportedArchitectures>
++        </asmv3:windowsSettings>
++    </asmv3:application>
++    <testNode>
++        <nestedTest>test</nestedTest>
++    </testNode>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithApplicationDefined.manifest b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithApplicationDefined.manifest
+new file mode 100644
+index 00000000000..bc8eb93d98a
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithApplicationDefined.manifest
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++    </asmv3:windowsSettings>
++  </asmv3:application>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithApplicationDefined.manifest_expected b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithApplicationDefined.manifest_expected
+new file mode 100644
+index 00000000000..7d2897b86ab
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithApplicationDefined.manifest_expected
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++       <supportedArchitectures>amd64 arm64</supportedArchitectures>
++    </asmv3:windowsSettings>
++  </asmv3:application>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithInvalidSupportedArchs.manifest b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithInvalidSupportedArchs.manifest
+new file mode 100644
+index 00000000000..951ab4c1734
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithInvalidSupportedArchs.manifest
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++      <supportedArchitectures>dummy</supportedArchitectures>
++    </asmv3:windowsSettings>
++  </asmv3:application>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithValidSupportedArchs.manifest b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithValidSupportedArchs.manifest
+new file mode 100644
+index 00000000000..2662a0c776d
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithValidSupportedArchs.manifest
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++      <supportedArchitectures>amd64 arm64</supportedArchitectures>
++      <test></test>
++    </asmv3:windowsSettings>
++  </asmv3:application>
++</assembly>
+diff --git a/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithValidSupportedArchs.manifest_expected b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithValidSupportedArchs.manifest_expected
+new file mode 100644
+index 00000000000..2662a0c776d
+--- /dev/null
++++ b/src/Tasks.UnitTests/TestResources/Manifests/testManifestWithValidSupportedArchs.manifest_expected
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
++    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
++      <supportedArchitectures>amd64 arm64</supportedArchitectures>
++      <test></test>
++    </asmv3:windowsSettings>
++  </asmv3:application>
++</assembly>
+diff --git a/src/Tasks/AddToWin32Manifest.cs b/src/Tasks/AddToWin32Manifest.cs
+new file mode 100644
+index 00000000000..50aeaba4434
+--- /dev/null
++++ b/src/Tasks/AddToWin32Manifest.cs
+@@ -0,0 +1,252 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++using System.Text;
++using System.Xml;
++
++using Microsoft.Build.Framework;
++using Microsoft.Build.Shared;
++using Microsoft.Build.Tasks.Deployment.ManifestUtilities;
++using Microsoft.Build.Utilities;
++
++namespace Microsoft.Build.Tasks
++{
++    /// <summary>
++    /// Generates an application manifest or adds an entry to the existing one when PreferNativeArm64 property is true.
++    /// </summary>
++    public sealed class AddToWin32Manifest : TaskExtension
++    {
++        private const string supportedArchitectures = "supportedArchitectures";
++        private const string windowsSettings = "windowsSettings";
++        private const string application = "application";
++        private const string asmv3Prefix = "asmv3";
++        private const string DefaultManifestName = "default.win32manifest";
++        private const string WindowsSettingsNamespace = "http://schemas.microsoft.com/SMI/2024/WindowsSettings";
++
++        private string _outputDirectory = string.Empty;
++        private string _supportedArchitectures = string.Empty;
++        private string _generatedManifestFullPath = string.Empty;
++
++        /// <summary>
++        /// Represents the result of validating an application manifest.
++        /// </summary>
++        private enum ManifestValidationResult
++        {
++            /// <summary>
++            /// The manifest validation was successful.
++            /// </summary>
++            Success = 1,
++
++            /// <summary>
++            /// The manifest validation failed.
++            /// </summary>
++            Failure,
++
++            /// <summary>
++            /// The supported architectures exist in the manifest with the expected value.
++            /// </summary>
++            SupportedArchitecturesExists,
++        }
++
++        /// <summary>
++        /// Existing application manifest.
++        /// </summary>
++        public ITaskItem? ApplicationManifest { get; set; }
++
++        /// <summary>
++        /// Intermediate output directory.
++        /// </summary>
++        [Required]
++        public string OutputDirectory
++        {
++            get => _outputDirectory;
++            set => _outputDirectory = value ?? throw new ArgumentNullException(nameof(OutputDirectory));
++        }
++
++        /// <summary>
++        /// Value for supportedArchitectures node.
++        /// </summary>
++        [Required]
++        public string SupportedArchitectures
++        {
++            get => _supportedArchitectures;
++            set => _supportedArchitectures = value ?? throw new ArgumentNullException(nameof(SupportedArchitectures));
++        }
++
++        /// <summary>
++        /// Returns path to the generated manifest.
++        /// </summary>
++        [Output]
++        public string ManifestPath
++        {
++            get => _generatedManifestFullPath;
++            private set => _generatedManifestFullPath = value;
++        }
++
++        private string? GetManifestPath()
++        {
++            if (ApplicationManifest != null)
++            {
++                if (string.IsNullOrEmpty(ApplicationManifest.ItemSpec) || !File.Exists(ApplicationManifest?.ItemSpec))
++                {
++                    Log.LogErrorWithCodeFromResources(null, ApplicationManifest?.ItemSpec, 0, 0, 0, 0, "AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound");
++                    return null;
++                }
++
++                return ApplicationManifest!.ItemSpec;
++            }
++
++            string? defaultManifestPath = ToolLocationHelper.GetPathToDotNetFrameworkFile(DefaultManifestName, TargetDotNetFrameworkVersion.Version46);
++
++            return defaultManifestPath;
++        }
++
++        private Stream? GetManifestStream(string? path)
++        {
++            // The logic for getting default manifest is similar to the one from Roslyn:
++            // If Roslyn logic returns null, we fall back to reading embedded manifest.
++            return path is null
++                    ? typeof(AddToWin32Manifest).Assembly.GetManifestResourceStream($"Microsoft.Build.Tasks.Resources.{DefaultManifestName}")
++                    : File.OpenRead(path);
++        }
++
++        public override bool Execute()
++        {
++            string? manifestPath = GetManifestPath();
++            try
++            {
++                using Stream? stream = GetManifestStream(manifestPath);
++
++                if (stream is null)
++                {
++                    Log.LogErrorWithCodeFromResources(null, manifestPath, 0, 0, 0, 0, "AddToWin32Manifest.ManifestCanNotBeOpened");
++
++                    return !Log.HasLoggedErrors;
++                }
++
++                XmlDocument document = LoadManifest(stream);
++                XmlNamespaceManager xmlNamespaceManager = XmlNamespaces.GetNamespaceManager(document.NameTable);
++
++                ManifestValidationResult validationResult = ValidateManifest(manifestPath, document, xmlNamespaceManager);
++
++                switch (validationResult)
++                {
++                    case ManifestValidationResult.Success:
++                        AddSupportedArchitecturesElement(document, xmlNamespaceManager);
++                        SaveManifest(document, Path.GetFileName(ApplicationManifest?.ItemSpec) ?? DefaultManifestName);
++                        return !Log.HasLoggedErrors;
++                    case ManifestValidationResult.SupportedArchitecturesExists:
++                        return !Log.HasLoggedErrors;
++                    case ManifestValidationResult.Failure:
++                        return !Log.HasLoggedErrors;
++                    default:
++                        return false;
++                }
++            }
++            catch (Exception ex)
++            {
++                Log.LogErrorWithCodeFromResources(null, manifestPath, 0, 0, 0, 0, "AddToWin32Manifest.ManifestCanNotBeOpenedWithException", ex.Message);
++
++                return !Log.HasLoggedErrors;
++            }
++        }
++
++        private XmlDocument LoadManifest(Stream stream)
++        {
++            XmlDocument document = new XmlDocument();
++
++            using (XmlReader xr = XmlReader.Create(stream, new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore, CloseInput = true }))
++            {
++                document.Load(xr);
++            }
++
++            return document;
++        }
++
++        private void SaveManifest(XmlDocument document, string manifestName)
++        {
++            ManifestPath = Path.Combine(OutputDirectory, manifestName);
++            using (var xmlWriter = new XmlTextWriter(ManifestPath, Encoding.UTF8))
++            {
++                xmlWriter.Formatting = Formatting.Indented;
++                xmlWriter.Indentation = 4;
++                document.Save(xmlWriter);
++            }
++        }
++
++        private ManifestValidationResult ValidateManifest(string? manifestPath, XmlDocument document, XmlNamespaceManager xmlNamespaceManager)
++        {
++            if (ApplicationManifest == null)
++            {
++                return ManifestValidationResult.Success;
++            }
++
++            XmlNode? assemblyNode = document.SelectSingleNode(XPaths.assemblyElement, xmlNamespaceManager);
++
++            if (assemblyNode is null)
++            {
++                Log.LogErrorWithCodeFromResources(null, manifestPath, 0, 0, 0, 0, "AddToWin32Manifest.AssemblyNodeIsMissed");
++                return ManifestValidationResult.Failure;
++            }
++
++            XmlNode? supportedArchitecturesNode = GetNode(assemblyNode, supportedArchitectures, xmlNamespaceManager);
++            if (supportedArchitecturesNode != null)
++            {
++                if (!string.Equals(supportedArchitecturesNode.InnerText.Trim(), SupportedArchitectures, StringComparison.OrdinalIgnoreCase))
++                {
++                    Log.LogErrorWithCodeFromResources(null, manifestPath, 0, 0, 0, 0, "AddToWin32Manifest.InvalidValueInSupportedArchitectures", supportedArchitecturesNode.InnerText);
++
++                    return ManifestValidationResult.Failure;
++                }
++
++                return ManifestValidationResult.SupportedArchitecturesExists;
++            }
++
++            return ManifestValidationResult.Success;
++        }
++
++        private void AddSupportedArchitecturesElement(XmlDocument document, XmlNamespaceManager xmlNamespaceManager)
++        {
++            XmlNode? assemblyNode = document.SelectSingleNode(XPaths.assemblyElement, xmlNamespaceManager);
++            XmlElement appNode = GetOrCreateXmlElement(document, xmlNamespaceManager, application, asmv3Prefix, XmlNamespaces.asmv3);
++            XmlElement winSettingsNode = GetOrCreateXmlElement(document, xmlNamespaceManager, windowsSettings, asmv3Prefix, XmlNamespaces.asmv3);
++            if (string.IsNullOrEmpty(winSettingsNode.GetAttribute(XMakeAttributes.xmlns)))
++            {
++                winSettingsNode.SetAttribute(XMakeAttributes.xmlns, WindowsSettingsNamespace);
++            }
++
++            XmlElement supportedArchitecturesNode = GetOrCreateXmlElement(document, xmlNamespaceManager, supportedArchitectures, namespaceURI: WindowsSettingsNamespace);
++            supportedArchitecturesNode.InnerText = SupportedArchitectures;
++            winSettingsNode.AppendChild(supportedArchitecturesNode);
++
++            // If ParentNode is null, this indicates that winSettingsNode was not a part of the manifest.
++            if (winSettingsNode.ParentNode == null)
++            {
++                appNode.AppendChild(winSettingsNode);
++            }
++
++            if (appNode.ParentNode == null)
++            {
++                assemblyNode!.AppendChild(appNode);
++            }
++        }
++
++        private XmlElement GetOrCreateXmlElement(XmlDocument document, XmlNamespaceManager xmlNamespaceManager, string localName, string prefix = "", string namespaceURI = "")
++        {
++            XmlNode? existingNode = GetNode(document, localName, xmlNamespaceManager);
++
++            if (existingNode is XmlElement element)
++            {
++                return element;
++            }
++
++            return !string.IsNullOrEmpty(prefix)
++                ? document.CreateElement(prefix, localName, namespaceURI)
++                : document.CreateElement(localName, namespaceURI);
++        }
++
++        private XmlNode? GetNode(XmlNode node, string localName, XmlNamespaceManager xmlNamespaceManager) => node.SelectSingleNode($"//*[local-name()='{localName}']", xmlNamespaceManager);
++    }
++}
+diff --git a/src/Tasks/MSBuildInternalMessage.cs b/src/Tasks/MSBuildInternalMessage.cs
+new file mode 100644
+index 00000000000..0595e286179
+--- /dev/null
++++ b/src/Tasks/MSBuildInternalMessage.cs
+@@ -0,0 +1,84 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using Microsoft.Build.Framework;
++
++namespace Microsoft.Build.Tasks
++{
++    /// <summary>
++    /// Represents a task that produces localized messages based on the specified resource name.
++    /// This task is intended to be called from internal targets only.
++    /// </summary>
++    public sealed class MSBuildInternalMessage : TaskExtension
++    {
++        private enum BuildMessageSeverity
++        {
++            /// <summary>
++            /// Indicates that the message corresponds to build information.
++            /// </summary>
++            Message,
++
++            /// <summary>
++            /// Indicates that the message corresponds to a build warning.
++            /// </summary>
++            Warning,
++
++            /// <summary>
++            /// Indicates that the message corresponds to a build error.
++            /// </summary>
++            Error,
++        }
++
++        /// <summary>
++        /// The name of the resource in Strings.resx that contains the desired error message.
++        /// </summary>
++        [Required]
++        public string ResourceName { get; set; } = string.Empty;
++
++        /// <summary>
++        /// Resource arguments to be used in the format string.
++        /// </summary>
++        public string[] FormatArguments { get; set; } = [];
++
++        /// <summary>
++        /// <see cref="BuildMessageSeverity"/>.
++        /// </summary>
++        [Required]
++        public string Severity { set; get; } = string.Empty;
++
++        /// <summary>
++        /// Configurable message importance.
++        /// </summary>
++        public string MessageImportance { get; set; } = "Normal";
++
++        public override bool Execute()
++        {
++            if (Enum.TryParse(Severity, ignoreCase: true, out BuildMessageSeverity severity))
++            {
++                switch (severity)
++                {
++                    case BuildMessageSeverity.Error:
++                        Log.LogErrorWithCodeFromResources(ResourceName, FormatArguments);
++                        return !Log.HasLoggedErrors;
++
++                    case BuildMessageSeverity.Warning:
++                        Log.LogWarningWithCodeFromResources(ResourceName, FormatArguments);
++                        return !Log.HasLoggedErrors;
++
++                    case BuildMessageSeverity.Message:
++                        MessageImportance importance = (MessageImportance)Enum.Parse(typeof(MessageImportance), MessageImportance, true);
++                        Log.LogMessageFromResources(importance, ResourceName, FormatArguments);
++                        return !Log.HasLoggedErrors;
++
++                    default:
++                        return !Log.HasLoggedErrors;
++                }
++            }
++
++            Log.LogErrorFromResources("CommonTarget.SpecifiedSeverityDoesNotExist", Severity);
++
++            return !Log.HasLoggedErrors;
++        }
++    }
++}
+diff --git a/src/Tasks/ManifestUtil/XmlNamespaces.cs b/src/Tasks/ManifestUtil/XmlNamespaces.cs
+index 033c1f4006c..bccdf44abf6 100644
+--- a/src/Tasks/ManifestUtil/XmlNamespaces.cs
++++ b/src/Tasks/ManifestUtil/XmlNamespaces.cs
+@@ -25,6 +25,7 @@ public static XmlNamespaceManager GetNamespaceManager(XmlNameTable nameTable)
+             nsmgr.AddNamespace("dsig", dsig);
+             nsmgr.AddNamespace("xrml", xrml);
+             nsmgr.AddNamespace("xsi", xsi);
++
+             return nsmgr;
+         }
+     }
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index 3012b0ef44e..5bdaff55739 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -258,7 +258,9 @@
+     <Compile Include="Move.cs" />
+     <Compile Include="MSBuild.cs" />
+     <Compile Include="NativeMethods.cs" />
++    <Compile Include="MSBuildInternalMessage.cs" />
+     <Compile Include="ParserState.cs" />
++    <Compile Include="AddToWin32Manifest.cs" />
+     <Compile Include="RedistList.cs" />
+     <Compile Include="RemoveDir.cs" />
+     <Compile Include="ResGenDependencies.cs" />
+@@ -484,6 +486,8 @@
+       <LogicalName>$(AssemblyName).Strings.ManifestUtilities.resources</LogicalName>
+       <SubType>Designer</SubType>
+     </EmbeddedResource>
++    <!-- The manifest is needed when PreferNativeArm64 is enabled in Unix environments. -->
++    <EmbeddedResource Include="Resources\default.win32manifest" />
+     <!-- Other Source Files -->
+     <EmbeddedResource Include="ManifestUtil\manifest.xml">
+       <LogicalName>Microsoft.Build.Tasks.Deployment.ManifestUtilities.manifest.xml</LogicalName>
+@@ -654,6 +658,9 @@
+     <!-- Needed by Xaml Task Factory -->
+     <Reference Include="System.Xaml" />
+   </ItemGroup>
++  <ItemGroup>
++    <None Include="Resources\default.win32manifest" />
++  </ItemGroup>
+   <ItemGroup>
+     <ProjectReference Include="..\Framework\Microsoft.Build.Framework.csproj" SetTargetFramework="TargetFramework=netstandard2.0" OutputItemType="NetstandardRefAssemblies" />
+     <ProjectReference Include="..\Utilities\Microsoft.Build.Utilities.csproj" SetTargetFramework="TargetFramework=netstandard2.0" OutputItemType="NetstandardRefAssemblies" />
+diff --git a/src/Tasks/Microsoft.Common.CurrentVersion.targets b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+index 5e81c64c525..4080585a710 100644
+--- a/src/Tasks/Microsoft.Common.CurrentVersion.targets
++++ b/src/Tasks/Microsoft.Common.CurrentVersion.targets
+@@ -427,6 +427,11 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     <_WindowsMetadataOutputPath>$(OutDir)$(WinMDExpOutputWindowsMetadataFilename)</_WindowsMetadataOutputPath>
+   </PropertyGroup>
+ 
++  <!-- ARM64-related properties -->
++  <PropertyGroup>
++    <_SupportedArchitectures>amd64 arm64</_SupportedArchitectures>
++  </PropertyGroup>
++
+   <ItemGroup>
+     <!-- Create an item for entry point of the ClickOnce application (Example: WindowsApplication1.exe) -->
+     <_DeploymentManifestEntryPoint Include="@(IntermediateAssembly)">
+@@ -854,6 +859,12 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       <PlatformTargetAsMSBuildArchitecture>x86</PlatformTargetAsMSBuildArchitecture>
+     </PropertyGroup>
+ 
++    <MSBuildInternalMessage Condition=" '$(Prefer32Bit)' == 'true' and '$(PreferNativeArm64)' == 'true' " ResourceName="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled" Severity="Error"/>
++
++    <MSBuildInternalMessage Condition=" '$(NoWin32Manifest)' == 'true' and '$(PreferNativeArm64)' == 'true' " ResourceName="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled" Severity="Error"/>
++
++    <MSBuildInternalMessage Condition=" '$(PreferNativeArm64)' == 'true' and '$(Platform)' != 'AnyCPU' " ResourceName="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled" Severity="Warning" FormatArguments="$(Platform)" />
++
+     <!--
+       Log an error if the user set MSBuildProjectExtensionsPath in the body of a project. In an SDK style project
+       if you set a value in the body, the value is not used by the top implicit import but is used by the bottom.
+@@ -3600,6 +3611,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       ResolveReferences;
+       ResolveKeySource;
+       SetWin32ManifestProperties;
++      _SetPreferNativeArm64Win32ManifestProperties;
+       FindReferenceAssembliesForReferences;
+       _GenerateCompileInputs;
+       BeforeCompile;
+@@ -4139,12 +4151,40 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+       <Win32Manifest>$(ApplicationManifest)</Win32Manifest>
+     </PropertyGroup>
+ 
+-    <GetFrameworkPath Condition="'$(ApplicationManifest)'=='' and '$(NoWin32Manifest)'!='true'">
++    <!-- If PreferNativeArm64 is enabled, it searches for the same default.win32manifest  -->
++    <GetFrameworkPath Condition="'$(ApplicationManifest)'=='' and '$(NoWin32Manifest)'!='true' and '$(PreferNativeArm64)' != 'true'">
+       <Output TaskParameter="FrameworkVersion40Path"  PropertyName="_FrameworkVersion40Path" />
+     </GetFrameworkPath>
+ 
+     <PropertyGroup>
+-      <EmbeddedWin32Manifest  Condition="'$(ApplicationManifest)'=='' and '$(NoWin32Manifest)'!='true' and Exists('$(_FrameworkVersion40Path)\default.win32manifest')">$(_FrameworkVersion40Path)\default.win32manifest</EmbeddedWin32Manifest>
++      <EmbeddedWin32Manifest Condition="'$(ApplicationManifest)'=='' and '$(NoWin32Manifest)'!='true' and '$(PreferNativeArm64)' != 'true' and Exists('$(_FrameworkVersion40Path)\default.win32manifest')">$(_FrameworkVersion40Path)\default.win32manifest</EmbeddedWin32Manifest>
++    </PropertyGroup>
++
++  </Target>
++
++  <!--
++    ============================================================
++                                        _SetPreferNativeArm64Win32ManifestProperties
++
++    Populates Manifest with SupportedArchitectures and updates Win32Manifest property to be used later in the build.
++    ============================================================
++    -->
++
++  <Target
++      Name="_SetPreferNativeArm64Win32ManifestProperties"
++      Condition=" '$(PreferNativeArm64)'=='true' and '$(NoWin32Manifest)'!='true'"
++      DependsOnTargets="SetWin32ManifestProperties">
++
++    <AddToWin32Manifest
++      ApplicationManifest="$(Win32Manifest)"
++      OutputDirectory="$(IntermediateOutputPath)"
++      SupportedArchitectures="$(_SupportedArchitectures)">
++
++      <Output TaskParameter="ManifestPath" PropertyName="_Win32Manifest"/>
++    </AddToWin32Manifest>
++
++    <PropertyGroup>
++      <Win32Manifest Condition="'$(_Win32Manifest)' != ''">$(_Win32Manifest)</Win32Manifest>
+     </PropertyGroup>
+ 
+   </Target>
+@@ -4294,6 +4334,13 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+ 
+     </GenerateApplicationManifest>
+ 
++    <AddToWin32Manifest
++        Condition="'$(PreferNativeArm64)'=='true'"
++        ApplicationManifest="@(ApplicationManifest)"
++        OutputDirectory="$(IntermediateOutputPath)"
++        SupportedArchitectures="$(_SupportedArchitectures)">
++    </AddToWin32Manifest>
++
+     <PropertyGroup>
+       <_DeploymentCopyApplicationManifest>true</_DeploymentCopyApplicationManifest>
+     </PropertyGroup>
+diff --git a/src/Tasks/Microsoft.Common.tasks b/src/Tasks/Microsoft.Common.tasks
+index cf67254502d..35018eb1918 100644
+--- a/src/Tasks/Microsoft.Common.tasks
++++ b/src/Tasks/Microsoft.Common.tasks
+@@ -8,6 +8,7 @@
+ 
+   <!-- NOTE: Using the fully qualified class name in a <UsingTask> tag is faster than using a partially qualified name. -->
+ 
++  <UsingTask TaskName="Microsoft.Build.Tasks.AddToWin32Manifest"                    AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.AL"                                    AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.AspNetCompiler"                        AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.AssignCulture"                         AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+@@ -62,6 +63,7 @@
+   <UsingTask TaskName="Microsoft.Build.Tasks.Message"                               AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.Move"                                  AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.MSBuild"                               AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
++  <UsingTask TaskName="Microsoft.Build.Tasks.MSBuildInternalMessage"                AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+   <UsingTask TaskName="Microsoft.Build.Tasks.ReadLinesFromFile"                     AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+ 
+   <UsingTask TaskName="Microsoft.Build.Tasks.RegisterAssembly"                      AssemblyName="Microsoft.Build.Tasks.Core, Version=15.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" Condition="'$(MSBuildRuntimeType)' == 'Core' or '$(DisableOutOfProcTaskHost)' != ''" />
+diff --git a/src/Tasks/Microsoft.NETFramework.CurrentVersion.props b/src/Tasks/Microsoft.NETFramework.CurrentVersion.props
+index 0f03f04dfef..8fe39f32479 100644
+--- a/src/Tasks/Microsoft.NETFramework.CurrentVersion.props
++++ b/src/Tasks/Microsoft.NETFramework.CurrentVersion.props
+@@ -83,7 +83,7 @@ Copyright (C) Microsoft Corporation. All rights reserved.
+     <TargetedRuntimeVersion Condition="'$(TargetedRuntimeVersion)' == ''">v$(MSBuildRuntimeVersion)</TargetedRuntimeVersion>
+   </PropertyGroup>
+ 
+-  <PropertyGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework' and '$(TargetingClr2Framework)' != 'true' and '$(TargetFrameworkVersion)' != 'v4.0' and ('$(OutputType)' == 'exe' or '$(OutputType)' == 'winexe' or '$(OutputType)' == 'appcontainerexe' or '$(OutputType)' == '')">
++  <PropertyGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework' and '$(TargetingClr2Framework)' != 'true' and '$(TargetFrameworkVersion)' != 'v4.0' and ('$(OutputType)' == 'exe' or '$(OutputType)' == 'winexe' or '$(OutputType)' == 'appcontainerexe' or '$(OutputType)' == '') and '$(PreferNativeArm64)' != 'true'">
+     <Prefer32Bit Condition="'$(Prefer32Bit)' == ''">true</Prefer32Bit>
+   </PropertyGroup>
+ 
+diff --git a/src/Tasks/Resources/Strings.resx b/src/Tasks/Resources/Strings.resx
+index a969d1dc8de..7761f84804a 100644
+--- a/src/Tasks/Resources/Strings.resx
++++ b/src/Tasks/Resources/Strings.resx
+@@ -2621,7 +2621,7 @@
+     <value>MSB3781: The SDK "{0}" depends on the following SDK(s) {1}, which have not been added to the project or were not found. Please ensure that you add these dependencies to your project or you may experience runtime issues. You can add dependencies to your project through the Reference Manager.</value>
+     <comment>{StrBegin="MSB3781: "}</comment>
+    </data>
+-    <data name="ResolveSDKReference.Prefer32BitNotSupportedWithNeutralProject" xml:space="preserve">
++   <data name="ResolveSDKReference.Prefer32BitNotSupportedWithNeutralProject" xml:space="preserve">
+     <value>MSB3782: The "{0}" SDK does not support targeting a neutral architecture with "Prefer 32-Bit" enabled for the project. Please go to the project properties (Build tab for C# and Compile tab for VB) and disable the "Prefer 32-bit" option, or change your project to target a non-neutral architecture.</value>
+     <comment>{StrBegin="MSB3782: "} Also, please localize "Prefer 32-Bit" in the same way that it is localized in wizard\vbdesigner\designer\proppages\buildproppage.resx</comment>
+    </data>
+@@ -3013,6 +3013,47 @@
+     <value>MSB3992: '{0}' is not set. When {1} is true, make sure to set a value for '{0}'.</value>
+     <comment>{StrBegin="MSB3992: "}</comment>
+   </data>
++
++  <!--
++        MSB4300 - MSB4310   Task: AddToWin32Manifest
++  -->
++  <data name="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++    <value>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</value>
++    <comment>{StrBegin="MSB4300: "}</comment>
++  </data>
++  <data name="AddToWin32Manifest.AssemblyNodeIsMissed">
++    <value>The assembly element is missing from the application manifest.</value>
++  </data>
++  <data name="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++    <value>The application manifest file cannot be found. Please make sure it exists.</value>
++  </data>
++  <data name="AddToWin32Manifest.ManifestCanNotBeOpened">
++    <value>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</value>
++  </data>
++  <data name="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++    <value>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</value>
++  </data>
++
++  <!--
++        MSB9901 - MSB9990   MSBuild common targets messages
++  -->
++  <data name="CommonTarget.SpecifiedSeverityDoesNotExist">
++    <value>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</value>
++    <comment>{StrBegin="MSB9901: "}</comment>
++  </data>
++  <data name="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++    <value>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</value>
++    <comment>{StrBegin="MSB9902: "}</comment>
++  </data>
++  <data name="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++    <value>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</value>
++    <comment>{StrBegin="MSB9903: "}</comment>
++  </data>
++  <data name="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++    <value>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</value>
++    <comment>{StrBegin="MSB9904: "}</comment>
++  </data>
++
+   <!--
+         The tasks message bucket is: MSB3001 - MSB3999
+ 
+@@ -3100,9 +3141,12 @@
+             MSB3971 - MSB3980   Task: GetReferenceAssemblyPaths overflow
+             MSB3981 - MSB3990   Task: GetCompatiblePlatform
+             MSB3991 - MSB3999   Task: CombineTargetFrameworkInfoProperties
++            MSB4300 - MSB4310   Task: AddToWin32Manifest
+ 
+             MSB4000 - MSB4200   Portable targets & tasks (vsproject\flavors\portable\msbuild)
+             MSB9000 - MSB9900   MSBuild targets files (C++)
++            
++            MSB9901 - MSB9990   MSBuild common targets messages
+ 
+         The following codes are not longer used but have shipped so should not be reused:
+             MSB3109
+diff --git a/src/Tasks/Resources/default.win32manifest b/src/Tasks/Resources/default.win32manifest
+new file mode 100644
+index 00000000000..f8f55e0a44e
+--- /dev/null
++++ b/src/Tasks/Resources/default.win32manifest
+@@ -0,0 +1,12 @@
++﻿<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <assemblyIdentity version="1.0.0.0" name="MyApplication.app"/>
++  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
++    <security>
++      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
++        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
++      </requestedPrivileges>
++    </security>
++  </trustInfo>
++</assembly>
+\ No newline at end of file
+diff --git a/src/Tasks/Resources/xlf/Strings.cs.xlf b/src/Tasks/Resources/xlf/Strings.cs.xlf
+index b4fc18d7e3f..3fa9306a389 100644
+--- a/src/Tasks/Resources/xlf/Strings.cs.xlf
++++ b/src/Tasks/Resources/xlf/Strings.cs.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="cs" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">Nebylo nalezeno požadované pole oldVersion pro element BindingRedirect.</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: Hodnota {0} není nastaven. Pokud {1} má hodnotu true, nezapomeňte nastavit hodnotu pro {0}.</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: Závažná chyba: víc než {0} argumentů příkazového řádku</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">Vlastnost StopOnFirstFailure nebude mít žádný účinek, jsou-li splněny všechny následující podmínky: 1) systém pracuje v režimu více procesů, 2) vlastnost BuildInParallel má hodnotu True, 3) vlastnost RunEachTargetSeparately má hodnotu False.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: Nelze číst řádky ze souboru {0}. {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.de.xlf b/src/Tasks/Resources/xlf/Strings.de.xlf
+index a185f1c58dc..fd521e44f5b 100644
+--- a/src/Tasks/Resources/xlf/Strings.de.xlf
++++ b/src/Tasks/Resources/xlf/Strings.de.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="de" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">Im BindingRedirect-Eintrag fehlt das Pflichtfeld "oldVersion".</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: „{0}“ ist nicht festgelegt. Wenn {1} wahr ist, legen Sie auf jeden Fall einen Wert für „{0}“ fest.</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: Schwerwiegender Fehler: mehr als {0} Befehlszeilenargumente.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">StopOnFirstFailure hat keine Auswirkungen, wenn die folgenden Bedingungen alle gelten: 1) Das System wird im Mehrprozessmodus ausgeführt. 2) Die BuildInParallel-Eigenschaft ist TRUE. 3) Die RunEachTargetSeparately-Eigenschaft ist FALSE.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: Die Zeilen aus der Datei "{0}" konnten nicht gelesen werden. {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.es.xlf b/src/Tasks/Resources/xlf/Strings.es.xlf
+index eef9d9a6a5e..c9a2d28d435 100644
+--- a/src/Tasks/Resources/xlf/Strings.es.xlf
++++ b/src/Tasks/Resources/xlf/Strings.es.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="es" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">Falta el campo obligatorio 'oldVersion' en BindingRedirect.</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: "{0}" no se ha establecido. Cuando {1} sea true, asegúrese de establecer un valor para "{0}".</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: Error irrecuperable: más de {0} argumentos de línea de comandos.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">StopOnFirstFailure no surtirá efecto si se dan todas las condiciones siguientes: 1) El sistema se ejecuta en modo de proceso múltiple. 2) La propiedad BuildInParallel es true. 3) La propiedad RunEachTargetSeparately es false.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: No se pudieron leer las líneas del archivo "{0}". {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.fr.xlf b/src/Tasks/Resources/xlf/Strings.fr.xlf
+index 0a38e39c972..8eed5b01bd8 100644
+--- a/src/Tasks/Resources/xlf/Strings.fr.xlf
++++ b/src/Tasks/Resources/xlf/Strings.fr.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="fr" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">Le champ 'oldVersion' obligatoire doit être défini pour BindingRedirect.</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: « {{0}0} » n’est pas défini. Lorsque {1} la valeur est true, veillez à définir une valeur pour «{0} ».</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: Erreur fatale : plus de {0} arguments de ligne de commande.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">StopOnFirstFailure reste sans effet dans les conditions suivantes : 1) Le système s'exécute en mode multiprocessus. 2) La propriété BuildInParallel a la valeur true. 3) La propriété RunEachTargetSeparately a la valeur false.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: Impossible de lire les lignes dans le fichier "{0}". {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.it.xlf b/src/Tasks/Resources/xlf/Strings.it.xlf
+index 27b03e70d2e..e5a855fe76d 100644
+--- a/src/Tasks/Resources/xlf/Strings.it.xlf
++++ b/src/Tasks/Resources/xlf/Strings.it.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="it" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">In BindingRedirect manca il campo obbligatorio 'oldVersion'.</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: '{0}' non è impostato. Quando {1} è true, assicurarsi di impostare un valore per '{0}'.</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: Errore irreversibile: più di {0} argomenti della riga di comando.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">StopOnFirstFailure non avrà alcun effetto in presenza di tutte le condizioni seguenti: 1) il sistema è in esecuzione in modalità a più processi 2) la proprietà BuildInParallel è true. 3) la proprietà RunEachTargetSeparately è false.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: non è stato possibile leggere le righe dal file "{0}". {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.ja.xlf b/src/Tasks/Resources/xlf/Strings.ja.xlf
+index 855a8a09ef6..94f01a2266c 100644
+--- a/src/Tasks/Resources/xlf/Strings.ja.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ja.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ja" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">BindingRedirect には必須フィールド 'oldVersion' がありません。</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: '{0}' が設定されていません。{1} が true の場合は、必ず '{0}' の値を設定してください。</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: 致命的なエラー: コマンド ライン引数が {0} を超えています。</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">StopOnFirstFailure は、次のすべての条件に該当する場合に無効となります。1) システムがマルチプロセッサ モードで実行されている。2) BuildInParallel プロパティが true に設定されている。3) RunEachTargetSeparately プロパティが false に設定されている。</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: ファイル "{0}" からの行を読み取れませんでした。{1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.ko.xlf b/src/Tasks/Resources/xlf/Strings.ko.xlf
+index 9e7d5d6eabc..5514d7f8bd5 100644
+--- a/src/Tasks/Resources/xlf/Strings.ko.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ko.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ko" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">BindingRedirect에 필수 필드인 'oldVersion'이 없습니다.</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: '{0}'이(가) 설정되지 않았습니다. {1}이(가) true인 경우 '{0}'에 값을 설정해야 합니다.</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: 심각한 오류: 명령줄 인수가 {0}개를 넘었습니다.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">다음 조건이 모두 충족되면 StopOnFirstFailure가 효과가 없습니다. 1) 시스템이 다중 프로세스 모드에서 실행 중입니다. 2) BuildInParallel 속성이 true입니다. 3) RunEachTargetSeparately 속성이 false입니다.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: "{0}" 파일에서 줄을 읽을 수 없습니다. {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.pl.xlf b/src/Tasks/Resources/xlf/Strings.pl.xlf
+index 6f0ed65f8bc..15ad8c47abe 100644
+--- a/src/Tasks/Resources/xlf/Strings.pl.xlf
++++ b/src/Tasks/Resources/xlf/Strings.pl.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="pl" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">W parametrze BindingRedirect brakuje wymaganego pola 'oldVersion'.</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: nie ustawiono „{0}”. Jeśli {1} ma wartość true, upewnij się, że ustawiono wartość dla „{0}”.</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: Błąd krytyczny: liczba argumentów wiersza polecenia większa niż {0}.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">Działanie funkcji StopOnFirstFailure nie przyniesie efektu, jeśli będą spełnione wszystkie następujące warunki: 1) System działa w trybie wieloprocesowym. 2) Właściwość BuildInParallel ma wartość true. 3) Właściwość RunEachTargetSeparately ma wartość false.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: Nie można odczytać wierszy z pliku „{0}”. {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.pt-BR.xlf b/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
+index d6bccad1740..939a17943d1 100644
+--- a/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Tasks/Resources/xlf/Strings.pt-BR.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="pt-BR" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">O campo "oldVersion" obrigatório está ausente em BindingRedirect.</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: '{0}' não está definido. Quando {1} for verdadeiro, certifique-se de definir um valor para '{0}'.</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: Erro Fatal: mais de {0} argumentos de linha de comando.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">StopOnFirstFailure não terá efeito quando estas condições existirem: 1) O sistema estiver sendo executado no modo de processamento múltiplo 2) A propriedade BuildInParallel for true. 3) A propriedade RunEachTargetSeparately for false.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: Não foi possível ler linhas do arquivo "{0}". {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.ru.xlf b/src/Tasks/Resources/xlf/Strings.ru.xlf
+index 13636f628c9..582ffa4c36a 100644
+--- a/src/Tasks/Resources/xlf/Strings.ru.xlf
++++ b/src/Tasks/Resources/xlf/Strings.ru.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="ru" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">В BindingRedirect отсутствует обязательное поле "oldVersion".</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: "{0}" не настроено. Если для {1} присвоено значение true, настройте значение для "{0}".</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: неустранимая ошибка: число аргументов командной строки превышает {0}.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">StopOnFirstFailure будет игнорироваться при одновременном соблюдении следующих условий: 1) система выполняется в режиме с несколькими процессами; 2) свойство BuildInParallel имеет значение true; 3) свойство RunEachTargetSeparately имеет значение false.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: Не удалось прочесть строки из файла "{0}". {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.tr.xlf b/src/Tasks/Resources/xlf/Strings.tr.xlf
+index 80e916c9578..7375345c76b 100644
+--- a/src/Tasks/Resources/xlf/Strings.tr.xlf
++++ b/src/Tasks/Resources/xlf/Strings.tr.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="tr" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">BindingRedirect için gereken 'oldVersion' alanı eksik.</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: '{0}' ayarlanmamış. {1} doğru olduğunda, '{0}' için bir değer ayarlandığından emin olun.</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: Kritik Hata: Komut satırı bağımsız değişkenleri şu sayıdan fazla: {0}.</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">Şu koşulların tümü doğru olduğunda StopOnFirstFailure etkisiz olur: 1) Sistem çoklu işlem modunda çalışıyorsa. 2) BuildInParallel özelliği true ise. 3) RunEachTargetSeparately özelliği false ise.</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: "{0}" dosyasındaki satırlar okunamadı. {1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf b/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
+index fb45fb03527..6a3730d88bb 100644
+--- a/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Tasks/Resources/xlf/Strings.zh-Hans.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="zh-Hans" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">BindingRedirect 缺少必需的字段“oldVersion”。</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: 未设置 "{0}"。如果 {1} 为 true，请确保为 "{0}" 设置值。</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: 严重错误: 超出 {0} 个命令行参数。</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">如果满足以下所有条件，StopOnFirstFailure 将不起任何作用: 1) 系统在多进程模式下运行。2) BuildInParallel 属性为 true。3) RunEachTargetSeparately 属性为 false。</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: 未能从文件“{0}”读取命令行。{1}</target>
+diff --git a/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf b/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
+index 1ce29e770f5..343d0d3315f 100644
+--- a/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Tasks/Resources/xlf/Strings.zh-Hant.xlf
+@@ -2,6 +2,16 @@
+ <xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2" xsi:schemaLocation="urn:oasis:names:tc:xliff:document:1.2 xliff-core-1.2-transitional.xsd">
+   <file datatype="xml" source-language="en" target-language="zh-Hant" original="../Strings.resx">
+     <body>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpened">
++        <source>The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file either does not exist or can not be read. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.ManifestCanNotBeOpenedWithException">
++        <source>The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</source>
++        <target state="new">The manifest file opening has failed with exception: '{0}'. Please make sure it exists and has relevant content.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="AppConfig.BindingRedirectMissingOldVersion">
+         <source>BindingRedirect is missing required field 'oldVersion'.</source>
+         <target state="translated">BindingRedirect 遺漏必要的 'oldVersion' 欄位。</target>
+@@ -131,6 +141,26 @@
+         <target state="translated">MSB3992: 未設定 '{0}'。當 {1} 為 true 時，請務必j將 '{0}' 設定一個值。</target>
+         <note>{StrBegin="MSB3992: "}</note>
+       </trans-unit>
++      <trans-unit id="CommonTarget.NoWin32ManifestAndPreferNativeArm64Enabled">
++        <source>MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</source>
++        <target state="new">MSB9903: PreferNativeArm64 requires a Win32 application manifest and is mutually exclusive with NoWin32Manifest.</target>
++        <note>{StrBegin="MSB9903: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.PlatformIsAnyCPUAndPreferNativeArm64Enabled">
++        <source>MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</source>
++        <target state="new">MSB9904: When PreferNativeArm64 is enabled, ensure that the Platform is set to AnyCPU. Current Platform: {0}.</target>
++        <note>{StrBegin="MSB9904: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.Prefer32BitAndPreferNativeArm64Enabled">
++        <source>MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</source>
++        <target state="new">MSB9902: Prefer32Bit and PreferNativeArm64 options are mutually exclusive. Please enable only one.</target>
++        <note>{StrBegin="MSB9902: "}</note>
++      </trans-unit>
++      <trans-unit id="CommonTarget.SpecifiedSeverityDoesNotExist">
++        <source>MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</source>
++        <target state="new">MSB9901: The specified severity is not relevant: '{0}' for the message: '{1}'.</target>
++        <note>{StrBegin="MSB9901: "}</note>
++      </trans-unit>
+       <trans-unit id="Compiler.FatalArguments">
+         <source>MSB3881: Fatal Error: more than {0} command line arguments.</source>
+         <target state="translated">MSB3881: 嚴重錯誤: 命令列引數的數目超過 {0} 個。</target>
+@@ -1564,6 +1594,21 @@
+         <target state="translated">當下列條件全部成立時，StopOnFirstFailure 將沒有作用: 1) 系統正在多處理程序模式中執行 2) BuildInParallel 屬性為 true。3) RunEachTargetSeparately 屬性為 false。</target>
+         <note>LOCALIZATION:  Do not localize the words "RunEachTargetSeparately", "BuildingInParallel", or "StopOnFirstFailure".</note>
+       </trans-unit>
++      <trans-unit id="AddToWin32Manifest.AssemblyNodeIsMissed">
++        <source>The assembly element is missing from the application manifest.</source>
++        <target state="new">The assembly element is missing from the application manifest.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.InvalidValueInSupportedArchitectures">
++        <source>MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</source>
++        <target state="new">MSB4300: The specified value '{0}' for the supportedArchitectures element is invalid. Either remove it from the manifest or set it to 'amd64 arm64'.</target>
++        <note>{StrBegin="MSB4300: "}</note>
++      </trans-unit>
++      <trans-unit id="AddToWin32Manifest.SpecifiedApplicationManifestCanNotBeFound">
++        <source>The application manifest file cannot be found. Please make sure it exists.</source>
++        <target state="new">The application manifest file cannot be found. Please make sure it exists.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ReadLinesFromFile.ErrorOrWarning">
+         <source>MSB3501: Could not read lines from file "{0}". {1}</source>
+         <target state="translated">MSB3501: 無法從檔案 "{0}" 讀取行。{1}</target>

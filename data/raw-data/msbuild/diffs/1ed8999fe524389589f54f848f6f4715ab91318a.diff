@@ -1,0 +1,1061 @@
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+index b21169ed135..b6128c390d2 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogReplayEventSource.cs
+@@ -16,7 +16,7 @@ namespace Microsoft.Build.Logging
+     /// by implementing IEventSource and raising corresponding events.
+     /// </summary>
+     /// <remarks>The class is public so that we can call it from MSBuild.exe when replaying a log file.</remarks>
+-    public sealed class BinaryLogReplayEventSource : EventArgsDispatcher
++    public sealed class BinaryLogReplayEventSource : EventArgsDispatcher, IEmbeddedContentSource
+     {
+         /// Touches the <see cref="ItemGroupLoggingHelper"/> static constructor
+         /// to ensure it initializes <see cref="TaskParameterEventArgs.MessageGetter"/>
+@@ -125,10 +125,29 @@ public void Replay(BinaryReader binaryReader, bool closeInput, CancellationToken
+         /// <param name="cancellationToken">A <see cref="CancellationToken"/> indicating the replay should stop as soon as possible.</param>
+         public void Replay(BuildEventArgsReader reader, CancellationToken cancellationToken)
+         {
++            _fileFormatVersionRead?.Invoke(reader.FileFormatVersion);
++            reader.EmbeddedContentRead += _embeddedContentRead;
++
+             while (!cancellationToken.IsCancellationRequested && reader.Read() is { } instance)
+             {
+                 Dispatch(instance);
+             }
+         }
++
++        private Action<int>? _fileFormatVersionRead;
++        event Action<int> ILogVersionInfo.FileFormatVersionRead
++        {
++            add => _fileFormatVersionRead += value;
++            remove => _fileFormatVersionRead -= value;
++        }
++        private Action<EmbeddedContentEventArgs>? _embeddedContentRead;
++        /// <inheritdoc cref="IEmbeddedContentSource.EmbeddedContentRead"/>
++        event Action<EmbeddedContentEventArgs>? IEmbeddedContentSource.EmbeddedContentRead
++        {
++            // Explicitly implemented event has to declare explicit add/remove accessors
++            //  https://stackoverflow.com/a/2268472/2308106
++            add => _embeddedContentRead += value;
++            remove => _embeddedContentRead -= value;
++        }
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogger.cs b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+index 9c60914d4a0..dd8dae49445 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogger.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+@@ -94,7 +94,12 @@ public enum ProjectImportsCollectionMode
+             /// <summary>
+             /// Create an external .ProjectImports.zip archive for the project files.
+             /// </summary>
+-            ZipFile
++            ZipFile,
++
++            /// <summary>
++            /// Don't collect any files from build events, but instead replay them from the given event source (if that one supports it).
++            /// </summary>
++            Replay,
+         }
+ 
+         /// <summary>
+@@ -116,15 +121,10 @@ public enum ProjectImportsCollectionMode
+         /// </summary>
+         public string Parameters { get; set; }
+ 
+-        /// <summary>
+-        /// Initializes the logger by subscribing to events of the specified event source.
+-        /// </summary>
+-        public void Initialize(IEventSource eventSource) => Initialize(eventSource, null);
+-
+         /// <summary>
+         /// Initializes the logger by subscribing to events of the specified event source and embedded content source.
+         /// </summary>
+-        public void Initialize(IEventSource eventSource, IEmbeddedContentSource embeddedFilesSource)
++        public void Initialize(IEventSource eventSource)
+         {
+             _initialTargetOutputLogging = Environment.GetEnvironmentVariable("MSBUILDTARGETOUTPUTLOGGING");
+             _initialLogImports = Traits.Instance.EscapeHatches.LogProjectImports;
+@@ -137,14 +137,9 @@ public void Initialize(IEventSource eventSource, IEmbeddedContentSource embedded
+             Traits.Instance.EscapeHatches.LogProjectImports = true;
+             bool logPropertiesAndItemsAfterEvaluation = Traits.Instance.EscapeHatches.LogPropertiesAndItemsAfterEvaluation ?? true;
+ 
+-            ProcessParameters();
+-
+-            if (embeddedFilesSource != null)
+-            {
+-                CollectProjectImports = ProjectImportsCollectionMode.None;
+-                embeddedFilesSource.EmbeddedContentRead += args =>
+-                    eventArgsWriter.WriteBlob(args.ContentKind.ToBinaryLogRecordKind(), args.ContentStream, args.Length);
+-            }
++            bool replayInitialInfo;
++            ILogVersionInfo versionInfo = null;
++            ProcessParameters(out replayInitialInfo);
+ 
+             try
+             {
+@@ -166,7 +161,7 @@ public void Initialize(IEventSource eventSource, IEmbeddedContentSource embedded
+ 
+                 stream = new FileStream(FilePath, FileMode.Create);
+ 
+-                if (CollectProjectImports != ProjectImportsCollectionMode.None)
++                if (CollectProjectImports != ProjectImportsCollectionMode.None && CollectProjectImports != ProjectImportsCollectionMode.Replay)
+                 {
+                     projectImportsCollector = new ProjectImportsCollector(FilePath, CollectProjectImports == ProjectImportsCollectionMode.ZipFile);
+                 }
+@@ -180,6 +175,20 @@ public void Initialize(IEventSource eventSource, IEmbeddedContentSource embedded
+                 {
+                     eventSource4.IncludeEvaluationPropertiesAndItems();
+                 }
++
++                if (eventSource is IEmbeddedContentSource embeddedFilesSource)
++                {
++                    if (CollectProjectImports == ProjectImportsCollectionMode.Replay)
++                    {
++                        embeddedFilesSource.EmbeddedContentRead += args =>
++                            eventArgsWriter.WriteBlob(args.ContentKind.ToBinaryLogRecordKind(), args.ContentStream, args.Length);
++                    }
++
++                    if (replayInitialInfo)
++                    {
++                        versionInfo = embeddedFilesSource;
++                    }
++                }
+             }
+             catch (Exception e)
+             {
+@@ -205,14 +214,14 @@ public void Initialize(IEventSource eventSource, IEmbeddedContentSource embedded
+                 eventArgsWriter.EmbedFile += EventArgsWriter_EmbedFile;
+             }
+ 
+-            if (embeddedFilesSource == null)
++            if (versionInfo == null)
+             {
+                 binaryWriter.Write(FileFormatVersion);
+                 LogInitialInfo();
+             }
+             else
+             {
+-                binaryWriter.Write(embeddedFilesSource.FileFormatVersion);
++                versionInfo.FileFormatVersionRead += version => binaryWriter.Write(version);
+             }
+ 
+             eventSource.AnyEventRaised += EventSource_AnyEventRaised;
+@@ -252,32 +261,18 @@ public void Shutdown()
+ 
+             Traits.Instance.EscapeHatches.LogProjectImports = _initialLogImports;
+ 
++
+             if (projectImportsCollector != null)
+             {
+                 projectImportsCollector.Close();
+ 
+                 if (CollectProjectImports == ProjectImportsCollectionMode.Embed)
+                 {
+-                    var archiveFilePath = projectImportsCollector.ArchiveFilePath;
++                    projectImportsCollector.ProcessResult(
++                        streamToEmbed => eventArgsWriter.WriteBlob(BinaryLogRecordKind.ProjectImportArchive, streamToEmbed),
++                        LogMessage);
+ 
+-                    // It is possible that the archive couldn't be created for some reason.
+-                    // Only embed it if it actually exists.
+-                    if (FileSystems.Default.FileExists(archiveFilePath))
+-                    {
+-                        using (FileStream fileStream = File.OpenRead(archiveFilePath))
+-                        {
+-                            if (fileStream.Length > int.MaxValue)
+-                            {
+-                                LogMessage("Imported files archive exceeded 2GB limit and it's not embedded.");
+-                            }
+-                            else
+-                            {
+-                                eventArgsWriter.WriteBlob(BinaryLogRecordKind.ProjectImportArchive, fileStream);
+-                            }
+-                        }
+-
+-                        File.Delete(archiveFilePath);
+-                    }
++                    projectImportsCollector.DeleteArchive();
+                 }
+ 
+                 projectImportsCollector = null;
+@@ -326,7 +321,7 @@ private void CollectImports(BuildEventArgs e)
+             {
+                 projectImportsCollector.AddFile(projectArgs.ProjectFile);
+             }
+-            else if (e is MetaprojectGeneratedEventArgs metaprojectArgs)
++            else if (e is MetaprojectGeneratedEventArgs { metaprojectXml: { } } metaprojectArgs)
+             {
+                 projectImportsCollector.AddFileFromMemory(metaprojectArgs.ProjectFile, metaprojectArgs.metaprojectXml);
+             }
+@@ -341,13 +336,14 @@ private void CollectImports(BuildEventArgs e)
+         /// </summary>
+         /// <exception cref="LoggerException">
+         /// </exception>
+-        private void ProcessParameters()
++        private void ProcessParameters(out bool replayInitialInfo)
+         {
+             if (Parameters == null)
+             {
+                 throw new LoggerException(ResourceUtilities.FormatResourceStringStripCodeAndKeyword("InvalidBinaryLoggerParameters", ""));
+             }
+ 
++            replayInitialInfo = false;
+             var parameters = Parameters.Split(MSBuildConstants.SemicolonChar, StringSplitOptions.RemoveEmptyEntries);
+             foreach (var parameter in parameters)
+             {
+@@ -363,6 +359,14 @@ private void ProcessParameters()
+                 {
+                     CollectProjectImports = ProjectImportsCollectionMode.ZipFile;
+                 }
++                else if (string.Equals(parameter, "ProjectImports=Replay", StringComparison.OrdinalIgnoreCase))
++                {
++                    CollectProjectImports = ProjectImportsCollectionMode.Replay;
++                }
++                else if (string.Equals(parameter, "ReplayInitialInfo", StringComparison.OrdinalIgnoreCase))
++                {
++                    replayInitialInfo = true;
++                }
+                 else if (parameter.EndsWith(".binlog", StringComparison.OrdinalIgnoreCase))
+                 {
+                     FilePath = parameter;
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+index 747a078a50c..6c53eeaa5d7 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsReader.cs
+@@ -5,6 +5,8 @@
+ using System.Collections;
+ using System.Collections.Generic;
+ using System.IO;
++using System.IO.Compression;
++using System.Linq;
+ using System.Reflection;
+ using System.Text;
+ using Microsoft.Build.BackEnd;
+@@ -98,7 +100,10 @@ public void Dispose()
+         /// The subscriber must read the exactly given length of binary data from the stream - otherwise exception is raised.
+         /// If no subscriber is attached, the data is skipped.
+         /// </summary>
+-        public event Action<EmbeddedContentEventArgs>? EmbeddedContentRead;
++        internal event Action<EmbeddedContentEventArgs>? EmbeddedContentRead;
++
++        /// <inheritdoc cref="IBuildFileReader.ArchiveFileEncountered"/>
++        public event Action<ArchiveFileEventArgs>? ArchiveFileEncountered;
+ 
+         /// <summary>
+         /// Reads the next log record from the <see cref="BinaryReader"/>.
+@@ -228,16 +233,72 @@ private static bool IsAuxiliaryRecord(BinaryLogRecordKind recordKind)
+         private void ReadEmbeddedContent(BinaryLogRecordKind recordKind)
+         {
+             int length = ReadInt32();
+-            if (EmbeddedContentRead != null)
++
++            if (ArchiveFileEncountered != null)
+             {
+-                long preEventPosition = binaryReader.BaseStream.CanSeek ? binaryReader.BaseStream.Position : 0;
+-                EmbeddedContentRead(new EmbeddedContentEventArgs(recordKind.ToEmbeddedContentKind(), binaryReader.BaseStream, length));
+-                long postEventPosition = binaryReader.BaseStream.CanSeek ? binaryReader.BaseStream.Position : length;
+-                if (postEventPosition - preEventPosition != length)
++                // We could create ZipArchive over the target stream, and write to that directly,
++                //  however, binlog format needs to know stream size upfront - which is unknown,
++                //  so we would need to write the size after - and that would require the target stream to be seekable (which it's not)
++                ProjectImportsCollector? projectImportsCollector = null;
++
++                if (EmbeddedContentRead != null)
++                {
++                    projectImportsCollector =
++                        new ProjectImportsCollector(Path.GetRandomFileName(), false, runOnBackground: false);
++                }
++
++                Stream embeddedStream = new SubStream(binaryReader.BaseStream, length);
++
++                // We are intentionally not grace handling corrupt embedded stream
++
++                using var zipArchive = new ZipArchive(embeddedStream, ZipArchiveMode.Read);
++
++                foreach (var entry in zipArchive.Entries/*.OrderBy(e => e.LastWriteTime)*/)
++                {
++                    var file = ArchiveFile.From(entry);
++                    ArchiveFileEventArgs archiveFileEventArgs = new(file);
++                    // ArchiveFileEventArgs is not IDisposable as we do not want to clutter exposed API
++                    using var cleanupScope = new CleanupScope(archiveFileEventArgs.Dispose);
++                    ArchiveFileEncountered(archiveFileEventArgs);
++
++                    if (projectImportsCollector != null)
++                    {
++                        var resultFile = archiveFileEventArgs.ObtainArchiveFile();
++
++                        if (resultFile.CanUseReader)
++                        {
++                            projectImportsCollector.AddFileFromMemory(
++                                resultFile.FullPath,
++                                resultFile.GetContentReader().BaseStream,
++                                makePathAbsolute: false,
++                                entryCreationStamp: entry.LastWriteTime);
++                        }
++                        else
++                        {
++                            projectImportsCollector.AddFileFromMemory(
++                                resultFile.FullPath,
++                                resultFile.GetContent(),
++                                encoding: resultFile.Encoding,
++                                makePathAbsolute: false,
++                                entryCreationStamp: entry.LastWriteTime);
++                        }
++                    }
++                }
++
++                if (EmbeddedContentRead != null)
+                 {
+-                    throw new InvalidDataException($"The {nameof(EmbeddedContentRead)} event handler must read exactly {length} bytes from the stream.");
++                    projectImportsCollector!.ProcessResult(
++                        streamToEmbed => EmbeddedContentRead(new EmbeddedContentEventArgs(EmbeddedContentKind.ProjectImportArchive, streamToEmbed)),
++                        error => throw new InvalidDataException(error));
++                    projectImportsCollector.DeleteArchive();
+                 }
+             }
++            else if (EmbeddedContentRead != null)
++            {
++                EmbeddedContentRead(new EmbeddedContentEventArgs(
++                    recordKind.ToEmbeddedContentKind(),
++                    new SubStream(binaryReader.BaseStream, length)));
++            }
+             else
+             {
+                 if (binaryReader.BaseStream.CanSeek)
+diff --git a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+index d962530bcc1..99ffe22d96d 100644
+--- a/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
++++ b/src/Build/Logging/BinaryLogger/BuildEventArgsWriter.cs
+@@ -230,13 +230,7 @@ private void WriteCore(BuildEventArgs e)
+             }
+         }
+ 
+-        public void WriteBlob(BinaryLogRecordKind kind, Stream stream, int length)
+-            => WriteBlobImpl(kind, stream, length);
+-
+-        public void WriteBlob(BinaryLogRecordKind kind, Stream stream)
+-            => WriteBlobImpl(kind, stream, null);
+-
+-        private void WriteBlobImpl(BinaryLogRecordKind kind, Stream stream, int? length)
++        public void WriteBlob(BinaryLogRecordKind kind, Stream stream, int? length = null)
+         {
+             if (stream.CanSeek && stream.Length > int.MaxValue)
+             {
+@@ -1121,9 +1115,10 @@ private void Write(byte[] bytes)
+ 
+         private void Write(Stream stream, int? length)
+         {
++            Stream destinationStream = binaryWriter.BaseStream;
+             if (length == null)
+             {
+-                stream.CopyTo(binaryWriter.BaseStream);
++                stream.CopyTo(destinationStream);
+                 return;
+             }
+ 
+@@ -1139,7 +1134,7 @@ private void Write(Stream stream, int? length)
+                     length > 0 &&
+                     (bytesRead = stream.Read(buffer, 0, Math.Min(buffer.Length, length.Value))) != 0)
+                 {
+-                    binaryWriter.BaseStream.Write(buffer, 0, bytesRead);
++                    destinationStream.Write(buffer, 0, bytesRead);
+                     length -= bytesRead;
+                 }
+             }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs
+index 59868eb43dd..5f3f75ab761 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFile.cs
+@@ -4,29 +4,46 @@
+ using System;
+ using System.IO;
+ using System.IO.Compression;
++using System.Text;
+ 
+ namespace Microsoft.Build.Logging
+ {
+-    public class ArchiveFile : IDisposable
++    public class ArchiveFile
+     {
+-        public ArchiveFile(string fullPath, StreamReader contentReader)
++        public ArchiveFile(string fullPath, Stream contentStream)
+         {
+             FullPath = fullPath;
+-            _contentReader = contentReader;
++            // We need to specify encoding without preamble - as then StreamReader will
++            //  automatically adjust the encoding to match the preamble (if present).
++            _contentReader = new StreamReader(contentStream, new System.Text.UTF8Encoding(false));
++        }
++
++        public ArchiveFile(string fullPath, string content, Encoding? contentEncoding = null)
++        {
++            FullPath = fullPath;
++            _content = content;
++            _stringAcquired = true;
++            _contentReader = StreamReader.Null;
++            _stringEncoding = contentEncoding ?? Encoding.UTF8;
+         }
+ 
+         public static ArchiveFile From(ZipArchiveEntry entry)
+         {
+-            return new ArchiveFile(CalculateArchivePath(entry.FullName), new StreamReader(entry.Open()));
++            return new ArchiveFile(entry.FullName, entry.Open());
+         }
+ 
+         public string FullPath { get; }
+ 
++        public Encoding Encoding => _stringEncoding ?? _contentReader.CurrentEncoding;
++
++        public bool CanUseReader => !_stringAcquired;
++        public bool CanUseString => !_streamAcquired;
++
+         public StreamReader GetContentReader()
+         {
+             if (_stringAcquired)
+             {
+-                throw new InvalidOperationException("Content already acquired as string via GetContent.");
++                throw new InvalidOperationException("Content already acquired as string via GetContent or initialized as string only.");
+             }
+ 
+             _streamAcquired = true;
+@@ -53,26 +70,10 @@ public string GetContent()
+         private bool _stringAcquired;
+         private readonly StreamReader _contentReader;
+         private string? _content;
++        private readonly Encoding? _stringEncoding;
+ 
+-        public static string CalculateArchivePath(string filePath)
+-        {
+-            string archivePath = filePath;
+-
+-            if (filePath.Contains(":") || (!filePath.StartsWith("\\") && !filePath.StartsWith("/")))
+-            {
+-                archivePath = archivePath.Replace(":", "");
+-                archivePath = archivePath.Replace("/", "\\");
+-                archivePath = archivePath.Replace("\\\\", "\\");
+-            }
+-            else
+-            {
+-                archivePath = archivePath.Replace("\\", "/");
+-                archivePath = archivePath.Replace("//", "/");
+-            }
+-
+-            return archivePath;
+-        }
+-
+-        public void Dispose() => _contentReader.Dispose();
++        // Intentionally not exposing this publicly (e.g. as IDisposable implementation)
++        // as we don't want to user to be bothered with ownership and disposing concerns.
++        internal void Dispose() => _contentReader.Dispose();
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgs.cs b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgs.cs
+new file mode 100644
+index 00000000000..7045f261d86
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgs.cs
+@@ -0,0 +1,47 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.IO;
++
++namespace Microsoft.Build.Logging;
++
++public class ArchiveFileEventArgs : EventArgs
++{
++    private ArchiveFile  _archiveFile;
++    private bool _resultSet;
++    private Action _disposeAction;
++
++    public ArchiveFileEventArgs(ArchiveFile archiveFile) =>
++        (_archiveFile, _resultSet, _disposeAction) = (archiveFile, true, archiveFile.Dispose);
++
++    public ArchiveFile ObtainArchiveFile()
++    {
++        if (!_resultSet)
++        {
++            throw new InvalidOperationException(
++                "ArchiveFile was obtained, but the final edited version was not set.");
++        }
++
++        _resultSet = false;
++        return _archiveFile;
++    }
++
++    public void SetResult(string resultPath, Stream resultStream)
++    {
++        _archiveFile = new ArchiveFile(resultPath, resultStream);
++        _disposeAction += _archiveFile.Dispose;
++        _resultSet = true;
++    }
++
++    public void SetResult(string resultPath, string resultContent)
++    {
++        _archiveFile = new ArchiveFile(resultPath, resultContent, _archiveFile.Encoding);
++        _disposeAction += _archiveFile.Dispose;
++        _resultSet = true;
++    }
++
++    // Intentionally not exposing this publicly (e.g. as IDisposable implementation)
++    // as we don't want to user to be bothered with ownership and disposing concerns.
++    internal void Dispose() => _disposeAction();
++}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgsExtensions.cs b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgsExtensions.cs
+new file mode 100644
+index 00000000000..818cffaa91a
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/ArchiveFileEventArgsExtensions.cs
+@@ -0,0 +1,23 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Logging;
++
++public static class ArchiveFileEventArgsExtensions
++{
++    public static Action<ArchiveFileEventArgs> ToArchiveFileHandler(this Action<StringReadEventArgs> stringHandler)
++    {
++        return args =>
++        {
++            var archiveFile = args.ObtainArchiveFile();
++            var pathArgs = new StringReadEventArgs(archiveFile.FullPath);
++            stringHandler(pathArgs);
++            var contentArgs = new StringReadEventArgs(archiveFile.GetContent());
++            stringHandler(contentArgs);
++
++            args.SetResult(pathArgs.StringToBeUsed, contentArgs.StringToBeUsed);
++        };
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/CleanupScope.cs b/src/Build/Logging/BinaryLogger/Postprocessing/CleanupScope.cs
+new file mode 100644
+index 00000000000..bef26ff4d13
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/CleanupScope.cs
+@@ -0,0 +1,15 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Logging;
++
++internal class CleanupScope : IDisposable
++{
++    private readonly Action _disposeAction;
++
++    public CleanupScope(Action disposeAction) => _disposeAction = disposeAction;
++
++    public void Dispose() => _disposeAction();
++}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
+index b5d6e985783..ce372c888d3 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/EmbeddedContentEventArgs.cs
+@@ -15,8 +15,14 @@ public EmbeddedContentEventArgs(EmbeddedContentKind contentKind, Stream contentS
+             Length = length;
+         }
+ 
++        public EmbeddedContentEventArgs(EmbeddedContentKind contentKind, Stream contentStream)
++        {
++            ContentKind = contentKind;
++            ContentStream = contentStream;
++        }
++
+         public EmbeddedContentKind ContentKind { get; }
+         public Stream ContentStream { get; }
+-        public int Length { get; }
++        public int? Length { get; }
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventArgsReaderNotifications.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventArgsReaderNotifications.cs
+index 41ec404904e..5f49119570f 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventArgsReaderNotifications.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventArgsReaderNotifications.cs
+@@ -6,7 +6,8 @@ namespace Microsoft.Build.Logging
+     /// <summary>
+     /// An interface for notifications from BuildEventArgsReader
+     /// </summary>
+-    public interface IBuildEventArgsReaderNotifications : IBuildEventStringsReader, IEmbeddedContentSource
++    // todo: IEmbeddedContentSource should not be here ideally
++    public interface IBuildEventArgsReaderNotifications : IBuildEventStringsReader, IBuildFileReader
+     {
+         /* For future use */
+     }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventStringsReader.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventStringsReader.cs
+index e9e7651ee78..bf3d54f8ff8 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventStringsReader.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildEventStringsReader.cs
+@@ -16,11 +16,5 @@ public interface IBuildEventStringsReader
+         /// The passed event arg can be reused and should not be stored.
+         /// </summary>
+         public event Action<StringReadEventArgs>? StringReadDone;
+-
+-        /// <summary>
+-        /// An event that allows the caller to be notified when a string is encountered in the binary log.
+-        /// BinaryReader passed in ctor is at the beginning of the string at this point.
+-        /// </summary>
+-        public event Action? StringEncountered;
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IBuildFileReader.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildFileReader.cs
+new file mode 100644
+index 00000000000..9910ee1a06a
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IBuildFileReader.cs
+@@ -0,0 +1,34 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Logging;
++
++public interface IBuildFileReader
++{
++    /// <summary>
++    /// An event that allows the caller to be notified when an embedded file is encountered in the binary log.
++    /// Subscribing to this event obligates the subscriber to read the file content and set the resulting content
++    ///  via <see cref="ArchiveFileEventArgs.SetResult(string,System.IO.Stream)"/> or <see cref="ArchiveFileEventArgs.SetResult(string,string)"/>.
++    /// When subscriber is OK with greedy reading entire content of the file, it can simplify subscribing to this event,
++    /// by using handler with same signature as handler for <see cref="IBuildEventStringsReader.StringReadDone"/> and wrapping it via
++    /// <see cref="ArchiveFileEventArgsExtensions.ToArchiveFileHandler"/> extension.
++    ///
++    /// <example>
++    /// <code>
++    /// private void OnStringReadDone(StringReadEventArgs e)
++    /// {
++    ///     e.StringToBeUsed = e.StringToBeUsed.Replace("foo", "bar");
++    /// }
++    ///
++    /// private void SubscribeToEvents()
++    /// {
++    ///     reader.StringReadDone += OnStringReadDone;
++    ///     reader.ArchiveFileEncountered += ((Action&lt;StringReadEventArgs&gt;)OnStringReadDone).ToArchiveFileHandler();
++    /// }
++    /// </code>
++    /// </example>
++    /// </summary>
++    public event Action<ArchiveFileEventArgs>? ArchiveFileEncountered;
++}
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs b/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs
+index e0080148b1a..eb9262939fa 100644
+--- a/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/IEmbeddedContentSource.cs
+@@ -5,9 +5,20 @@
+ 
+ namespace Microsoft.Build.Logging
+ {
+-    public interface IEmbeddedContentSource
++
++    internal interface ILogVersionInfo
++    {
++        event Action<int> FileFormatVersionRead;
++    }
++
++    internal interface IEmbeddedContentSource : ILogVersionInfo
+     {
+-        int FileFormatVersion { get; }
++        
++        /// <summary>
++        /// Raised when the log reader encounters a project import archive (embedded content) in the stream.
++        /// The subscriber must read the exactly given length of binary data from the stream - otherwise exception is raised.
++        /// If no subscriber is attached, the data is skipped.
++        /// </summary>
+         event Action<EmbeddedContentEventArgs> EmbeddedContentRead;
+     }
+ }
+diff --git a/src/Build/Logging/BinaryLogger/Postprocessing/SubStream.cs b/src/Build/Logging/BinaryLogger/Postprocessing/SubStream.cs
+new file mode 100644
+index 00000000000..277c9ac66c0
+--- /dev/null
++++ b/src/Build/Logging/BinaryLogger/Postprocessing/SubStream.cs
+@@ -0,0 +1,56 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++
++namespace Microsoft.Build.Logging
++{
++    /// <summary>
++    /// Bounded read-only, forward-only view over an underlying stream.
++    /// </summary>
++    internal class SubStream : Stream
++    {
++        // Do not Dispose/Close on Dispose/Close !!
++        private readonly Stream _stream;
++        private readonly long _length;
++        private long _position;
++
++        public SubStream(Stream stream, long length)
++        {
++            _stream = stream;
++            _length = length;
++
++            if (!stream.CanRead)
++            {
++                throw new InvalidOperationException("Stream must be readable.");
++            }
++        }
++
++        public override bool CanRead => true;
++
++        public override bool CanSeek => false;
++
++        public override bool CanWrite => false;
++
++        public override long Length => _length;
++
++        public override long Position { get => _position; set => throw new NotImplementedException(); }
++
++        public override void Flush() { }
++        public override int Read(byte[] buffer, int offset, int count)
++        {
++            count = Math.Min((int)Math.Max(Length - _position, 0), count);
++            int read = _stream.Read(buffer, offset, count);
++            _position += read;
++            return read;
++        }
++        public override long Seek(long offset, SeekOrigin origin) => throw new NotImplementedException();
++        public override void SetLength(long value) => throw new NotImplementedException();
++        public override void Write(byte[] buffer, int offset, int count) => throw new NotImplementedException();
++    }
++}
+diff --git a/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs b/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
+index 27ededae8cc..24e86af2991 100644
+--- a/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
++++ b/src/Build/Logging/BinaryLogger/ProjectImportsCollector.cs
+@@ -8,8 +8,7 @@
+ using System.Text;
+ using System.Threading.Tasks;
+ using Microsoft.Build.Shared;
+-
+-#nullable disable
++using Microsoft.Build.Shared.FileSystem;
+ 
+ namespace Microsoft.Build.Logging
+ {
+@@ -21,10 +20,10 @@ namespace Microsoft.Build.Logging
+     /// </summary>
+     internal class ProjectImportsCollector
+     {
+-        private Stream _fileStream;
+-        private ZipArchive _zipArchive;
+-
+-        public string ArchiveFilePath { get; }
++        private Stream? _fileStream;
++        private ZipArchive? _zipArchive;
++        private readonly string _archiveFilePath;
++        private readonly bool _runOnBackground;
+ 
+         /// <summary>
+         /// Avoid visiting each file more than once.
+@@ -34,12 +33,16 @@ internal class ProjectImportsCollector
+         // this will form a chain of file write tasks, running sequentially on a background thread
+         private Task _currentTask = Task.CompletedTask;
+ 
+-        public ProjectImportsCollector(string logFilePath, bool createFile, string sourcesArchiveExtension = ".ProjectImports.zip")
++        public ProjectImportsCollector(
++            string logFilePath,
++            bool createFile,
++            string sourcesArchiveExtension = ".ProjectImports.zip",
++            bool runOnBackground = true)
+         {
+             if (createFile)
+             {
+                 // Archive file will be stored alongside the binlog
+-                ArchiveFilePath = Path.ChangeExtension(logFilePath, sourcesArchiveExtension);
++                _archiveFilePath = Path.ChangeExtension(logFilePath, sourcesArchiveExtension);
+             }
+             else
+             {
+@@ -50,7 +53,7 @@ public ProjectImportsCollector(string logFilePath, bool createFile, string sourc
+                 }
+ 
+                 // Archive file will be temporarily stored in MSBuild cache folder and deleted when no longer needed
+-                ArchiveFilePath = Path.Combine(
++                _archiveFilePath = Path.Combine(
+                     cacheDirectory,
+                     Path.ChangeExtension(
+                         Path.GetFileName(logFilePath),
+@@ -59,7 +62,7 @@ public ProjectImportsCollector(string logFilePath, bool createFile, string sourc
+ 
+             try
+             {
+-                _fileStream = new FileStream(ArchiveFilePath, FileMode.Create, FileAccess.ReadWrite, FileShare.Delete);
++                _fileStream = new FileStream(_archiveFilePath, FileMode.Create, FileAccess.ReadWrite, FileShare.Delete);
+                 _zipArchive = new ZipArchive(_fileStream, ZipArchiveMode.Create);
+             }
+             catch
+@@ -69,50 +72,72 @@ public ProjectImportsCollector(string logFilePath, bool createFile, string sourc
+                 _fileStream = null;
+                 _zipArchive = null;
+             }
++            _runOnBackground = runOnBackground;
++        }
++
++        public void AddFile(string? filePath)
++        {
++            AddFileHelper(filePath, AddFileCore);
+         }
+ 
+-        public void AddFile(string filePath)
++        public void AddFileFromMemory(
++            string? filePath,
++            string data,
++            Encoding? encoding = null,
++            DateTimeOffset? entryCreationStamp = null,
++            bool makePathAbsolute = true)
++        {
++            AddFileHelper(filePath, path =>
++                AddFileFromMemoryCore(path, data, encoding ?? Encoding.UTF8, makePathAbsolute, entryCreationStamp));
++        }
++
++        public void AddFileFromMemory(
++            string? filePath,
++            Stream data,
++            DateTimeOffset? entryCreationStamp = null,
++            bool makePathAbsolute = true)
++        {
++            AddFileHelper(filePath, path => AddFileFromMemoryCore(path, data, makePathAbsolute, entryCreationStamp));
++        }
++
++        private void AddFileHelper(
++            string? filePath,
++            Action<string> addFileWorker)
+         {
+             if (filePath != null && _fileStream != null)
+             {
++                Action addFileAction = WrapWithExceptionSwallowing(() => addFileWorker(filePath));
++
+                 lock (_fileStream)
+                 {
+-                    // enqueue the task to add a file and return quickly
+-                    // to avoid holding up the current thread
+-                    _currentTask = _currentTask.ContinueWith(t =>
++                    if (_runOnBackground)
++                    {
++                        // enqueue the task to add a file and return quickly
++                        // to avoid holding up the current thread
++                        _currentTask = _currentTask.ContinueWith(
++                            t => { addFileAction(); },
++                            TaskScheduler.Default);
++                    }
++                    else
+                     {
+-                        try
+-                        {
+-                            AddFileCore(filePath);
+-                        }
+-                        catch
+-                        {
+-                        }
+-                    }, TaskScheduler.Default);
++                        addFileAction();
++                    }
+                 }
+             }
+         }
+ 
+-        public void AddFileFromMemory(string filePath, string data)
++        private Action WrapWithExceptionSwallowing(Action action)
+         {
+-            if (filePath != null && data != null && _fileStream != null)
++            return () =>
+             {
+-                lock (_fileStream)
++                try
+                 {
+-                    // enqueue the task to add a file and return quickly
+-                    // to avoid holding up the current thread
+-                    _currentTask = _currentTask.ContinueWith(t =>
+-                    {
+-                        try
+-                        {
+-                            AddFileFromMemoryCore(filePath, data);
+-                        }
+-                        catch
+-                        {
+-                        }
+-                    }, TaskScheduler.Default);
++                    action();
+                 }
+-            }
++                catch
++                {
++                }
++            };
+         }
+ 
+         /// <remarks>
+@@ -122,61 +147,94 @@ public void AddFileFromMemory(string filePath, string data)
+         private void AddFileCore(string filePath)
+         {
+             // quick check to avoid repeated disk access for Exists etc.
+-            if (_processedFiles.Contains(filePath))
++            if (!ShouldAddFile(ref filePath, true, true))
+             {
+                 return;
+             }
+ 
+-            if (!File.Exists(filePath))
++            using FileStream content = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
++            AddFileData(filePath, content, null);
++        }
++
++        /// <remarks>
++        /// This method doesn't need locking/synchronization because it's only called
++        /// from a task that is chained linearly
++        /// </remarks>
++        private void AddFileFromMemoryCore(string filePath, string data, Encoding encoding, bool makePathAbsolute, DateTimeOffset? entryCreationStamp)
++        {
++            // quick check to avoid repeated disk access for Exists etc.
++            if (!ShouldAddFile(ref filePath, false, makePathAbsolute))
+             {
+-                _processedFiles.Add(filePath);
+                 return;
+             }
+ 
+-            filePath = Path.GetFullPath(filePath);
++            AddFileData(filePath, data, encoding, entryCreationStamp);
++        }
+ 
+-            // if the file is already included, don't include it again
+-            if (!_processedFiles.Add(filePath))
++        private void AddFileFromMemoryCore(string filePath, Stream data, bool makePathAbsolute, DateTimeOffset? entryCreationStamp)
++        {
++            // quick check to avoid repeated disk access for Exists etc.
++            if (!ShouldAddFile(ref filePath, false, makePathAbsolute))
+             {
+                 return;
+             }
+ 
+-            using FileStream content = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+-            using Stream entryStream = OpenArchiveEntry(filePath);
+-            content.CopyTo(entryStream);
++            AddFileData(filePath, data, entryCreationStamp);
+         }
+ 
+-        /// <remarks>
+-        /// This method doesn't need locking/synchronization because it's only called
+-        /// from a task that is chained linearly
+-        /// </remarks>
+-        private void AddFileFromMemoryCore(string filePath, string data)
++        private void AddFileData(string filePath, Stream data, DateTimeOffset? entryCreationStamp)
++        {
++            using Stream entryStream = OpenArchiveEntry(filePath, entryCreationStamp);
++            data.CopyTo(entryStream);
++        }
++
++        private void AddFileData(string filePath, string data, Encoding encoding, DateTimeOffset? entryCreationStamp)
++        {
++            using Stream entryStream = OpenArchiveEntry(filePath, entryCreationStamp);
++            using MemoryStream memoryStream = new MemoryStream();
++            // We need writer as encoding.GetBytes() isn't obliged to output preamble
++            // We cannot write directly to entryStream (preamble is written separately) as it's compressed differnetly, then writing the whole stream at once
++            using StreamWriter writer = new StreamWriter(memoryStream, encoding);
++            writer.Write(data);
++            writer.Flush();
++            memoryStream.Position = 0;
++            memoryStream.CopyTo(entryStream);
++        }
++
++        private bool ShouldAddFile(ref string filePath, bool checkFileExistence, bool makeAbsolute)
+         {
+             // quick check to avoid repeated disk access for Exists etc.
+             if (_processedFiles.Contains(filePath))
+             {
+-                return;
++                return false;
+             }
+ 
+-            filePath = Path.GetFullPath(filePath);
+-
+-            // if the file is already included, don't include it again
+-            if (!_processedFiles.Add(filePath))
++            if (checkFileExistence && !File.Exists(filePath))
+             {
+-                return;
++                _processedFiles.Add(filePath);
++                return false;
+             }
+ 
+-            using (Stream entryStream = OpenArchiveEntry(filePath))
+-            using (var content = new MemoryStream(Encoding.UTF8.GetBytes(data)))
++            // Only make the path absolute if it's request. In the replay scenario, the file entries
++            //  are read from zip archive - where ':' is stripped and path can then seem relative.
++            if (makeAbsolute)
+             {
+-                content.CopyTo(entryStream);
++                filePath = Path.GetFullPath(filePath);
+             }
++
++            // if the file is already included, don't include it again
++            return _processedFiles.Add(filePath);
+         }
+ 
+-        private Stream OpenArchiveEntry(string filePath)
++        private Stream OpenArchiveEntry(string filePath, DateTimeOffset? entryCreationStamp)
+         {
+             string archivePath = CalculateArchivePath(filePath);
+-            var archiveEntry = _zipArchive.CreateEntry(archivePath);
++            var archiveEntry = _zipArchive!.CreateEntry(archivePath);
++            if (entryCreationStamp.HasValue)
++            {
++                archiveEntry.LastWriteTime = entryCreationStamp.Value;
++            }
++
+             return archiveEntry.Open();
+         }
+ 
+@@ -191,6 +249,27 @@ private static string CalculateArchivePath(string filePath)
+             return archivePath;
+         }
+ 
++        public void ProcessResult(Action<Stream> consumeStream, Action<string> onError)
++        {
++            Close();
++
++            // It is possible that the archive couldn't be created for some reason.
++            // Only embed it if it actually exists.
++            if (FileSystems.Default.FileExists(_archiveFilePath))
++            {
++                using FileStream fileStream = File.OpenRead(_archiveFilePath);
++
++                if (fileStream.Length > int.MaxValue)
++                {
++                    onError("Imported files archive exceeded 2GB limit and it's not embedded.");
++                }
++                else
++                {
++                    consumeStream(fileStream);
++                }
++            }
++        }
++
+         public void Close()
+         {
+             // wait for all pending file writes to complete
+@@ -208,5 +287,11 @@ public void Close()
+                 _fileStream = null;
+             }
+         }
++
++        public void DeleteArchive()
++        {
++            Close();
++            File.Delete(_archiveFilePath);
++        }
+     }
+ }

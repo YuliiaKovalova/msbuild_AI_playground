@@ -1,0 +1,434 @@
+diff --git a/build.sh b/build.sh
+index 2d2a01b1ee0..543728b084c 100755
+--- a/build.sh
++++ b/build.sh
+@@ -8,4 +8,4 @@ while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symli
+ done
+ ScriptRoot="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+ 
+-. "$ScriptRoot/eng/common/build.sh" --build --restore "$@"
++. "$ScriptRoot/eng/common/build.sh" --build "$@"
+diff --git a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+index 9e443496105..445f1668bdf 100644
+--- a/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
++++ b/src/Build.UnitTests/Graph/ProjectGraph_Tests.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Collections.Immutable;
++using System.Diagnostics;
+ using System.IO;
+ using System.Linq;
+ using System.Text.RegularExpressions;
+@@ -66,6 +67,56 @@ public void ConstructWithSingleNode()
+             }
+         }
+ 
++        [Fact]
++        public void  AnyCPUSetPlatformMetaDataWasNotSet()
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                TransientTestFile entryProject = CreateProjectFile(env, 1, extraContent: @"<PropertyGroup>
++                                                                                                <EnableDynamicPlatformResolution>true</EnableDynamicPlatformResolution>
++                                                                                                <Platform>x86</Platform>
++                                                                                                <Platforms>x86</Platforms>
++                                                                                            </PropertyGroup>
++                                                                                            <ItemGroup>
++                                                                                                <ProjectReference Include=""$(MSBuildThisFileDirectory)2.proj"" >
++                                                                                                </ProjectReference>
++                                                                                            </ItemGroup>");
++                var file = env.CreateFile("2.proj", @"
++                                <Project>
++                                <PropertyGroup>
++                                    <Platforms>AnyCPU</Platforms>
++                                </PropertyGroup>
++                                </Project>");
++                ProjectGraph graph = new ProjectGraph(entryProject.Path);
++                GetFirstNodeWithProjectNumber(graph, 2).ProjectInstance.GlobalProperties["Platform"].ShouldBe("AnyCPU");
++            }
++        }
++
++        [Fact]
++        public void SetPlatformMetaDataWasNotSet()
++        {
++            using (var env = TestEnvironment.Create())
++            {
++                TransientTestFile entryProject = CreateProjectFile(env, 1, extraContent: @"<PropertyGroup>
++                                                                                                <EnableDynamicPlatformResolution>true</EnableDynamicPlatformResolution>
++                                                                                                <Platform>x86</Platform>
++                                                                                                <Platforms>x86</Platforms>
++                                                                                            </PropertyGroup>
++                                                                                            <ItemGroup>
++                                                                                                <ProjectReference Include=""$(MSBuildThisFileDirectory)2.proj"" >
++                                                                                                </ProjectReference>
++                                                                                            </ItemGroup>");
++                var file = env.CreateFile("2.proj", @"
++                                <Project>
++                                <PropertyGroup>
++                                    <Platforms>x86;x64</Platforms>
++                                </PropertyGroup>
++                                </Project>");
++                ProjectGraph graph = new ProjectGraph(entryProject.Path);
++                GetFirstNodeWithProjectNumber(graph, 2).ProjectInstance.GlobalProperties["Platform"].ShouldBe("x86");
++            }
++        }
++
+         [Fact]
+         public void ConstructionMetricsAreAvailable()
+         {
+diff --git a/src/Build/Graph/ProjectInterpretation.cs b/src/Build/Graph/ProjectInterpretation.cs
+index 08e0e5a56b8..3981b1135c5 100644
+--- a/src/Build/Graph/ProjectInterpretation.cs
++++ b/src/Build/Graph/ProjectInterpretation.cs
+@@ -1,4 +1,4 @@
+-﻿// Copyright (c) Microsoft. All rights reserved.
++// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using System;
+@@ -6,11 +6,13 @@
+ using System.Collections.Immutable;
+ using System.Globalization;
+ using System.Linq;
++using System.Runtime.CompilerServices;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Exceptions;
+ using Microsoft.Build.Execution;
++using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ 
+ #nullable disable
+@@ -19,6 +21,7 @@ namespace Microsoft.Build.Graph
+ {
+     internal sealed class ProjectInterpretation
+     {
++        private const string EnableDynamicPlatformResolutionMetadataName  = "EnableDynamicPlatformResolution";
+         private const string FullPathMetadataName = "FullPath";
+         private const string ToolsVersionMetadataName = "ToolsVersion";
+         private const string SetConfigurationMetadataName = "SetConfiguration";
+@@ -227,6 +230,13 @@ ProjectItemInstance projectReference
+             // The properties on the project reference supersede the ones from the MSBuild task instead of appending.
+             if (newProperties.Count == 0)
+             {
++                // This mimics the _GetProjectReferenceTargetFrameworkProperties task in order to properly reflect what the build graph looks like in
++                // a traversal in which EnableDynamicPlatformResolution is turned on
++                if (ConversionUtilities.ValidBooleanTrue(projectReference.Project.GetPropertyValue(EnableDynamicPlatformResolutionMetadataName)) && String.IsNullOrEmpty(projectReference.GetMetadataValue(SetPlatformMetadataName)))
++                {
++                    var SelectedPlatform = PlatformNegotiation.GetNearestPlatform(projectReference);    
++                    projectReference.SetMetadata("SetPlatform", $"Platform={SelectedPlatform}");
++                }
+                 // TODO: Mimic AssignProjectConfiguration's behavior for determining the values for these.
+                 var setConfigurationString = projectReference.GetMetadataValue(SetConfigurationMetadataName);
+                 var setPlatformString = projectReference.GetMetadataValue(SetPlatformMetadataName);
+@@ -239,7 +249,6 @@ ProjectItemInstance projectReference
+                         $"{setConfigurationString};{setPlatformString};{setTargetFrameworkString}").ToImmutableDictionary();
+                 }
+             }
+-
+             return new GlobalPropertyPartsForMSBuildTask(newProperties, defaultParts.AdditionalProperties, newUndefineProperties);
+         }
+ 
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index c25e4dc39fe..8ac55f4d56d 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -122,6 +122,10 @@
+     <Compile Include="..\Shared\NodeShutdown.cs" />
+     <Compile Include="..\Shared\NamedPipeUtil.cs" />
+     <Compile Include="..\Shared\ProcessExtensions.cs" />
++    <Compile Include="..\Shared\PlatformNegotiation.cs">
++      <Link>PlatformNegotiation.cs</Link>
++      <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
++    </Compile>
+     <Compile Include="..\Shared\TaskLoggingHelper.cs">
+       <Link>BackEnd\Components\RequestBuilder\IntrinsicTasks\TaskLoggingHelper.cs</Link>
+       <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
+diff --git a/src/Shared/PlatformNegotiation.cs b/src/Shared/PlatformNegotiation.cs
+new file mode 100644
+index 00000000000..94d854fcd84
+--- /dev/null
++++ b/src/Shared/PlatformNegotiation.cs
+@@ -0,0 +1,125 @@
++// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using System;
++using System.Collections.Generic;
++using Microsoft.Build.Framework;
++using Microsoft.Build.Utilities;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Construction;
++using Microsoft.Build.Execution;
++using Microsoft.Build.Evaluation;
++
++namespace Microsoft.Build.Shared
++{
++    /// <summary>
++    /// This class contains only static methods, which are used in both the 
++    /// tasks and graph projects in order for two projects to negotiate which platform a projectreference
++    /// should be built as.
++    /// </summary>
++    static internal class PlatformNegotiation
++    {
++        private const string PlatformLookupTableMetadataName = "PlatformLookupTable";
++        private const string PlatformMetadataName = "Platform";
++        private const string PlatformsMetadataName = "Platforms";
++        internal static string? GetNearestPlatform(ProjectItemInstance projectReference, TaskLoggingHelper? Log = null)
++        {
++
++            var referencedProject = new Project(projectReference.EvaluatedInclude);
++            var projectReferencePlatformMetadata = referencedProject.GetPropertyValue(PlatformsMetadataName);
++            var projectReferenceLookupTableMetadata = referencedProject.GetPropertyValue(PlatformLookupTableMetadataName);
++            var currentProjectPlatformMetadata = projectReference.Project.GetPropertyValue(PlatformMetadataName);
++            var currentPlatformLookupTableMetadata = projectReference.Project.GetPropertyValue(PlatformLookupTableMetadataName);
++            var projectPath = projectReference.EvaluatedInclude;
++
++
++
++
++            Dictionary<string, string>? currentProjectLookupTable = ExtractLookupTable(currentPlatformLookupTableMetadata, Log);
++
++            if (string.IsNullOrEmpty(projectReferencePlatformMetadata))
++            {
++                Log?.LogWarningWithCodeFromResources("GetCompatiblePlatform.NoPlatformsListed", projectPath);
++                return null;
++            }
++            Dictionary<string, string>? projectReferenceLookupTable = ExtractLookupTable(projectReferenceLookupTableMetadata, Log);
++            HashSet<string> projectReferencePlatforms = new HashSet<string>();
++            foreach (string s in projectReferencePlatformMetadata.Split(MSBuildConstants.SemicolonChar, StringSplitOptions.RemoveEmptyEntries))
++            {
++                projectReferencePlatforms.Add(s);
++            }
++
++            string buildProjectReferenceAs = string.Empty;
++
++            if (projectReferencePlatforms.Contains(currentProjectPlatformMetadata))
++            {
++                buildProjectReferenceAs = currentProjectPlatformMetadata;
++                Log?.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.SamePlatform");
++            }
++            // Prioritize PlatformLookupTable **metadata** attached to the ProjectReference item
++            // before the current project's table. We do this to allow per-ProjectReference fine tuning.
++            else if (projectReferenceLookupTable != null &&
++                    projectReferenceLookupTable.TryGetValue(currentProjectPlatformMetadata, out var projectreference) &&
++                    projectReferencePlatforms.Contains(projectreference))
++            {
++                buildProjectReferenceAs = projectReferenceLookupTable[currentProjectPlatformMetadata];
++                Log?.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.FoundMappingInTable", currentProjectPlatformMetadata, buildProjectReferenceAs, projectReferenceLookupTableMetadata); 
++            }
++            // Current project's translation table follows
++            else if (currentProjectLookupTable != null &&
++                    currentProjectLookupTable.ContainsKey(currentProjectPlatformMetadata) &&
++                    projectReferencePlatforms.Contains(currentProjectLookupTable[currentProjectPlatformMetadata]))
++            {
++                buildProjectReferenceAs = currentProjectLookupTable[currentProjectPlatformMetadata];
++                Log?.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.FoundMappingInTable", currentProjectPlatformMetadata, buildProjectReferenceAs, currentPlatformLookupTableMetadata);
++            }
++            // AnyCPU if possible
++            else if (projectReferencePlatforms.Contains("AnyCPU") && buildProjectReferenceAs.Equals(String.Empty))
++            {
++                buildProjectReferenceAs = "AnyCPU";
++                Log?.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.AnyCPUDefault");
++            }
++            else
++            {
++                // Keep NearestPlatform empty, log a warning. Common.CurrentVersion.targets will undefine 
++                // Platform/PlatformTarget when this is the case.
++                Log?.LogWarningWithCodeFromResources("GetCompatiblePlatform.NoCompatiblePlatformFound", projectPath);
++            }
++
++            return buildProjectReferenceAs;
++        }
++
++        internal static void test(ProjectItemInstance stringTable)
++        {
++            Console.Write("hello");
++        }
++
++        internal static Dictionary<string, string>? ExtractLookupTable(string stringTable, TaskLoggingHelper? Log = null)
++        {
++            if (string.IsNullOrEmpty(stringTable))
++            {
++                return null;
++            }
++
++            Dictionary<string, string> table = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
++
++            foreach (string s in stringTable.Trim().Split(MSBuildConstants.SemicolonChar, StringSplitOptions.RemoveEmptyEntries))
++            {
++                string[] keyVal = s.Trim().Split(MSBuildConstants.EqualsChar);
++
++                // Invalid table, don't use it.
++                if (keyVal.Length != 2 || string.IsNullOrEmpty(keyVal[0]) || string.IsNullOrEmpty(keyVal[1]))
++                {
++                    Log?.LogWarningWithCodeFromResources("GetCompatiblePlatform.InvalidLookupTableFormat", stringTable);
++                    return null;
++                }
++
++                table[keyVal[0]] = keyVal[1];
++            }
++
++            Log?.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.LookupTableParsed", stringTable);
++
++            return table;
++        }
++    }
++}
+diff --git a/src/Tasks/GetCompatiblePlatform.cs b/src/Tasks/GetCompatiblePlatform.cs
+index f2b823767fd..6815f2f89a6 100644
+--- a/src/Tasks/GetCompatiblePlatform.cs
++++ b/src/Tasks/GetCompatiblePlatform.cs
+@@ -1,12 +1,14 @@
+ ﻿// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
++using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Utilities;
+ using System;
+ using System.Collections.Generic;
+ 
++
+ namespace Microsoft.Build.Tasks
+ {
+     /// <summary>
+@@ -51,8 +53,6 @@ public GetCompatiblePlatform()
+ 
+         public override bool Execute()
+         {
+-            Dictionary<string, string>? currentProjectLookupTable = ExtractLookupTable(PlatformLookupTable);
+-
+             AssignedProjectsWithPlatform = new ITaskItem[AnnotatedProjects.Length];
+             for (int i = 0; i < AnnotatedProjects.Length; i++)
+             {
+@@ -60,94 +60,17 @@ public override bool Execute()
+ 
+                 string projectReferencePlatformMetadata = AssignedProjectsWithPlatform[i].GetMetadata("Platforms");
+ 
+-                if (string.IsNullOrEmpty(projectReferencePlatformMetadata))
+-                {
+-                    Log.LogWarningWithCodeFromResources("GetCompatiblePlatform.NoPlatformsListed", AssignedProjectsWithPlatform[i].ItemSpec);
+-                    continue;
+-                }
+-
+                 string projectReferenceLookupTableMetadata = AssignedProjectsWithPlatform[i].GetMetadata("PlatformLookupTable");
+                 // Pull platformlookuptable metadata from the referenced project. This allows custom
+                 // mappings on a per-ProjectReference basis.
+-                Dictionary<string, string>? projectReferenceLookupTable = ExtractLookupTable(projectReferenceLookupTableMetadata);
+-
+-                HashSet<string> projectReferencePlatforms = new HashSet<string>();
+-                foreach (string s in projectReferencePlatformMetadata.Split(MSBuildConstants.SemicolonChar, StringSplitOptions.RemoveEmptyEntries))
+-                {
+-                    projectReferencePlatforms.Add(s);
+-                }
+-
+-                string buildProjectReferenceAs = string.Empty;
+-
+-                // Prefer matching platforms
+-                if (projectReferencePlatforms.Contains(CurrentProjectPlatform))
+-                {
+-                    buildProjectReferenceAs = CurrentProjectPlatform;
+-                    Log.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.SamePlatform");
+-                }
+-                // Prioritize PlatformLookupTable **metadata** attached to the ProjectReference item
+-                // before the current project's table. We do this to allow per-ProjectReference fine tuning.
+-                else if (projectReferenceLookupTable != null &&
+-                        projectReferenceLookupTable.ContainsKey(CurrentProjectPlatform) &&
+-                        projectReferencePlatforms.Contains(projectReferenceLookupTable[CurrentProjectPlatform]))
+-                {
+-                    buildProjectReferenceAs = projectReferenceLookupTable[CurrentProjectPlatform];
+-                    Log.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.FoundMappingInTable", CurrentProjectPlatform, buildProjectReferenceAs, projectReferenceLookupTableMetadata);
+-                }
+-                // Current project's translation table follows
+-                else if (currentProjectLookupTable != null &&
+-                        currentProjectLookupTable.ContainsKey(CurrentProjectPlatform) &&
+-                        projectReferencePlatforms.Contains(currentProjectLookupTable[CurrentProjectPlatform]))
+-                {
+-                    buildProjectReferenceAs = currentProjectLookupTable[CurrentProjectPlatform];
+-                    Log.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.FoundMappingInTable", CurrentProjectPlatform, buildProjectReferenceAs, PlatformLookupTable);
+-                }
+-                // AnyCPU if possible
+-                else if (projectReferencePlatforms.Contains("AnyCPU"))
+-                {
+-                    buildProjectReferenceAs = "AnyCPU";
+-                    Log.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.AnyCPUDefault");
+-                }
+-                else
+-                {
+-                    // Keep NearestPlatform empty, log a warning. Common.CurrentVersion.targets will undefine 
+-                    // Platform/PlatformTarget when this is the case.
+-                    Log.LogWarningWithCodeFromResources("GetCompatiblePlatform.NoCompatiblePlatformFound", AssignedProjectsWithPlatform[i].ItemSpec);
+-                }
+-
++                var projectReference = (ProjectItemInstance)AssignedProjectsWithPlatform[i];
++                string? buildProjectReferenceAs = PlatformNegotiation.GetNearestPlatform(projectReference, Log);
++                
+                 AssignedProjectsWithPlatform[i].SetMetadata("NearestPlatform", buildProjectReferenceAs);
+                 Log.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.DisplayChosenPlatform", AssignedProjectsWithPlatform[i].ItemSpec, buildProjectReferenceAs);
+             }
+ 
+             return !Log.HasLoggedErrors;
+         }
+-
+-        private Dictionary<string, string>? ExtractLookupTable(string stringTable)
+-        {
+-            if (string.IsNullOrEmpty(stringTable))
+-            {
+-                return null;
+-            }
+-
+-            Dictionary<string, string> table = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+-
+-            foreach (string s in stringTable.Trim().Split(MSBuildConstants.SemicolonChar, StringSplitOptions.RemoveEmptyEntries))
+-            {
+-                string[] keyVal = s.Trim().Split(MSBuildConstants.EqualsChar);
+-
+-                // Invalid table, don't use it.
+-                if (keyVal.Length != 2 || string.IsNullOrEmpty(keyVal[0]) || string.IsNullOrEmpty(keyVal[1]))
+-                {
+-                    Log.LogWarningWithCodeFromResources("GetCompatiblePlatform.InvalidLookupTableFormat", stringTable);
+-                    return null;
+-                }
+-
+-                table[keyVal[0]] = keyVal[1];
+-            }
+-
+-            Log.LogMessageFromResources(MessageImportance.Low, "GetCompatiblePlatform.LookupTableParsed", stringTable);
+-
+-            return table;
+-        }
+     }
+ }
+diff --git a/src/Tasks/Microsoft.Build.Tasks.csproj b/src/Tasks/Microsoft.Build.Tasks.csproj
+index 96ff4e3a91b..6c741a842b3 100644
+--- a/src/Tasks/Microsoft.Build.Tasks.csproj
++++ b/src/Tasks/Microsoft.Build.Tasks.csproj
+@@ -1,4 +1,4 @@
+-<Project Sdk="Microsoft.NET.Sdk">
++﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <Import Project="..\Shared\FileSystemSources.proj" />
+   <Import Project="..\Shared\DebuggingSources.proj" />
+@@ -191,6 +191,10 @@
+     <Compile Include="..\Shared\LanguageParser\VisualBasictokenizer.cs">
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+     </Compile>
++    <Compile Include="..\Shared\PlatformNegotiation.cs">
++      <Link>PlatformNegotiation.cs</Link>
++      <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
++    </Compile>
+     <Compile Include="..\Shared\XMakeAttributes.cs">
+       <ExcludeFromStyleCop>true</ExcludeFromStyleCop>
+     </Compile>
+@@ -964,6 +968,7 @@
+   <ItemGroup>
+     <ProjectReference Include="..\Framework\Microsoft.Build.Framework.csproj" SetTargetFramework="TargetFramework=netstandard2.0" OutputItemType="NetstandardRefAssemblies" />
+     <ProjectReference Include="..\Utilities\Microsoft.Build.Utilities.csproj" SetTargetFramework="TargetFramework=netstandard2.0" OutputItemType="NetstandardRefAssemblies" />
++    <ProjectReference Include="..\Build\Microsoft.Build.csproj" SetTargetFramework="TargetFramework=netstandard2.0" OutputItemType="NetstandardRefAssemblies" />
+     <ProjectReference Include="..\Framework\Microsoft.Build.Framework.csproj"/>
+     <ProjectReference Include="..\Utilities\Microsoft.Build.Utilities.csproj"/>
+     <ProjectReference Include="..\StringTools\StringTools.csproj" />

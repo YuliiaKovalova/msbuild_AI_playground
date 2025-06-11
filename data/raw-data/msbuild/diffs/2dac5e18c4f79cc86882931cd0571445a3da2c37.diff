@@ -1,0 +1,798 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index f8a5acf81fc..d5b65f9d28f 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -562,6 +562,12 @@ public void BeginBuild(BuildParameters parameters)
+ #if FEATURE_REPORTFILEACCESSES
+                 if (_buildParameters.ReportFileAccesses)
+                 {
++                    // To properly report file access, we need to disable the in-proc node which won't be detoured.
++                    _buildParameters.DisableInProcNode = true;
++
++                    // Node reuse must be disabled as future builds will not be able to listen to events raised by detours.
++                    _buildParameters.EnableNodeReuse = false;
++
+                     _componentFactories.ReplaceFactory(BuildComponentType.NodeLauncher, DetouredNodeLauncher.CreateComponent);
+                 }
+ #endif
+@@ -576,11 +582,16 @@ public void BeginBuild(BuildParameters parameters)
+ 
+                 InitializeCaches();
+ 
++#if FEATURE_REPORTFILEACCESSES
+                 var fileAccessManager = ((IBuildComponentHost)this).GetComponent(BuildComponentType.FileAccessManager) as IFileAccessManager;
++#endif
++
+                 _projectCacheService = new ProjectCacheService(
+                     this,
+                     loggingService,
++#if FEATURE_REPORTFILEACCESSES
+                     fileAccessManager,
++#endif
+                     _configCache,
+                     _buildParameters.ProjectCacheDescriptor);
+ 
+@@ -2398,8 +2409,9 @@ private void HandleResult(int node, BuildResult result)
+             if (_buildSubmissions.TryGetValue(result.SubmissionId, out BuildSubmission buildSubmission))
+             {
+                 // The result may be associated with the build submission due to it being the submission which
+-                // caused the build, but not the actual request which was used with the build submission. Ensure
+-                // only the actual submission's request is considered.
++                // caused the build, but not the actual request which was originally used with the build submission.
++                // ie. it may be a dependency of the "root-level" project which is associated with this submission, which
++                // isn't what we're looking for. Ensure only the actual submission's request is considered.
+                 if (buildSubmission.BuildRequest != null
+                     && buildSubmission.BuildRequest.ConfigurationId == configuration.ConfigurationId
+                     && _projectCacheService.ShouldUseCache(configuration))
+diff --git a/src/Build/BackEnd/BuildManager/BuildParameters.cs b/src/Build/BackEnd/BuildManager/BuildParameters.cs
+index c692db04664..582532e5795 100644
+--- a/src/Build/BackEnd/BuildManager/BuildParameters.cs
++++ b/src/Build/BackEnd/BuildManager/BuildParameters.cs
+@@ -811,20 +811,7 @@ public string OutputResultsCacheFile
+         public bool ReportFileAccesses
+         {
+             get => _reportFileAccesses;
+-            set
+-            {
+-                _reportFileAccesses = value;
+-
+-                // TODO dfederm: What if either of these are set after ReportFileAccesses is? Do we need to move this elsewhere?
+-                if (_reportFileAccesses)
+-                {
+-                    // To properly report file access, we need to disable the in-proc node which won't be detoured.
+-                    DisableInProcNode = true;
+-
+-                    // Node reuse must be disabled as future builds will not be able to listen to events raised by detours.
+-                    EnableNodeReuse = false;
+-                }
+-            }
++            set => _reportFileAccesses = value;
+         }
+ #endif
+ 
+diff --git a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+index d8406cf2b94..c4d543c87da 100644
+--- a/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
++++ b/src/Build/BackEnd/Components/BuildComponentFactoryCollection.cs
+@@ -83,7 +83,9 @@ public void RegisterDefaultFactories()
+             // SDK resolution
+             _componentEntriesByType[BuildComponentType.SdkResolverService] = new BuildComponentEntry(BuildComponentType.SdkResolverService, MainNodeSdkResolverService.CreateComponent, CreationPattern.Singleton);
+ 
++#if FEATURE_REPORTFILEACCESSES
+             _componentEntriesByType[BuildComponentType.FileAccessManager] = new BuildComponentEntry(BuildComponentType.FileAccessManager, FileAccessManager.CreateComponent, CreationPattern.Singleton);
++#endif
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs b/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs
+index f690ea66926..445b8caf217 100644
+--- a/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs
++++ b/src/Build/BackEnd/Components/Communications/DetouredNodeLauncher.cs
+@@ -71,13 +71,9 @@ public Process Start(string msbuildLocation, string commandLineArgs, int nodeId)
+ 
+             string exeName = msbuildLocation;
+ 
+-#if RUNTIME_TYPE_NETCORE || MONO
+-            // Mono automagically uses the current mono, to execute a managed assembly
+-            if (!NativeMethodsShared.IsMono)
+-            {
+-                // Run the child process with the same host as the currently-running process.
+-                exeName = CurrentHost.GetCurrentHost();
+-            }
++#if RUNTIME_TYPE_NETCORE
++            // Run the child process with the same host as the currently-running process.
++            exeName = CurrentHost.GetCurrentHost();
+ #endif
+ 
+             var eventListener = new DetoursEventListener(_fileAccessManager, nodeId);
+@@ -117,7 +113,7 @@ public Process Start(string msbuildLocation, string commandLineArgs, int nodeId)
+             // needed for logging process arguments when a new process is invoked; see DetoursEventListener.cs
+             info.FileAccessManifest.ReportProcessArgs = true;
+ 
+-            // By default, Domino sets the timestamp of all input files to January 1, 1970
++            // By default, BuildXL sets the timestamp of all input files to January 1, 1970
+             // This breaks some tools like Robocopy which will not copy a file to the destination if the file exists at the destination and has a timestamp that is more recent than the source file
+             info.FileAccessManifest.NormalizeReadTimestamps = false;
+ 
+diff --git a/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs b/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs
+index fbafcab1c16..efbe32a0f64 100644
+--- a/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs
++++ b/src/Build/BackEnd/Components/FileAccesses/FileAccessManager.cs
+@@ -1,9 +1,11 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++#if FEATURE_REPORTFILEACCESSES
+ using System;
+ using System.Collections.Concurrent;
+ using System.IO;
++using System.Runtime.Versioning;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+ using Microsoft.Build.Execution;
+@@ -19,6 +21,7 @@ private record Handlers(Action<BuildRequest, FileAccessData> FileAccessHander, A
+         // In order to synchronize between the node communication and the file access reporting, a special file access
+         // is used to mark when the file accesses should be considered complete. Only after both this special file access is seen
+         // and the build result is reported can plugins be notified about project completion.
++        // NOTE! This is currently Windows-specific and will need to change once this feature is opened up to more scenarios.
+         private static readonly string FileAccessCompletionPrefix = BuildParameters.StartupDirectory[0] + @":\{MSBuildFileAccessCompletion}\";
+ 
+         private IScheduler? _scheduler;
+@@ -67,8 +70,8 @@ public void ReportFileAccess(FileAccessData fileAccessData, int nodeId)
+             }
+             else if (_tempDirectory != null && fileAccessPath.StartsWith(_tempDirectory))
+             {
+-                // Ignore the temp directory as these are related to internal MSBuild functionality and not always directly related to the execution of the project itself,
+-                // so should not be exposed to handlers.
++                // Ignore MSBuild's temp directory as these are related to internal MSBuild functionality and not always directly related to the execution of the project itself,
++                // so should not be exposed to handlers. Note that this is not %TEMP% but instead a subdir under %TEMP% which is only expected to be used by MSBuild.
+                 return;
+             }
+             else
+@@ -134,6 +137,9 @@ private void UnregisterHandlers(Handlers handlersToRemove)
+             }
+         }
+ 
++        // The [SupportedOSPlatform] attribute is a safeguard to ensure that the comment on FileAccessCompletionPrefix regarding being Windows-only gets addressed.
++        // [SupportedOSPlatform] doesn't apply to fields, so using it here as a reasonable proxy.
++        [SupportedOSPlatform("windows")]
+         public static void NotifyFileAccessCompletion(int globalRequestId)
+         {
+             // Make a dummy file access to use as a notification that the file accesses should be completed for a project.
+@@ -179,3 +185,4 @@ public void Dispose()
+         }
+     }
+ }
++#endif
+diff --git a/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs b/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs
+index 5772ad93d21..3dd724afef3 100644
+--- a/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs
++++ b/src/Build/BackEnd/Components/FileAccesses/IFileAccessManager.cs
+@@ -1,6 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++#if FEATURE_REPORTFILEACCESSES
+ using System;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+@@ -14,7 +15,7 @@ internal interface IFileAccessManager
+ 
+         void ReportProcess(ProcessData processData, int nodeId);
+ 
+-        // Note: HandlerRegistration is exposed directly instead of IDisposable to avoid boxing.
++        // Note: The return type of FileAccessManager.HandlerRegistration is exposed directly instead of IDisposable to avoid boxing.
+         FileAccessManager.HandlerRegistration RegisterHandlers(
+             Action<BuildRequest, FileAccessData> fileAccessHandler,
+             Action<BuildRequest, ProcessData> processHandler);
+@@ -22,3 +23,4 @@ FileAccessManager.HandlerRegistration RegisterHandlers(
+         void WaitForFileAccessReportCompletion(int globalRequestId, CancellationToken cancellationToken);
+     }
+ }
++#endif
+diff --git a/src/Build/BackEnd/Components/FileAccesses/OutOfProcNodeFileAccessManager.cs b/src/Build/BackEnd/Components/FileAccesses/OutOfProcNodeFileAccessManager.cs
+index ea1f42f1c79..80255059350 100644
+--- a/src/Build/BackEnd/Components/FileAccesses/OutOfProcNodeFileAccessManager.cs
++++ b/src/Build/BackEnd/Components/FileAccesses/OutOfProcNodeFileAccessManager.cs
+@@ -1,6 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++#if FEATURE_REPORTFILEACCESSES
+ using System;
+ using System.Threading;
+ using Microsoft.Build.BackEnd;
+@@ -59,3 +60,4 @@ public void WaitForFileAccessReportCompletion(int globalRequestId, CancellationT
+             throw new NotImplementedException("This method should not be called in OOP nodes.");
+     }
+ }
++#endif
+diff --git a/src/Build/BackEnd/Components/IBuildComponentHost.cs b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+index be9fa43f5e8..5ae9d947906 100644
+--- a/src/Build/BackEnd/Components/IBuildComponentHost.cs
++++ b/src/Build/BackEnd/Components/IBuildComponentHost.cs
+@@ -131,10 +131,12 @@ internal enum BuildComponentType
+         /// </summary>
+         SdkResolverService,
+ 
++#if FEATURE_REPORTFILEACCESSES
+         /// <summary>
+         /// The component which is the sink for file access reports and forwards reports to other components.
+         /// </summary>
+         FileAccessManager,
++#endif
+ 
+         /// <summary>
+         /// The component which launches new MSBuild nodes.
+diff --git a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+index 8e90f5a0933..0960e200e33 100644
+--- a/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
++++ b/src/Build/BackEnd/Components/ProjectCache/ProjectCacheService.cs
+@@ -36,7 +36,9 @@ internal sealed class ProjectCacheService : IAsyncDisposable
+         private readonly BuildManager _buildManager;
+         private readonly IBuildComponentHost _componentHost;
+         private readonly ILoggingService _loggingService;
++#if FEATURE_REPORTFILEACCESSES
+         private readonly IFileAccessManager _fileAccessManager;
++#endif
+         private readonly IConfigCache _configCache;
+ 
+         private readonly ProjectCacheDescriptor? _globalProjectCacheDescriptor;
+@@ -53,7 +55,9 @@ internal sealed class ProjectCacheService : IAsyncDisposable
+         private record struct ProjectCachePlugin(
+             string Name,
+             ProjectCachePluginBase? Instance,
++#if FEATURE_REPORTFILEACCESSES
+             FileAccessManager.HandlerRegistration? HandlerRegistration,
++#endif
+             ExceptionDispatchInfo? InitializationException = null);
+ 
+         /// <summary>
+@@ -72,14 +76,18 @@ private DefaultMSBuildFileSystem()
+         public ProjectCacheService(
+             BuildManager buildManager,
+             ILoggingService loggingService,
++#if FEATURE_REPORTFILEACCESSES
+             IFileAccessManager fileAccessManager,
++#endif
+             IConfigCache configCache,
+             ProjectCacheDescriptor? globalProjectCacheDescriptor)
+         {
+             _buildManager = buildManager;
+             _componentHost = buildManager;
+             _loggingService = loggingService;
++#if FEATURE_REPORTFILEACCESSES
+             _fileAccessManager = fileAccessManager;
++#endif
+             _configCache = configCache;
+             _globalProjectCacheDescriptor = globalProjectCacheDescriptor;
+         }
+@@ -203,7 +211,13 @@ private async Task<ProjectCachePlugin> CreateAndInitializePluginAsync(
+                 }
+                 catch (Exception e)
+                 {
+-                    return new ProjectCachePlugin(pluginTypeName, Instance: null, HandlerRegistration: null, ExceptionDispatchInfo.Capture(e));
++                    return new ProjectCachePlugin(
++                        pluginTypeName,
++                        Instance: null,
++#if FEATURE_REPORTFILEACCESSES
++                        HandlerRegistration: null,
++#endif
++                        ExceptionDispatchInfo.Capture(e));
+                 }
+                 finally
+                 {
+@@ -234,7 +248,11 @@ await pluginInstance.BeginBuildAsync(
+                     ProjectCacheException.ThrowForErrorLoggedInsideTheProjectCache("ProjectCacheInitializationFailed");
+                 }
+ 
+-                FileAccessManager.HandlerRegistration handlerRegistration = _fileAccessManager.RegisterHandlers(
++#if FEATURE_REPORTFILEACCESSES
++            FileAccessManager.HandlerRegistration? handlerRegistration = null;
++            if (_componentHost.BuildParameters.ReportFileAccesses)
++            {
++                handlerRegistration = _fileAccessManager.RegisterHandlers(
+                     (buildRequest, fileAccessData) =>
+                     {
+                         // TODO: Filter out projects which do not configure this plugin
+@@ -247,12 +265,26 @@ await pluginInstance.BeginBuildAsync(
+                         FileAccessContext fileAccessContext = GetFileAccessContext(buildRequest);
+                         pluginInstance.HandleProcess(fileAccessContext, processData);
+                     });
++            }
++#endif
+ 
+-                return new ProjectCachePlugin(pluginTypeName, pluginInstance, handlerRegistration);
++                return new ProjectCachePlugin(
++                    pluginTypeName,
++                    pluginInstance,
++#if FEATURE_REPORTFILEACCESSES
++                    handlerRegistration,
++#endif
++                    InitializationException: null);
+             }
+             catch (Exception e)
+             {
+-                return new ProjectCachePlugin(pluginTypeName, Instance: null, HandlerRegistration: null, ExceptionDispatchInfo.Capture(e));
++                return new ProjectCachePlugin(
++                    pluginTypeName,
++                    Instance: null,
++#if FEATURE_REPORTFILEACCESSES
++                    HandlerRegistration: null,
++#endif
++                    ExceptionDispatchInfo.Capture(e));
+             }
+             finally
+             {
+@@ -773,10 +805,12 @@ public async ValueTask DisposeAsync()
+                         return;
+                     }
+ 
++#if FEATURE_REPORTFILEACCESSES
+                     if (plugin.HandlerRegistration.HasValue)
+                     {
+                         plugin.HandlerRegistration.Value.Dispose();
+                     }
++#endif
+ 
+                     MSBuildEventSource.Log.ProjectCacheEndBuildStart(plugin.Name);
+                     try
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index 58a1c4a7a6f..c5d8282d5bb 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -156,9 +156,12 @@ public OutOfProcNode()
+             OutOfProcNodeSdkResolverServiceFactory sdkResolverServiceFactory = new OutOfProcNodeSdkResolverServiceFactory(SendPacket);
+             ((IBuildComponentHost)this).RegisterFactory(BuildComponentType.SdkResolverService, sdkResolverServiceFactory.CreateInstance);
+             _sdkResolverService = (this as IBuildComponentHost).GetComponent(BuildComponentType.SdkResolverService) as ISdkResolverService;
++
++#if FEATURE_REPORTFILEACCESSES
+             ((IBuildComponentHost)this).RegisterFactory(
+                 BuildComponentType.FileAccessManager,
+                 (componentType) => OutOfProcNodeFileAccessManager.CreateComponent(componentType, SendPacket));
++#endif
+ 
+             if (s_projectRootElementCacheBase == null)
+             {
+diff --git a/src/Build/Collections/RetrievableEntryHashSet/HashSet.cs b/src/Build/Collections/RetrievableEntryHashSet/HashSet.cs
+index 21bfc210bc1..fb954982e34 100644
+--- a/src/Build/Collections/RetrievableEntryHashSet/HashSet.cs
++++ b/src/Build/Collections/RetrievableEntryHashSet/HashSet.cs
+@@ -32,6 +32,9 @@
+ 
+ #nullable disable
+ 
++// The BuildXL package causes an indirect dependency on the RuntimeContracts package, which adds an analyzer which forbids the use of System.Diagnostics.Contract.
++// So effectively if your dependencies use RuntimeContracts, it attempts to force itself on your as well.
++// See: https://github.com/SergeyTeplyakov/RuntimeContracts/issues/12
+ #pragma warning disable RA001 // Do not use System.Diagnostics.Contract class.
+ 
+ namespace Microsoft.Build.Collections
+diff --git a/src/Build/Instance/TaskFactories/TaskHostTask.cs b/src/Build/Instance/TaskFactories/TaskHostTask.cs
+index f4b3e0e4e70..4fb2fe61f8d 100644
+--- a/src/Build/Instance/TaskFactories/TaskHostTask.cs
++++ b/src/Build/Instance/TaskFactories/TaskHostTask.cs
+@@ -436,10 +436,13 @@ private void HandlePacket(INodePacket packet, out bool taskFinished)
+         private void HandleTaskHostTaskComplete(TaskHostTaskComplete taskHostTaskComplete)
+         {
+ #if FEATURE_REPORTFILEACCESSES
+-            foreach (FileAccessData fileAccessData in taskHostTaskComplete.FileAccessData)
++            if (taskHostTaskComplete.FileAccessData.Count > 0)
+             {
+-                ((IFileAccessManager)_buildComponentHost.GetComponent(BuildComponentType.FileAccessManager))
+-                    .ReportFileAccess(fileAccessData, _buildComponentHost.BuildParameters.NodeId);
++                IFileAccessManager fileAccessManager = ((IFileAccessManager)_buildComponentHost.GetComponent(BuildComponentType.FileAccessManager));
++                foreach (FileAccessData fileAccessData in taskHostTaskComplete.FileAccessData)
++                {
++                    fileAccessManager.ReportFileAccess(fileAccessData, _buildComponentHost.BuildParameters.NodeId);
++                }
+             }
+ #endif
+ 
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index ae7133c5857..77ba4bf1928 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1907,7 +1907,7 @@ Utilization:          {0} Average Utilization: {1:###.0}</value>
+     <value>MSB4268: The project cache failed to shut down properly.</value>
+   </data>
+   <data name="ProjectCacheHandleBuildResultFailed" xml:space="preserve">
+-    <value>MSB4269: The project cache failed while handling build result for the following project: {0}.</value>
++    <value>MSB4269: The project cache failed while handling a build result for the following project: {0}.</value>
+   </data>
+   <data name="NoProjectCachePluginFoundInAssembly" xml:space="preserve">
+     <value>MSB4270: No project cache plugins found in assembly "{0}". Expected one.</value>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 3f65b88955b..58322b4d71c 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index c30384189db..9df8c02b4e4 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index c5948e2a812..6f6a8accdd3 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 2f69c6eefee..fb485ad66d5 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 3ada9c0cf41..90e465e9b9c 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 7144e1ad301..b5bd9c4b976 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index ffc49aa8594..0119bf3cf53 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 64671e3b796..0a42102a49e 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 986884982d0..68b22a9abcb 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 957a43c74d8..5c11764c3ca 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index 51385eef3e8..199be842787 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index 2d94fc55ad7..78cef9bde28 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 45ce25a25b7..da21593b766 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -265,8 +265,8 @@
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHandleBuildResultFailed">
+-        <source>MSB4269: The project cache failed while handling build result for the following project: {0}.</source>
+-        <target state="new">MSB4269: The project cache failed while handling build result for the following project: {0}.</target>
++        <source>MSB4269: The project cache failed while handling a build result for the following project: {0}.</source>
++        <target state="new">MSB4269: The project cache failed while handling a build result for the following project: {0}.</target>
+         <note />
+       </trans-unit>
+       <trans-unit id="ProjectCacheHitWithDefaultTargets">
+diff --git a/src/Framework/BinaryTranslator.cs b/src/Framework/BinaryTranslator.cs
+index 8c923902aef..207390427d6 100644
+--- a/src/Framework/BinaryTranslator.cs
++++ b/src/Framework/BinaryTranslator.cs
+@@ -437,9 +437,7 @@ public void Translate(ref FileAccessData fileAccessData)
+                 DesiredAccess desiredAccess = default;
+                 FlagsAndAttributes flagsAndAttributes = default;
+                 string path = default;
+-#nullable enable
+-                string? processArgs = default;
+-#nullable disable
++                string processArgs = default;
+                 bool isAnAugmentedFileAccess = default;
+                 TranslateEnum(ref reportedFileOperation, (int)reportedFileOperation);
+                 TranslateEnum(ref requestedAccess, (int)requestedAccess);
+@@ -1205,9 +1203,7 @@ public void Translate(ref FileAccessData fileAccessData)
+                 DesiredAccess desiredAccess = fileAccessData.DesiredAccess;
+                 FlagsAndAttributes flagsAndAttributes = fileAccessData.FlagsAndAttributes;
+                 string path = fileAccessData.Path;
+-#nullable enable
+-                string? processArgs = fileAccessData.ProcessArgs;
+-#nullable disable
++                string processArgs = fileAccessData.ProcessArgs;
+                 bool isAnAugmentedFileAccess = fileAccessData.IsAnAugmentedFileAccess;
+                 TranslateEnum(ref reportedFileOperation, (int)reportedFileOperation);
+                 TranslateEnum(ref requestedAccess, (int)requestedAccess);
+diff --git a/src/Framework/FileAccess/DesiredAccess.cs b/src/Framework/FileAccess/DesiredAccess.cs
+index 1bb2e4bb492..056c74d6f19 100644
+--- a/src/Framework/FileAccess/DesiredAccess.cs
++++ b/src/Framework/FileAccess/DesiredAccess.cs
+@@ -5,6 +5,12 @@
+ 
+ namespace Microsoft.Build.Framework.FileAccess
+ {
++    /*
++     * Implementation note: This is a copy of BuildXL.Processes.DesiredAccess.
++     * The purpose of the copy is because this is part of the public MSBuild API and it's not desirable to
++     * expose BuildXL types directly.
++     */
++
+     /// <summary>
+     /// The requested access to the file or device.
+     /// </summary>
+@@ -13,7 +19,6 @@ namespace Microsoft.Build.Framework.FileAccess
+     /// </remarks>
+     [Flags]
+     [CLSCompliant(false)]
+-
+     public enum DesiredAccess : uint
+     {
+         /// <summary>
+diff --git a/src/Framework/FileAccess/FlagsAndAttributes.cs b/src/Framework/FileAccess/FlagsAndAttributes.cs
+index 00e0b9a5c2d..8b01f48106f 100644
+--- a/src/Framework/FileAccess/FlagsAndAttributes.cs
++++ b/src/Framework/FileAccess/FlagsAndAttributes.cs
+@@ -5,6 +5,12 @@
+ 
+ namespace Microsoft.Build.Framework.FileAccess
+ {
++    /*
++     * Implementation note: This is a copy of BuildXL.Processes.FlagsAndAttributes.
++     * The purpose of the copy is because this is part of the public MSBuild API and it's not desirable to
++     * expose BuildXL types directly.
++     */
++
+     /// <summary>
+     /// The file or device attributes and flags.
+     /// </summary>
+diff --git a/src/Framework/FileAccess/ProcessData.cs b/src/Framework/FileAccess/ProcessData.cs
+index aa7a17b57cd..aa4c8ab873c 100644
+--- a/src/Framework/FileAccess/ProcessData.cs
++++ b/src/Framework/FileAccess/ProcessData.cs
+@@ -17,7 +17,6 @@ namespace Microsoft.Build.Framework.FileAccess
+     [CLSCompliant(false)]
+     public readonly record struct ProcessData(
+         string ProcessName,
+-
+         uint ProcessId,
+         uint ParentProcessId,
+         DateTime CreationDateTime,
+diff --git a/src/Framework/FileAccess/ReportedFileOperation.cs b/src/Framework/FileAccess/ReportedFileOperation.cs
+index 205fc7f5b31..22e90c56cea 100644
+--- a/src/Framework/FileAccess/ReportedFileOperation.cs
++++ b/src/Framework/FileAccess/ReportedFileOperation.cs
+@@ -3,6 +3,12 @@
+ 
+ namespace Microsoft.Build.Framework.FileAccess
+ {
++    /*
++     * Implementation note: This is a copy of BuildXL.Processes.ReportedFileOperation.
++     * The purpose of the copy is because this is part of the public MSBuild API and it's not desirable to
++     * expose BuildXL types directly.
++     */
++
+     /// <summary>
+     /// Which operation resulted in a reported file access.
+     /// </summary>
+diff --git a/src/Framework/FileAccess/RequestedAccess.cs b/src/Framework/FileAccess/RequestedAccess.cs
+index d86831f2979..b522571460f 100644
+--- a/src/Framework/FileAccess/RequestedAccess.cs
++++ b/src/Framework/FileAccess/RequestedAccess.cs
+@@ -5,6 +5,12 @@
+ 
+ namespace Microsoft.Build.Framework.FileAccess
+ {
++    /*
++     * Implementation note: This is a copy of BuildXL.Processes.RequestedAccess.
++     * The purpose of the copy is because this is part of the public MSBuild API and it's not desirable to
++     * expose BuildXL types directly.
++     */
++
+     /// <summary>
+     /// Level of access requested by a reported file operation.
+     /// </summary>
+diff --git a/src/MSBuild/OutOfProcTaskHostNode.cs b/src/MSBuild/OutOfProcTaskHostNode.cs
+index 39be08f4b80..64ab30c8d6d 100644
+--- a/src/MSBuild/OutOfProcTaskHostNode.cs
++++ b/src/MSBuild/OutOfProcTaskHostNode.cs
+@@ -171,7 +171,7 @@ internal class OutOfProcTaskHostNode :
+         /// <summary>
+         /// The file accesses reported by the most recently completed task.
+         /// </summary>
+-        private List<FileAccessData> _fileAccessData;
++        private List<FileAccessData> _fileAccessData = new List<FileAccessData>();
+ #endif
+ 
+         /// <summary>
+@@ -202,9 +202,6 @@ public OutOfProcTaskHostNode()
+ 
+ #if !CLR2COMPATIBILITY
+             EngineServices = new EngineServicesImpl(this);
+-#endif
+-#if FEATURE_REPORTFILEACCESSES
+-            _fileAccessData = new List<FileAccessData>();
+ #endif
+         }
+ 
+@@ -559,15 +556,15 @@ public override void ReportFileAccess(FileAccessData fileAccessData)
+ 
+ #endif
+ 
+-                #region INodePacketFactory Members
++        #region INodePacketFactory Members
+ 
+-                /// <summary>
+-                /// Registers the specified handler for a particular packet type.
+-                /// </summary>
+-                /// <param name="packetType">The packet type.</param>
+-                /// <param name="factory">The factory for packets of the specified type.</param>
+-                /// <param name="handler">The handler to be called when packets of the specified type are received.</param>
+-                public void RegisterPacketHandler(NodePacketType packetType, NodePacketFactoryMethod factory, INodePacketHandler handler)
++        /// <summary>
++        /// Registers the specified handler for a particular packet type.
++        /// </summary>
++        /// <param name="packetType">The packet type.</param>
++        /// <param name="factory">The factory for packets of the specified type.</param>
++        /// <param name="handler">The handler to be called when packets of the specified type are received.</param>
++        public void RegisterPacketHandler(NodePacketType packetType, NodePacketFactoryMethod factory, INodePacketHandler handler)
+         {
+             _packetFactory.RegisterPacketHandler(packetType, factory, handler);
+         }
+diff --git a/src/Shared/INodePacket.cs b/src/Shared/INodePacket.cs
+index 4b077475510..52d335944af 100644
+--- a/src/Shared/INodePacket.cs
++++ b/src/Shared/INodePacket.cs
+@@ -190,6 +190,16 @@ internal enum NodePacketType : byte
+         /// </summary>
+         ResourceResponse,
+ 
++        /// <summary>
++        /// Message sent from a node reporting a file access.
++        /// </summary>
++        FileAccessReport,
++
++        /// <summary>
++        /// Message sent from a node reporting process data.
++        /// </summary>
++        ProcessReport,
++
+         /// <summary>
+         /// Command in form of MSBuild command line for server node - MSBuild Server.
+         /// Keep this enum value constant intact as this is part of contract with dotnet CLI
+@@ -213,16 +223,6 @@ internal enum NodePacketType : byte
+         /// Keep this enum value constant intact as this is part of contract with dotnet CLI
+         /// </summary>
+         ServerNodeBuildCancel = 0xF3,
+-
+-        /// <summary>
+-        /// Message sent from a node reporting a file access.
+-        /// </summary>
+-        FileAccessReport,
+-
+-        /// <summary>
+-        /// Message sent from a node reporting process data.
+-        /// </summary>
+-        ProcessReport,
+     }
+     #endregion
+ 

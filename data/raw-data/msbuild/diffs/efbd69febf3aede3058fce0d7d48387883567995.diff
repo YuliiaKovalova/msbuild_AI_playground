@@ -1,0 +1,298 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index 6546f1529be..d291f93dbc2 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -2951,7 +2951,8 @@ private void OnProjectStarted(object sender, ProjectStartedEventArgs e)
+             });
+         }
+ 
+-        public void AttachBuildCheckForReplay(
++        public void InitializeLoggingService(
++            BuildParameters buildParameters,
+             BinaryLogReplayEventSource replayEventSource,
+             IEnumerable<ILogger> loggers,
+             IEnumerable<ForwardingLoggerRecord> forwardingLoggers,
+@@ -2959,17 +2960,9 @@ public void AttachBuildCheckForReplay(
+             ISet<string> warningsNotAsErrors,
+             ISet<string> warningsAsMessages)
+         {
+-            _buildParameters = new BuildParameters
+-            {
+-                MaxNodeCount = 1,
+-                IsBuildCheckEnabled = true,
+-                UseSynchronousLogging = true
+-            };
++            _buildParameters = buildParameters;
+ 
+-            if (_workQueue == null)
+-            {
+-                _workQueue = new ActionBlock<Action>(action => ProcessWorkQueue(action));
+-            }
++            _workQueue ??= new ActionBlock<Action>(action => ProcessWorkQueue(action));
+ 
+             lock (_syncLock)
+             {
+@@ -2982,14 +2975,14 @@ public void AttachBuildCheckForReplay(
+                 warningsNotAsErrors,
+                 warningsAsMessages);
+ 
+-                replayEventSource.AttachLoggingService(loggingService as LoggingService);
++                loggingService.Initialize(replayEventSource);
+             }
+         }
+ 
+         /// <summary>
+         /// Creates a logging service around the specified set of loggers.
+         /// </summary>
+-        private ILoggingService CreateLoggingService(
++        private LoggingService CreateLoggingService(
+             IEnumerable<ILogger> loggers,
+             IEnumerable<ForwardingLoggerRecord> forwardingLoggers,
+             ISet<string> warningsAsErrors,
+@@ -3004,7 +2997,7 @@ private ILoggingService CreateLoggingService(
+                                         ? LoggerMode.Synchronous
+                                         : LoggerMode.Asynchronous;
+ 
+-            ILoggingService loggingService = LoggingService.CreateLoggingService(loggerMode,
++            LoggingService loggingService = (LoggingService)LoggingService.CreateLoggingService(loggerMode,
+                 1 /*This logging service is used for the build manager and the inproc node, therefore it should have the first nodeId*/);
+ 
+             ((IBuildComponent)loggingService).InitializeComponent(this);
+diff --git a/src/Build/BackEnd/Components/Logging/LoggingService.cs b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+index 1b19f496efa..1749605136d 100644
+--- a/src/Build/BackEnd/Components/Logging/LoggingService.cs
++++ b/src/Build/BackEnd/Components/Logging/LoggingService.cs
+@@ -783,6 +783,11 @@ public static ILoggingService CreateLoggingService(LoggerMode mode, int node)
+             return new LoggingService(mode, node);
+         }
+ 
++        internal void Initialize(IEventSource eventSource)
++        {
++            eventSource.AnyEventRaised += (object sender, BuildEventArgs e) => ProcessLoggingEvent(e);
++        }
++
+         /// <summary>
+         /// NotThreadSafe, this method should only be called from the component host thread
+         /// Called by the build component host when a component is first initialized.
+diff --git a/src/BuildCheck.UnitTests/EndToEndTests.cs b/src/BuildCheck.UnitTests/EndToEndTests.cs
+index 8ec267358ca..0f658b6d1a2 100644
+--- a/src/BuildCheck.UnitTests/EndToEndTests.cs
++++ b/src/BuildCheck.UnitTests/EndToEndTests.cs
+@@ -41,7 +41,7 @@ public void SampleAnalyzerIntegrationTest_AnalyzeOnBuild(bool buildInOutOfProces
+ 
+         string output = RunnerUtilities.ExecBootstrapedMSBuild(
+             $"{Path.GetFileName(projectFile.Path)} /m:1 -nr:False -restore" +
+-            (analysisRequested ? " -analyze" : string.Empty), out bool success, false, _env.Output);
++            (analysisRequested ? " -analyze" : string.Empty), out bool success, false, _env.Output, timeoutMilliseconds: 120_000);
+ 
+         _env.Output.WriteLine(output);
+ 
+@@ -77,7 +77,7 @@ public void SampleAnalyzerIntegrationTest_ReplayAnalyzedBuild(bool buildInOutOfP
+ 
+         string output = RunnerUtilities.ExecBootstrapedMSBuild(
+             $"{logFile} -flp:logfile={Path.Combine(projectDirectory!, "logFile.log")};verbosity=diagnostic",
+-            out success, false, _env.Output);
++            out success, false, _env.Output, timeoutMilliseconds: 120_000);
+         _env.Output.WriteLine(output);
+ 
+         success.ShouldBeTrue();
+@@ -116,7 +116,7 @@ public void SampleAnalyzerIntegrationTest_AnalyzeOnBuildReplay(bool buildInOutOf
+ 
+         string output = RunnerUtilities.ExecBootstrapedMSBuild(
+           $"{logFile} {(analysisRequested ? "-analyze" : string.Empty)}",
+-          out success, false, _env.Output);
++          out success, false, _env.Output, timeoutMilliseconds: 120_000);
+ 
+         _env.Output.WriteLine(output);
+ 
+@@ -162,7 +162,6 @@ private void PrepareSampleProjectsAndConfig(bool buildInOutOfProcessNode, out Tr
+ 
+         string contents2 = $"""
+             <Project Sdk="Microsoft.NET.Sdk">
+-                               
+                 <PropertyGroup>
+                 <OutputType>Exe</OutputType>
+                 <TargetFramework>net8.0</TargetFramework>
+@@ -188,27 +187,20 @@ private void PrepareSampleProjectsAndConfig(bool buildInOutOfProcessNode, out Tr
+         projectFile = _env.CreateFile(workFolder, "FooBar.csproj", contents);
+         TransientTestFile projectFile2 = _env.CreateFile(workFolder, "FooBar-Copy.csproj", contents2);
+ 
+-        // var cache = new SimpleProjectRootElementCache();
+-        // ProjectRootElement xml = ProjectRootElement.OpenProjectOrSolution(projectFile.Path, /*unused*/null, /*unused*/null, cache, false /*Not explicitly loaded - unused*/);
+-
+-        TransientTestFile config = _env.CreateFile(workFolder, "editorconfig.json",
+-            /*lang=json,strict*/
++        TransientTestFile config = _env.CreateFile(workFolder, ".editorconfig",
+             """
+-            {
+-                "BC0101": {
+-                    "IsEnabled": true,
+-                    "Severity": "Error"
+-                },
+-                "COND0543": {
+-                    "IsEnabled": false,
+-                    "Severity": "Error",
+-                    "EvaluationAnalysisScope": "AnalyzedProjectOnly",
+-                    "CustomSwitch": "QWERTY"
+-                },
+-                "BLA": {
+-                    "IsEnabled": false
+-                }
+-            }
++            root=true
++
++            [*.csproj]
++            build_check.BC0101.IsEnabled=true
++            build_check.BC0101.Severity=warning
++
++            build_check.COND0543.IsEnabled=false
++            build_check.COND0543.Severity=Error
++            build_check.COND0543.EvaluationAnalysisScope=AnalyzedProjectOnly
++            build_check.COND0543.CustomSwitch=QWERTY
++
++            build_check.BLA.IsEnabled=false
+             """);
+ 
+         // OSX links /var into /private, which makes Path.GetTempPath() return "/var..." but Directory.GetCurrentDirectory return "/private/var...".
+@@ -231,7 +223,7 @@ public void CustomAnalyzerTest(string analysisCandidate, string[] expectedRegist
+             AddCustomDataSourceToNugetConfig(analysisCandidatePath);
+ 
+             string projectAnalysisBuildLog = RunnerUtilities.ExecBootstrapedMSBuild(
+-                $"{Path.Combine(analysisCandidatePath, $"{analysisCandidate}.csproj")} /m:1 -nr:False -restore /p:OutputPath={env.CreateFolder().Path} -analyze -verbosity:d",
++                $"{Path.Combine(analysisCandidatePath, $"{analysisCandidate}.csproj")} /m:1 -nr:False -restore /p:OutputPath={env.CreateFolder().Path} -analyze -verbosity:n",
+                 out bool successBuild);
+             successBuild.ShouldBeTrue(projectAnalysisBuildLog);
+ 
+@@ -256,6 +248,7 @@ private void AddCustomDataSourceToNugetConfig(string analysisCandidatePath)
+         if (doc.DocumentElement != null)
+         {
+             XmlNode? packageSourcesNode = doc.SelectSingleNode("//packageSources");
++
+             // The test packages are generated during the test project build and saved in CustomAnalyzers folder.
+             string analyzersPackagesPath = Path.Combine(Directory.GetParent(AssemblyLocation)?.Parent?.FullName ?? string.Empty, "CustomAnalyzers");
+             AddPackageSource(doc, packageSourcesNode, "Key", analyzersPackagesPath);
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 47ba769c277..dbba44c889a 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -808,15 +808,26 @@ public static ExitType Execute(
+                     // as if a build is happening
+                     if (FileUtilities.IsBinaryLogFilename(projectFile))
+                     {
+-                        ReplayBinaryLog(
+-                            projectFile,
+-                            loggers,
+-                            distributedLoggerRecords,
+-                            cpuCount,
+-                            isBuildCheckEnabled,
+-                            warningsAsErrors,
+-                            warningsNotAsErrors,
+-                            warningsAsMessages);
++                        if (isBuildCheckEnabled)
++                        {
++
++                            AnalyzeBinaryLogOnReplay(
++                                projectFile,
++                                loggers,
++                                distributedLoggerRecords,
++                                cpuCount,
++                                warningsAsErrors,
++                                warningsNotAsErrors,
++                                warningsAsMessages);
++                        }
++                        else
++                        {
++                            ReplayBinaryLog(
++                                projectFile,
++                                loggers,
++                                distributedLoggerRecords,
++                                cpuCount);
++                        }
+                     }
+                     else if (outputPropertiesItemsOrTargetResults && FileUtilities.IsSolutionFilename(projectFile))
+                     {
+@@ -4410,46 +4421,59 @@ private static bool CreateAndConfigureLogger(
+             return true;
+         }
+ 
+-        private static void ReplayBinaryLog(
++        private static void AnalyzeBinaryLogOnReplay(
+             string binaryLogFilePath,
+             ILogger[] loggers,
+             IEnumerable<DistributedLoggerRecord> distributedLoggerRecords,
+             int cpuCount,
+-            bool isBuildCheckEnabled,
+             ISet<string> warningsAsErrors,
+             ISet<string> warningsNotAsErrors,
+             ISet<string> warningsAsMessages)
+         {
+             var replayEventSource = new BinaryLogReplayEventSource();
+ 
+-            if (isBuildCheckEnabled)
++            var buildParameters = new BuildParameters
+             {
+-                List<ForwardingLoggerRecord> remoteLoggerRecords = [];
+-                foreach (DistributedLoggerRecord distRecord in distributedLoggerRecords)
+-                {
+-                    remoteLoggerRecords.Add(new ForwardingLoggerRecord(distRecord.CentralLogger, distRecord.ForwardingLoggerDescription));
+-                }
++                MaxNodeCount = 1,
++                IsBuildCheckEnabled = true,
++                UseSynchronousLogging = true
++            };
+ 
+-                BuildManager.DefaultBuildManager.AttachBuildCheckForReplay(
+-                    replayEventSource,
+-                    loggers,
+-                    remoteLoggerRecords,
+-                    warningsAsErrors,
+-                    warningsNotAsErrors,
+-                    warningsAsMessages);
++            List<ForwardingLoggerRecord> remoteLoggerRecords = [];
++            foreach (DistributedLoggerRecord distRecord in distributedLoggerRecords)
++            {
++                remoteLoggerRecords.Add(new ForwardingLoggerRecord(distRecord.CentralLogger, distRecord.ForwardingLoggerDescription));
++            }
+ 
+-                try
+-                {
+-                    replayEventSource.Replay(binaryLogFilePath, s_buildCancellationSource.Token);
+-                }
+-                catch (Exception ex)
+-                {
+-                    var message = ResourceUtilities.FormatResourceStringStripCodeAndKeyword("InvalidLogFileFormat", ex.Message);
+-                    Console.WriteLine(message);
+-                }
++            BuildManager.DefaultBuildManager.InitializeLoggingService(
++                buildParameters,
++                replayEventSource,
++                loggers,
++                remoteLoggerRecords,
++                warningsAsErrors,
++                warningsNotAsErrors,
++                warningsAsMessages);
+ 
+-                return;
++            // Replaying events to loggingService with registered BuildChecke logger
++            // whitch issues new events and loggingService handles them accordingly similar to what is happenning during build process
++            try
++            {
++                replayEventSource.Replay(binaryLogFilePath, s_buildCancellationSource.Token);
+             }
++            catch (Exception ex)
++            {
++                var message = ResourceUtilities.FormatResourceStringStripCodeAndKeyword("InvalidLogFileFormat", ex.Message);
++                Console.WriteLine(message);
++            }
++        }
++
++        private static void ReplayBinaryLog(
++            string binaryLogFilePath,
++            ILogger[] loggers,
++            IEnumerable<DistributedLoggerRecord> distributedLoggerRecords,
++            int cpuCount)
++        {
++            var replayEventSource = new BinaryLogReplayEventSource();
+ 
+             foreach (var distributedLoggerRecord in distributedLoggerRecords)
+             {

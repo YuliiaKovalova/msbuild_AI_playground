@@ -1,0 +1,323 @@
+diff --git a/src/Build/BackEnd/Components/Communications/NodeEndpointInProc.cs b/src/Build/BackEnd/Components/Communications/NodeEndpointInProc.cs
+index fe81fa4298d..35dcda21565 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeEndpointInProc.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeEndpointInProc.cs
+@@ -221,6 +221,12 @@ public void SendData(INodePacket packet)
+                 EnqueuePacket(packet);
+             }
+         }
++
++        public void ClientWillDisconnect()
++        {
++            // We do not need to do anything here for InProc node.
++        }
++
+         #endregion
+ 
+         #region Internal Methods
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index 5017de2d535..982da1af8ea 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -214,13 +214,13 @@ private NodeEngineShutdownReason HandleShutdown(out Exception? exception)
+         {
+             CommunicationsUtilities.Trace("Shutting down with reason: {0}, and exception: {1}.", _shutdownReason, _shutdownException);
+ 
+-            exception = _shutdownException;
++            // On Windows, a process holds a handle to the current directory,
++            // so reset it away from a user-requested folder that may get deleted.
++            NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);
+ 
+-            if (_nodeEndpoint.LinkStatus == LinkStatus.Active)
+-            {
+-                _nodeEndpoint.OnLinkStatusChanged -= OnLinkStatusChanged;
+-            }
++            exception = _shutdownException;
+ 
++            _nodeEndpoint.OnLinkStatusChanged -= OnLinkStatusChanged;
+             _nodeEndpoint.Disconnect();
+ 
+             CommunicationsUtilities.Trace("Shut down complete.");
+@@ -339,6 +339,7 @@ private void HandleServerNodeBuildCommand(ServerNodeBuildCommand command)
+             // so reset it away from a user-requested folder that may get deleted.
+             NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);
+ 
++            _nodeEndpoint.ClientWillDisconnect();
+             var response = new ServerNodeBuildResult(buildResult.exitCode, buildResult.exitType);
+             SendPacket(response);
+ 
+diff --git a/src/Framework.UnitTests/Microsoft.Build.Framework.UnitTests.csproj b/src/Framework.UnitTests/Microsoft.Build.Framework.UnitTests.csproj
+index b66f3a66b80..e3b953a332a 100644
+--- a/src/Framework.UnitTests/Microsoft.Build.Framework.UnitTests.csproj
++++ b/src/Framework.UnitTests/Microsoft.Build.Framework.UnitTests.csproj
+@@ -34,6 +34,7 @@
+     <Compile Include="..\Shared\ErrorUtilities.cs" />
+     <Compile Include="..\Shared\EscapingUtilities.cs" />
+     <Compile Include="..\Shared\BuildEnvironmentHelper.cs" />
++    <Compile Include="..\Shared\ProcessExtensions.cs" />
+     <Compile Include="..\Shared\ResourceUtilities.cs" />
+     <Compile Include="..\Shared\ExceptionHandling.cs" />
+     <Compile Include="..\Shared\FileUtilitiesRegex.cs" />
+diff --git a/src/MSBuild.UnitTests/MSBuildServer_Tests.cs b/src/MSBuild.UnitTests/MSBuildServer_Tests.cs
+index a7ecdde6176..28b9ae44e3e 100644
+--- a/src/MSBuild.UnitTests/MSBuildServer_Tests.cs
++++ b/src/MSBuild.UnitTests/MSBuildServer_Tests.cs
+@@ -109,7 +109,7 @@ public void MSBuildServerTest()
+                 Thread.Sleep(1000);
+ 
+                 // Kill the server
+-                ProcessExtensions.KillTree(Process.GetProcessById(pidOfServerProcess), 1000);
++                Process.GetProcessById(pidOfServerProcess).KillTree(1000);
+             });
+ 
+             // Start long-lived task execution
+@@ -120,9 +120,12 @@ public void MSBuildServerTest()
+ 
+             // Ensure that a new build can still succeed and that its server node is different.
+             output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++
+             success.ShouldBeTrue();
+             newPidOfInitialProcess = ParseNumber(output, "Process ID is ");
+             int newServerProcessId = ParseNumber(output, "Server ID is ");
++            // Register process to clean up (be killed) after tests ends.
++            _env.WithTransientProcess(newServerProcessId);
+             newPidOfInitialProcess.ShouldNotBe(pidOfInitialProcess, "Process started by two MSBuild executions should be different.");
+             newPidOfInitialProcess.ShouldNotBe(newServerProcessId, "We started a server node to execute the target rather than running it in-proc, so its pid should be different.");
+             pidOfServerProcess.ShouldNotBe(newServerProcessId, "Node used by both the first and second build should not be the same.");
+@@ -138,6 +141,8 @@ public void VerifyMixedLegacyBehavior()
+             success.ShouldBeTrue();
+             int pidOfInitialProcess = ParseNumber(output, "Process ID is ");
+             int pidOfServerProcess = ParseNumber(output, "Server ID is ");
++            // Register process to clean up (be killed) after tests ends.
++            _env.WithTransientProcess(pidOfServerProcess);
+             pidOfInitialProcess.ShouldNotBe(pidOfServerProcess, "We started a server node to execute the target rather than running it in-proc, so its pid should be different.");
+ 
+             Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "");
+@@ -154,6 +159,12 @@ public void VerifyMixedLegacyBehavior()
+             pidOfNewserverProcess = ParseNumber(output, "Server ID is ");
+             pidOfInitialProcess.ShouldNotBe(pidOfNewserverProcess, "We started a server node to execute the target rather than running it in-proc, so its pid should be different.");
+             pidOfServerProcess.ShouldBe(pidOfNewserverProcess, "Server node should be the same as from earlier.");
++
++            if (pidOfServerProcess != pidOfNewserverProcess)
++            {
++                // Register process to clean up (be killed) after tests ends.
++                _env.WithTransientProcess(pidOfNewserverProcess);
++            }
+         }
+ 
+         [Fact]
+@@ -163,48 +174,40 @@ public void BuildsWhileBuildIsRunningOnServer()
+             TransientTestFile project = _env.CreateFile("testProject.proj", printPidContents);
+             TransientTestFile sleepProject = _env.CreateFile("napProject.proj", sleepingTaskContents);
+ 
+-            int pidOfServerProcess = -1;
+-            Task? t = null;
+-            try
+-            {
+-                // Start a server node and find its PID.
+-                string output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out bool success, false, _output);
+-                pidOfServerProcess = ParseNumber(output, "Server ID is ");
++            int pidOfServerProcess;
++            Task t;
++            // Start a server node and find its PID.
++            string output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out bool success, false, _output);
++            pidOfServerProcess = ParseNumber(output, "Server ID is ");
++            _env.WithTransientProcess(pidOfServerProcess);
+ 
+-                t = Task.Run(() =>
+-                {
+-                    RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, sleepProject.Path, out _, false, _output);
+-                });
++            t = Task.Run(() =>
++            {
++                RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, sleepProject.Path, out _, false, _output);
++            });
+ 
+-                // The server will soon be in use; make sure we don't try to use it before that happens.
+-                Thread.Sleep(1000);
++            // The server will soon be in use; make sure we don't try to use it before that happens.
++            Thread.Sleep(1000);
+ 
+-                Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "0");
++            Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "0");
+ 
+-                output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
+-                success.ShouldBeTrue();
+-                ParseNumber(output, "Server ID is ").ShouldBe(ParseNumber(output, "Process ID is "), "There should not be a server node for this build.");
++            output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++            success.ShouldBeTrue();
++            ParseNumber(output, "Server ID is ").ShouldBe(ParseNumber(output, "Process ID is "), "There should not be a server node for this build.");
+ 
+-                Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "1");
++            Environment.SetEnvironmentVariable("MSBUILDUSESERVER", "1");
+ 
+-                output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
+-                success.ShouldBeTrue();
+-                pidOfServerProcess.ShouldNotBe(ParseNumber(output, "Server ID is "), "The server should be otherwise occupied.");
+-                pidOfServerProcess.ShouldNotBe(ParseNumber(output, "Process ID is "), "There should not be a server node for this build.");
+-                ParseNumber(output, "Server ID is ").ShouldBe(ParseNumber(output, "Process ID is "), "Process ID and Server ID should coincide.");
+-            }
+-            finally
+-            {
+-                if (pidOfServerProcess > -1)
+-                {
+-                    ProcessExtensions.KillTree(Process.GetProcessById(pidOfServerProcess), 1000);
+-                }
+-
+-                if (t is not null)
+-                {
+-                    t.Wait();
+-                }
+-            }
++            output = RunnerUtilities.ExecMSBuild(BuildEnvironmentHelper.Instance.CurrentMSBuildExePath, project.Path, out success, false, _output);
++            success.ShouldBeTrue();
++            pidOfServerProcess.ShouldNotBe(ParseNumber(output, "Server ID is "), "The server should be otherwise occupied.");
++            pidOfServerProcess.ShouldNotBe(ParseNumber(output, "Process ID is "), "There should not be a server node for this build.");
++            ParseNumber(output, "Server ID is ").ShouldBe(ParseNumber(output, "Process ID is "), "Process ID and Server ID should coincide.");
++
++            // Clean up process and tasks
++            // 1st kill registered processes
++            _env.Dispose();
++            // 2nd wait for sleep task which will ends as soon as the process is killed above.
++            t.Wait();
+         }
+ 
+         private int ParseNumber(string searchString, string toFind)
+diff --git a/src/Shared/INodeEndpoint.cs b/src/Shared/INodeEndpoint.cs
+index cb8ce4a4c0a..ef2f319f023 100644
+--- a/src/Shared/INodeEndpoint.cs
++++ b/src/Shared/INodeEndpoint.cs
+@@ -103,5 +103,11 @@ LinkStatus LinkStatus
+         /// <param name="packet">The packet to be sent.</param>
+         void SendData(INodePacket packet);
+         #endregion
++
++        /// <summary>
++        /// Called when we are about to send last packet to finalize graceful disconnection with client.
++        /// This is needed to handle race condition when both client and server is gracefully about to close connection.
++        /// </summary>
++        void ClientWillDisconnect();
+     }
+ }
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index 6477869dc05..0be21ce32c0 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -73,6 +73,13 @@ internal abstract class NodeEndpointOutOfProcBase : INodeEndpoint
+         /// </summary>
+         private AutoResetEvent _terminatePacketPump;
+ 
++        /// <summary>
++        /// True if this side is gracefully disconnecting.
++        /// In such case we have sent last packet to client side and we expect
++        /// client will soon broke pipe connection - unless server do it first.
++        /// </summary>
++        private bool _isClientDisconnecting;
++
+         /// <summary>
+         /// The thread which runs the asynchronous packet pump
+         /// </summary>
+@@ -179,6 +186,14 @@ public void SendData(INodePacket packet)
+             }
+         }
+ 
++        /// <summary>
++        /// Called when we are about to send last packet to finalize graceful disconnection with client.
++        /// </summary>
++        public void ClientWillDisconnect()
++        {
++            _isClientDisconnecting = true;
++        }
++
+ #endregion
+ 
+ #region Construction
+@@ -312,6 +327,7 @@ private void InitializeAsyncPacketThread()
+         {
+             lock (_asyncDataMonitor)
+             {
++                _isClientDisconnecting = false;
+                 _packetPump = new Thread(PacketPumpProc);
+                 _packetPump.IsBackground = true;
+                 _packetPump.Name = "OutOfProc Endpoint Packet Pump";
+@@ -548,14 +564,25 @@ private void RunReadLoop(Stream localReadPipe, Stream localWritePipe,
+                                 // Incomplete read.  Abort.
+                                 if (bytesRead == 0)
+                                 {
+-                                    CommunicationsUtilities.Trace("Parent disconnected abruptly");
++                                    if (_isClientDisconnecting)
++                                    {
++                                        CommunicationsUtilities.Trace("Parent disconnected gracefully.");
++                                        // Do not change link status to failed as this could make node think connection has failed
++                                        // and recycle node, while this is perfectly expected and handled race condition
++                                        // (both client and node is about to close pipe and client can be faster).
++                                    }
++                                    else
++                                    {
++                                        CommunicationsUtilities.Trace("Parent disconnected abruptly.");
++                                        ChangeLinkStatus(LinkStatus.Failed);
++                                    }
+                                 }
+                                 else
+                                 {
+                                     CommunicationsUtilities.Trace("Incomplete header read from server.  {0} of {1} bytes read", bytesRead, headerByte.Length);
++                                    ChangeLinkStatus(LinkStatus.Failed);
+                                 }
+ 
+-                                ChangeLinkStatus(LinkStatus.Failed);
+                                 exitLoop = true;
+                                 break;
+                             }
+diff --git a/src/Shared/UnitTests/TestEnvironment.cs b/src/Shared/UnitTests/TestEnvironment.cs
+index 6ede3f2d7fb..2db94fa9e83 100644
+--- a/src/Shared/UnitTests/TestEnvironment.cs
++++ b/src/Shared/UnitTests/TestEnvironment.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.IO;
+ using System.IO.Compression;
+ using System.Linq;
+@@ -328,6 +329,15 @@ public TransientTestState SetCurrentDirectory(string newWorkingDirectory)
+             return WithTransientTestState(new TransientWorkingDirectory(newWorkingDirectory));
+         }
+ 
++        /// <summary>
++        /// Register process ID to be finished/killed after tests ends.
++        /// </summary>
++        public TransientTestProcess WithTransientProcess(int processId)
++        {
++            TransientTestProcess transientTestProcess = new(processId);
++            return WithTransientTestState(transientTestProcess);
++        }
++
+         #endregion
+ 
+         private class DefaultOutput : ITestOutputHelper
+@@ -560,6 +570,24 @@ public override void Revert()
+         }
+     }
+ 
++    public class TransientTestProcess : TransientTestState
++    {
++        private readonly int _processId;
++
++        public TransientTestProcess(int processId)
++        {
++            _processId = processId;
++        }
++
++        public override void Revert()
++        {
++            if (_processId > -1)
++            {
++                Process.GetProcessById(_processId).KillTree(1000);
++            }
++        }
++    }
++
+ 
+     public class TransientTestFile : TransientTestState
+     {

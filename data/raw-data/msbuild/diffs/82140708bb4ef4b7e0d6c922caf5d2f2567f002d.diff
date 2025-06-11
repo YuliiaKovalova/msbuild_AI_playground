@@ -1,0 +1,243 @@
+diff --git a/src/Build/BackEnd/Client/MSBuildClient.cs b/src/Build/BackEnd/Client/MSBuildClient.cs
+index c8b3c4adc7f..9e9ca8c58d5 100644
+--- a/src/Build/BackEnd/Client/MSBuildClient.cs
++++ b/src/Build/BackEnd/Client/MSBuildClient.cs
+@@ -51,6 +51,11 @@ public sealed class MSBuildClient
+         /// </summary>
+         private bool _buildFinished = false;
+ 
++        /// <summary>
++        /// Whether the build was canceled.
++        /// </summary>
++        private bool _buildCanceled = false;
++
+         /// <summary>
+         /// Handshake between server and client.
+         /// </summary>
+@@ -196,6 +201,7 @@ public MSBuildClientExitResult Execute(string commandLine, CancellationToken can
+                     {
+                         case 0:
+                             HandleCancellation();
++                            waitHandles[0] = CancellationToken.None.WaitHandle;
+                             break;
+ 
+                         case 1:
+@@ -204,8 +210,7 @@ public MSBuildClientExitResult Execute(string commandLine, CancellationToken can
+ 
+                         case 2:
+                             while (packetPump.ReceivedPacketsQueue.TryDequeue(out INodePacket? packet) &&
+-                                   !_buildFinished &&
+-                                   !cancellationToken.IsCancellationRequested)
++                                   !_buildFinished)
+                             {
+                                 if (packet != null)
+                                 {
+@@ -228,6 +233,24 @@ public MSBuildClientExitResult Execute(string commandLine, CancellationToken can
+             return _exitResult;
+         }
+ 
++        private bool TrySendPacket(Func<INodePacket> packetResolver)
++        {
++            INodePacket? packet = null;
++            try
++            {
++                packet = packetResolver();
++                WritePacket(_nodeStream, packet);
++                CommunicationsUtilities.Trace($"Command packet of type '{packet.Type}' sent...");
++            }
++            catch (Exception ex)
++            {
++                CommunicationsUtilities.Trace($"Failed to send command packet of type '{packet?.Type.ToString() ?? "Unknown"}' to server: {0}", ex);
++                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ConnectionError;
++                return false;
++            }
++
++            return true;
++        }
+         private void SupportVT100()
+         {
+             IntPtr stdOut = NativeMethodsShared.GetStdHandle(NativeMethodsShared.STD_OUTPUT_HANDLE);
+@@ -301,23 +324,9 @@ private Process LaunchNode(string exeLocation, string msBuildServerArguments, Di
+             return Process.Start(processStartInfo) ?? throw new InvalidOperationException("MSBuild server node failed to launch.");
+         }
+ 
+-        private bool TrySendBuildCommand(string commandLine)
+-        {
+-            try
+-            {
+-                ServerNodeBuildCommand buildCommand = GetServerNodeBuildCommand(commandLine);
+-                WritePacket(_nodeStream, buildCommand);
+-                CommunicationsUtilities.Trace("Build command sent...");
+-            }
+-            catch (Exception ex)
+-            {
+-                CommunicationsUtilities.Trace("Failed to send build command to server: {0}", ex);
+-                _exitResult.MSBuildClientExitType = MSBuildClientExitType.ConnectionError;
+-                return false;
+-            }
++        private bool TrySendBuildCommand(string commandLine) => TrySendPacket(() => GetServerNodeBuildCommand(commandLine));
+ 
+-            return true;
+-        }
++        private bool TrySendCancelCommand() => TrySendPacket(() => ServerNodeBuildCancel.Instance);
+ 
+         private ServerNodeBuildCommand GetServerNodeBuildCommand(string commandLine)
+         {
+@@ -354,14 +363,11 @@ private ServerNodeHandshake GetHandshake()
+         /// </summary>
+         private void HandleCancellation()
+         {
+-            // TODO.
+-            // Send cancellation command to server.
+-            // SendCancelCommand(_nodeStream);
++            TrySendCancelCommand();
+ 
+             Console.WriteLine("MSBuild client cancelled.");
+             CommunicationsUtilities.Trace("MSBuild client cancelled.");
+-            _exitResult.MSBuildClientExitType = MSBuildClientExitType.Cancelled;
+-            _buildFinished = true;
++            _buildCanceled = true;
+         }
+ 
+         /// <summary>
+@@ -411,7 +417,7 @@ private void HandleServerNodeConsoleWrite(ServerNodeConsoleWrite consoleWrite)
+         private void HandleServerNodeBuildResult(ServerNodeBuildResult response)
+         {
+             CommunicationsUtilities.Trace("Build response received: exit code {0}, exit type '{1}'", response.ExitCode, response.ExitType);
+-            _exitResult.MSBuildClientExitType = MSBuildClientExitType.Success;
++            _exitResult.MSBuildClientExitType = _buildCanceled ? MSBuildClientExitType.Cancelled : MSBuildClientExitType.Success;
+             _exitResult.MSBuildAppExitTypeString = response.ExitType;
+             _buildFinished = true;
+         }
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+index f795a3eceae..5017de2d535 100644
+--- a/src/Build/BackEnd/Node/OutOfProcServerNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -20,8 +20,6 @@ public sealed class OutOfProcServerNode : INode, INodePacketFactory, INodePacket
+     {
+         private readonly Func<string, (int exitCode, string exitType)> _buildFunction;
+ 
+-        private readonly Action _onCancel;
+-
+         /// <summary>
+         /// The endpoint used to talk to the host.
+         /// </summary>
+@@ -62,14 +60,11 @@ public sealed class OutOfProcServerNode : INode, INodePacketFactory, INodePacket
+         /// </summary>
+         private readonly bool _debugCommunications;
+ 
+-        private Task? _buildTask;
+-
+         private string _serverBusyMutexName = default!;
+ 
+-        public OutOfProcServerNode(Func<string, (int exitCode, string exitType)> buildFunction, Action onCancel)
++        public OutOfProcServerNode(Func<string, (int exitCode, string exitType)> buildFunction)
+         {
+             _buildFunction = buildFunction;
+-            _onCancel = onCancel;
+             new Dictionary<string, string>();
+             _debugCommunications = (Environment.GetEnvironmentVariable("MSBUILDDEBUGCOMM") == "1");
+ 
+@@ -279,14 +274,14 @@ private void HandlePacket(INodePacket packet)
+                     HandleServerNodeBuildCommandAsync((ServerNodeBuildCommand)packet);
+                     break;
+                 case NodePacketType.ServerNodeBuildCancel:
+-                    _onCancel();
++                    BuildManager.DefaultBuildManager.CancelAllSubmissions();
+                     break;
+             }
+         }
+ 
+         private void HandleServerNodeBuildCommandAsync(ServerNodeBuildCommand command)
+         {
+-            _buildTask = Task.Run(() =>
++            Task.Run(() =>
+             {
+                 try
+                 {
+@@ -298,10 +293,6 @@ private void HandleServerNodeBuildCommandAsync(ServerNodeBuildCommand command)
+                     _shutdownReason = NodeEngineShutdownReason.Error;
+                     _shutdownEvent.Set();
+                 }
+-                finally
+-                {
+-                    _buildTask = null;
+-                }
+             });
+         }
+ 
+diff --git a/src/Build/BackEnd/Node/ServerNodeBuildCancel.cs b/src/Build/BackEnd/Node/ServerNodeBuildCancel.cs
+index 349c1b8170d..813d85c78bd 100644
+--- a/src/Build/BackEnd/Node/ServerNodeBuildCancel.cs
++++ b/src/Build/BackEnd/Node/ServerNodeBuildCancel.cs
+@@ -6,6 +6,8 @@ namespace Microsoft.Build.BackEnd
+ {
+     internal sealed class ServerNodeBuildCancel : INodePacket
+     {
++        public static ServerNodeBuildCancel Instance { get; } = new ServerNodeBuildCancel();
++
+         public NodePacketType Type => NodePacketType.ServerNodeBuildCancel;
+ 
+         public void Translate(ITranslator translator)
+diff --git a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+index 349a8e57aac..2f2373e0785 100644
+--- a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+@@ -15,5 +15,5 @@ Microsoft.Build.Execution.MSBuildClientExitType.ServerBusy = 1 -> Microsoft.Buil
+ Microsoft.Build.Execution.MSBuildClientExitType.Success = 0 -> Microsoft.Build.Execution.MSBuildClientExitType
+ Microsoft.Build.Execution.MSBuildClientExitType.Unexpected = 4 -> Microsoft.Build.Execution.MSBuildClientExitType
+ Microsoft.Build.Execution.OutOfProcServerNode
+-Microsoft.Build.Execution.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction, System.Action onCancel) -> void
++Microsoft.Build.Execution.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction) -> void
+ Microsoft.Build.Execution.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
+diff --git a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+index 39c901f1b5c..b7e25f06956 100644
+--- a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+@@ -15,5 +15,5 @@ Microsoft.Build.Execution.MSBuildClientExitType.ServerBusy = 1 -> Microsoft.Buil
+ Microsoft.Build.Execution.MSBuildClientExitType.Success = 0 -> Microsoft.Build.Execution.MSBuildClientExitType
+ Microsoft.Build.Execution.MSBuildClientExitType.Unexpected = 4 -> Microsoft.Build.Execution.MSBuildClientExitType
+ Microsoft.Build.Execution.OutOfProcServerNode
+-Microsoft.Build.Execution.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction, System.Action onCancel) -> void
++Microsoft.Build.Execution.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction) -> void
+ Microsoft.Build.Execution.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
+\ No newline at end of file
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index b7d98c179d5..a14f09fccdb 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -224,6 +224,8 @@ string[] args
+             int exitCode;
+             if (Environment.GetEnvironmentVariable(Traits.UseMSBuildServerEnvVarName) == "1")
+             {
++                Console.CancelKeyPress += Console_CancelKeyPress;
++
+                 // Use the client app to execute build in msbuild server. Opt-in feature.
+                 exitCode = ((s_initialized && MSBuildClientApp.Execute(
+ #if FEATURE_GET_COMMANDLINE
+@@ -866,8 +868,7 @@ private static void Console_CancelKeyPress(object sender, ConsoleCancelEventArgs
+         {
+             if (e.SpecialKey == ConsoleSpecialKey.ControlBreak)
+             {
+-                e.Cancel = false; // required; the process will now be terminated rudely
+-                return;
++                Environment.Exit(1); // the process will now be terminated rudely
+             }
+ 
+             e.Cancel = true; // do not terminate rudely
+@@ -2684,14 +2685,7 @@ private static void StartLocalNode(CommandLineSwitches commandLineSwitches, bool
+                         return (exitCode, exitType.ToString());
+                     };
+ 
+-                    Action onCancel = () =>
+-                    {
+-                        Console.WriteLine(ResourceUtilities.GetResourceString("AbortingBuild"));
+-
+-                        BuildManager.DefaultBuildManager.CancelAllSubmissions();
+-                    };
+-
+-                    OutOfProcServerNode node = new(buildFunction, onCancel);
++                    OutOfProcServerNode node = new(buildFunction);
+ 
+                     s_isServerNode = true;
+                     shutdownReason = node.Run(out nodeException);

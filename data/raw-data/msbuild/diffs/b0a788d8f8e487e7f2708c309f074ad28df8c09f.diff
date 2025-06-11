@@ -1,0 +1,1181 @@
+diff --git a/src/Build.UnitTests/BackEnd/RedirectConsoleWriter_Tests.cs b/src/Build.UnitTests/BackEnd/RedirectConsoleWriter_Tests.cs
+new file mode 100644
+index 00000000000..9e58d151b66
+--- /dev/null
++++ b/src/Build.UnitTests/BackEnd/RedirectConsoleWriter_Tests.cs
+@@ -0,0 +1,29 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++//
++
++using System;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.Build.Execution;
++using Xunit;
++
++namespace Microsoft.Build.Engine.UnitTests.BackEnd
++{
++    public class RedirectConsoleWriter_Tests
++    {
++        [Fact]
++        public async Task EmitConsoleMessages()
++        {
++            StringBuilder sb = new StringBuilder();
++            var writer = OutOfProcServerNode.RedirectConsoleWriter.Create(text => sb.Append(text));
++
++            writer.WriteLine("Line 1");
++            await Task.Delay(300);
++            writer.Write("Line 2");
++            writer.Dispose();
++
++            Assert.Equal($"Line 1{Environment.NewLine}Line 2", sb.ToString());
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs b/src/Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs
+index dce14e3d422..6881debdae2 100644
+--- a/src/Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs
++++ b/src/Build/BackEnd/Components/Communications/NodeEndpointOutOfProc.cs
+@@ -54,7 +54,7 @@ internal NodeEndpointOutOfProc(
+         /// <summary>
+         /// Returns the host handshake for this node endpoint
+         /// </summary>
+-        protected override Handshake GetHandshake()
++        protected override IHandshake GetHandshake()
+         {
+             return new Handshake(CommunicationsUtilities.GetHandshakeOptions(taskHost: false, architectureFlagToSet: XMakeAttributes.GetCurrentMSBuildArchitecture(), nodeReuse: _enableReuse, lowPriority: _lowPriority));
+         }
+diff --git a/src/Build/BackEnd/Components/Communications/ServerNodeEndpointOutOfProc.cs b/src/Build/BackEnd/Components/Communications/ServerNodeEndpointOutOfProc.cs
+new file mode 100644
+index 00000000000..528d27056da
+--- /dev/null
++++ b/src/Build/BackEnd/Components/Communications/ServerNodeEndpointOutOfProc.cs
+@@ -0,0 +1,38 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++//
++
++using Microsoft.Build.Internal;
++
++namespace Microsoft.Build.BackEnd
++{
++    /// <summary>
++    /// This is an implementation of out-of-proc server node endpoint.
++    /// </summary>
++    internal sealed class ServerNodeEndpointOutOfProc : NodeEndpointOutOfProcBase
++    {
++        private readonly IHandshake _handshake;
++
++        /// <summary>
++        /// Instantiates an endpoint to act as a client
++        /// </summary>
++        /// <param name="pipeName">The name of the pipe to which we should connect.</param>
++        /// <param name="handshake"></param>
++        internal ServerNodeEndpointOutOfProc(
++            string pipeName,
++            IHandshake handshake)
++        {
++            _handshake = handshake;
++
++            InternalConstruct(pipeName);
++        }
++
++        /// <summary>
++        /// Returns the host handshake for this node endpoint
++        /// </summary>
++        protected override IHandshake GetHandshake()
++        {
++            return _handshake;
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Node/ConsoleOutput.cs b/src/Build/BackEnd/Node/ConsoleOutput.cs
+new file mode 100644
+index 00000000000..8cf4092bc84
+--- /dev/null
++++ b/src/Build/BackEnd/Node/ConsoleOutput.cs
+@@ -0,0 +1,12 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++//
++
++namespace Microsoft.Build.BackEnd
++{
++    internal enum ConsoleOutput
++    {
++        Standard = 1,
++        Error
++    }
++}
+diff --git a/src/Build/BackEnd/Node/OutOfProcServerNode.cs b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+new file mode 100644
+index 00000000000..3d532f3506c
+--- /dev/null
++++ b/src/Build/BackEnd/Node/OutOfProcServerNode.cs
+@@ -0,0 +1,368 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.Collections.Concurrent;
++using System.IO;
++using System.Threading;
++using Microsoft.Build.BackEnd;
++using Microsoft.Build.Shared;
++using Microsoft.Build.Internal;
++
++namespace Microsoft.Build.Execution
++{
++    /// <summary>
++    /// This class represents an implementation of INode for out-of-proc server nodes aka MSBuild server 
++    /// </summary>
++    public sealed class OutOfProcServerNode : INode, INodePacketFactory, INodePacketHandler
++    {
++        private readonly Func<string, (int exitCode, string exitType)> _buildFunction;
++
++        /// <summary>
++        /// The endpoint used to talk to the host.
++        /// </summary>
++        private INodeEndpoint _nodeEndpoint = default!;
++
++        /// <summary>
++        /// The packet factory.
++        /// </summary>
++        private readonly NodePacketFactory _packetFactory;
++
++        /// <summary>
++        /// The queue of packets we have received but which have not yet been processed.
++        /// </summary>
++        private readonly ConcurrentQueue<INodePacket> _receivedPackets;
++
++        /// <summary>
++        /// The event which is set when we receive packets.
++        /// </summary>
++        private readonly AutoResetEvent _packetReceivedEvent;
++
++        /// <summary>
++        /// The event which is set when we should shut down.
++        /// </summary>
++        private readonly ManualResetEvent _shutdownEvent;
++
++        /// <summary>
++        /// The reason we are shutting down.
++        /// </summary>
++        private NodeEngineShutdownReason _shutdownReason;
++
++        /// <summary>
++        /// The exception, if any, which caused shutdown.
++        /// </summary>
++        private Exception? _shutdownException = null;
++
++        /// <summary>
++        /// Flag indicating if we should debug communications or not.
++        /// </summary>
++        private readonly bool _debugCommunications;
++
++        private string _serverBusyMutexName = default!;
++
++        public OutOfProcServerNode(Func<string, (int exitCode, string exitType)> buildFunction)
++        {
++            _buildFunction = buildFunction;
++            new Dictionary<string, string>();
++            _debugCommunications = (Environment.GetEnvironmentVariable("MSBUILDDEBUGCOMM") == "1");
++
++            _receivedPackets = new ConcurrentQueue<INodePacket>();
++            _packetReceivedEvent = new AutoResetEvent(false);
++            _shutdownEvent = new ManualResetEvent(false);
++            _packetFactory = new NodePacketFactory();
++
++            (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.ServerNodeBuildCommand, ServerNodeBuildCommand.FactoryForDeserialization, this);
++            (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.NodeBuildComplete, NodeBuildComplete.FactoryForDeserialization, this);
++        }
++
++        #region INode Members
++
++        /// <summary>
++        /// Starts up the node and processes messages until the node is requested to shut down.
++        /// </summary>
++        /// <param name="shutdownException">The exception which caused shutdown, if any.</param>
++        /// <returns>The reason for shutting down.</returns>
++        public NodeEngineShutdownReason Run(out Exception? shutdownException)
++        {
++            string msBuildLocation = BuildEnvironmentHelper.Instance.CurrentMSBuildExePath;
++            var handshake = new ServerNodeHandshake(
++                CommunicationsUtilities.GetHandshakeOptions(taskHost: false, architectureFlagToSet: XMakeAttributes.GetCurrentMSBuildArchitecture()),
++                msBuildLocation);
++
++            string pipeName = NamedPipeUtil.GetPipeNameOrPath("MSBuildServer-" + handshake.ComputeHash());
++
++            string serverRunningMutexName = $@"{ServerNamedMutex.RunningServerMutexNamePrefix}{pipeName}";
++            _serverBusyMutexName = $@"{ServerNamedMutex.BusyServerMutexNamePrefix}{pipeName}";
++
++            // TODO: shall we address possible race condition. It is harmless as it, with acceptable probability, just cause unnecessary process spawning
++            // and of two processes will become victim and fails, build will not be affected
++            using var serverRunningMutex = ServerNamedMutex.OpenOrCreateMutex(serverRunningMutexName, out bool mutexCreatedNew);
++            if (!mutexCreatedNew)
++            {
++                shutdownException = new InvalidOperationException("MSBuild server is already running!");
++                return NodeEngineShutdownReason.Error;
++            }
++
++            _nodeEndpoint = new ServerNodeEndpointOutOfProc(pipeName, handshake);
++            _nodeEndpoint.OnLinkStatusChanged += OnLinkStatusChanged;
++            _nodeEndpoint.Listen(this);
++
++            var waitHandles = new WaitHandle[] { _shutdownEvent, _packetReceivedEvent };
++
++            // Get the current directory before doing any work. We need this so we can restore the directory when the node shutsdown.
++            while (true)
++            {
++                int index = WaitHandle.WaitAny(waitHandles);
++                switch (index)
++                {
++                    case 0:
++                        NodeEngineShutdownReason shutdownReason = HandleShutdown(out shutdownException);
++                        return shutdownReason;
++
++                    case 1:
++
++                        while (_receivedPackets.TryDequeue(out INodePacket? packet))
++                        {
++                            if (packet != null)
++                            {
++                                HandlePacket(packet);
++                            }
++                        }
++
++                        break;
++                }
++            }
++
++            // UNREACHABLE
++        }
++
++        #endregion
++
++        #region INodePacketFactory Members
++
++        /// <summary>
++        /// Registers a packet handler.
++        /// </summary>
++        /// <param name="packetType">The packet type for which the handler should be registered.</param>
++        /// <param name="factory">The factory used to create packets.</param>
++        /// <param name="handler">The handler for the packets.</param>
++        void INodePacketFactory.RegisterPacketHandler(NodePacketType packetType, NodePacketFactoryMethod factory, INodePacketHandler handler)
++        {
++            _packetFactory.RegisterPacketHandler(packetType, factory, handler);
++        }
++
++        /// <summary>
++        /// Unregisters a packet handler.
++        /// </summary>
++        /// <param name="packetType">The type of packet for which the handler should be unregistered.</param>
++        void INodePacketFactory.UnregisterPacketHandler(NodePacketType packetType)
++        {
++            _packetFactory.UnregisterPacketHandler(packetType);
++        }
++
++        /// <summary>
++        /// Deserializes and routes a packer to the appropriate handler.
++        /// </summary>
++        /// <param name="nodeId">The node from which the packet was received.</param>
++        /// <param name="packetType">The packet type.</param>
++        /// <param name="translator">The translator to use as a source for packet data.</param>
++        void INodePacketFactory.DeserializeAndRoutePacket(int nodeId, NodePacketType packetType, ITranslator translator)
++        {
++            _packetFactory.DeserializeAndRoutePacket(nodeId, packetType, translator);
++        }
++
++        /// <summary>
++        /// Routes a packet to the appropriate handler.
++        /// </summary>
++        /// <param name="nodeId">The node id from which the packet was received.</param>
++        /// <param name="packet">The packet to route.</param>
++        void INodePacketFactory.RoutePacket(int nodeId, INodePacket packet)
++        {
++            _packetFactory.RoutePacket(nodeId, packet);
++        }
++
++        #endregion
++
++        #region INodePacketHandler Members
++
++        /// <summary>
++        /// Called when a packet has been received.
++        /// </summary>
++        /// <param name="node">The node from which the packet was received.</param>
++        /// <param name="packet">The packet.</param>
++        void INodePacketHandler.PacketReceived(int node, INodePacket packet)
++        {
++            _receivedPackets.Enqueue(packet);
++            _packetReceivedEvent.Set();
++        }
++
++        #endregion
++
++        /// <summary>
++        /// Perform necessary actions to shut down the node.
++        /// </summary>
++        // TODO: it is too complicated, for simple role of server node it needs to be simplified
++        private NodeEngineShutdownReason HandleShutdown(out Exception? exception)
++        {
++            CommunicationsUtilities.Trace("Shutting down with reason: {0}, and exception: {1}.", _shutdownReason, _shutdownException);
++
++            exception = _shutdownException;
++
++            if (_nodeEndpoint.LinkStatus == LinkStatus.Active)
++            {
++                _nodeEndpoint.OnLinkStatusChanged -= OnLinkStatusChanged;
++            }
++
++            _nodeEndpoint.Disconnect();
++
++            CommunicationsUtilities.Trace("Shut down complete.");
++
++            return _shutdownReason;
++        }
++
++        /// <summary>
++        /// Event handler for the node endpoint's LinkStatusChanged event.
++        /// </summary>
++        private void OnLinkStatusChanged(INodeEndpoint endpoint, LinkStatus status)
++        {
++            switch (status)
++            {
++                case LinkStatus.ConnectionFailed:
++                case LinkStatus.Failed:
++                    _shutdownReason = NodeEngineShutdownReason.ConnectionFailed;
++                    _shutdownEvent.Set();
++                    break;
++
++                case LinkStatus.Inactive:
++                    break;
++
++                case LinkStatus.Active:
++                    break;
++
++                default:
++                    break;
++            }
++        }
++
++        /// <summary>
++        /// Callback for logging packets to be sent.
++        /// </summary>
++        private void SendPacket(INodePacket packet)
++        {
++            if (_nodeEndpoint.LinkStatus == LinkStatus.Active)
++            {
++                _nodeEndpoint.SendData(packet);
++            }
++        }
++
++        /// <summary>
++        /// Dispatches the packet to the correct handler.
++        /// </summary>
++        private void HandlePacket(INodePacket packet)
++        {
++            switch (packet.Type)
++            {
++                case NodePacketType.ServerNodeBuildCommand:
++                    HandleServerNodeBuildCommand((ServerNodeBuildCommand)packet);
++                    break;
++            }
++        }
++
++        private void HandleServerNodeBuildCommand(ServerNodeBuildCommand command)
++        {
++            using var serverBusyMutex = ServerNamedMutex.OpenOrCreateMutex(name: _serverBusyMutexName, createdNew: out var holdsMutex);
++            if (!holdsMutex)
++            {
++                // Client must have send request message to server even though serer is busy.
++                // It is not a race condition, as client exclusivity is also guaranteed by name pipe which allows only one client to connect.
++                _shutdownException = new InvalidOperationException("Client requested build while server is busy processing previous client build request.");
++                _shutdownReason = NodeEngineShutdownReason.Error;
++                _shutdownEvent.Set();
++            }
++
++            // set build process context
++            Directory.SetCurrentDirectory(command.StartupDirectory);
++            CommunicationsUtilities.SetEnvironment(command.BuildProcessEnvironment);
++            Thread.CurrentThread.CurrentCulture = command.Culture;
++            Thread.CurrentThread.CurrentUICulture = command.UICulture;
++
++            // configure console output redirection
++            var oldOut = Console.Out;
++            var oldErr = Console.Error;
++            (int exitCode, string exitType) buildResult;
++
++            // Dispose must be called before the server sends ServerNodeBuildResult packet
++            using (var outWriter = RedirectConsoleWriter.Create(text => SendPacket(new ServerNodeConsoleWrite(text, ConsoleOutput.Standard))))
++            using (var errWriter = RedirectConsoleWriter.Create(text => SendPacket(new ServerNodeConsoleWrite(text, ConsoleOutput.Error))))
++            {
++                Console.SetOut(outWriter);
++                Console.SetError(errWriter);
++
++                buildResult = _buildFunction(command.CommandLine);
++
++                Console.SetOut(oldOut);
++                Console.SetError(oldErr);
++            }
++          
++            // On Windows, a process holds a handle to the current directory,
++            // so reset it away from a user-requested folder that may get deleted.
++            NativeMethodsShared.SetCurrentDirectory(BuildEnvironmentHelper.Instance.CurrentMSBuildToolsDirectory);
++
++            var response = new ServerNodeBuildResult(buildResult.exitCode, buildResult.exitType);
++            SendPacket(response);
++
++            _shutdownReason = NodeEngineShutdownReason.BuildCompleteReuse;
++            _shutdownEvent.Set();
++        }
++
++        internal sealed class RedirectConsoleWriter : StringWriter
++        {
++            private readonly Action<string> _writeCallback;
++            private readonly Timer _timer;
++            private readonly TextWriter _syncWriter;
++
++            private RedirectConsoleWriter(Action<string> writeCallback)
++            {
++                _writeCallback = writeCallback;
++                _syncWriter = Synchronized(this);
++                _timer = new Timer(TimerCallback, null, 0, 200);
++            }
++
++            public static TextWriter Create(Action<string> writeCallback)
++            {
++                RedirectConsoleWriter writer = new(writeCallback);
++                return writer._syncWriter;
++            }
++
++            private void TimerCallback(object? state)
++            {
++                if (GetStringBuilder().Length > 0)
++                {
++                    _syncWriter.Flush();
++                }
++            }
++
++            protected override void Dispose(bool disposing)
++            {
++                if (disposing)
++                {
++                    _timer.Dispose();
++                    Flush();
++                }
++
++                base.Dispose(disposing);
++            }
++
++            public override void Flush()
++            {
++                var sb = GetStringBuilder();
++                var captured = sb.ToString();
++                sb.Clear();
++                _writeCallback(captured);
++
++                base.Flush();
++            }
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Node/ServerNamedMutex.cs b/src/Build/BackEnd/Node/ServerNamedMutex.cs
+new file mode 100644
+index 00000000000..e149cda704b
+--- /dev/null
++++ b/src/Build/BackEnd/Node/ServerNamedMutex.cs
+@@ -0,0 +1,91 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Threading;
++
++namespace Microsoft.Build.Execution
++{
++    internal sealed class ServerNamedMutex : IDisposable
++    {
++        public const string RunningServerMutexNamePrefix = @"Global\server-running-";
++        public const string BusyServerMutexNamePrefix = @"Global\server-busy-";
++
++        private readonly Mutex _serverMutex;
++
++        public bool IsDisposed { get; private set; }
++
++        public bool IsLocked { get; private set; }
++
++        public ServerNamedMutex(string mutexName, out bool createdNew)
++        {
++            _serverMutex = new Mutex(
++                initiallyOwned: true,
++                name: mutexName,
++                createdNew: out createdNew);
++
++            if (createdNew)
++            {
++                IsLocked = true;
++            }
++        }
++
++        internal static ServerNamedMutex OpenOrCreateMutex(string name, out bool createdNew)
++        {
++            // TODO: verify it is not needed anymore
++            // if (PlatformInformation.IsRunningOnMono)
++            // {
++            //     return new ServerFileMutexPair(name, initiallyOwned: true, out createdNew);
++            // }
++            // else
++
++            return new ServerNamedMutex(name, out createdNew);
++        }
++
++        public static bool WasOpen(string mutexName)
++        {
++            bool result = Mutex.TryOpenExisting(mutexName, out Mutex? mutex);
++            mutex?.Dispose();
++
++            return result;
++        }
++
++        public bool TryLock(int timeoutMs)
++        {
++            if (IsDisposed)
++            {
++                throw new ObjectDisposedException(nameof(ServerNamedMutex));
++            }
++
++            if (IsLocked)
++            {
++                throw new InvalidOperationException("Lock already held");
++            }
++
++            return IsLocked = _serverMutex.WaitOne(timeoutMs);
++        }
++
++        public void Dispose()
++        {
++            if (IsDisposed)
++            {
++                return;
++            }
++
++            IsDisposed = true;
++
++            try
++            {
++                if (IsLocked)
++                {
++                    _serverMutex.ReleaseMutex();
++                }
++            }
++            finally
++            {
++                _serverMutex.Dispose();
++                IsLocked = false;
++            }
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs b/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs
+new file mode 100644
+index 00000000000..48ab050cf1e
+--- /dev/null
++++ b/src/Build/BackEnd/Node/ServerNodeBuildCommand.cs
+@@ -0,0 +1,92 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++//
++
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++
++namespace Microsoft.Build.BackEnd
++{
++    /// <summary>
++    /// Contains all of the information necessary for a entry node to run a command line.
++    /// </summary>
++    internal sealed class ServerNodeBuildCommand : INodePacket
++    {
++        private string _commandLine = default!;
++        private string _startupDirectory = default!;
++        private Dictionary<string, string> _buildProcessEnvironment = default!;
++        private CultureInfo _culture = default!;
++        private CultureInfo _uiCulture = default!;
++
++        /// <summary>
++        /// Retrieves the packet type.
++        /// </summary>
++        public NodePacketType Type => NodePacketType.ServerNodeBuildCommand;
++
++        /// <summary>
++        /// The startup directory
++        /// </summary>
++        public string CommandLine => _commandLine;
++
++        /// <summary>
++        /// The startup directory
++        /// </summary>
++        public string StartupDirectory => _startupDirectory;
++
++        /// <summary>
++        /// The process environment.
++        /// </summary>
++        public Dictionary<string, string> BuildProcessEnvironment => _buildProcessEnvironment;
++
++        /// <summary>
++        /// The culture
++        /// </summary>
++        public CultureInfo Culture => _culture;
++
++        /// <summary>
++        /// The UI culture.
++        /// </summary>
++        public CultureInfo UICulture => _uiCulture;
++
++        /// <summary>
++        /// Private constructor for deserialization
++        /// </summary>
++        private ServerNodeBuildCommand()
++        {
++        }
++
++        public ServerNodeBuildCommand(string commandLine, string startupDirectory, Dictionary<string, string> buildProcessEnvironment, CultureInfo culture, CultureInfo uiCulture)
++        {
++            _commandLine = commandLine;
++            _startupDirectory = startupDirectory;
++            _buildProcessEnvironment = buildProcessEnvironment;
++            _culture = culture;
++            _uiCulture = uiCulture;
++        }
++
++        /// <summary>
++        /// Translates the packet to/from binary form.
++        /// </summary>
++        /// <param name="translator">The translator to use.</param>
++        public void Translate(ITranslator translator)
++        {
++            translator.Translate(ref _commandLine);
++            translator.Translate(ref _startupDirectory);
++            translator.TranslateDictionary(ref _buildProcessEnvironment, StringComparer.OrdinalIgnoreCase);
++            translator.TranslateCulture(ref _culture);
++            translator.TranslateCulture(ref _uiCulture);
++        }
++
++        /// <summary>
++        /// Factory for deserialization.
++        /// </summary>
++        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        {
++            ServerNodeBuildCommand command = new();
++            command.Translate(translator);
++
++            return command;
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Node/ServerNodeBuildResult.cs b/src/Build/BackEnd/Node/ServerNodeBuildResult.cs
+new file mode 100644
+index 00000000000..b7b9b3e7a2c
+--- /dev/null
++++ b/src/Build/BackEnd/Node/ServerNodeBuildResult.cs
+@@ -0,0 +1,50 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++//
++
++namespace Microsoft.Build.BackEnd
++{
++    internal sealed class ServerNodeBuildResult : INodePacket
++    {
++        private int _exitCode = default!;
++        private string _exitType = default!;
++
++        /// <summary>
++        /// Packet type.
++        /// This has to be in sync with <see cref="NodePacketType.ServerNodeBuildResult" />
++        /// </summary>
++        public NodePacketType Type => NodePacketType.ServerNodeBuildResult;
++
++        public int ExitCode => _exitCode;
++
++        public string ExitType => _exitType;
++
++        /// <summary>
++        /// Private constructor for deserialization
++        /// </summary>
++        private ServerNodeBuildResult() { }
++
++        public ServerNodeBuildResult(int exitCode, string exitType)
++        {
++            _exitCode = exitCode;
++            _exitType = exitType;
++        }
++
++        public void Translate(ITranslator translator)
++        {
++            translator.Translate(ref _exitCode);
++            translator.Translate(ref _exitType);
++        }
++
++        /// <summary>
++        /// Factory for deserialization.
++        /// </summary>
++        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        {
++            ServerNodeBuildResult command = new();
++            command.Translate(translator);
++
++            return command;
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Node/ServerNodeConsoleWrite.cs b/src/Build/BackEnd/Node/ServerNodeConsoleWrite.cs
+new file mode 100644
+index 00000000000..da3f8473905
+--- /dev/null
++++ b/src/Build/BackEnd/Node/ServerNodeConsoleWrite.cs
+@@ -0,0 +1,48 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++namespace Microsoft.Build.BackEnd
++{
++    internal sealed class ServerNodeConsoleWrite : INodePacket
++    {
++        private string _text = default!;
++        private ConsoleOutput _outputType = default!;
++
++        /// <summary>
++        /// Packet type.
++        /// </summary>
++        public NodePacketType Type => NodePacketType.ServerNodeConsoleWrite;
++
++        public string Text => _text;
++
++        /// <summary>
++        /// Console output for the message
++        /// </summary>
++        public ConsoleOutput OutputType => _outputType;
++
++        /// <summary>
++        /// Private constructor for deserialization
++        /// </summary>
++        private ServerNodeConsoleWrite() { }
++
++        public ServerNodeConsoleWrite(string text, ConsoleOutput outputType)
++        {
++            _text = text;
++            _outputType = outputType;
++        }
++
++        public void Translate(ITranslator translator)
++        {
++            translator.Translate(ref _text);
++            translator.TranslateEnum(ref _outputType, (int)_outputType);
++        }
++
++        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        {
++            ServerNodeConsoleWrite command = new();
++            command.Translate(translator);
++
++            return command;
++        }
++    }
++}
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index db86e8cbc7a..0bdc0df6561 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -145,9 +145,16 @@
+     <Compile Include="BackEnd\Components\Caching\ConfigCacheWithOverride.cs" />
+     <Compile Include="BackEnd\Components\Caching\ResultsCacheWithOverride.cs" />
+     <Compile Include="BackEnd\Components\ProjectCache\*.cs" />
++    <Compile Include="BackEnd\Components\Communications\ServerNodeEndpointOutOfProc.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\SdkResolverException.cs" />
+     <Compile Include="BackEnd\Components\SdkResolution\TranslationHelpers.cs" />
+     <Compile Include="FileSystem\*.cs" />
++    <Compile Include="BackEnd\Node\ConsoleOutput.cs" />
++    <Compile Include="BackEnd\Node\ServerNamedMutex.cs" />
++    <Compile Include="BackEnd\Node\ServerNodeBuildCommand.cs" />
++    <Compile Include="BackEnd\Node\ServerNodeConsoleWrite.cs" />
++    <Compile Include="BackEnd\Node\ServerNodeBuildResult.cs" />
++    <Compile Include="BackEnd\Node\OutOfProcServerNode.cs" />
+     <Compile Include="Utilities\ImmutableCollectionsExtensions.cs" />
+     <Compile Include="Utilities\NuGetFrameworkWrapper.cs" />
+     <Compile Include="ObjectModelRemoting\ConstructionObjectLinks\ProjectUsingTaskParameterElementLink.cs" />
+diff --git a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+index e69de29bb2d..6a1467598ac 100644
+--- a/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/net/PublicAPI.Unshipped.txt
+@@ -0,0 +1,3 @@
++Microsoft.Build.Execution.OutOfProcServerNode
++Microsoft.Build.Execution.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction) -> void
++Microsoft.Build.Execution.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
+diff --git a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+index e69de29bb2d..6cdbdc2bcc1 100644
+--- a/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
++++ b/src/Build/PublicAPI/netstandard/PublicAPI.Unshipped.txt
+@@ -0,0 +1,4 @@
++
++Microsoft.Build.Execution.OutOfProcServerNode
++Microsoft.Build.Execution.OutOfProcServerNode.OutOfProcServerNode(System.Func<string, (int exitCode, string exitType)> buildFunction) -> void
++Microsoft.Build.Execution.OutOfProcServerNode.Run(out System.Exception shutdownException) -> Microsoft.Build.Execution.NodeEngineShutdownReason
+\ No newline at end of file
+diff --git a/src/MSBuild/NodeEndpointOutOfProcTaskHost.cs b/src/MSBuild/NodeEndpointOutOfProcTaskHost.cs
+index 36ea494b383..0f1e1eacb05 100644
+--- a/src/MSBuild/NodeEndpointOutOfProcTaskHost.cs
++++ b/src/MSBuild/NodeEndpointOutOfProcTaskHost.cs
+@@ -28,7 +28,7 @@ internal NodeEndpointOutOfProcTaskHost()
+         /// <summary>
+         /// Returns the host handshake for this node endpoint
+         /// </summary>
+-        protected override Handshake GetHandshake()
++        protected override IHandshake GetHandshake()
+         {
+             return new Handshake(CommunicationsUtilities.GetHandshakeOptions(taskHost: true));
+         }
+diff --git a/src/MSBuild/XMake.cs b/src/MSBuild/XMake.cs
+index 42251449d2a..83c62ace30a 100644
+--- a/src/MSBuild/XMake.cs
++++ b/src/MSBuild/XMake.cs
+@@ -1959,6 +1959,11 @@ private static bool IsEnvironmentVariable(string envVar)
+         /// </summary>
+         internal static bool usingSwitchesFromAutoResponseFile = false;
+ 
++        /// <summary>
++        /// Indicates that this process is working as a server.
++        /// </summary>
++        private static bool s_isServerNode;
++
+         /// <summary>
+         /// Parses the auto-response file (assumes the "/noautoresponse" switch is not specified on the command line), and combines the
+         /// switches from the auto-response file with the switches passed in.
+@@ -2629,6 +2634,42 @@ private static void StartLocalNode(CommandLineSwitches commandLineSwitches, bool
+                     OutOfProcTaskHostNode node = new OutOfProcTaskHostNode();
+                     shutdownReason = node.Run(out nodeException);
+                 }
++                else if (nodeModeNumber == 8)
++                {
++                    // Since build function has to reuse code from *this* class and OutOfProcServerNode is in different assembly
++                    // we have to pass down xmake build invocation to avoid circular dependency
++                    Func<string, (int exitCode, string exitType)> buildFunction = (commandLine) =>
++                    {
++                        int exitCode;
++                        ExitType exitType;
++
++                        if (!s_initialized)
++                        {
++                            exitType = ExitType.InitializationError;
++                        }
++                        else
++                        {
++                            exitType = Execute(
++#if FEATURE_GET_COMMANDLINE
++                                    commandLine
++#else
++                                    QuotingUtilities.SplitUnquoted(commandLine).ToArray()
++#endif
++                                );
++                            exitCode = exitType == ExitType.Success ? 0 : 1;
++                        }
++                        exitCode = exitType == ExitType.Success ? 0 : 1;
++
++                        return (exitCode, exitType.ToString());
++                    };
++
++                    OutOfProcServerNode node = new(buildFunction);
++
++                    s_isServerNode = true;
++                    shutdownReason = node.Run(out nodeException);
++
++                    FileUtilities.ClearCacheDirectory();
++                }
+                 else
+                 {
+                     CommandLineSwitchException.Throw("InvalidNodeNumberValue", nodeModeNumber.ToString());
+@@ -3124,6 +3165,12 @@ List<ILogger> loggers
+                     consoleParameters = AggregateParameters(consoleParameters, consoleLoggerParameters);
+                 }
+ 
++                // Always use ANSI escape codes when the build is initiated by server
++                if (s_isServerNode)
++                {
++                    consoleParameters = AggregateParameters(consoleParameters, new[] { "FORCECONSOLECOLOR" });
++                }
++
+                 // Check to see if there is a possibility we will be logging from an out-of-proc node.
+                 // If so (we're multi-proc or the in-proc node is disabled), we register a distributed logger.
+                 if (cpuCount == 1 && Environment.GetEnvironmentVariable("MSBUILDNOINPROCNODE") != "1")
+diff --git a/src/Shared/BinaryTranslator.cs b/src/Shared/BinaryTranslator.cs
+index b1540445884..1a999ac682d 100644
+--- a/src/Shared/BinaryTranslator.cs
++++ b/src/Shared/BinaryTranslator.cs
+@@ -435,6 +435,7 @@ private static bool TryLoadCulture(string cultureName, out CultureInfo cultureIn
+             /// Finally, converting the enum to an int assumes that we always want to transport enums as ints.  This
+             /// works in all of our current cases, but certainly isn't perfectly generic.</remarks>
+             public void TranslateEnum<T>(ref T value, int numericValue)
++                where T : struct, Enum
+             {
+                 numericValue = _reader.ReadInt32();
+                 Type enumType = value.GetType();
+@@ -1039,10 +1040,8 @@ public void TranslateCulture(ref CultureInfo value)
+             /// Finally, converting the enum to an int assumes that we always want to transport enums as ints.  This
+             /// works in all of our current cases, but certainly isn't perfectly generic.</remarks>
+             public void TranslateEnum<T>(ref T value, int numericValue)
++                where T : struct, Enum
+             {
+-                Type enumType = value.GetType();
+-                ErrorUtilities.VerifyThrow(enumType.GetTypeInfo().IsEnum, "Must pass an enum type.");
+-
+                 _writer.Write(numericValue);
+             }
+ 
+diff --git a/src/Shared/CommunicationsUtilities.cs b/src/Shared/CommunicationsUtilities.cs
+index 9fdf1e22306..7e86ff4ee03 100644
+--- a/src/Shared/CommunicationsUtilities.cs
++++ b/src/Shared/CommunicationsUtilities.cs
+@@ -14,6 +14,8 @@
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+ using System.Reflection;
++using System.Security.Cryptography;
++using System.Text;
+ 
+ #if !CLR2COMPATIBILITY
+ using Microsoft.Build.Shared.Debugging;
+@@ -75,7 +77,24 @@ internal enum HandshakeOptions
+         Arm64 = 128,
+     }
+ 
+-    internal readonly struct Handshake
++    internal interface IHandshake
++    {
++        int[] RetrieveHandshakeComponents();
++
++        /// <summary>
++        /// Get string key representing all handshake values. It does not need to be human readable.
++        /// </summary>
++        string GetKey();
++
++        /// <summary>
++        /// Some handshakes uses very 1st byte to encode version of handshake in it,
++        /// so if it does not match it can reject it early based on very first byte.
++        /// Null means that no such encoding is used
++        /// </summary>
++        byte? ExpectedVersionInFirstByte { get; }
++    }
++
++    internal readonly struct Handshake : IHandshake
+     {
+         readonly int options;
+         readonly int salt;
+@@ -113,7 +132,7 @@ public override string ToString()
+             return String.Format("{0} {1} {2} {3} {4} {5} {6}", options, salt, fileVersionMajor, fileVersionMinor, fileVersionBuild, fileVersionPrivate, sessionId);
+         }
+ 
+-        internal int[] RetrieveHandshakeComponents()
++        public int[] RetrieveHandshakeComponents()
+         {
+             return new int[]
+             {
+@@ -126,6 +145,88 @@ internal int[] RetrieveHandshakeComponents()
+                 CommunicationsUtilities.AvoidEndOfHandshakeSignal(sessionId)
+             };
+         }
++
++        public string GetKey() => $"{options} {salt} {fileVersionMajor} {fileVersionMinor} {fileVersionBuild} {fileVersionPrivate} {sessionId}".ToString(CultureInfo.InvariantCulture);
++
++        public byte? ExpectedVersionInFirstByte => CommunicationsUtilities.handshakeVersion;
++    }
++
++    internal sealed class ServerNodeHandshake : IHandshake
++    {
++        readonly int _options;
++        readonly int _salt;
++        readonly int _fileVersionMajor;
++        readonly int _fileVersionMinor;
++        readonly int _fileVersionBuild;
++        readonly int _fileVersionRevision;
++
++        internal ServerNodeHandshake(HandshakeOptions nodeType, string msBuildLocation)
++        {
++            // We currently use 6 bits of this 32-bit integer. Very old builds will instantly reject any handshake that does not start with F5 or 06; slightly old builds always lead with 00.
++            // This indicates in the first byte that we are a modern build.
++            _options = (int)nodeType | (CommunicationsUtilities.handshakeVersion << 24);
++            string handshakeSalt = Environment.GetEnvironmentVariable("MSBUILDNODEHANDSHAKESALT");
++            var msBuildFile = new FileInfo(msBuildLocation);
++            var msBuildDirectory = msBuildFile.DirectoryName;
++            _salt = ComputeHandshakeHash(handshakeSalt + msBuildDirectory);
++            Version fileVersion = new Version(FileVersionInfo.GetVersionInfo(msBuildLocation).FileVersion ?? string.Empty);
++            _fileVersionMajor = fileVersion.Major;
++            _fileVersionMinor = fileVersion.Minor;
++            _fileVersionBuild = fileVersion.Build;
++            _fileVersionRevision = fileVersion.Revision;
++        }
++
++        internal const int EndOfHandshakeSignal = -0x2a2a2a2a;
++
++        /// <summary>
++        /// Compute stable hash as integer
++        /// </summary>
++        private static int ComputeHandshakeHash(string fromString)
++        {
++            using var sha = SHA256.Create();
++            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(fromString));
++
++            return BitConverter.ToInt32(bytes, 0);
++        }
++
++        internal static int AvoidEndOfHandshakeSignal(int x)
++        {
++            return x == EndOfHandshakeSignal ? ~x : x;
++        }
++
++        public int[] RetrieveHandshakeComponents()
++        {
++            return new int[]
++            {
++                AvoidEndOfHandshakeSignal(_options),
++                AvoidEndOfHandshakeSignal(_salt),
++                AvoidEndOfHandshakeSignal(_fileVersionMajor),
++                AvoidEndOfHandshakeSignal(_fileVersionMinor),
++                AvoidEndOfHandshakeSignal(_fileVersionBuild),
++                AvoidEndOfHandshakeSignal(_fileVersionRevision),
++            };
++        }
++
++        public string GetKey()
++        {
++            return $"{_options} {_salt} {_fileVersionMajor} {_fileVersionMinor} {_fileVersionBuild} {_fileVersionRevision}"
++                .ToString(CultureInfo.InvariantCulture);
++        }
++
++        public byte? ExpectedVersionInFirstByte => null;
++
++        /// <summary>
++        /// Computes Handshake stable hash string representing whole state of handshake.
++        /// </summary>
++        public string ComputeHash()
++        {
++            var input = GetKey();
++            using var sha = SHA256.Create();
++            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
++            return Convert.ToBase64String(bytes)
++                .Replace("/", "_")
++                .Replace("=", string.Empty);
++        }
+     }
+ 
+     /// <summary>
+diff --git a/src/Shared/INodePacket.cs b/src/Shared/INodePacket.cs
+index 481a99bfce9..b0ec1f1f6c5 100644
+--- a/src/Shared/INodePacket.cs
++++ b/src/Shared/INodePacket.cs
+@@ -189,6 +189,24 @@ internal enum NodePacketType : byte
+         /// Message sent back to a node informing it about the resource that were granted by the scheduler.
+         /// </summary>
+         ResourceResponse,
++
++        /// <summary>
++        /// Command in form of MSBuild command line for server node - MSBuild Server.
++        /// Keep this enum value constant intact as this is part of contract with dotnet CLI
++        /// </summary>
++        ServerNodeBuildCommand = 0xF0,
++
++        /// <summary>
++        /// Response from server node command
++        /// Keep this enum value constant intact as this is part of contract with dotnet CLI
++        /// </summary>
++        ServerNodeBuildResult = 0xF1,
++
++        /// <summary>
++        /// Info about server console activity. 
++        /// Keep this enum value constant intact as this is part of contract with dotnet CLI
++        /// </summary>
++        ServerNodeConsoleWrite = 0xF2,
+     }
+     #endregion
+ 
+diff --git a/src/Shared/ITranslator.cs b/src/Shared/ITranslator.cs
+index 61dc02cc3a0..56f47d0c5f4 100644
+--- a/src/Shared/ITranslator.cs
++++ b/src/Shared/ITranslator.cs
+@@ -235,7 +235,8 @@ BinaryWriter Writer
+         /// can you simply pass as ref Enum, because an enum instance doesn't match that function signature.
+         /// Finally, converting the enum to an int assumes that we always want to transport enums as ints.  This
+         /// works in all of our current cases, but certainly isn't perfectly generic.</remarks>
+-        void TranslateEnum<T>(ref T value, int numericValue);
++        void TranslateEnum<T>(ref T value, int numericValue)
++            where T : struct, Enum;
+ 
+         /// <summary>
+         /// Translates a value using the .Net binary formatter.
+diff --git a/src/Shared/NamedPipeUtil.cs b/src/Shared/NamedPipeUtil.cs
+index 4fbe37002a4..9db07e16722 100644
+--- a/src/Shared/NamedPipeUtil.cs
++++ b/src/Shared/NamedPipeUtil.cs
+@@ -17,6 +17,11 @@ internal static string GetPipeNameOrPath(int? processId = null)
+ 
+             string pipeName = $"MSBuild{processId}";
+ 
++            return GetPipeNameOrPath(pipeName);
++        }
++
++        internal static string GetPipeNameOrPath(string pipeName)
++        {
+             if (NativeMethodsShared.IsUnixLike)
+             {
+                 // If we're on a Unix machine then named pipes are implemented using Unix Domain Sockets.
+diff --git a/src/Shared/NodeEndpointOutOfProcBase.cs b/src/Shared/NodeEndpointOutOfProcBase.cs
+index ea696a53ec3..f402ecac71a 100644
+--- a/src/Shared/NodeEndpointOutOfProcBase.cs
++++ b/src/Shared/NodeEndpointOutOfProcBase.cs
+@@ -14,6 +14,7 @@
+ using Microsoft.Build.Shared;
+ #if FEATURE_SECURITY_PERMISSIONS || FEATURE_PIPE_SECURITY
+ using System.Security.AccessControl;
++using System.Linq;
+ #endif
+ #if FEATURE_PIPE_SECURITY && FEATURE_NAMED_PIPE_SECURITY_CONSTRUCTOR
+ using System.Security.Principal;
+@@ -185,7 +186,7 @@ public void SendData(INodePacket packet)
+         /// <summary>
+         /// Instantiates an endpoint to act as a client
+         /// </summary>
+-        internal void InternalConstruct()
++        internal void InternalConstruct(string pipeName = null)
+         {
+             _status = LinkStatus.Inactive;
+             _asyncDataMonitor = new object();
+@@ -194,7 +195,7 @@ internal void InternalConstruct()
+             _packetStream = new MemoryStream();
+             _binaryWriter = new BinaryWriter(_packetStream);
+ 
+-            string pipeName = NamedPipeUtil.GetPipeNameOrPath();
++            pipeName ??= NamedPipeUtil.GetPipeNameOrPath();
+ 
+ #if FEATURE_PIPE_SECURITY && FEATURE_NAMED_PIPE_SECURITY_CONSTRUCTOR
+             if (!NativeMethodsShared.IsMono)
+@@ -245,7 +246,7 @@ internal void InternalConstruct()
+         /// <summary>
+         /// Returns the host handshake for this node endpoint
+         /// </summary>
+-        protected abstract Handshake GetHandshake();
++        protected abstract IHandshake GetHandshake();
+ 
+         /// <summary>
+         /// Updates the current link status if it has changed and notifies any registered delegates.
+@@ -373,7 +374,7 @@ private void PacketPumpProc()
+                     // The handshake protocol is a series of int exchanges.  The host sends us a each component, and we
+                     // verify it. Afterwards, the host sends an "End of Handshake" signal, to which we respond in kind.
+                     // Once the handshake is complete, both sides can be assured the other is ready to accept data.
+-                    Handshake handshake = GetHandshake();
++                    IHandshake handshake = GetHandshake();
+                     try
+                     {
+                         int[] handshakeComponents = handshake.RetrieveHandshakeComponents();

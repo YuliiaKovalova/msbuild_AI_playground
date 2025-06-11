@@ -1,0 +1,563 @@
+diff --git a/src/Framework/BinaryTranslator.cs b/src/Framework/BinaryTranslator.cs
+index ecf16907307..28b8aaf5209 100644
+--- a/src/Framework/BinaryTranslator.cs
++++ b/src/Framework/BinaryTranslator.cs
+@@ -50,6 +50,12 @@ internal static ITranslator GetWriteTranslator(Stream stream)
+             return new BinaryWriteTranslator(stream);
+         }
+ 
++        // TODO: Avoid expsoing write translator?
++        internal static ITranslator GetWriteTranslator(Stream stream, InterningWriteTranslator interner)
++        {
++            return new BinaryWriteTranslator(stream, interner, isInterning: true);
++        }
++
+         /// <summary>
+         /// Implementation of ITranslator for reading from a stream.
+         /// </summary>
+@@ -65,6 +71,10 @@ private class BinaryReadTranslator : ITranslator
+             /// </summary>
+             private BinaryReader _reader;
+ 
++            private InterningReadTranslator _interner;
++
++            public bool IsInterning { get; private set; }
++
+ #nullable enable
+             /// <summary>
+             /// Constructs a serializer from the specified stream, operating in the designated mode.
+@@ -73,6 +83,7 @@ public BinaryReadTranslator(Stream packetStream, BinaryReaderFactory buffer)
+             {
+                 _packetStream = packetStream;
+                 _reader = buffer.Create(packetStream);
++                _interner = new(this);
+             }
+ #nullable disable
+ 
+@@ -788,6 +799,75 @@ public bool TranslateNullable<T>(T value)
+                 bool haveRef = _reader.ReadBoolean();
+                 return haveRef;
+             }
++
++            public void WithInterning(IEqualityComparer<string> comparer, int initialCapacity, Action<ITranslator> internBlock)
++            {
++                if (IsInterning)
++                {
++                    throw new InvalidOperationException("Cannot enter recursive intern block.");
++                }
++
++                IsInterning = true;
++
++                _interner.Translate(this);
++                internBlock(this);
++
++                IsInterning = false;
++            }
++
++            public void Intern(ref string str, bool nullable)
++            {
++                if (!IsInterning)
++                {
++                    Translate(ref str);
++                }
++                else if (nullable)
++                {
++                    str = _interner.ReadNullable();
++                }
++                else
++                {
++                    str = _interner.Read();
++                }
++            }
++
++            public void Intern(ref string[] array)
++            {
++                if (!IsInterning)
++                {
++                    Translate(ref array);
++                }
++
++                if (!TranslateNullable(array))
++                {
++                    return;
++                }
++
++
++                int count = _reader.ReadInt32();
++                array = new string[count];
++
++                for (int i = 0; i < count; i++)
++                {
++                    array[i] = _interner.ReadNullable();
++                }
++            }
++
++            public void InternPath(ref string str, bool nullable)
++            {
++                if (!IsInterning)
++                {
++                    Translate(ref str);
++                }
++                else if (nullable)
++                {
++                    str = _interner.ReadNullablePath();
++                }
++                else
++                {
++                    str = _interner.ReadPath();
++                }
++            }
+         }
+ 
+         /// <summary>
+@@ -805,14 +885,25 @@ private class BinaryWriteTranslator : ITranslator
+             /// </summary>
+             private BinaryWriter _writer;
+ 
++            private readonly InterningWriteTranslator _interner = new();
++
++            public bool IsInterning { get; private set; }
++
+             /// <summary>
+             /// Constructs a serializer from the specified stream, operating in the designated mode.
+             /// </summary>
+             /// <param name="packetStream">The stream serving as the source or destination of data.</param>
+             public BinaryWriteTranslator(Stream packetStream)
++                : this(packetStream, new InterningWriteTranslator())
++            {
++            }
++
++            internal BinaryWriteTranslator(Stream packetStream, InterningWriteTranslator interner, bool isInterning = false)
+             {
+                 _packetStream = packetStream;
+                 _writer = new BinaryWriter(packetStream);
++                _interner = interner;
++                IsInterning = isInterning;
+             }
+ 
+             /// <summary>
+@@ -1510,6 +1601,71 @@ public bool TranslateNullable<T>(T value)
+                 _writer.Write(haveRef);
+                 return haveRef;
+             }
++
++            public void WithInterning(IEqualityComparer<string> comparer, int initialCapacity, Action<ITranslator> internBlock)
++            {
++                if (IsInterning)
++                {
++                    throw new InvalidOperationException("Cannot enter recursive intern block.");
++                }
++
++                _interner.InitCapacity(comparer, initialCapacity);
++                internBlock(_interner.Translator);
++                _interner.Translate(this);
++            }
++
++            public void Intern(ref string str, bool nullable)
++            {
++                if (!IsInterning)
++                {
++                    Translate(ref str);
++                }
++                else if (nullable)
++                {
++                    _interner.InternNullable(str);
++                }
++                else
++                {
++                    _interner.Intern(str);
++                }
++            }
++
++            public void Intern(ref string[] array)
++            {
++                if (!IsInterning)
++                {
++                    Translate(ref array);
++                }
++
++                if (!_interner.Translator.TranslateNullable(array))
++                {
++                    return;
++                }
++
++                int count = array.Length;
++                _interner.Translator.Translate(ref count);
++
++                for (int i = 0; i < count; i++)
++                {
++                    _interner.InternNullable(array[i]);
++                }
++            }
++
++            public void InternPath(ref string str, bool nullable)
++            {
++                if (!IsInterning)
++                {
++                    Translate(ref str);
++                }
++                else if (nullable)
++                {
++                    _interner.InternNullablePath(str);
++                }
++                else
++                {
++                    _interner.InternPath(str);
++                }
++            }
+         }
+     }
+ }
+diff --git a/src/Framework/ITranslator.cs b/src/Framework/ITranslator.cs
+index 5f6655cef36..efe33cfb0a6 100644
+--- a/src/Framework/ITranslator.cs
++++ b/src/Framework/ITranslator.cs
+@@ -98,6 +98,8 @@ BinaryWriter Writer
+             get;
+         }
+ 
++        bool IsInterning { get; }
++
+         /// <summary>
+         /// Translates a boolean.
+         /// </summary>
+@@ -366,5 +368,14 @@ void TranslateDictionary<D, T>(ref D dictionary, ObjectTranslator<T> objectTrans
+         /// <typeparam name="T">The type of object to test.</typeparam>
+         /// <returns>True if the object should be written, false otherwise.</returns>
+         bool TranslateNullable<T>(T value);
++
++        void Intern(ref string str, bool nullable = false);
++
++        void Intern(ref string[] array);
++
++
++        void InternPath(ref string str, bool nullable = false);
++
++        void WithInterning(IEqualityComparer<string> comparer, int initialCapacity, Action<ITranslator> internBlock);
+     }
+ }
+diff --git a/src/Framework/InterningReadTranslator.cs b/src/Framework/InterningReadTranslator.cs
+new file mode 100644
+index 00000000000..f717fc4a3c1
+--- /dev/null
++++ b/src/Framework/InterningReadTranslator.cs
+@@ -0,0 +1,94 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using Microsoft.Build.BackEnd;
++
++namespace Microsoft.Build.BackEnd
++{
++    internal sealed class InterningReadTranslator : ITranslatable
++    {
++        private List<string> _strings = [];
++
++        private Dictionary<PathIds, string> _pathIdsToString = [];
++
++        private readonly ITranslator _translator;
++
++        internal InterningReadTranslator(ITranslator translator)
++        {
++            _translator = translator;
++        }
++
++        internal string? ReadNullable()
++        {
++            if (!_translator.TranslateNullable(string.Empty))
++            {
++                return null;
++            }
++
++            return Read();
++        }
++
++        internal string Read()
++        {
++            int key = -1;
++            _translator.Translate(ref key);
++            return _strings[key];
++        }
++
++        internal string? ReadNullablePath()
++        {
++            if (!_translator.TranslateNullable(string.Empty))
++            {
++                return null;
++            }
++
++            return ReadPath();
++        }
++
++        internal string ReadPath()
++        {
++            if (!_translator.TranslateNullable(string.Empty))
++            {
++                return Read();
++            }
++
++            int directoryKey = -1;
++            int fileNameKey = -1;
++            _translator.Translate(ref directoryKey);
++            _translator.Translate(ref fileNameKey);
++
++            PathIds pathIds = new(directoryKey, fileNameKey);
++
++            if (_pathIdsToString.TryGetValue(pathIds, out string? path))
++            {
++                return path;
++            }
++
++            string directory = _strings[pathIds.DirectoryId];
++            string fileName = _strings[pathIds.FileNameId];
++            string str = string.Concat(directory, fileName);
++            _pathIdsToString.Add(pathIds, str);
++
++            return str;
++        }
++
++        public void Translate(ITranslator translator)
++        {
++            _translator.Translate(ref _strings);
++            foreach (string str in _strings)
++            {
++                Console.WriteLine(str);
++            }
++#if NET
++            _pathIdsToString.EnsureCapacity(_strings.Count);
++#else
++            _pathIdsToString = new(_strings.Count);
++#endif
++        }
++
++        private readonly record struct PathIds(int DirectoryId, int FileNameId);
++    }
++}
+diff --git a/src/Framework/InterningWriteTranslator.cs b/src/Framework/InterningWriteTranslator.cs
+new file mode 100644
+index 00000000000..b992ca68e8d
+--- /dev/null
++++ b/src/Framework/InterningWriteTranslator.cs
+@@ -0,0 +1,131 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using Microsoft.Build.BackEnd;
++
++namespace Microsoft.Build.BackEnd
++{
++    internal sealed class InterningWriteTranslator : ITranslatable
++    {
++        private List<string> _strings = [];
++
++        private Dictionary<string, int> _stringToIds = [];
++
++        private Dictionary<string, PathIds> _stringToPathIds = [];
++
++        private MemoryStream _packetStream = new();
++
++#pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
++        // Recursive loop
++        internal ITranslator Translator { get; private set; }
++#pragma warning restore CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
++
++        internal void InitCapacity(IEqualityComparer<string> comparer, int count)
++        {
++            if (Translator == null)
++            {
++                Translator = BinaryTranslator.GetWriteTranslator(_packetStream, this);
++            }
++
++            int capacity = count * 8;
++            int bufferCapacity = capacity * 128;
++            _stringToIds = new Dictionary<string, int>(count * 8, comparer);
++            _stringToPathIds = new Dictionary<string, PathIds>(count * 8, comparer);
++            _strings.Clear();
++            _strings.Capacity = capacity;
++            _packetStream.Position = 0;
++            _packetStream.SetLength(0);
++            _packetStream.Capacity = bufferCapacity;
++        }
++
++        internal void Intern(string str) => InternString(str);
++
++        internal void InternNullable(string str)
++        {
++            if (!Translator.TranslateNullable(str))
++            {
++                return;
++            }
++
++            InternString(str);
++        }
++
++        private int InternString(string str)
++        {
++            if (!_stringToIds.TryGetValue(str, out int index))
++            {
++                index = _strings.Count;
++                _stringToIds.Add(str, index);
++                _strings.Add(str);
++            }
++
++            Translator.Translate(ref index);
++            return index;
++        }
++
++        internal void InternNullablePath(string str)
++        {
++            if (!Translator.TranslateNullable(str))
++            {
++                return;
++            }
++
++            InternPath(str);
++        }
++
++        internal void InternPath(string str)
++        {
++            if (_stringToPathIds.TryGetValue(str, out PathIds pathIds))
++            {
++                _ = Translator.TranslateNullable(string.Empty);
++                int directoryId = pathIds.DirectoryId;
++                int fileNameId = pathIds.FileNameId;
++                Translator.Translate(ref directoryId);
++                Translator.Translate(ref fileNameId);
++                return;
++            }
++
++            int splitId = str.LastIndexOf(Path.DirectorySeparatorChar);
++
++            if (splitId == -1)
++            {
++                splitId = str.LastIndexOf(Path.AltDirectorySeparatorChar);
++            }
++
++            bool hasDirectorySeparator = splitId > -1
++                && splitId < str.Length - 1
++                && str.IndexOf('%') == -1;
++
++            if (!hasDirectorySeparator)
++            {
++                string? dummy = null;
++                _ = Translator.TranslateNullable(dummy);
++                _ = InternString(str);
++                return;
++            }
++
++            // If we've seen a string already and know it's pathlike, we just need the index duo
++            string directory = str.Substring(0, splitId + 1);
++            string fileName = str.Substring(splitId + 1);
++
++            _ = Translator.TranslateNullable(string.Empty);
++            int directoryIndex = InternString(directory);
++            int fileNameIndex = InternString(fileName);
++
++            _stringToPathIds.Add(str, new PathIds(directoryIndex, fileNameIndex));
++        }
++
++        public void Translate(ITranslator translator)
++        {
++            translator.Translate(ref _strings);
++            byte[] buffer = _packetStream.GetBuffer();
++            int bufferSize = (int)_packetStream.Length;
++            translator.Writer.Write(buffer, 0, bufferSize);
++        }
++
++        private readonly record struct PathIds(int DirectoryId, int FileNameId);
++    }
++}
+diff --git a/src/MSBuildTaskHost/MSBuildTaskHost.csproj b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+index a189f58567a..4ca8ad45391 100644
+--- a/src/MSBuildTaskHost/MSBuildTaskHost.csproj
++++ b/src/MSBuildTaskHost/MSBuildTaskHost.csproj
+@@ -221,6 +221,9 @@
+     <Compile Include="..\Shared\TaskParameter.cs" />
+     <Compile Include="..\Shared\AssemblyNameExtension.cs" />
+ 
++    <Compile Include="..\Framework\InterningReadTranslator.cs" />
++    <Compile Include="..\Framework\InterningWriteTranslator.cs" />
++
+     <Compile Include="..\Shared\FileSystem\IFileSystem.cs" />
+     <Compile Include="..\Shared\FileSystem\FileSystems.cs" />
+     <Compile Include="FileSystem\MSBuildTaskHostFileSystem.cs" />
+diff --git a/src/Shared/TranslatorHelpers.cs b/src/Shared/TranslatorHelpers.cs
+index 2835756fa6c..20e274a040d 100644
+--- a/src/Shared/TranslatorHelpers.cs
++++ b/src/Shared/TranslatorHelpers.cs
+@@ -89,6 +89,52 @@ public static void TranslateDictionary<T>(
+             translator.TranslateDictionary(ref dictionary, comparer, AdaptFactory(valueFactory));
+         }
+ 
++        public static void InternDictionary(this ITranslator translator, ref Dictionary<string, string> dictionary, IEqualityComparer<string> comparer)
++        {
++            IDictionary<string, string> localDict = dictionary;
++            translator.TranslateDictionary(
++                ref localDict,
++                (ITranslator translator, ref string key) => translator.Intern(ref key),
++                (ITranslator translator, ref string val) => translator.Intern(ref val),
++                capacity => new Dictionary<string, string>(capacity, comparer));
++            dictionary = (Dictionary<string, string>)localDict;
++        }
++
++        public static void InternDictionary<T>(this ITranslator translator, ref Dictionary<string, T> dictionary, IEqualityComparer<string> stringComparer, NodePacketValueFactory<T> valueFactory)
++            where T : ITranslatable
++        {
++            IDictionary<string, T> localDict = dictionary;
++            translator.TranslateDictionary(
++                ref localDict,
++                (ITranslator translator, ref string key) => translator.Intern(ref key),
++                AdaptFactory(valueFactory),
++                capacity => new Dictionary<string, T>(capacity, stringComparer));
++            dictionary = (Dictionary<string, T>)localDict;
++        }
++
++        public static void InternPathDictionary(this ITranslator translator, ref Dictionary<string, string> dictionary, IEqualityComparer<string> comparer)
++        {
++            IDictionary<string, string> localDict = dictionary;
++            translator.TranslateDictionary(
++                ref localDict,
++                (ITranslator translator, ref string key) => translator.Intern(ref key),
++                (ITranslator translator, ref string val) => translator.InternPath(ref val),
++                capacity => new Dictionary<string, string>(capacity, comparer));
++            dictionary = (Dictionary<string, string>)localDict;
++        }
++
++        public static void InternPathDictionary<T>(this ITranslator translator, ref Dictionary<string, T> dictionary, IEqualityComparer<string> stringComparer, NodePacketValueFactory<T> valueFactory)
++            where T : ITranslatable
++        {
++            IDictionary<string, T> localDict = dictionary;
++            translator.TranslateDictionary(
++                ref localDict,
++                (ITranslator translator, ref string key) => translator.InternPath(ref key),
++                AdaptFactory(valueFactory),
++                capacity => new Dictionary<string, T>(capacity, stringComparer));
++            dictionary = (Dictionary<string, T>)localDict;
++        }
++
+         public static void TranslateDictionary<D, T>(
+             this ITranslator translator,
+             ref D dictionary,
+@@ -247,14 +293,14 @@ public static void Translate(this ITranslator translator, ref AssemblyName assem
+                 publicKeyToken = assemblyName.GetPublicKeyToken();
+             }
+ 
+-            translator.Translate(ref name);
++            translator.InternPath(ref name, nullable: true);
+             translator.Translate(ref version);
+             translator.TranslateEnum(ref flags, (int)flags);
+             translator.TranslateEnum(ref processorArchitecture, (int)processorArchitecture);
+             translator.Translate(ref cultureInfo);
+             translator.TranslateEnum(ref hashAlgorithm, (int)hashAlgorithm);
+             translator.TranslateEnum(ref versionCompatibility, (int)versionCompatibility);
+-            translator.Translate(ref codeBase);
++            translator.Intern(ref codeBase, nullable: true);
+ 
+             translator.Translate(ref publicKey);
+             translator.Translate(ref publicKeyToken);

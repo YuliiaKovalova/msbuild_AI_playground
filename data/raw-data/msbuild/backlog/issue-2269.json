@@ -1,0 +1,159 @@
+{
+  "number": 2269,
+  "title": "Msbuild 15.0 hangs when triggered from Powershell",
+  "body": "I am trying to upgrade from MSBduil 4.0 to 15.0. The same set of solution files I build take about 9 minutes in total with msbuild 4.0 but take 10 minutes each when I run them with msbuild 15.0. The symptoms are always the same, the build itself (according to the logs) is done within seconds but the process from Start-Process msbuild.exe takes 10minutes to exit.\r\n\r\nI tried several suggestions on the web; like using nr:false, /p:UseSharedCompilation=false but nothing worked all the way.\r\n\r\nThe strange thing is that I run the same msbuild.exe command in cmd and it doesn't reproduce this.\r\n\r\nI should mention that when I build multiple solutions back to back, /p:UseSharedCompilation=false seems to work but I also have to use powershell to start cmd.exe which starts msbuild.exe.\r\n\r\nIf I used /p:UseSharedCompilation=false while building 1 solution only, it takes about double the time it would normally take.\r\n\r\nIn summary, what I want to do is:\r\n\r\nStart-Process $msBuildPath $msBuildArguments\r\nwhere $msBuildArguments are: <solutionName>  /p:Configuration=Debug /m /p:BuildInParallel=true /nr:False  \"/p:WarningLevel=4\"  /p:Platform=\"Any CPU\"  /target:Rebuild  /nologo /v:q  /fileLogger \"/fileLoggerParameters:LogFile=C:\\temp\\BuildLogs\\<solutionName>.msbuild.log;verbosity=normal;ShowTimeStamp\"\r\n\r\nAfter a week or so of trying different things, I wanted to ask you for suggestions about what I can do to avoid this.",
+  "state": "OPEN",
+  "createdAt": "2017-07-07T04:48:55Z",
+  "updatedAt": "2024-02-21T16:36:29Z",
+  "closedAt": null,
+  "author": {
+    "login": "andremakram"
+  },
+  "labels": [
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "It sounds like `Start-Process` isn't returning until _all child processes_ of the launched `msbuild.exe` exit.\r\n\r\nMSBuild spawns other processes, some of which are server processes that persist in an attempt to amortize startup time across many builds. Any task _may_ do this, but there are two processes that commonly persist: \r\n* `msbuild.exe` itself (for multi-process builds)\r\n  * You're already disabling this behavior by passing `/nodeReuse:false` on the command line\r\n* `vbcscompiler.exe` (which does all of the C# and Visual Basic compilation)\r\n  * This is not started when you set `UseSharedCompilation=false`\r\n\r\nI don't think there's a way to control the lifetime or timeout of `vbcscompiler.exe`--there's no way for it to know when \"the build\" is complete, because MSBuild doesn't really know about it. Only the `Csc` and `Vbc` tasks do.\r\n\r\nAs you've discovered, disabling the compiler server has a performance cost, because you have to wait for `csc.exe` to initialize for every project, instead of just once.\r\n\r\nI can see a few options:\r\n* Convince PowerShell to wait only for the top-level child process, and not all of its transitive children\r\n  * This should be safe since `vbcscompiler.exe` will only respond to requests from \"compatible\" `Csc` task invocations, so even if the next build switches compiler versions, the process shouldn't harm builds, and at idle it shouldn't be particularly resource-intensive.\r\n* Disable the compiler server and live with the longer times.\r\n* Some kind of awful attempt to detect MSBuild completion and kill child process.\r\n  * I don't recommend this.",
+        "createdAt": "2017-07-07T16:03:24Z",
+        "updatedAt": "2017-07-07T16:03:24Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "I am encountering the same issue and my workaround as of now is to use the default `/maxcpucount:1` instead of `/m` as it doesn't spawn any other process.",
+        "createdAt": "2017-08-01T07:31:58Z",
+        "updatedAt": "2017-08-01T07:31:58Z",
+        "author": {
+          "login": "superhoang"
+        }
+      },
+      {
+        "body": "@andremakram an alternative might be to add a custom target that will shutdown the vbcscompiler at the end of your build, that way you will not need to wait for it to timeout and shutdown.\r\n\r\nhttps://github.com/dotnet/roslyn/pull/7930 implemented a -shutdown option for the vbcscompiler server",
+        "createdAt": "2017-11-19T15:34:45Z",
+        "updatedAt": "2017-11-19T15:34:45Z",
+        "author": {
+          "login": "japj"
+        }
+      },
+      {
+        "body": "> Convince PowerShell to wait only for the top-level child process, and not all of its transitive children\r\n\r\n@rainersigwald That would be great. How???\r\n\r\n> Disable the compiler server and live with the longer times.\r\n\r\nLimited effectiveness. Still hangs sometimes. I think it hangs on first run after startup or after killing all msbuild.exe.\r\n\r\n> Some kind of awful attempt to detect MSBuild completion and kill child process\r\n\r\nLike poll for completion in powershell? how to know when it's done? Or kill all msbuild.exe from inside each build. yuk",
+        "createdAt": "2020-07-21T09:16:39Z",
+        "updatedAt": "2020-07-21T09:16:39Z",
+        "author": {
+          "login": "stevebroshar"
+        }
+      },
+      {
+        "body": "Is there any progress on this issue? I'm facing it right now and it is quite annoying :( ",
+        "createdAt": "2020-09-11T11:41:09Z",
+        "updatedAt": "2020-09-11T11:41:09Z",
+        "author": {
+          "login": "klinki"
+        }
+      },
+      {
+        "body": "@klinki : yes, I can report progress. I did solve the issue some time ago. Thanks for the prompt to share.\r\n\r\nThanks to @rainersigwald for providing ideas to try. Disabling the server aspect doesn't seem possible. I tried several different ways, but was not able to completely turn it off. Killing the child processes might be possible, but would be complicated code and a huge nasty hack. But, waiting for the top-level process to exit turned out to be easy enough and very effective. And, you still get the benefit of the process caching that msbuild provides!\r\n\r\nThe general idea is to get the process ID from Start-Process and then use Wait-Process:\r\n\r\n```\r\n  $process = Start-Process -FilePath $filePath -ArgumentList $argumentText -NoNewWindow -PassThru\r\n  Wait-Process -InputObject $process\r\n```\r\n\r\nI think it's unfortunate that Start-Process -Wait is confusing. At first blush it seems to provide what you want, but since it's too helpful (waiting for decendents), it's problematic. IMO, the default wait behavior should wait for only the process it creates. It could provide the extra feature of waiting for all decendents via a different switch.\r\n\r\nHere's more code to show how to use and integrate the use of Wait-Process.\r\n\r\n```\r\n<#\r\n.SYNOPSIS\r\nStarts a process and waits for it to exit.\r\n.NOTES\r\nThe behavior of this is different than using 'Start-Process -Wait' since that waits for the \r\nprocess and all _decendent_ processes to exit which causes a hang if the process starts a child \r\nprocess that does not exit when the first process exits (something that msbuild often does).\r\n\r\nAlthough this function is only _needed_ if the started process might start long-running child\r\nprocesses, it is general purpose and without known disadvantages such that it can be used for \r\nany synchronous, job-like application -- for any situation that you otherwise might use \r\n'Start-Process -Wait'.\r\n#>\r\nfunction StartAndWaitForExit([string]$filePath, [string]$argumentText) {\r\n  Write-Host \"Run: $filePath $argumentText\"\r\n  if (!$argumentText) {\r\n    # Start-Process fails if ArgumentList param is empty, so pass something innocuous\r\n    $argumentText = \" \"\r\n  }\r\n  $process = Start-Process -FilePath $filePath -ArgumentList $argumentText -NoNewWindow -PassThru\r\n  Wait-Process -InputObject $process\r\n  if ($process.ExitCode -gt 0) {Write-Error \"$filePath returned error code $($process.ExitCode)\"}\r\n}\r\n\r\n<#\r\n.NOTES\r\nThe script hangs when invoking msbuild via Start-Process -Wait since it waits for the process and\r\nall decendent processes to exit and msbuild starts and leaves running child processes. Note that \r\n/nodeReuse:false is supposed to prevent this problem but does not. \r\n#>\r\nfunction RunMsBuild([string]$filePath, [string]$additionalArgs=\"\") {\r\n  $argumentText = \"$filePath /t:Build `\"/p:Configuration=$configuration`\" `\"/p:Platform=$platform`\" /MaxCpuCount $additionalArgs\"\r\n  StartAndWaitForExit \"msbuild\" $argumentText\r\n}\r\n```",
+        "createdAt": "2020-09-11T13:21:42Z",
+        "updatedAt": "2020-09-11T13:27:22Z",
+        "author": {
+          "login": "stevebroshar"
+        }
+      },
+      {
+        "body": "Thanks! it looks good, I will try it. For now, as a workaround, I execute the msbuild from `cmd.exe` which seems to be working just fine. It's pretty weird, but it works. ",
+        "createdAt": "2020-09-14T14:29:04Z",
+        "updatedAt": "2020-09-14T14:29:04Z",
+        "author": {
+          "login": "klinki"
+        }
+      },
+      {
+        "body": "You are running cmd.exe with params to run msbuild? Something like this?\r\n\r\n`Start-Process -Wait -FilePath cmd.exe -ArgumentList \"/c msbuild ...\"`\r\n\r\nI found that that works some times. It does _not_ work when no cached msbuild processes are running -- like after reboot. When no cached processes exist, then running msbuild will result in a msbuild sub-process that outlives the creating process and this causes 'Start-Process -Wait' to hang.\r\n\r\nBut, when a cached process does exist, then when you run msbuild it will not create a new cached one ... and not hang. ... This got me since while testing this stuff. I invariably would end up having a msbuild cached process and then code as you describe works fine. But, I would find that sometimes it didn't (it would hang) and that was very hard to pin down since it was only the first run after reboot. \r\n\r\nTo test whether your powershell code is working, kill all the msbuild processes first.",
+        "createdAt": "2020-09-14T15:06:16Z",
+        "updatedAt": "2020-09-14T15:06:16Z",
+        "author": {
+          "login": "stevebroshar"
+        }
+      },
+      {
+        "body": "You might want to switch nodereuse off in Msbuild arguments, see also https://docs.microsoft.com/en-us/visualstudio/msbuild/msbuild-command-line-reference?view=vs-2019#switches",
+        "createdAt": "2020-09-14T15:14:34Z",
+        "updatedAt": "2020-09-14T15:14:34Z",
+        "author": {
+          "login": "japj"
+        }
+      },
+      {
+        "body": "I did try setting nodeResult to false. It didn't help me. IOW it would still hang. \r\n\r\nMaybe I did something wrong since it seemed to ignore my request to not cache processes.\r\n\r\nBut ...  I am also concerned about performance. msbuild caches processes for performance. If you tell it not to do that (and it works) then you lose that performance gain. I want the performance gain _and_ I want it to not hang.",
+        "createdAt": "2020-09-14T15:34:36Z",
+        "updatedAt": "2020-09-14T15:34:36Z",
+        "author": {
+          "login": "stevebroshar"
+        }
+      },
+      {
+        "body": "> \r\n> \r\n> You are running cmd.exe with params to run msbuild? Something like this?\r\n> \r\n> `Start-Process -Wait -FilePath cmd.exe -ArgumentList \"/c msbuild ...\"`\r\n> \r\n> I found that that works some times. It does _not_ work when no cached msbuild processes are running -- like after reboot. When no cached processes exist, then running msbuild will result in a msbuild sub-process that outlives the creating process and this causes 'Start-Process -Wait' to hang.\r\n> \r\n\r\nI execute it like this:\r\n```\r\ncmd.exe /C \"\"\"$msBuildPath\"\" EmSite\\\\EmSite.csproj /nr:false /m /p:DeployOnBuild=true /p:PublishProfile=FolderProfile\";\r\n```\r\n\r\nand it seems to be working fine.",
+        "createdAt": "2020-10-13T13:42:46Z",
+        "updatedAt": "2020-10-13T13:42:46Z",
+        "author": {
+          "login": "klinki"
+        }
+      },
+      {
+        "body": "@klinki : Seems that you are not using Start-Process. That was not clear from your earlier post ... partly since other earlier posts were exclusively about Start-Process and since you didn't say you were not using start-process. Anyway, if that works, then great. I do wonder if there are any limitations with that approach. Sadly, I'm not working with that script (or company) any more so I'm may not get around to looking into it more.",
+        "createdAt": "2020-10-13T15:40:12Z",
+        "updatedAt": "2020-10-13T15:40:12Z",
+        "author": {
+          "login": "stevebroshar"
+        }
+      },
+      {
+        "body": "@stevebroshar Yeah, you are right, sorry I wasn't clear about it from the beginning. In ideal world, I would use `Start-Process` with `MSBuild` directly, but since it is not working properly, I found this workaround with using `cmd.exe` and it seems to be working quite well. I never encountered that bug with MSBuild hanging anymore, so for me this workarounds solves that issue.\r\n",
+        "createdAt": "2020-10-14T15:08:48Z",
+        "updatedAt": "2020-10-14T15:08:48Z",
+        "author": {
+          "login": "klinki"
+        }
+      },
+      {
+        "body": "I can confirm that this problem still remains in the latest build tools.\r\n\r\nThis problem was haunting me for months and cost me many days of my life while I've been waiting for MSBuild to finish. Anyway... Here is my solution (with UserShareCompilation=false):\r\n\r\n## Working MSBuild setup\r\n```powershell\r\n[System.IO.FileInfo] $mapsSolutionFile = 'PathToYourSolutionFile'\r\nnuget restore \"$($mapsSolutionFile.FullName)\"\r\n[System.IO.FileInfo] $msbuildAbsolutePath = Get-MSBuildAbsolutePath\r\n$msbuildArgumentList = @(\r\n\t\"`\"$($mapsSolutionFile.FullName)`\"\",\r\n\t\"/p:Configuration=Release-Dev\",\r\n\t\"/p:Platform=\"\"Any CPU\"\"\",\r\n\t\"/p:UseSharedCompilation=false\",\r\n\t\"/nodeReuse:false\"\r\n)\r\nStart-Process -FilePath $msbuildAbsolutePath.FullName -ArgumentList $msbuildArgumentList -NoNewWindow -Wait\r\n\r\nfunction Get-MSBuildAbsolutePath\r\n{\r\n    [OutputType([System.IO.FileInfo])]\r\n\r\n    $msbuildAbsolutePath = &\"${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe\" -latest -prerelease -products * -requires Microsoft.Component.MSBuild -find MSBuild\\**\\Bin\\MSBuild.exe\r\n    if ([object]::Equals($msbuildAbsolutePath, $null))\r\n    {\r\n        $msbuildAbsolutePath = Get-ChildItem -Path ${env:ProgramFiles(x86)} -File -Recurse -Filter MSBuild.exe -ErrorAction:SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName\r\n    }\r\n    return $msbuildAbsolutePath\r\n}\r\n```\r\n",
+        "createdAt": "2021-03-10T09:44:58Z",
+        "updatedAt": "2021-03-10T10:02:40Z",
+        "author": {
+          "login": "KUTlime"
+        }
+      },
+      {
+        "body": "@KUTlime I think your solution prevents the temporary hang by disabling process caching. I see how that significantly improves performance. So, it's a solid solution.\r\n\r\nThe down side is that it turns off the process caching optimization. Also, in my opinion, the problem is that PowerShell waits for sub-processes to exit -- which is just weird.\r\n\r\nJust wanting to point out that there is a way to prevent the temporary hang without disabling the process caching optimization -- by using the PowerShell commands in comment above.",
+        "createdAt": "2021-03-11T14:12:43Z",
+        "updatedAt": "2021-03-11T14:15:05Z",
+        "author": {
+          "login": "stevebroshar"
+        }
+      },
+      {
+        "body": "@stevebroshar I tested both approaches before I wrote my previous comment. Unfortunately, your suggestion with `-PassThru` and `Wait-Process` doesn't work on my side (I'm using MSBuild tools 16.9 + PowerShell 7.1.2).",
+        "createdAt": "2021-03-11T14:28:33Z",
+        "updatedAt": "2021-03-11T14:28:33Z",
+        "author": {
+          "login": "KUTlime"
+        }
+      },
+      {
+        "body": "I had this exact issue and it was solved by creating a process using the system. Diagnostic.process class instead of using start-process\r\n![16371820444891084988835684359417](https://user-images.githubusercontent.com/75280016/142279954-6e8d3175-f755-4abb-acb4-6931cd85bfca.jpg)\r\n\r\n\r\nHope this helps at least 1 person",
+        "createdAt": "2021-11-17T20:48:24Z",
+        "updatedAt": "2021-11-17T20:48:24Z",
+        "author": {
+          "login": "L3Prichaun13"
+        }
+      }
+    ]
+  }
+}

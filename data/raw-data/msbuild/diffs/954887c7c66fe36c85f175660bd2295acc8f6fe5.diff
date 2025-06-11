@@ -1,0 +1,732 @@
+diff --git a/documentation/README.md b/documentation/README.md
+index 082fab41bb3..2de997ba44e 100644
+--- a/documentation/README.md
++++ b/documentation/README.md
+@@ -39,6 +39,7 @@ The folder contains collection of docs and references for MSBuild, detailed info
+ ### Problems?
+ 
+ * [Rebuilding when nothing changed](wiki/Rebuilding-when-nothing-changed.md)
++* [Controling References Behavior](wiki/Controlling-Dependencies-Behavior.md)
+ * [Something's wrong in my build](wiki/Something's-wrong-in-my-build.md)
+ * [Some gotchas around the Microsoft.Build.Framework project/assembly](wiki/Microsoft.Build.Framework.md)
+ * [GAC and MSBuild](wiki/UnGAC.md)
+@@ -50,16 +51,16 @@ The folder contains collection of docs and references for MSBuild, detailed info
+ * [`ProjectReference`](ProjectReference-Protocol.md)
+ * [MSBuild Server](MSBuild-Server.md)
+ * [Low priority nodes](specs/low-priority-switch.md)
++* [Threading in MSBuild worker nodes](specs/threading.md)
++* [Nodes orchestration](wiki/Nodes-Orchestration.md)
+ * [Project cache plugin](specs/project-cache.md)
+ * [Support for remote host objects](specs/remote-host-object.md)
+ * [Static graph](specs/static-graph.md)
+ * [Single project isolated builds: implementation details](specs/single-project-isolated-builds.md)
+ * [Task isolation](specs/task-isolation-and-dependencies.md)
+-* [Threading in MSBuild worker nodes](specs/threading.md)
+ * [Target maps](wiki/Target-Maps.md)
+ * [Managing parallelism in MSBuild](specs/resource-management.md)
+ * [SDK resolution](specs/sdk-resolvers-algorithm.md)
+-* [Nodes orchestration](wiki/Nodes-Orchestration.md)
+ 
+ ### Tasks
+ 
+diff --git a/documentation/wiki/Controlling-Dependencies-Behavior.md b/documentation/wiki/Controlling-Dependencies-Behavior.md
+new file mode 100644
+index 00000000000..ceafb75a2d1
+--- /dev/null
++++ b/documentation/wiki/Controlling-Dependencies-Behavior.md
+@@ -0,0 +1,264 @@
++# Controlling references behavior
++
++MSBuild recognizes a [few types of references](https://learn.microsoft.com/previous-versions/visualstudio/visual-studio-2015/msbuild/common-msbuild-project-items) (here we are mainly interested in `ProjectReference`, `PackageReference`, `Reference` aka assembly reference) and offers optional mechanisms to tailor some aspects of the references workings - transitive references resolution, multitargeted references resolution, copying references to output directory.
++
++## .NET SDK projects and access to transitive references
++
++[.NET SDK projects](https://learn.microsoft.com/dotnet/core/project-sdk/overview) by default make all transitive references accessible as if they were direct references.
++
++This is provided for the compiler and analyzers to be able to properly inspect the whole dependency or/and inheritance chain of types when deciding about particular checks.
++
++It is facilitated via `project.assets.json` file created by NuGet client during the restore operation. This file captures the whole transitive closure of the project dependency tree.
++
++SDK build tasks require existence of this file (hence the infamous `Assets file <path>\project.assets.json not found` if the MSBuild.exe is run without prior restore operation). It is used to reconstruct the `ProjectReference`s and create `Reference` items for the content of `PackageReference`s for the project and make them available to the rest of the build. For this reason MSBuild and compiler by default sees those transitive references as if they were direct references.
++
++## Access to transitive project references
++
++Above described behavior can lead to easy unintentional breaking out of layering architecture separation. 
++
++This behavior can be opted-out for `ProjectReference`s via `DisableTransitiveProjectReferences` property on the referencing project.
++
++<a name="OnionArchSample"></a>*Example*:
++
++Let's imagine an `Onion Architecture` design:
++
++```mermaid
++flowchart LR
++    Service[Service Layer] --> Repository
++    Repository[Repository Layer] --> Domain[Domain Layer]
++```
++
++Service Layer definition:
++
++```xml
++<Project Sdk="Microsoft.NET.Sdk">
++  <ItemGroup>
++    <ProjectReference Include="..\Repository\Repository.csproj" />
++  </ItemGroup>
++
++  <PropertyGroup>
++    <TargetFramework>net48</TargetFramework>
++    <LangVersion>10</LangVersion>
++    <!-- This prevents referencing types from transitive project references. -->
++    <DisableTransitiveProjectReferences>true</DisableTransitiveProjectReferences>
++  </PropertyGroup>
++</Project>
++```
++
++```csharp
++namespace Service;
++	
++public class PersonsAccessor
++{
++    private Repository.Persona _persona;
++    // This is allowed unless DisableTransitiveProjectReferences=true is passed into build.
++    // private Domain.PersonTable _tbl;
++}
++```
++
++## Access to transitive package references
++
++The transitive access to references works by default for package references as well. This can be opted out for referencing projects via `PrivateAssets=compile` on the `PackageReference` of the concern. (More details on [Controlling package dependency assets](https://learn.microsoft.com/nuget/consume-packages/package-references-in-project-files#controlling-dependency-assets)).
++
++When using this metadatum - the access to the package, its dirrect and transitive dependencies is **not** restricted for the project declaring the refenerence on the package in its `Project` element. It is restricted for the projects referencing the project (or package) that specified the `PackageRegerence` with the `PrivateAssets` metadatum.
++
++*Example*:
++
++In our previous example let's have `Repository Layer` reference `newtonsoft.json`:
++
++```mermaid
++flowchart LR
++    Service[Service Layer] --> Repository
++    Repository[Repository Layer] --> newtonsoft.json[newtonsoft.json]
++```
++
++We are not able to influence access to `newtonsoft.json` and its dependencies (would there be any) in the `Repository Layer`, but we can prevent it from propagating to `Service Layer`.
++
++`Repository Layer`:
++
++```xml
++<ItemGroup>
++  <PackageReference Include="newtonsoft.json" Version="13.0.1">
++    <!-- This prevents the reference to be available to referencing types. -->
++    <PrivateAssets>compile</PrivateAssets>
++  </PackageReference>
++</ItemGroup>
++```
++
++Unless opted out via `PrivateAssets=compile`, our `Service Layer` would have access to `newtonsoft.json`:
++
++```csharp
++namespace Service;
++//This is allowed unless PrivateAssets=compile is set on the PackageDependency in Repository.
++//using Newtonsoft.Json;
++	
++public class PersonsAccessor
++{
++    private Repository.Persona _persona;
++}
++```
++
++**Notes:**
++   `PrivateAssets` metadatum (and it's counterparts `IncludeAssets` and `ExcludeAssets`) is applicable to `PackageReference` and controls exposure of dependencies to the consuming projects, not the current project. It is currently not possible to prevent access to package references from within directly referencing project - this is purely decision of the package itself (as it can define it's dependencies as `PrivateAssets`).
++
++## Not copying dependencies to output
++
++By default the above mentioned dependency types are copied to the build output directory during the build. There can be various scenarios where this behavior is not desired (examples: dependency is compile time only or contains a logic for build; component is plugin to a main app and there is a desire not to duplicate common dependencies in output).
++
++Overriding this logic depends on the type of the dependency.
++
++### Not copying Assembly Reference
++
++Copying can be opted out via [Private metadata on the Reference item](https://learn.microsoft.com/previous-versions/visualstudio/visual-studio-2015/msbuild/common-msbuild-project-items?view=vs-2015#reference) (which corresponds to the `Copy Local` property of the reference in the Visual Studio properties dialog for the reference):
++
++```xml
++<ItemGroup>
++  <Reference Include="mydll">
++    <HintPath>..\somepath\mydll.dll</HintPath>
++    <!-- This indicates that the reference should not be copied to output folder. -->
++    <Private>false</Private>
++  </Reference>
++</ItemGroup>
++```
++
++### Not copying PackageReference
++
++Detailed options description can be found in [Controlling package dependency assets](https://learn.microsoft.com/nuget/consume-packages/package-references-in-project-files#controlling-dependency-assets). Here we'll offer three artifical examples:
++
++**Not copying package dependency to the immediate output folder:**
++
++```xml
++<ItemGroup>
++  <PackageReference Include="newtonsoft.json" Version="13.0.1">
++    <!-- This allows compiling against the dependency, but prevents it's copying to output folder or flow to downstream dependant projects. -->
++    <IncludeAssets>compile</IncludeAssets>
++  </PackageReference>
++</ItemGroup>
++```
++
++**Not copying package dependency to the downstream dependants output folder:**
++
++```xml
++<ItemGroup>
++  <PackageReference Include="newtonsoft.json" Version="13.0.1">
++    <!-- The dependency is copied to output folder in current referencing project, 
++           but it's not copied to output folder of projects referencing current project. -->
++    <PrivateAssets>all</PrivateAssets>
++  </PackageReference>
++</ItemGroup>
++```
++
++**Not copying package dependency from the upstream dependencies:**
++
++```xml
++<ItemGroup>
++  <ProjectReference Include="../somepath/MyProj.csproj">
++    <!-- This prevents PackageReferences from MyProj.csproj to be copied to output of current project. -->
++    <ExcludeAssets>all</ExcludeAssets>
++  </ProjectReference>
++</ItemGroup>
++```
++
++### Not copying ProjectReference
++
++The opt-out mechanism is analogous to [Assembly Reference copy opt-out](#not-copying-assembly-reference):
++
++```xml
++<ItemGroup>
++  <ProjectReference Include="../somepath/MyProj.csproj">
++    <!-- This indicates that the referenced project output should not be copied to output folder. -->
++    <Private>false</Private>
++  </ProjectReference>
++</ItemGroup>
++```
++
++Same metadata and logic applies here as it is being inherited from the `Reference` Item definition and the logic treats it identicaly. 
++
++## ProjectReference without accessibility and copying to output
++
++In a specific scenarios we might want to indicate that specific project should be built prior our project but said project should not be reference accessible nor its output copied to current project output. This can be helpful for build time only dependencies - projects defining behavior that is going to be used as build step of a current project.
++
++Such a behavior can be achived with [`ReferenceOutputAssembly` metadata](https://learn.microsoft.com/visualstudio/msbuild/common-msbuild-project-items?view=vs-2022#projectreference):
++
++```xml
++<ItemGroup>
++  <ProjectReference Include="../somepath/MyProj.csproj">
++    <!-- This indicates that the referenced project should not be referenced in code and output should not be copied to output folder. 
++         This way we basically only indicate the build order.
++    -->
++    <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
++  </ProjectReference>
++</ItemGroup>
++```
++
++**Note:** This technique has possibly unexpected behavior when referencing project with executable output type (`<OutputType>Exe</OutputType>`) - in such case the output assembly (`.dll`) is still not copied and referenced (as the metadatum name implies) and hence the types defined within the project cannot be referenced, however other supplementary output (added as `content` or `none`) is copied to the current project output folder (for .NET Core this includes `deps.json`, `runtimeconfig.json` and mainly `<app>.exe`). In that case we can combine (or replace) the `ReferenceOutputAssembly` metadata with `Private` metadata - [as described above](#not-copying-projectreference). More details on this case [here](https://github.com/dotnet/msbuild/issues/4795#issuecomment-1442390297)
++
++## Forcing TargetFramework of a referenced multitargeted project
++
++Consider agaoin our previous [Onion architecture example](#OnionArchSample), but now the individual projects will be [multitargeted](https://learn.microsoft.com/nuget/create-packages/multiple-target-frameworks-project-file). 
++
++Repository Layer:
++
++```xml
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <TargetFrameworks>netstandard2.0;net48</TargetFrameworks>
++  </PropertyGroup>
++
++  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
++    <ProjectReference Include="..\Domain-net48\Domain-net48.csproj" />
++    <PackageReference Include="System.Text.Json" Version="7.0.2" />
++  </ItemGroup>
++
++  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
++    <ProjectReference Include="..\Domain-netstd20\Domain-netstd20.csproj" />
++    <PackageReference Include="newtonsoft.json" Version="13.0.1">
++  </ItemGroup>
++</Project>
++```
++
++And it's going to be referenced by Service Layer:
++
++
++```xml
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <OutputType>Exe</OutputType>
++    <TargetFrameworks>net48;netstandard2.0</TargetFrameworks>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <ProjectReference Include="..\Repository\Repository.csproj"  />
++  </ItemGroup>
++</Project>
++```
++
++Building the Service Layer will create output folders for `net7` and `net48`:
++
++```
++net48
++ |---- Repository.dll (targeted for net48)
++ |---- Domain-net48.dll
++ |---- System.Text.Json.dll
++
++net7
++ |---- Repository.dll (targeted for netstandard2.0)
++ |---- Domain-netstd20.dll
++ |---- Newtonsoft.Json.dll 
++```
++
++Should we want to reference the netstandard version of the Repository Layer in our Service Layer - we can force the reference chain via `SetTargetFramework` metadata on `ProjectReference` item:
++
++```xml
++  <ItemGroup>
++    <ProjectReference Include="..\Repository\Repository.csproj" SetTargetFramework="TargetFramework=netstandard2.0" />
++  </ItemGroup>
++```
++
++**Notes:** 
++
++`SetTargetFramework` is currently not honored by the NuGet client([nuget issue #12436](https://github.com/NuGet/Home/issues/12436)), so the output folder will contain binaries from nuget packages as if this metadata was not used. To workaround this the apropriate nuget needs to be directly referenced from the project enforcing reference framework via `SetTargetFramework`, or copied to output/publish folder via different means.
++
++
++`SetTargetFramework` will properly enforce the framework for the `ProjectReference` chain. Once the `TargetFramework` overriding is encountered it is passed down the reference chain and the `ProjectReference`s respect it during the `TargetFramework` resolution. Due to the nature of handling of [transitive references in .NET-SDK style projects](#net-sdk-projects-and-access-to-transitive-references) and the fact that NuGet client doesn't honor `SetTargetFramework`, the transitive references can get resolved and built for multiple `TargetFramework`s. This means the output folder will contain proper version of the direct dependency - Repository Layer. The transitive references might overbuild, and output folder of current project (Service Layer) might contain both versions of the transitive project dependency (Domain-net48.dll and Domain-netstd20.dll). This limitation can be workarounded by switching of the transitive project references via `DisableTransitiveProjectReferences` (same as shown in [Access to transitive project references](#access-to-transitive-project-references))
++
+diff --git a/documentation/wiki/Providing-Binary-Logs.md b/documentation/wiki/Providing-Binary-Logs.md
+index b9be0b3f59b..6f3abb1d467 100644
+--- a/documentation/wiki/Providing-Binary-Logs.md
++++ b/documentation/wiki/Providing-Binary-Logs.md
+@@ -24,7 +24,7 @@ Set `MSBUILDDEBUGENGINE` environment variable to `'1'` and (optionally) set `MSB
+ `PowerShell:`
+ ```
+ > $env:MSBUILDDEBUGENGINE = 1
+-> $env:MSBUILDDEBUGPATH= C:\MSBuildReproLogs
++> $env:MSBUILDDEBUGPATH="C:\MSBuildReproLogs"
+ > & "devenv.exe" MySolution.sln
+ ```
+ 
+diff --git a/eng/Version.Details.xml b/eng/Version.Details.xml
+index 761a3318143..73b325714ae 100644
+--- a/eng/Version.Details.xml
++++ b/eng/Version.Details.xml
+@@ -23,9 +23,9 @@
+       <Sha>bc3233146e1fcd393ed471d5005333c83363e0fe</Sha>
+       <SourceBuild RepoName="xliff-tasks" ManagedOnly="true" />
+     </Dependency>
+-    <Dependency Name="NuGet.Build.Tasks" Version="6.5.0-rc.149">
++    <Dependency Name="NuGet.Build.Tasks" Version="6.7.0-preview.1.16">
+       <Uri>https://github.com/nuget/nuget.client</Uri>
+-      <Sha>ca5029046d7b6e55f322c45abb7b342054543710</Sha>
++      <Sha>7eaba9f3f68b8df63d5dcf10e2a8ef3591164ddf</Sha>
+     </Dependency>
+     <Dependency Name="Microsoft.Net.Compilers.Toolset" Version="4.7.0-1.23217.19">
+       <Uri>https://github.com/dotnet/roslyn</Uri>
+diff --git a/eng/Versions.props b/eng/Versions.props
+index f604dcf26a1..122ebf66416 100644
+--- a/eng/Versions.props
++++ b/eng/Versions.props
+@@ -52,7 +52,7 @@
+     <MicrosoftExtensionsDependencyModelVersion>7.0.0</MicrosoftExtensionsDependencyModelVersion>
+     <MicrosoftIORedistVersion>6.0.0</MicrosoftIORedistVersion>
+     <MicrosoftNetCompilersToolsetVersion>4.7.0-1.23217.19</MicrosoftNetCompilersToolsetVersion>
+-    <NuGetBuildTasksVersion>6.5.0-rc.149</NuGetBuildTasksVersion>
++    <NuGetBuildTasksVersion>6.7.0-preview.1.16</NuGetBuildTasksVersion>
+     <SystemRuntimeCompilerServicesUnsafeVersion>6.0.0</SystemRuntimeCompilerServicesUnsafeVersion>
+     <SystemTextJsonVersion>7.0.0</SystemTextJsonVersion>
+     <SystemThreadingTasksDataflowVersion>7.0.0</SystemThreadingTasksDataflowVersion>
+diff --git a/eng/sdl-tsa-vars.config b/eng/sdl-tsa-vars.config
+new file mode 100644
+index 00000000000..a6303401812
+--- /dev/null
++++ b/eng/sdl-tsa-vars.config
+@@ -0,0 +1,11 @@
++-SourceToolsList @("policheck","credscan")
++-TsaInstanceURL https://devdiv.visualstudio.com/
++-TsaProjectName DEVDIV
++-TsaNotificationEmail dotnetdevexcli@microsoft.com
++-TsaCodebaseAdmin REDMOND\marcpop
++-TsaBugAreaPath "DevDiv\NET Tools\MSBuild"
++-TsaIterationPath DevDiv
++-TsaRepositoryName DotNet-msbuild-Trusted
++-TsaCodebaseName DotNet-msbuild-Trusted
++-TsaOnboard $True
++-TsaPublish $True
+diff --git a/src/Build.OM.UnitTests/Construction/ProjectItemElement_Tests.cs b/src/Build.OM.UnitTests/Construction/ProjectItemElement_Tests.cs
+index ac62b8e21d7..721a4521fdc 100644
+--- a/src/Build.OM.UnitTests/Construction/ProjectItemElement_Tests.cs
++++ b/src/Build.OM.UnitTests/Construction/ProjectItemElement_Tests.cs
+@@ -82,6 +82,30 @@ public void ReadNoChildren(string project)
+             Assert.Equal(0, Helpers.Count(item.Metadata));
+         }
+ 
++        [Fact]
++        public void ReadMetadataLocationPreserved()
++        {
++            string project = """
++                <Project>
++                    <Target Name='t'>
++                        <ItemGroup>
++                            <i Include='i' MetadataA='123' MetadataB='xyz' />
++                        </ItemGroup>
++                    </Target>
++                </Project>
++                """;
++
++            ProjectItemElement item = GetItemFromContent(project);
++            Assert.Equal(2, item.Metadata.Count);
++            ProjectMetadataElement metadatum1 = item.Metadata.First();
++            ProjectMetadataElement metadatum2 = item.Metadata.Skip(1).First();
++
++            Assert.Equal(4, metadatum1.Location.Line);
++            Assert.Equal(4, metadatum2.Location.Line);
++            Assert.Equal(27, metadatum1.Location.Column);
++            Assert.Equal(43, metadatum2.Location.Column);
++        }
++
+         /// <summary>
+         /// Read item with no include
+         /// </summary>
+diff --git a/src/Build.UnitTests/BackEnd/MSBuild_Tests.cs b/src/Build.UnitTests/BackEnd/MSBuild_Tests.cs
+index 98d37bfc4cb..9b0a1eae9bb 100644
+--- a/src/Build.UnitTests/BackEnd/MSBuild_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/MSBuild_Tests.cs
+@@ -4,7 +4,6 @@
+ using System;
+ using System.Collections.Generic;
+ using System.IO;
+-
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+@@ -824,7 +823,8 @@ public void ItemsRecursionWithinTarget()
+                       </Target>
+                     </Project>
+                 """;
+-            var projectFile = env.CreateFile("test.proj", ObjectModelHelpers.CleanupFileContents(projectContent));
++            string projFileName = "test.proj";
++            var projectFile = env.CreateFile(projFileName, ObjectModelHelpers.CleanupFileContents(projectContent));
+ 
+             MockLogger logger = new MockLogger(_testOutput);
+             ObjectModelHelpers.BuildTempProjectFileExpectSuccess(projectFile.Path, logger);
+@@ -839,6 +839,10 @@ public void ItemsRecursionWithinTarget()
+             logger.AssertLogContains(string.Format(ResourceUtilities.GetResourceString("ItemReferencingSelfInTarget"), "iin1", "Filename"));
+             logger.AssertLogContains(string.Format(ResourceUtilities.GetResourceString("ItemReferencingSelfInTarget"), "iin1", "Extension"));
+             logger.AssertMessageCount("MSB4120", 6);
++            // The location of the offending attribute (TargetPath) is transferred - for both metadatums (%(Filename) and %(Extension)) on correct locations in xml
++            logger.AssertMessageCount($"{projFileName}(4,34):", 2, false);
++            logger.AssertMessageCount($"{projFileName}(5,34):", 2, false);
++            logger.AssertMessageCount($"{projFileName}(6,34):", 2, false);
+             Assert.Equal(0, logger.WarningCount);
+             Assert.Equal(0, logger.ErrorCount);
+         }
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs b/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
+index fcf7564d228..096c90e5ff9 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/IntrinsicTasks/ItemGroupIntrinsicTask.cs
+@@ -185,7 +185,6 @@ private void ExecuteAdd(ProjectItemGroupTaskItemInstance child, ItemBucket bucke
+                 if (condition)
+                 {
+                     ExpanderOptions expanderOptions = ExpanderOptions.ExpandAll;
+-                    ElementLocation location = metadataInstance.Location;
+                     if (ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_6) &&
+                         // If multiple buckets were expanded - we do not want to repeat same error for same metadatum on a same line
+                         bucket.BucketSequenceNumber == 0 &&
+@@ -193,11 +192,9 @@ private void ExecuteAdd(ProjectItemGroupTaskItemInstance child, ItemBucket bucke
+                         child.Include.IndexOf("@(", StringComparison.Ordinal) == -1)
+                     {
+                         expanderOptions |= ExpanderOptions.LogOnItemMetadataSelfReference;
+-                        // Temporary workaround of unavailability of full Location info on metadata: https://github.com/dotnet/msbuild/issues/8579
+-                        location = child.Location;
+                     }
+ 
+-                    string evaluatedValue = bucket.Expander.ExpandIntoStringLeaveEscaped(metadataInstance.Value, expanderOptions, location, loggingContext);
++                    string evaluatedValue = bucket.Expander.ExpandIntoStringLeaveEscaped(metadataInstance.Value, expanderOptions, metadataInstance.Location, loggingContext);
+ 
+                     // This both stores the metadata so we can add it to all the items we just created later, and 
+                     // exposes this metadata to further metadata evaluations in subsequent loop iterations.
+diff --git a/src/Build/Construction/ProjectMetadataElement.cs b/src/Build/Construction/ProjectMetadataElement.cs
+index a8ba5cd5c10..473f39c0476 100644
+--- a/src/Build/Construction/ProjectMetadataElement.cs
++++ b/src/Build/Construction/ProjectMetadataElement.cs
+@@ -100,13 +100,13 @@ public string Value
+         /// Creates an unparented ProjectMetadataElement, wrapping an unparented XmlElement.
+         /// Caller should then ensure the element is added to a parent.
+         /// </summary>
+-        internal static ProjectMetadataElement CreateDisconnected(string name, ProjectRootElement containingProject)
++        internal static ProjectMetadataElement CreateDisconnected(string name, ProjectRootElement containingProject, ElementLocation location = null)
+         {
+             XmlUtilities.VerifyThrowArgumentValidElementName(name);
+             ErrorUtilities.VerifyThrowArgument(!FileUtilities.ItemSpecModifiers.IsItemSpecModifier(name), "ItemSpecModifierCannotBeCustomMetadata", name);
+             ErrorUtilities.VerifyThrowInvalidOperation(!XMakeElements.ReservedItemNames.Contains(name), "CannotModifyReservedItemMetadata", name);
+ 
+-            XmlElementWithLocation element = containingProject.CreateElement(name);
++            XmlElementWithLocation element = containingProject.CreateElement(name, location);
+ 
+             return new ProjectMetadataElement(element, containingProject);
+         }
+diff --git a/src/Build/Construction/ProjectRootElement.cs b/src/Build/Construction/ProjectRootElement.cs
+index b0ff4459c4a..626751e11cf 100644
+--- a/src/Build/Construction/ProjectRootElement.cs
++++ b/src/Build/Construction/ProjectRootElement.cs
+@@ -1327,13 +1327,22 @@ public ProjectMetadataElement CreateMetadataElement(string name)
+         /// Caller must add it to the location of choice in the project.
+         /// </summary>
+         public ProjectMetadataElement CreateMetadataElement(string name, string unevaluatedValue)
++        {
++            return this.CreateMetadataElement(name, unevaluatedValue, null);
++        }
++
++        /// <summary>
++        /// Creates a metadata node.
++        /// Caller must add it to the location of choice in the project.
++        /// </summary>
++        public ProjectMetadataElement CreateMetadataElement(string name, string unevaluatedValue, ElementLocation location)
+         {
+             if (Link != null)
+             {
+                 return RootLink.CreateMetadataElement(name, unevaluatedValue);
+             }
+ 
+-            ProjectMetadataElement metadatum = ProjectMetadataElement.CreateDisconnected(name, this);
++            ProjectMetadataElement metadatum = ProjectMetadataElement.CreateDisconnected(name, this, location);
+ 
+             metadatum.Value = unevaluatedValue;
+ 
+@@ -1785,14 +1794,23 @@ internal static ProjectRootElement OpenProjectOrSolution(string fullPath, IDicti
+             return projectRootElement;
+         }
+ 
++        /// <summary>
++        /// Creates a metadata node.
++        /// Caller must add it to the location of choice in the project.
++        /// </summary>
++        internal ProjectMetadataElement CreateMetadataElement(XmlAttributeWithLocation attribute)
++        {
++            return CreateMetadataElement(attribute.Name, attribute.Value, attribute.Location);
++        }
++
+         /// <summary>
+         /// Creates a XmlElement with the specified name in the document
+         /// containing this project.
+         /// </summary>
+-        internal XmlElementWithLocation CreateElement(string name)
++        internal XmlElementWithLocation CreateElement(string name, ElementLocation location = null)
+         {
+             ErrorUtilities.VerifyThrow(Link == null, "External project");
+-            return (XmlElementWithLocation)XmlDocument.CreateElement(name, XmlNamespace);
++            return (XmlElementWithLocation)XmlDocument.CreateElement(name, XmlNamespace, location);
+         }
+ 
+         /// <summary>
+diff --git a/src/Build/ElementLocation/XmlDocumentWithLocation.cs b/src/Build/ElementLocation/XmlDocumentWithLocation.cs
+index bbc34c86a57..88b0de71dbb 100644
+--- a/src/Build/ElementLocation/XmlDocumentWithLocation.cs
++++ b/src/Build/ElementLocation/XmlDocumentWithLocation.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.IO;
++using System.Threading;
+ using System.Xml;
+ using Microsoft.Build.Internal;
+ using Microsoft.Build.Shared;
+@@ -59,6 +60,13 @@ internal class XmlDocumentWithLocation : XmlDocument
+         /// </summary>
+         private bool? _loadAsReadOnly;
+ 
++        /// <summary>
++        /// Location of the element to be created via 'CreateElement' call. So that we can
++        ///  receive and use location from the caller up the stack even if we are being called via
++        /// <see cref="XmlDocument"/> internal methods.
++        /// </summary>
++        private readonly AsyncLocal<ElementLocation> _elementLocation = new AsyncLocal<ElementLocation>();
++
+         /// <summary>
+         /// Constructor
+         /// </summary>
+@@ -180,6 +188,31 @@ public override void Load(string fullPath)
+             }
+         }
+ 
++        /// <summary>
++        /// Called during parse, to add an element.
++        /// </summary>
++        /// <remarks>
++        /// We create our own kind of element, that we can give location information to.
++        /// In order to pass the location through the callchain, that contains XmlDocument function
++        ///  that then calls back to our XmlDocumentWithLocation (so we cannot use call stack via passing via parameters),
++        ///  we use async local field, that simulates variable on call stack.
++        /// </remarks>
++        internal XmlElement CreateElement(string localName, string namespaceURI, ElementLocation location)
++        {
++            if (location != null)
++            {
++                this._elementLocation.Value = location;
++            }
++            try
++            {
++                return CreateElement(localName, namespaceURI);
++            }
++            finally
++            {
++                this._elementLocation.Value = null;
++            }
++        }
++
+         /// <summary>
+         /// Called during load, to add an element.
+         /// </summary>
+@@ -192,6 +225,10 @@ public override XmlElement CreateElement(string prefix, string localName, string
+             {
+                 return new XmlElementWithLocation(prefix, localName, namespaceURI, this, _reader.LineNumber, _reader.LinePosition);
+             }
++            else if (_elementLocation?.Value != null)
++            {
++                return new XmlElementWithLocation(prefix, localName, namespaceURI, this, _elementLocation.Value.Line, _elementLocation.Value.Column);
++            }
+ 
+             // Must be a subsequent edit; we can't provide location information
+             return new XmlElementWithLocation(prefix, localName, namespaceURI, this);
+diff --git a/src/Build/Evaluation/ItemSpec.cs b/src/Build/Evaluation/ItemSpec.cs
+index 89b2ffd1938..c45edf0764b 100644
+--- a/src/Build/Evaluation/ItemSpec.cs
++++ b/src/Build/Evaluation/ItemSpec.cs
+@@ -80,7 +80,7 @@ public ItemExpressionFragment(
+ 
+             public override int MatchCount(string itemToMatch)
+             {
+-                return ReferencedItems.Count(v => v.ItemAsValueFragment.MatchCount(itemToMatch) > 0);
++                return ReferencedItems.Count(v => v.ItemAsValueFragment.IsMatch(itemToMatch));
+             }
+ 
+             public override bool IsMatch(string itemToMatch)
+diff --git a/src/Build/Evaluation/ProjectParser.cs b/src/Build/Evaluation/ProjectParser.cs
+index e622acbfdc5..5de3520dab8 100644
+--- a/src/Build/Evaluation/ProjectParser.cs
++++ b/src/Build/Evaluation/ProjectParser.cs
+@@ -324,7 +324,7 @@ private ProjectItemElement ParseProjectItemElement(XmlElementWithLocation elemen
+                 }
+                 else if (isValidMetadataNameInAttribute)
+                 {
+-                    ProjectMetadataElement metadatum = _project.CreateMetadataElement(attribute.Name, attribute.Value);
++                    ProjectMetadataElement metadatum = _project.CreateMetadataElement(attribute);
+                     metadatum.ExpressedAsAttribute = true;
+                     metadatum.Parent = item;
+ 
+@@ -744,7 +744,7 @@ private ProjectItemDefinitionElement ParseProjectItemDefinitionXml(XmlElementWit
+                 }
+                 else if (isValidMetadataNameInAttribute)
+                 {
+-                    ProjectMetadataElement metadatum = _project.CreateMetadataElement(attribute.Name, attribute.Value);
++                    ProjectMetadataElement metadatum = _project.CreateMetadataElement(attribute);
+                     metadatum.ExpressedAsAttribute = true;
+                     metadatum.Parent = itemDefinition;
+ 
+diff --git a/src/Shared/UnitTests/MockLogger.cs b/src/Shared/UnitTests/MockLogger.cs
+index 9a9bec6d5c9..c52765ccd49 100644
+--- a/src/Shared/UnitTests/MockLogger.cs
++++ b/src/Shared/UnitTests/MockLogger.cs
+@@ -282,8 +282,13 @@ internal void LoggerEventHandler(object sender, BuildEventArgs eventArgs)
+                             bool logMessage = !(eventArgs is BuildFinishedEventArgs) || LogBuildFinished;
+                             if (logMessage)
+                             {
+-                                _fullLog.AppendLine(eventArgs.Message);
+-                                _testOutputHelper?.WriteLine(eventArgs.Message);
++                                string msg = eventArgs.Message;
++                                if (eventArgs is BuildMessageEventArgs m && m.LineNumber != 0)
++                                {
++                                    msg = $"{m.File}({m.LineNumber},{m.ColumnNumber}): {msg}";
++                                }
++                                _fullLog.AppendLine(msg);
++                                _testOutputHelper?.WriteLine(msg);
+                             }
+                             break;
+                         }
+@@ -496,9 +501,9 @@ internal void AssertLogDoesntContain(string contains)
+         /// </summary>
+         internal void AssertNoWarnings() => Assert.Equal(0, WarningCount);
+ 
+-        internal void AssertMessageCount(string message, int expectedCount)
++        internal void AssertMessageCount(string message, int expectedCount, bool regexSearch = true)
+         {
+-            var matches = Regex.Matches(FullLog, message);
++            var matches = Regex.Matches(FullLog, regexSearch ? message : Regex.Escape(message));
+             matches.Count.ShouldBe(expectedCount);
+         }
+     }
+diff --git a/src/Shared/UnitTests/ObjectModelHelpers.cs b/src/Shared/UnitTests/ObjectModelHelpers.cs
+index 31ce5b63c29..b5b4ad1b610 100644
+--- a/src/Shared/UnitTests/ObjectModelHelpers.cs
++++ b/src/Shared/UnitTests/ObjectModelHelpers.cs
+@@ -1155,6 +1155,11 @@ internal static string GetOSPlatformAsString()
+         /// </summary>
+         internal static int Count(IEnumerable enumerable)
+         {
++            if (enumerable is ICollection c)
++            {
++                return c.Count;
++            }
++
+             int i = 0;
+             foreach (object _ in enumerable)
+             {
+diff --git a/src/Shared/XmlUtilities.cs b/src/Shared/XmlUtilities.cs
+index e37749e172c..27e32d603cb 100644
+--- a/src/Shared/XmlUtilities.cs
++++ b/src/Shared/XmlUtilities.cs
+@@ -32,9 +32,8 @@ internal static XmlElementWithLocation RenameXmlElement(XmlElementWithLocation o
+                 return oldElement;
+             }
+ 
+-            XmlElementWithLocation newElement = (xmlNamespace == null)
+-                ? (XmlElementWithLocation)oldElement.OwnerDocument.CreateElement(newElementName)
+-                : (XmlElementWithLocation)oldElement.OwnerDocument.CreateElement(newElementName, xmlNamespace);
++            XmlElementWithLocation newElement =
++                (XmlElementWithLocation)((XmlDocumentWithLocation)oldElement.OwnerDocument).CreateElement(newElementName, xmlNamespace ?? string.Empty, oldElement.Location);
+ 
+             // Copy over all the attributes.
+             foreach (XmlAttribute oldAttribute in oldElement.Attributes)
+diff --git a/src/Utilities.UnitTests/ToolTask_Tests.cs b/src/Utilities.UnitTests/ToolTask_Tests.cs
+index 06811207770..76d4dd912fb 100644
+--- a/src/Utilities.UnitTests/ToolTask_Tests.cs
++++ b/src/Utilities.UnitTests/ToolTask_Tests.cs
+@@ -846,10 +846,12 @@ public void ToolTaskThatTimeoutAndRetry(int repeats, int initialDelay, int follo
+         {
+             using var env = TestEnvironment.Create(_output);
+ 
++            MockEngine engine = new();
++
+             // Task under test:
+             var task = new ToolTaskThatSleeps
+             {
+-                BuildEngine = new MockEngine(),
++                BuildEngine = engine,
+                 InitialDelay = initialDelay,
+                 FollowupDelay = followupDelay,
+                 Timeout = timeout
+@@ -861,6 +863,9 @@ public void ToolTaskThatTimeoutAndRetry(int repeats, int initialDelay, int follo
+             {
+                 // Execute the task:
+                 result = task.Execute();
++
++                _output.WriteLine(engine.Log);
++
+                 task.RepeatCount.ShouldBe(i);
+ 
+                 // The first execution may fail (timeout), but all following ones should succeed:
+@@ -882,7 +887,7 @@ public void ToolTaskThatTimeoutAndRetry(int repeats, int initialDelay, int follo
+         private sealed class ToolTaskThatSleeps : ToolTask
+         {
+             // PowerShell command to sleep:
+-            private readonly string _powerShellSleep = "-ExecutionPolicy RemoteSigned -Command \"Start-Sleep -Milliseconds {0}\"";
++            private readonly string _powerShellSleep = "-NoProfile -ExecutionPolicy RemoteSigned -Command \"Start-Sleep -Milliseconds {0}\"";
+ 
+             // UNIX command to sleep:
+             private readonly string _unixSleep = "-c \"sleep {0}\"";

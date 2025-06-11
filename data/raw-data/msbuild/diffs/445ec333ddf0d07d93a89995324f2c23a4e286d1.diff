@@ -1,0 +1,155 @@
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index cd59ba32a8b..e9714427c50 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -2178,10 +2178,11 @@ private void HandleResourceRequest(int node, ResourceRequest request)
+         {
+             if (request.IsAcquire)
+             {
+-                var coresAcquired = _scheduler.RequestCores(request.BlockedRequestId, request.NumCores);
+-                var response = new ResourceResponse(request.BlockedRequestId, coresAcquired);
+-
+-                _nodeManager.SendData(node, response);
++                _scheduler.RequestCores(request.BlockedRequestId, request.NumCores).ContinueWith((Task<int> task) =>
++                {
++                    var response = new ResourceResponse(request.BlockedRequestId, task.Result);
++                    _nodeManager.SendData(node, response);
++                }, TaskContinuationOptions.ExecuteSynchronously);
+             }
+             else
+             {
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index b9348df003d..bb53debf53e 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -2,7 +2,6 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Eventing;
+@@ -19,7 +18,6 @@
+ using System.Linq;
+ using System.Threading;
+ using System.Threading.Tasks;
+-using Microsoft.Build.Experimental.ProjectCache;
+ using NodeLoggingContext = Microsoft.Build.BackEnd.Logging.NodeLoggingContext;
+ using ProjectLoggingContext = Microsoft.Build.BackEnd.Logging.ProjectLoggingContext;
+ 
+diff --git a/src/Build/BackEnd/Components/Scheduler/IScheduler.cs b/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
+index a97e829a156..0e8d516072e 100644
+--- a/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using System.Collections.Generic;
++using System.Threading.Tasks;
+ using Microsoft.Build.Execution;
+ 
+ namespace Microsoft.Build.BackEnd
+@@ -72,7 +73,7 @@ internal interface IScheduler : IBuildComponent
+         /// <summary>
+         /// Requests CPU resources.
+         /// </summary>
+-        int RequestCores(int requestId, int requestedCores);
++        Task<int> RequestCores(int requestId, int requestedCores);
+ 
+         /// <summary>
+         /// Returns CPU resources.
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index c1d78db318a..84c65c34eb6 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -9,7 +9,7 @@
+ using System.Linq;
+ using System.Text;
+ using System.Threading;
+-
++using System.Threading.Tasks;
+ using Microsoft.Build.BackEnd.Components.ResourceManager;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+@@ -101,6 +101,11 @@ internal class Scheduler : IScheduler
+         /// </summary>
+         private SchedulingData _schedulingData;
+ 
++        /// <summary>
++        /// A queue of RequestCores request waiting for at least one core to become available.
++        /// </summary>
++        private Queue<TaskCompletionSource<int>> _pendingRequestCoresCallbacks = new Queue<TaskCompletionSource<int>>();
++
+         #endregion
+ 
+         /// <summary>
+@@ -502,6 +507,7 @@ public void Reset()
+             DumpRequests();
+             _schedulingPlan = null;
+             _schedulingData = new SchedulingData();
++            _pendingRequestCoresCallbacks = new Queue<TaskCompletionSource<int>>();
+             _availableNodes = new Dictionary<int, NodeInfo>(8);
+             _currentInProcNodeCount = 0;
+             _currentOutOfProcNodeCount = 0;
+@@ -535,12 +541,36 @@ public void WriteDetailedSummary(int submissionId)
+         /// <summary>
+         /// Requests CPU resources.
+         /// </summary>
+-        public int RequestCores(int requestId, int requestedCores)
++        public Task<int> RequestCores(int requestId, int requestedCores)
+         {
+-            int grantedCores = Math.Min(requestedCores, GetAvailableCoresForExplicitRequests());
+-            SchedulableRequest request = _schedulingData.GetScheduledRequest(requestId);
+-            request.AddRequestedCores(grantedCores);
+-            return grantedCores;
++            if (requestedCores == 0)
++            {
++                return Task.FromResult(0);
++            }
++
++            Func<int, int> grantCores = (int availableCores) =>
++            {
++                int grantedCores = Math.Min(requestedCores, availableCores);
++                if (grantedCores > 0)
++                {
++                    SchedulableRequest request = _schedulingData.GetScheduledRequest(requestId);
++                    request.AddRequestedCores(grantedCores);
++                }
++                return grantedCores;
++            };
++
++            int grantedCores = grantCores(GetAvailableCoresForExplicitRequests());
++            if (grantedCores > 0)
++            {
++                return Task.FromResult(grantedCores);
++            }
++            else
++            {
++                // We have no cores to grant at the moment, queue up the request.
++                TaskCompletionSource<int> completionSource = new TaskCompletionSource<int>();
++                _pendingRequestCoresCallbacks.Enqueue(completionSource);
++                return completionSource.Task.ContinueWith((Task<int> task) => grantCores(task.Result), TaskContinuationOptions.ExecuteSynchronously);
++            }
+         }
+ 
+         /// <summary>
+@@ -1780,6 +1810,18 @@ private void ResolveRequestFromCacheAndResumeIfPossible(SchedulableRequest reque
+         /// </summary>
+         private void ResumeRequiredWork(List<ScheduleResponse> responses)
+         {
++            // If we have pending RequestCore calls, satisfy those first.
++            while (_pendingRequestCoresCallbacks.Count > 0)
++            {
++                int availableCores = GetAvailableCoresForExplicitRequests();
++                if (availableCores == 0)
++                {
++                    break;
++                }
++                TaskCompletionSource<int> completionSource = _pendingRequestCoresCallbacks.Dequeue();
++                completionSource.SetResult(availableCores);
++            }
++
+             // Resume any ready requests on the existing nodes.
+             foreach (int nodeId in _availableNodes.Keys)
+             {

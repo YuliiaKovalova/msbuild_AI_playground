@@ -1,0 +1,143 @@
+{
+  "number": 397,
+  "title": ".NET applications invoked through <Exec> tasks may send malformed UTF-8 to their children",
+  "body": "This was reported internally in reference to the Windows Driver Kit.\n\nVisual Studio 2015 Update 1 shipped with a fix (#143) to allow tools to run with paths that included non-ANSI Unicode characters.  It did this by changing the Windows codepage within the `.cmd` script emitted by `Exec` to one that supports UTF-8.\n\nThis causes problems when a child process spawns another child process and attempts to write to its standard input.  From the excellent internal repro:\n\n``` xml\n<Project xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">\n    <Target Name=\"Repro\">\n        <Exec Command=\"repro.exe\" />\n    </Target>\n</Project>\n```\n\nWhere `repro.exe` is compiled from\n\n``` C#\nusing System;\nusing System.Diagnostics;\nusing System.IO;\n\nnamespace Repro\n{\n    class Repro\n    {\n        static void Main(string[] args)\n        {\n            using (Process cmdProcess = new Process())\n            {\n                ProcessStartInfo cmdProcessStartInfo = new ProcessStartInfo(\"cmd.exe\");\n                cmdProcessStartInfo.UseShellExecute = false;\n                cmdProcessStartInfo.RedirectStandardInput = true;\n                cmdProcess.StartInfo = cmdProcessStartInfo;\n                cmdProcess.Start();\n\n                StreamWriter inputWriter = cmdProcess.StandardInput;\n                inputWriter.AutoFlush = true;\n                inputWriter.WriteLine(\"set CL=\");\n                inputWriter.WriteLine(\"exit\");\n                cmdProcess.WaitForExit();\n\n                Console.WriteLine(\"Exit code: \" + cmdProcess.ExitCode);\n            }\n            Console.Write(\"Repro Exiting\");\n        }\n    }\n}\n```\n\nProduces this output:\n\n```\nMicrosoft (R) Build Engine version 14.0.24720.0\nCopyright (C) Microsoft Corporation. All rights reserved.\n\nBuild started 12/7/2015 5:00:43 PM.\nProject \"d:\\work\\sdv_encoding\\project.vcxproj\" on node 1 (default targets).\nRepro:\n  repro.exe\n  Microsoft Windows [Version 10.0.10240]\n  (c) 2015 Microsoft Corporation. All rights reserved.\n\n  d:\\work\\sdv_encoding>\ufffd\ufffd\ufffdset CL=\n  '\ufffd\ufffd\ufffdset' is not recognized as an internal or external command,\n  operable program or batch file.\n\n  d:\\work\\sdv_encoding>exit\n  Exit code: 9009\n  Repro Exiting\nDone Building Project \"d:\\work\\sdv_encoding\\project.vcxproj\" (default targets).\n```\n\nNote the super-sketchy \"unknown Unicode character\" glyphs that `cmd.exe` is complaining about not understanding when prepended to `set`.\n",
+  "state": "CLOSED",
+  "createdAt": "2015-12-07T23:06:06Z",
+  "updatedAt": "2024-02-21T17:29:35Z",
+  "closedAt": "2016-01-22T22:50:17Z",
+  "author": {
+    "login": "rainersigwald"
+  },
+  "labels": [
+    "triaged"
+  ],
+  "assignees": {
+    "nodes": []
+  },
+  "milestone": null,
+  "comments": {
+    "nodes": [
+      {
+        "body": "I narrowed down what was going on here by adding logging to the repro program:\n\n``` csharp\nConsole.WriteLine($\"input enc: {cmdProcess.StandardInput.Encoding}\");\n```\n\nThat showed that for success cases (`repro.exe` run from a bare command line), the encoding was `System.Text.SBCSCodePageEncoding`, while when invoked from MSBuild it was `System.Text.UTF8Encoding`.\n\nBy default, UTF-8 encodings in .NET use a Unicode [Byte Order Mark](http://unicode.org/faq/utf_bom.html#bom1) at the beginning of the stream.  `cmd.exe` does not support BOMs, and the UTF-8 BOM is three bytes, so it's probably what we're seeing here.\n\nThis hypothesis is confirmed by setting the codepage at an interactive console with `chcp 65001`, then running the program.  The same error is produced.\n\nSince that's the case, while this problem was exposed by the MSBuild change, it's not exactly _caused_ by it.\n\nA managed tool can ensure that it won't send a BOM to a child process's stdin, but only indirectly.  The [source for the Process class](http://referencesource.microsoft.com/#System/services/monitoring/system/diagnosticts/Process.cs,2160) creates a child process's stdin stream by creating a new stream based on the current process's `Console.InputEncoding`.  Unfortunately, there's no good way to determine whether a UTF-8 encoding will or will not emit a BOM.\n\nAdding this snippet before creating a child process seems to avoid the issue by ensuring that a BOM is never sent to a child process if the current process is in UTF-8 land.\n\n``` csharp\nif (Console.InputEncoding.Equals(Encoding.UTF8))\n{\n    Console.InputEncoding = new UTF8Encoding(false);\n}\n```\n",
+        "createdAt": "2015-12-07T23:20:54Z",
+        "updatedAt": "2015-12-07T23:20:54Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Just as a FYI: A BOM has no place in a UTF-8 encoding. A byte order mark only has a place in a 16-bit encoding, where it is unknown whether the encoding it little- or big-endian, and so the first character to be emitted in the 16-bit stream is a BOM. In translating a 16-bit stream to a UTF-8 stream, any BOM should be stripped out and not emitted at all.\n",
+        "createdAt": "2015-12-07T23:27:06Z",
+        "updatedAt": "2015-12-07T23:27:06Z",
+        "author": {
+          "login": "PKRoma"
+        }
+      },
+      {
+        "body": "@PKRoma I thought that too, but it doesn't appear to be specified that way.  http://unicode.org/faq/utf_bom.html#bom4 explicitly mentions that it is valid in UTF-8.\n\nAnd, of course, programs are at the mercy of the implementations of the .NET Framework and the Windows shell.  .NET's `UTF8Encoding` uses a BOM by default, and `cmd.exe` cannot interpret one, so this problem arises.\n\nEdit:  I was curious so I found the actual [standard](http://www.unicode.org/versions/Unicode7.0.0/ch03.pdf) language:\n\n> While there is obviously no need for a byte order signature when using UTF-8, there are occasions when processes convert UTF-16 or UTF-32 data containing a byte order mark into UTF-8. When represented in UTF-8, the byte order mark turns into the byte sequence `<EF BB BF>`. Its usage at the beginning of a UTF-8 data stream is neither required nor recommended by the Unicode Standard, but its presence does not affect conformance to the UTF-8 encoding scheme. Identification of the `<EF BB BF>` byte sequence at the beginning of a data stream can, however, be taken as a near-certain indication that the data stream is using the UTF-8 encoding scheme.\n",
+        "createdAt": "2015-12-07T23:34:14Z",
+        "updatedAt": "2015-12-08T15:51:28Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Another possible workaround:  change the `Exec` task's `Command` attribute to prepend\n\n``` cmd\nchcp 437 &amp;&amp;\n```\n\nto the command.  That will effectively undo the change we made and return `cmd.exe` to the \"standard\" codepage (for US English).  It may be easier to deploy this workaround than to fix the tool that is called.\n",
+        "createdAt": "2015-12-08T15:54:46Z",
+        "updatedAt": "2015-12-08T16:30:07Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "I think that MSBuild is doing the right thing; the problem is with the WDK.  I don't want to lose the ability to use Unicode filenames in MSBuild tasks.\n",
+        "createdAt": "2015-12-08T20:59:36Z",
+        "updatedAt": "2015-12-08T20:59:36Z",
+        "author": {
+          "login": "DemiMarie"
+        }
+      },
+      {
+        "body": "Hmm. I still have a question here. How is it that cmd.exe is interpreting the first three bytes of stdin in repro.exe as three separate characters and printing error blobs for each of them? If the problem only exists when the encoding is 65001 as you found, then they shouldn't be interpreted as three separate characters at all, but rather, if anything at all, they should be interpreted as a single BOM Unicode character and cause only one error blob? Once it figures out that it's got a BOM character, couldn't cmd.exe then treat it as a NOP?\n",
+        "createdAt": "2015-12-08T22:11:24Z",
+        "updatedAt": "2015-12-08T22:11:24Z",
+        "author": {
+          "login": "PKRoma"
+        }
+      },
+      {
+        "body": "@PKRoma I think the issue is that the innermost `cmd.exe` is operating with the system default codepage (which is 437 on US English Windows).  When it gets fed the UTF-8 BOM bytes, it interprets them each as bogus ASCII.  I'm not sure what would happen if you started `cmd.exe`, ran `chcp 65001`, and _then_ streamed UTF-8-with-BOM to it.\n",
+        "createdAt": "2015-12-09T23:35:55Z",
+        "updatedAt": "2015-12-09T23:35:55Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "@drbo Thanks for the feedback.  We agree.  Unless we hear from more folks that this is causing real problems, we plan to keep the current behavior.\n",
+        "createdAt": "2015-12-09T23:37:43Z",
+        "updatedAt": "2015-12-09T23:37:43Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Update:  There are indeed some more problems related to this change.  See [comments](http://blogs.msdn.com/b/bharry/archive/2015/11/30/vs-2015-update-1-and-tfs-2015-update-1-are-available.aspx#10658899) [on](http://blogs.msdn.com/b/bharry/archive/2015/11/30/vs-2015-update-1-and-tfs-2015-update-1-are-available.aspx#10658449) Brian Harry's Update 1 blog post, both of which used `al.exe` in a post-build event (which is just a UI way of creating an `Exec`).  @jaredpar posted the `chcp 437` workaround there, which worked for those folks.\n\nThere was [another related problem report](http://blogs.msdn.com/b/bharry/archive/2015/11/30/vs-2015-update-1-and-tfs-2015-update-1-are-available.aspx#10658922) there as well.  That user had an em dash in their project file rather than a hyphen character.  This sort of thing happens all the time when you copy/paste code from Outlook or another program that autocorrects.  Prior to Update 1, it looks like that dash was [fallback encoded](https://msdn.microsoft.com/en-us/library/ms404377%28v=vs.110%29.aspx#FallbackStrategy) to the tool-expected hyphen.  After Update 1, the dash was included in the Exec-generated `.cmd` file and the command line tool stopped recognizing it.\n",
+        "createdAt": "2015-12-11T16:55:09Z",
+        "updatedAt": "2015-12-11T16:55:09Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "Team triage: we're going to attempt to conditionalize the codepage change, so that if the string from the project contains non-ANSI characters we'll use the current behavior of changing the codepage to Unicode. If the string is representable in the current system encoding, we'll use the old behavior with no `chcp`. This makes understanding this sort of problem when it occurs vastly more difficult, but should dramatically reduce the incidence rate.\n",
+        "createdAt": "2016-01-20T00:08:32Z",
+        "updatedAt": "2016-01-20T00:08:32Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "@rainersigwald \n\n> Team triage: we're going to attempt to conditionalize the codepage change, so that if the string from the project contains non-ANSI characters\n\nWhich string are you referring to here?\n\nIn addition to detection have you all considered an option to let users specifically opt in / out of this behavior?\n",
+        "createdAt": "2016-01-20T16:25:34Z",
+        "updatedAt": "2016-01-20T16:25:34Z",
+        "author": {
+          "login": "jaredpar"
+        }
+      },
+      {
+        "body": "@jaredpar The string is the (property- and item-expanded) contents of the `Exec`'s `Command` attribute. It sounds like @AndyGerlicher is planning to allow a codepage override in addition to the detection logic. IM transcript:\n\n```\n[\u200e1/\u200e20/\u200e2016 6:18 PM] Andy Gerlicher: \nso... should we add a property to override for Exec?\nCodePage as int? something like that?\n[\u200e1/\u200e20/\u200e2016 6:18 PM] Rainer Sigwald: \nI say no because it's basically impossible to decide when to use it\nfor example, the UI-accessible PostBuildEvent is implemented with Exec\nare we going to modify that target definition to take an additional variable?\nI guess we could\n[\u200e1/\u200e20/\u200e2016 6:20 PM] Rainer Sigwald: \nwe could just have a convention that all Exec tasks take an optional $(ExecCodepageNumber) and if an individual is having problems with a project they could set that\n[\u200e1/\u200e20/\u200e2016 6:20 PM] Andy Gerlicher: \nI would say we don't modify anything, just have an out for the user if a workaround is needed\n[\u200e1/\u200e20/\u200e2016 6:21 PM] Rainer Sigwald: \nbut to use the out, they'd have to modify the callsite of Exec\nif it's in our targets or in a package they can't do that\n[\u200e1/\u200e20/\u200e2016 6:21 PM] Andy Gerlicher: \nI'm thinking for custom Exec, not our stuff\nthis change should fix our stuff\n[\u200e1/\u200e20/\u200e2016 6:22 PM] Rainer Sigwald: \noh, so you're thinking in addition?\n[\u200e1/\u200e20/\u200e2016 6:23 PM] Andy Gerlicher: \nyeah. like an OverrideCodePage property you could set\nand if you set that it will always use it\non that exec call\n[\u200e1/\u200e20/\u200e2016 6:23 PM] Rainer Sigwald: \nthat makes sense to me, I think\n```\n",
+        "createdAt": "2016-01-21T00:29:58Z",
+        "updatedAt": "2016-01-21T00:29:58Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      },
+      {
+        "body": "@rainersigwald @AndyGerlicher how would one specify the equivalent of `CP_ACP` in this setting?  Essentially asking for the behavior before this change? \n",
+        "createdAt": "2016-01-21T18:19:33Z",
+        "updatedAt": "2016-01-21T18:19:33Z",
+        "author": {
+          "login": "jaredpar"
+        }
+      },
+      {
+        "body": "This issue is currently breaking my builds in that the error stream of one of my applications called via exec is suddenly producing something (Character 65279, which should be a zero-width no breaking space) when it shouldn't.\n\nSo for those of us who have been hit by this is there a work around until VS2015.2 comes out (assuming this patch will be in that release)? \n",
+        "createdAt": "2016-02-17T02:45:41Z",
+        "updatedAt": "2016-02-17T02:45:41Z",
+        "author": {
+          "login": "pvandervelde"
+        }
+      },
+      {
+        "body": "@pvandervelde #442 will be in Update 2 (and it is in the currently-available CTP). Until then, you can work around the way that you did, or by explicitly setting the codepage in the `Exec` task invocation as mentioned [above](https://github.com/Microsoft/msbuild/issues/397#issuecomment-162925595).\n\nI'm surprised at a few things from your situation:\n- Your task invokes a `Process` directly, _not_ through `Exec`. That shouldn't be subject to the codepage change. Are you invoking `msbuild.exe` within an `Exec` task from another MSBuild?\n- The fact that you're seeing the BOM emitted to an otherwise-empty stream is interesting, though. IIRC .NET does not emit it when the stream is set up, only before the first written character. It might be worth looking at the behavior of OpenCover when run under the Unicode codepage--which is something that a user could set up outside of MSBuild, which would potentially cause problems regardless of MSBuild's behavior.\n",
+        "createdAt": "2016-02-17T16:21:37Z",
+        "updatedAt": "2016-02-17T16:21:37Z",
+        "author": {
+          "login": "rainersigwald"
+        }
+      }
+    ]
+  }
+}

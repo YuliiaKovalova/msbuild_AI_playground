@@ -1,0 +1,2973 @@
+diff --git a/documentation/specs/resource-management.md b/documentation/specs/resource-management.md
+new file mode 100644
+index 00000000000..92343be73a4
+--- /dev/null
++++ b/documentation/specs/resource-management.md
+@@ -0,0 +1,41 @@
++# Managing tools with their own parallelism in MSBuild
++
++MSBuild supports building projects in parallel using multiple processes. Most users opt into `Environment.ProcessorCount` parallelism at the MSBuild layer.
++
++In addition, tools sometimes support parallel execution. The Visual C++ compiler `cl.exe` supports `/MP[n]`, which parallelizes compilation at the translation-unit (file) level. If a number isn't specified, it defaults to `NUM_PROCS`.
++
++When used in combination, `NUM_PROCS * NUM_PROCS` compiler processes can be launched, all of which would like to do file I/O and intense computation. This generally overwhelms the operating system's scheduler and causes thrashing and terrible build times.
++
++As a result, the standard guidance is to use only one multiproc option: MSBuild's _or_ `cl.exe`'s. But that leaves the machine underloaded when things could be happening in parallel.
++
++## Design
++
++`IBuildEngine` will be extended to allow a task to indicate to MSBuild that it would like to consume more than one CPU core (`RequestCores`). These will be advisory only — a task can still do as much work as it desires with as many threads and processes as it desires.
++
++A cooperating task would limit its own parallelism to the number of CPU cores MSBuild can reserve for the requesting task.
++
++`RequestCores(int requestedCores)` will always return a positive value, possibly less than the parameter if that many cores are not available. If no cores are available at the moment, the call blocks until at least one becomes available. The first `RequestCores` call made by a task is guaranteed to be non-blocking, though, as at minimum it will return the "implicit" core allocated to the task itself. This leads to two conceptual ways of adopting the API. Either the task calls `RequestCores` once, passing the desired number of cores, and then limiting its parallelism to whatever the call returns. Or the task makes additional calls throughout its execution, perhaps as it discovers more work to do. In this second scenario the task must be OK with waiting for additional cores for a long time or even forever if the sum of allocated cores has exceeded the limit defined by the policy.
++
++All resources acquired by a task will be automatically returned when the task's `Execute()` method returns, and a task can optionally return a subset by calling `ReleaseCores`. Additionally, all resources will be returned when the task calls `Reacquire` as this call is a signal to the scheduler that external tools have finished their work and the task can continue running. It does not matter when the resources where allocated - whether it was before or after calling `Yield` - they will all be released. Depending on the scheduling policy, freeing resources on `Reacquire` may prevent deadlocks.
++
++The exact core reservation policy and its interaction with task execution scheduling is still TBD. The pool of resources explicitly allocated by tasks may be completely separate, i.e. MSBuild will not wait until a resource is freed before starting execution of new tasks. Or it may be partially or fully shared to prevent oversubscribing the machine. In general, `ReleaseCores` may cause a transition of a waiting task to a Ready state. And vice-versa, completing a task or calling `Yield` may unblock a pending `RequestCores` call issued by a task.
++
++## Example 1
++
++In a 16-process build of a solution with 30 projects, 16 worker nodes are launched and begin executing work. Most block on dependencies to projects `A`, `B`, `C`, `D`, and `E`, so they don't have tasks running holding resources.
++
++Task `Work` is called in project `A` with 25 inputs. It would like to run as many as possible in parallel. It calls
++
++```C#
++int allowedParallelism = BuildEngine8.RequestCores(Inputs.Count); // Inputs.Count == 25
++```
++
++and gets up to `16`--the number of cores available to the build overall.
++
++While `A` runs `Work`, projects `B` and `C` run another task `Work2` that also calls `RequestCores` with a high value. Since `Work` in `A` has reserved all cores, the calls in `B` and `C` may return only 1, indicating that the task should not be doing parallel work. Subsequent `RequestCores` may block, waiting on `Work` to release cores (or return).
++
++When `Work` returns, MSBuild automatically returns all resources reserved by the task to the pool. At that time blocked `RequestCores` calls in `Work2` may unblock.
++
++## Implementation
++
++The `RequestCores` and `ReleaseCores` calls are marshaled back to the scheduler via newly introduced `INodePacket` implementations. The scheduler, having full view of the state of the system - i.e. number of build requests running, waiting, yielding, ..., number of cores explicitly allocated by individual tasks using the new API - is free to implement an arbitrary core allocation policy. In the initial implementation the policy will be controlled by a couple of environment variables to make it easy to test different settings.
+diff --git a/ref/Microsoft.Build.Framework/net/Microsoft.Build.Framework.cs b/ref/Microsoft.Build.Framework/net/Microsoft.Build.Framework.cs
+index 9af57bd0778..1318a437f92 100644
+--- a/ref/Microsoft.Build.Framework/net/Microsoft.Build.Framework.cs
++++ b/ref/Microsoft.Build.Framework/net/Microsoft.Build.Framework.cs
+@@ -218,6 +218,11 @@ public partial interface IBuildEngine8 : Microsoft.Build.Framework.IBuildEngine,
+     {
+         bool ShouldTreatWarningAsError(string warningCode);
+     }
++    public partial interface IBuildEngine9 : Microsoft.Build.Framework.IBuildEngine, Microsoft.Build.Framework.IBuildEngine2, Microsoft.Build.Framework.IBuildEngine3, Microsoft.Build.Framework.IBuildEngine4, Microsoft.Build.Framework.IBuildEngine5, Microsoft.Build.Framework.IBuildEngine6, Microsoft.Build.Framework.IBuildEngine7, Microsoft.Build.Framework.IBuildEngine8
++    {
++        void ReleaseCores(int coresToRelease);
++        int RequestCores(int requestedCores);
++    }
+     public partial interface ICancelableTask : Microsoft.Build.Framework.ITask
+     {
+         void Cancel();
+diff --git a/ref/Microsoft.Build.Framework/netstandard/Microsoft.Build.Framework.cs b/ref/Microsoft.Build.Framework/netstandard/Microsoft.Build.Framework.cs
+index 03972724856..9d3b8a4e277 100644
+--- a/ref/Microsoft.Build.Framework/netstandard/Microsoft.Build.Framework.cs
++++ b/ref/Microsoft.Build.Framework/netstandard/Microsoft.Build.Framework.cs
+@@ -218,6 +218,11 @@ public partial interface IBuildEngine8 : Microsoft.Build.Framework.IBuildEngine,
+     {
+         bool ShouldTreatWarningAsError(string warningCode);
+     }
++    public partial interface IBuildEngine9 : Microsoft.Build.Framework.IBuildEngine, Microsoft.Build.Framework.IBuildEngine2, Microsoft.Build.Framework.IBuildEngine3, Microsoft.Build.Framework.IBuildEngine4, Microsoft.Build.Framework.IBuildEngine5, Microsoft.Build.Framework.IBuildEngine6, Microsoft.Build.Framework.IBuildEngine7, Microsoft.Build.Framework.IBuildEngine8
++    {
++        void ReleaseCores(int coresToRelease);
++        int RequestCores(int requestedCores);
++    }
+     public partial interface ICancelableTask : Microsoft.Build.Framework.ITask
+     {
+         void Cancel();
+diff --git a/ref/Microsoft.Build.Utilities.Core/net/Microsoft.Build.Utilities.Core.cs b/ref/Microsoft.Build.Utilities.Core/net/Microsoft.Build.Utilities.Core.cs
+index de994107a7a..4491f300e5c 100644
+--- a/ref/Microsoft.Build.Utilities.Core/net/Microsoft.Build.Utilities.Core.cs
++++ b/ref/Microsoft.Build.Utilities.Core/net/Microsoft.Build.Utilities.Core.cs
+@@ -354,6 +354,7 @@ protected Task(System.Resources.ResourceManager taskResources, string helpKeywor
+         public Microsoft.Build.Framework.IBuildEngine6 BuildEngine6 { get { throw null; } }
+         public Microsoft.Build.Framework.IBuildEngine7 BuildEngine7 { get { throw null; } }
+         public Microsoft.Build.Framework.IBuildEngine8 BuildEngine8 { get { throw null; } }
++        public Microsoft.Build.Framework.IBuildEngine9 BuildEngine9 { get { throw null; } }
+         protected string HelpKeywordPrefix { get { throw null; } set { } }
+         public Microsoft.Build.Framework.ITaskHost HostObject { get { throw null; } set { } }
+         public Microsoft.Build.Utilities.TaskLoggingHelper Log { get { throw null; } }
+diff --git a/ref/Microsoft.Build.Utilities.Core/netstandard/Microsoft.Build.Utilities.Core.cs b/ref/Microsoft.Build.Utilities.Core/netstandard/Microsoft.Build.Utilities.Core.cs
+index ff4b2b17f1b..f0ad18e1545 100644
+--- a/ref/Microsoft.Build.Utilities.Core/netstandard/Microsoft.Build.Utilities.Core.cs
++++ b/ref/Microsoft.Build.Utilities.Core/netstandard/Microsoft.Build.Utilities.Core.cs
+@@ -199,6 +199,7 @@ protected Task(System.Resources.ResourceManager taskResources, string helpKeywor
+         public Microsoft.Build.Framework.IBuildEngine6 BuildEngine6 { get { throw null; } }
+         public Microsoft.Build.Framework.IBuildEngine7 BuildEngine7 { get { throw null; } }
+         public Microsoft.Build.Framework.IBuildEngine8 BuildEngine8 { get { throw null; } }
++        public Microsoft.Build.Framework.IBuildEngine9 BuildEngine9 { get { throw null; } }
+         protected string HelpKeywordPrefix { get { throw null; } set { } }
+         public Microsoft.Build.Framework.ITaskHost HostObject { get { throw null; } set { } }
+         public Microsoft.Build.Utilities.TaskLoggingHelper Log { get { throw null; } }
+diff --git a/src/Build.UnitTests/BackEnd/BuildRequestEngine_Tests.cs b/src/Build.UnitTests/BackEnd/BuildRequestEngine_Tests.cs
+index 185e828aae6..bd2e1172fe5 100644
+--- a/src/Build.UnitTests/BackEnd/BuildRequestEngine_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/BuildRequestEngine_Tests.cs
+@@ -74,6 +74,8 @@ public MockRequestBuilder()
+ 
+             public event BuildRequestBlockedDelegate OnBuildRequestBlocked;
+ 
++            public event ResourceRequestDelegate OnResourceRequest;
++
+             public void BuildRequest(NodeLoggingContext context, BuildRequestEntry entry)
+             {
+                 Assert.Null(_builderThread); // "Received BuildRequest while one was in progress"
+@@ -171,6 +173,11 @@ public void RaiseRequestBlocked(BuildRequestEntry entry, int blockingId, string
+                 OnBuildRequestBlocked?.Invoke(entry, blockingId, blockingTarget, null);
+             }
+ 
++            public void RaiseResourceRequest(ResourceRequest request)
++            {
++                OnResourceRequest?.Invoke(request);
++            }
++
+             public void ContinueRequest()
+             {
+                 if (ThrowExceptionOnContinue)
+@@ -180,6 +187,10 @@ public void ContinueRequest()
+                 _continueEvent.Set();
+             }
+ 
++            public void ContinueRequestWithResources(ResourceResponse response)
++            {
++            }
++
+             public void CancelRequest()
+             {
+                 this.BeginCancel();
+@@ -256,6 +267,9 @@ private ProjectInstance CreateStandinProject()
+         private AutoResetEvent _engineExceptionEvent;
+         private Exception _engineException_Exception;
+ 
++        private AutoResetEvent _engineResourceRequestEvent;
++        private ResourceRequest _engineResourceRequest_Request;
++
+         private IBuildRequestEngine _engine;
+         private IConfigCache _cache;
+         private int _nodeRequestId;
+@@ -272,6 +286,7 @@ public BuildRequestEngine_Tests()
+             _newRequestEvent = new AutoResetEvent(false);
+             _newConfigurationEvent = new AutoResetEvent(false);
+             _engineExceptionEvent = new AutoResetEvent(false);
++            _engineResourceRequestEvent = new AutoResetEvent(false);
+ 
+             _engine = (IBuildRequestEngine)_host.GetComponent(BuildComponentType.RequestEngine);
+             _cache = (IConfigCache)_host.GetComponent(BuildComponentType.ConfigCache);
+@@ -293,6 +308,7 @@ public void Dispose()
+             _newRequestEvent.Dispose();
+             _newConfigurationEvent.Dispose();
+             _engineExceptionEvent.Dispose();
++            _engineResourceRequestEvent.Dispose();
+ 
+             _host = null;
+         }
+@@ -305,6 +321,7 @@ private void ConfigureEngine(IBuildRequestEngine engine)
+             engine.OnRequestResumed += this.Engine_RequestResumed;
+             engine.OnStatusChanged += this.Engine_EngineStatusChanged;
+             engine.OnEngineException += this.Engine_Exception;
++            engine.OnResourceRequest += this.Engine_ResourceRequest;
+         }
+ 
+         /// <summary>
+@@ -579,5 +596,15 @@ private void Engine_Exception(Exception e)
+             _engineException_Exception = e;
+             _engineExceptionEvent.Set();
+         }
++
++        /// <summary>
++        /// Callback for event raised when resources are requested.
++        /// </summary>
++        /// <param name="request">The resource request</param>
++        private void Engine_ResourceRequest(ResourceRequest request)
++        {
++            _engineResourceRequest_Request = request;
++            _engineResourceRequestEvent.Set();
++        }
+     }
+ }
+diff --git a/src/Build.UnitTests/BackEnd/TargetBuilder_Tests.cs b/src/Build.UnitTests/BackEnd/TargetBuilder_Tests.cs
+index 9d8db26b192..fe416e2e901 100644
+--- a/src/Build.UnitTests/BackEnd/TargetBuilder_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TargetBuilder_Tests.cs
+@@ -1417,6 +1417,21 @@ void IRequestBuilderCallback.ExitMSBuildCallbackState()
+         {
+         }
+ 
++        /// <summary>
++        /// Empty impl
++        /// </summary>
++        int IRequestBuilderCallback.RequestCores(object monitorLockObject, int requestedCores, bool waitForCores)
++        {
++            return 0;
++        }
++
++        /// <summary>
++        /// Empty impl
++        /// </summary>
++        void IRequestBuilderCallback.ReleaseCores(int coresToRelease)
++        {
++        }
++
+         #endregion
+ 
+         /// <summary>
+diff --git a/src/Build.UnitTests/BackEnd/TargetEntry_Tests.cs b/src/Build.UnitTests/BackEnd/TargetEntry_Tests.cs
+index 54c1888e2dd..faa5e75e688 100644
+--- a/src/Build.UnitTests/BackEnd/TargetEntry_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TargetEntry_Tests.cs
+@@ -978,6 +978,21 @@ void IRequestBuilderCallback.ExitMSBuildCallbackState()
+         {
+         }
+ 
++        /// <summary>
++        /// Empty impl
++        /// </summary>
++        int IRequestBuilderCallback.RequestCores(object monitorLockObject, int requestedCores, bool waitForCores)
++        {
++            return 0;
++        }
++
++        /// <summary>
++        /// Empty impl
++        /// </summary>
++        void IRequestBuilderCallback.ReleaseCores(int coresToRelease)
++        {
++        }
++
+         #endregion
+ 
+         /// <summary>
+diff --git a/src/Build.UnitTests/BackEnd/TaskBuilder_Tests.cs b/src/Build.UnitTests/BackEnd/TaskBuilder_Tests.cs
+index ed6ff1db561..6e1556b5712 100644
+--- a/src/Build.UnitTests/BackEnd/TaskBuilder_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TaskBuilder_Tests.cs
+@@ -755,6 +755,21 @@ void IRequestBuilderCallback.ExitMSBuildCallbackState()
+         {
+         }
+ 
++        /// <summary>
++        /// Empty impl
++        /// </summary>
++        int IRequestBuilderCallback.RequestCores(object monitorLockObject, int requestedCores, bool waitForCores)
++        {
++            return 0;
++        }
++
++        /// <summary>
++        /// Empty impl
++        /// </summary>
++        void IRequestBuilderCallback.ReleaseCores(int coresToRelease)
++        {
++        }
++
+         #endregion
+ 
+         #region IRequestBuilderCallback Members
+diff --git a/src/Build.UnitTests/BackEnd/TaskHost_Tests.cs b/src/Build.UnitTests/BackEnd/TaskHost_Tests.cs
+index 3996c7221e8..1db0b3935b2 100644
+--- a/src/Build.UnitTests/BackEnd/TaskHost_Tests.cs
++++ b/src/Build.UnitTests/BackEnd/TaskHost_Tests.cs
+@@ -15,6 +15,7 @@
+ using TaskItem = Microsoft.Build.Execution.ProjectItemInstance.TaskItem;
+ using System.Threading.Tasks;
+ using Xunit;
++using Shouldly;
+ 
+ namespace Microsoft.Build.UnitTests.BackEnd
+ {
+@@ -705,6 +706,90 @@ public void TasksGetNoGlobalPropertiesIfNoneSpecified()
+             mockLogger.AssertLogContains("Global property count: 0");
+         }
+ 
++        [Fact]
++        public void RequestCoresThrowsOnInvalidInput()
++        {
++            Assert.Throws<ArgumentOutOfRangeException>(() =>
++            {
++                _taskHost.RequestCores(0);
++            });
++
++            Assert.Throws<ArgumentOutOfRangeException>(() =>
++            {
++                _taskHost.RequestCores(-1);
++            });
++        }
++
++        [Fact]
++        public void RequestCoresUsesImplicitCore()
++        {
++            // If the request callback has no cores to grant, we still get 1 for the implicit core.
++            _mockRequestCallback.CoresToGrant = 0;
++            _taskHost.RequestCores(3).ShouldBe(1);
++            _mockRequestCallback.LastRequestedCores.ShouldBe(2);
++            _mockRequestCallback.LastWaitForCores.ShouldBeFalse();
++        }
++
++        [Fact]
++        public void RequestCoresUsesCoresFromRequestCallback()
++        {
++            // The request callback has 1 core to grant, we should see it returned from RequestCores.
++            _mockRequestCallback.CoresToGrant = 1;
++            _taskHost.RequestCores(3).ShouldBe(2);
++            _mockRequestCallback.LastRequestedCores.ShouldBe(2);
++            _mockRequestCallback.LastWaitForCores.ShouldBeFalse();
++
++            // Since we've used the implicit core, the second call will return only what the request callback gives us and may block.
++            _mockRequestCallback.CoresToGrant = 1;
++            _taskHost.RequestCores(3).ShouldBe(1);
++            _mockRequestCallback.LastRequestedCores.ShouldBe(3);
++            _mockRequestCallback.LastWaitForCores.ShouldBeTrue();
++        }
++
++        [Fact]
++        public void ReleaseCoresThrowsOnInvalidInput()
++        {
++            Assert.Throws<ArgumentOutOfRangeException>(() =>
++            {
++                _taskHost.ReleaseCores(0);
++            });
++
++            Assert.Throws<ArgumentOutOfRangeException>(() =>
++            {
++                _taskHost.ReleaseCores(-1);
++            });
++        }
++
++        [Fact]
++        public void ReleaseCoresReturnsCoresToRequestCallback()
++        {
++            _mockRequestCallback.CoresToGrant = 1;
++            _taskHost.RequestCores(3).ShouldBe(2);
++
++            // We return one of two granted cores, the call passes through to the request callback.
++            _taskHost.ReleaseCores(1);
++            _mockRequestCallback.LastCoresToRelease.ShouldBe(1);
++
++            // The implicit core is still allocated so a subsequent RequestCores call may block.
++            _taskHost.RequestCores(1);
++            _mockRequestCallback.LastWaitForCores.ShouldBeTrue();
++        }
++
++        [Fact]
++        public void ReleaseCoresReturnsImplicitCore()
++        {
++            _mockRequestCallback.CoresToGrant = 1;
++            _taskHost.RequestCores(3).ShouldBe(2);
++
++            // We return both granted cores, one of them is returned to the request callback.
++            _taskHost.ReleaseCores(2);
++            _mockRequestCallback.LastCoresToRelease.ShouldBe(1);
++
++            // The implicit core is not allocated anymore so a subsequent RequestCores call won't block.
++            _taskHost.RequestCores(1);
++            _mockRequestCallback.LastWaitForCores.ShouldBeFalse();
++        }
++
+         #region Helper Classes
+ 
+         /// <summary>
+@@ -1221,6 +1306,26 @@ internal class MockIRequestBuilderCallback : IRequestBuilderCallback, IRequestBu
+             /// </summary>
+             private BuildResult[] _buildResultsToReturn;
+ 
++            /// <summary>
++            /// The requestedCores argument passed to the last RequestCores call.
++            /// </summary>
++            public int LastRequestedCores { get; private set; }
++
++            /// <summary>
++            /// The waitForCores argument passed to the last RequestCores call.
++            /// </summary>
++            public bool LastWaitForCores { get; private set; }
++
++            /// <summary>
++            /// The value to be returned from the RequestCores call.
++            /// </summary>
++            public int CoresToGrant { get; set; }
++
++            /// <summary>
++            /// The coresToRelease argument passed to the last ReleaseCores call.
++            /// </summary>
++            public int LastCoresToRelease { get; private set; }
++
+             /// <summary>
+             /// Constructor which takes an array of build results to return from the BuildProjects method when it is called.
+             /// </summary>
+@@ -1247,6 +1352,11 @@ internal MockIRequestBuilderCallback(BuildResult[] buildResultsToReturn)
+             /// Not Implemented
+             /// </summary>
+             public event BuildRequestBlockedDelegate OnBuildRequestBlocked;
++
++            /// <summary>
++            /// Not Implemented
++            /// </summary>
++            public event ResourceRequestDelegate OnResourceRequest;
+ #pragma warning restore
+ 
+             /// <summary>
+@@ -1294,6 +1404,24 @@ public void ExitMSBuildCallbackState()
+             {
+             }
+ 
++            /// <summary>
++            /// Mock
++            /// </summary>
++            public int RequestCores(object monitorLockObject, int requestedCores, bool waitForCores)
++            {
++                LastRequestedCores = requestedCores;
++                LastWaitForCores = waitForCores;
++                return CoresToGrant;
++            }
++
++            /// <summary>
++            /// Mock
++            /// </summary>
++            public void ReleaseCores(int coresToRelease)
++            {
++                LastCoresToRelease = coresToRelease;
++            }
++
+             /// <summary>
+             /// Mock of the Block on target in progress.
+             /// </summary>
+@@ -1318,6 +1446,14 @@ public void ContinueRequest()
+                 throw new NotImplementedException();
+             }
+ 
++            /// <summary>
++            /// Not Implemented
++            /// </summary>
++            public void ContinueRequestWithResources(ResourceResponse response)
++            {
++                throw new NotImplementedException();
++            }
++
+             /// <summary>
+             /// Not Implemented
+             /// </summary>
+diff --git a/src/Build/BackEnd/BuildManager/BuildManager.cs b/src/Build/BackEnd/BuildManager/BuildManager.cs
+index d2da0c1dbfc..30deca7f025 100644
+--- a/src/Build/BackEnd/BuildManager/BuildManager.cs
++++ b/src/Build/BackEnd/BuildManager/BuildManager.cs
+@@ -462,6 +462,7 @@ public void BeginBuild(BuildParameters parameters)
+                 _nodeManager.RegisterPacketHandler(NodePacketType.BuildResult, BuildResult.FactoryForDeserialization, this);
+                 _nodeManager.RegisterPacketHandler(NodePacketType.NodeShutdown, NodeShutdown.FactoryForDeserialization, this);
+                 _nodeManager.RegisterPacketHandler(NodePacketType.ResolveSdkRequest, SdkResolverRequest.FactoryForDeserialization, SdkResolverService as INodePacketHandler);
++                _nodeManager.RegisterPacketHandler(NodePacketType.ResourceRequest, ResourceRequest.FactoryForDeserialization, this);
+ 
+                 if (_threadException != null)
+                 {
+@@ -1537,6 +1538,11 @@ private void ProcessPacket(int node, INodePacket packet)
+                         HandleResult(node, result);
+                         break;
+ 
++                    case NodePacketType.ResourceRequest:
++                        ResourceRequest request = ExpectPacketType<ResourceRequest>(packet, NodePacketType.ResourceRequest);
++                        HandleResourceRequest(node, request);
++                        break;
++
+                     case NodePacketType.NodeShutdown:
+                         // Remove the node from the list of active nodes.  When they are all done, we have shut down fully
+                         NodeShutdown shutdownPacket = ExpectPacketType<NodeShutdown>(packet, NodePacketType.NodeShutdown);
+@@ -2174,6 +2180,30 @@ private void HandleNewRequest(int node, BuildRequestBlocker blocker)
+             PerformSchedulingActions(response);
+         }
+ 
++        /// <summary>
++        /// Handles a resource request coming from a node.
++        /// </summary>
++        private void HandleResourceRequest(int node, ResourceRequest request)
++        {
++            if (request.IsResourceAcquire)
++            {
++                // Resource request requires a response and may be blocking. Our continuation is effectively a callback
++                // to be called once at least one core becomes available.
++                _scheduler.RequestCores(request.GlobalRequestId, request.NumCores, request.IsBlocking).ContinueWith((Task<int> task) =>
++                {
++                    var response = new ResourceResponse(request.GlobalRequestId, task.Result);
++                    _nodeManager.SendData(node, response);
++                }, TaskContinuationOptions.ExecuteSynchronously);
++            }
++            else
++            {
++                // Resource release is a one-way call, no response is expected. We release the cores as instructed
++                // and kick the scheduler because there may be work waiting for cores to become available.
++                IEnumerable<ScheduleResponse> response = _scheduler.ReleaseCores(request.GlobalRequestId, request.NumCores);
++                PerformSchedulingActions(response);
++            }
++        }
++
+         /// <summary>
+         /// Handles a configuration request coming from a node.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+index 05e6671a6d6..1038643d11f 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/BuildRequestEngine.cs
+@@ -164,6 +164,11 @@ internal BuildRequestEngine()
+         /// </summary>
+         public event EngineExceptionDelegate OnEngineException;
+ 
++        /// <summary>
++        /// Raised when resources are requested.
++        /// </summary>
++        public event ResourceRequestDelegate OnResourceRequest;
++
+         /// <summary>
+         /// Returns the current engine status.
+         /// </summary>
+@@ -454,6 +459,21 @@ public void UnblockBuildRequest(BuildRequestUnblocker unblocker)
+                 isLastTask: false);
+         }
+ 
++        /// <summary>
++        /// Notifies the engine of a resource response granting the node resources.
++        /// </summary>
++        /// <param name="response">The resource response.</param>
++        public void GrantResources(ResourceResponse response)
++        {
++            QueueAction(
++                () =>
++                {
++                    BuildRequestEntry entry = _requestsByGlobalRequestId[response.GlobalRequestId];
++                    entry.Builder.ContinueRequestWithResources(response);
++                },
++                isLastTask: false);
++        }
++
+         /// <summary>
+         /// Reports a configuration response to the request, allowing it to satisfy outstanding requests.
+         /// <seealso cref="BuildRequestConfigurationResponse"/>
+@@ -773,6 +793,7 @@ private void EvaluateRequestStates()
+                 // Shut it down because we already have enough in reserve.
+                 completedEntry.Builder.OnNewBuildRequests -= Builder_OnNewBuildRequests;
+                 completedEntry.Builder.OnBuildRequestBlocked -= Builder_OnBlockedRequest;
++                completedEntry.Builder.OnResourceRequest -= Builder_OnResourceRequest;
+                 ((IBuildComponent)completedEntry.Builder).ShutdownComponent();
+ 
+                 BuildRequestConfiguration configuration = _configCache[completedEntry.Request.ConfigurationId];
+@@ -914,6 +935,7 @@ private IRequestBuilder GetRequestBuilder()
+             // state changes.
+             builder.OnNewBuildRequests += Builder_OnNewBuildRequests;
+             builder.OnBuildRequestBlocked += Builder_OnBlockedRequest;
++            builder.OnResourceRequest += Builder_OnResourceRequest;
+ 
+             return builder;
+         }
+@@ -979,6 +1001,14 @@ private void Builder_OnBlockedRequest(BuildRequestEntry issuingEntry, int blocki
+                 isLastTask: false);
+         }
+ 
++        /// <summary>
++        /// Called when the request builder needs to request resources.
++        /// </summary>
++        private void Builder_OnResourceRequest(ResourceRequest request)
++        {
++            OnResourceRequest?.Invoke(request);
++        }
++
+         #endregion
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/BuildRequestEngine/IBuildRequestEngine.cs b/src/Build/BackEnd/Components/BuildRequestEngine/IBuildRequestEngine.cs
+index 75cc6ef4dc9..13d40bd7c19 100644
+--- a/src/Build/BackEnd/Components/BuildRequestEngine/IBuildRequestEngine.cs
++++ b/src/Build/BackEnd/Components/BuildRequestEngine/IBuildRequestEngine.cs
+@@ -39,6 +39,12 @@ namespace Microsoft.Build.BackEnd
+     /// <param name="config">The configuration needing an ID</param>
+     internal delegate void NewConfigurationRequestDelegate(BuildRequestConfiguration config);
+ 
++    /// <summary>
++    /// Callback for event raised when a resource is requested.
++    /// </summary>
++    /// <param name="request">The resources being requested</param>
++    internal delegate void ResourceRequestDelegate(ResourceRequest request);
++
+     /// <summary>
+     /// Callback for event raised when there is an unhandled exception in the engine.
+     /// </summary>
+@@ -110,6 +116,11 @@ internal interface IBuildRequestEngine
+         /// </summary>
+         event NewConfigurationRequestDelegate OnNewConfigurationRequest;
+ 
++        /// <summary>
++        /// Raised when resources are requested.
++        /// </summary>
++        event ResourceRequestDelegate OnResourceRequest;
++
+         /// <summary>
+         /// Raised when an unhandled exception occurs in the engine.
+         /// </summary>
+@@ -154,6 +165,12 @@ internal interface IBuildRequestEngine
+         /// <param name="unblocker">The unblocking information</param>
+         void UnblockBuildRequest(BuildRequestUnblocker unblocker);
+ 
++        /// <summary>
++        /// Notifies the engine of a resource response granting the node resources.
++        /// </summary>
++        /// <param name="response">The resource response.</param>
++        void GrantResources(ResourceResponse response);
++
+         /// <summary>
+         /// Notifies the engine of a configuration response packet, typically generated by the Build Request Manager.  This packet is used to set
+         /// the global configuration ID for a specific configuration.
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilder.cs
+index a0de5afca83..5db9a001e46 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilder.cs
+@@ -48,6 +48,11 @@ internal interface IRequestBuilder
+         /// </summary>
+         event BuildRequestBlockedDelegate OnBuildRequestBlocked;
+ 
++        /// <summary>
++        /// Raised when resources are requested.
++        /// </summary>
++        event ResourceRequestDelegate OnResourceRequest;
++
+         /// <summary>
+         /// Builds the request contained in the specified entry.
+         /// </summary>
+@@ -60,6 +65,11 @@ internal interface IRequestBuilder
+         /// </summary>
+         void ContinueRequest();
+ 
++        /// <summary>
++        /// Continues building a request which was previously waiting for a resource grant.
++        /// </summary>
++        void ContinueRequestWithResources(ResourceResponse response);
++
+         /// <summary>
+         /// Cancels an existing request.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilderCallback.cs b/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilderCallback.cs
+index 63b77897dd5..386db137259 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilderCallback.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/IRequestBuilderCallback.cs
+@@ -55,5 +55,21 @@ internal interface IRequestBuilderCallback
+         /// Exits the previous MSBuild callback state.
+         /// </summary>
+         void ExitMSBuildCallbackState();
++
++        /// <summary>
++        /// Requests CPU resources from the scheduler.
++        /// </summary>
++        /// <param name="monitorLockObject">The object used by the caller for synchronization. The lock on this object must be taken when calling this method.</param>
++        /// <param name="requestedCores">Number of logical cores being requested.</param>
++        /// <param name="waitForCores">True to make the request block and wait for at least one core.</param>
++        /// <returns>Number of logical cores actually granted. If <paramref name="waitForCores"/> is false, the call can return
++        /// zero. Otherwise the return value is positive.</returns>
++        int RequestCores(object monitorLockObject, int requestedCores, bool waitForCores);
++
++        /// <summary>
++        /// Returns CPU resources to the scheduler.
++        /// </summary>
++        /// <param name="coresToRelease">Number of logical cores being returned.</param>
++        void ReleaseCores(int coresToRelease);
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+index d5b83a1566c..7b7f60f06cc 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/RequestBuilder.cs
+@@ -2,7 +2,6 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using Microsoft.Build.BackEnd.Logging;
+-using Microsoft.Build.BackEnd.SdkResolution;
+ using Microsoft.Build.Collections;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Eventing;
+@@ -19,7 +18,6 @@
+ using System.Linq;
+ using System.Threading;
+ using System.Threading.Tasks;
+-using Microsoft.Build.Experimental.ProjectCache;
+ using NodeLoggingContext = Microsoft.Build.BackEnd.Logging.NodeLoggingContext;
+ using ProjectLoggingContext = Microsoft.Build.BackEnd.Logging.ProjectLoggingContext;
+ 
+@@ -50,6 +48,11 @@ internal class RequestBuilder : IRequestBuilder, IRequestBuilderCallback, IBuild
+         /// </summary>
+         private IDictionary<int, BuildResult> _continueResults;
+ 
++        /// <summary>
++        /// Queue of actions to call when a resource request is responded to.
++        /// </summary>
++        private ConcurrentQueue<Action<ResourceResponse>> _pendingResourceRequests;
++
+         /// <summary>
+         /// The task representing the currently-executing build request.
+         /// </summary>
+@@ -107,6 +110,7 @@ internal RequestBuilder()
+         {
+             _terminateEvent = new ManualResetEvent(false);
+             _continueEvent = new AutoResetEvent(false);
++            _pendingResourceRequests = new ConcurrentQueue<Action<ResourceResponse>>();
+         }
+ 
+         /// <summary>
+@@ -124,6 +128,11 @@ internal RequestBuilder()
+         /// </summary>
+         public event BuildRequestBlockedDelegate OnBuildRequestBlocked;
+ 
++        /// <summary>
++        /// The event raised when resources are requested.
++        /// </summary>
++        public event ResourceRequestDelegate OnResourceRequest;
++
+         /// <summary>
+         /// The current block type
+         /// </summary>
+@@ -220,6 +229,19 @@ public void ContinueRequest()
+             _continueEvent.Set();
+         }
+ 
++        /// <summary>
++        /// Continues a build request after receiving a resource response.
++        /// </summary>
++        public void ContinueRequestWithResources(ResourceResponse response)
++        {
++            ErrorUtilities.VerifyThrow(HasActiveBuildRequest, "Request not building");
++            ErrorUtilities.VerifyThrow(!_terminateEvent.WaitOne(0), "Request already terminated");
++            ErrorUtilities.VerifyThrow(!_pendingResourceRequests.IsEmpty, "No pending resource requests");
++            VerifyEntryInActiveOrWaitingState();
++
++            _pendingResourceRequests.Dequeue()(response);
++        }
++
+         /// <summary>
+         /// Terminates the build request
+         /// </summary>
+@@ -460,6 +482,61 @@ public void ExitMSBuildCallbackState()
+             _inMSBuildCallback = false;
+         }
+ 
++        /// <summary>
++        /// Requests CPU resources from the scheduler.
++        /// </summary>
++        public int RequestCores(object monitorLockObject, int requestedCores, bool waitForCores)
++        {
++            ErrorUtilities.VerifyThrow(Monitor.IsEntered(monitorLockObject), "Not running under the given lock");
++            VerifyIsNotZombie();
++
++            // The task may be calling RequestCores from multiple threads and the call may be blocking, so in general, we have to maintain
++            // a queue of pending requests.
++            ResourceResponse responseObject = null;
++            using AutoResetEvent responseEvent = new AutoResetEvent(false);
++            _pendingResourceRequests.Enqueue((ResourceResponse response) =>
++            {
++                responseObject = response;
++                responseEvent.Set();
++            });
++
++            RaiseResourceRequest(ResourceRequest.CreateAcquireRequest(_requestEntry.Request.GlobalRequestId, requestedCores, waitForCores));
++
++            // Wait for one of two events to be signaled: 1) The build was canceled, 2) The response to our request was received.
++            WaitHandle[] waitHandles = new WaitHandle[] { _terminateEvent, responseEvent };
++            int waitResult;
++
++            // Drop the lock so that the same task can call ReleaseCores from other threads to unblock itself.
++            Monitor.Exit(monitorLockObject);
++            try
++            {
++                waitResult = WaitHandle.WaitAny(waitHandles);
++            }
++            finally
++            {
++                // Now re-take the lock before continuing.
++                Monitor.Enter(monitorLockObject);
++            }
++
++            if (waitResult == 0)
++            {
++                // We've been aborted.
++                throw new BuildAbortedException();
++            }
++
++            VerifyEntryInActiveOrWaitingState();
++            return responseObject.NumCores;
++        }
++
++        /// <summary>
++        /// Returns CPU resources to the scheduler.
++        /// </summary>
++        public void ReleaseCores(int coresToRelease)
++        {
++            VerifyIsNotZombie();
++            RaiseResourceRequest(ResourceRequest.CreateReleaseRequest(_requestEntry.Request.GlobalRequestId, coresToRelease));
++        }
++
+         #endregion
+ 
+         #region IBuildComponent Members
+@@ -676,6 +753,15 @@ private void VerifyEntryInActiveState()
+             ErrorUtilities.VerifyThrow(_requestEntry.State == BuildRequestEntryState.Active, "Entry is not in the Active state, it is in the {0} state.", _requestEntry.State);
+         }
+ 
++        /// <summary>
++        /// Asserts that the entry is in the active or waiting state.
++        /// </summary>
++        private void VerifyEntryInActiveOrWaitingState()
++        {
++            ErrorUtilities.VerifyThrow(_requestEntry.State == BuildRequestEntryState.Active || _requestEntry.State == BuildRequestEntryState.Waiting,
++                "Entry is not in the Active or Waiting state, it is in the {0} state.", _requestEntry.State);
++        }
++
+         /// <summary>
+         /// The entry point for the request builder thread.
+         /// </summary>
+@@ -986,6 +1072,15 @@ private void RaiseOnBlockedRequest(int blockingGlobalRequestId, string blockingT
+             OnBuildRequestBlocked?.Invoke(_requestEntry, blockingGlobalRequestId, blockingTarget, partialBuildResult);
+         }
+ 
++        /// <summary>
++        /// Invokes the OnResourceRequest event
++        /// </summary>
++        /// <param name="request"></param>
++        private void RaiseResourceRequest(ResourceRequest request)
++        {
++            OnResourceRequest?.Invoke(request);
++        }
++
+         /// <summary>
+         /// This method is called to reset the current directory to the one appropriate for this project.  It should be called any time
+         /// the project is resumed.
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
+index d79147775b7..ba7547452ab 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TargetBuilder.cs
+@@ -363,6 +363,24 @@ void IRequestBuilderCallback.ExitMSBuildCallbackState()
+             _requestBuilderCallback.ExitMSBuildCallbackState();
+         }
+ 
++        /// <summary>
++        /// Requests CPU resources from the scheduler.
++        /// </summary>
++        /// <remarks>This method is called from the <see cref="TaskHost"/>.</remarks>
++        int IRequestBuilderCallback.RequestCores(object monitorLockObject, int requestedCores, bool waitForCores)
++        {
++            return _requestBuilderCallback.RequestCores(monitorLockObject, requestedCores, waitForCores);
++        }
++
++        /// <summary>
++        /// Returns CPU resources to the scheduler.
++        /// </summary>
++        /// <remarks>This method is called from the <see cref="TaskHost"/>.</remarks>
++        void IRequestBuilderCallback.ReleaseCores(int coresToRelease)
++        {
++            _requestBuilderCallback.ReleaseCores(coresToRelease);
++        }
++
+         #endregion
+ 
+         /// <summary>
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+index 58a0e6931bc..5390d169443 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskBuilder.cs
+@@ -338,9 +338,7 @@ private async Task<WorkUnitResult> ExecuteTask(TaskExecutionMode mode, Lookup lo
+             {
+                 _taskExecutionHost.CleanupForTask();
+ 
+-#if FEATURE_APPDOMAIN
+                 taskHost?.MarkAsInactive();
+-#endif
+ 
+                 // Now all task batches are done, apply all item adds to the outer 
+                 // target batch; we do this even if the task wasn't found (in that case,
+diff --git a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+index 3bc78d7159a..88b32c65d1e 100644
+--- a/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
++++ b/src/Build/BackEnd/Components/RequestBuilder/TaskHost.cs
+@@ -33,7 +33,7 @@ internal class TaskHost :
+ #if FEATURE_APPDOMAIN
+         MarshalByRefObject,
+ #endif
+-        IBuildEngine8
++        IBuildEngine9
+     {
+         /// <summary>
+         /// True if the "secret" environment variable MSBUILDNOINPROCNODE is set.
+@@ -361,6 +361,10 @@ public void Yield()
+         /// </summary>
+         public void Reacquire()
+         {
++            // Release all cores on reacquire. The assumption here is that the task is done with CPU intensive work at this point and forgetting
++            // to release explicitly granted cores when reacquiring the node may lead to deadlocks.
++            ReleaseAllCores();
++
+             lock (_callbackMonitor)
+             {
+                 IRequestBuilderCallback builderCallback = _requestEntry.Builder as IRequestBuilderCallback;
+@@ -670,13 +674,16 @@ public IReadOnlyDictionary<string, string> GetGlobalProperties()
+         #endregion
+ 
+         #region IBuildEngine7 Members
++
+         /// <summary>
+         /// Enables or disables emitting a default error when a task fails without logging errors
+         /// </summary>
+         public bool AllowFailureWithoutError { get; set; } = false;
++
+         #endregion
+ 
+         #region IBuildEngine8 Members
++
+         private ICollection<string> _warningsAsErrors;
+ 
+         /// <summary>
+@@ -712,6 +719,132 @@ public bool ShouldTreatWarningAsError(string warningCode)
+             // An empty set means all warnings are errors.
+             return WarningsAsErrors.Count == 0 || WarningsAsErrors.Contains(warningCode);
+         }
++
++        #endregion
++
++        #region IBuildEngine9 Members
++
++        /// <summary>
++        /// Additional cores granted to the task by the scheduler. Does not include the one implicit core automatically granted to all tasks.
++        /// </summary>
++        private int _additionalAcquiredCores = 0;
++
++        /// <summary>
++        /// True if the one implicit core has been allocated by <see cref="RequestCores"/>, false otherwise.
++        /// </summary>
++        private bool _isImplicitCoreUsed = false;
++
++        /// <summary>
++        /// Total number of cores granted to the task, including the one implicit core.
++        /// </summary>
++        private int TotalAcquiredCores => _additionalAcquiredCores + (_isImplicitCoreUsed ? 1 : 0);
++
++        /// <summary>
++        /// Allocates shared CPU resources. Called by a task when it's about to do potentially multi-threaded/multi-process work.
++        /// </summary>
++        /// <param name="requestedCores">The number of cores the task wants to use.</param>
++        /// <returns>The number of cores the task is allowed to use given the current state of the build. This number is always between
++        /// 1 and <paramref name="requestedCores"/>. If the task has allocated its one implicit core, this call may block, waiting for
++        /// at least one core to become available.</returns>
++        public int RequestCores(int requestedCores)
++        {
++            ErrorUtilities.VerifyThrowArgumentOutOfRange(requestedCores > 0, nameof(requestedCores));
++
++            lock (_callbackMonitor)
++            {
++                IRequestBuilderCallback builderCallback = _requestEntry.Builder as IRequestBuilderCallback;
++
++                int coresAcquired = 0;
++                bool allocatingImplicitCore = false;
++                if (_isImplicitCoreUsed)
++                {
++                    coresAcquired = builderCallback.RequestCores(_callbackMonitor, requestedCores, waitForCores: true);
++                }
++                else
++                {
++                    _isImplicitCoreUsed = true;
++                    allocatingImplicitCore = true;
++                    if (requestedCores > 1)
++                    {
++                        coresAcquired = builderCallback.RequestCores(_callbackMonitor, requestedCores - 1, waitForCores: false);
++                    }
++                }
++                _additionalAcquiredCores += coresAcquired;
++
++                if (allocatingImplicitCore)
++                {
++                    // Pad the result with the one implicit core if it was still available.
++                    // This ensures that first call never blocks and always returns >= 1.
++                    coresAcquired++;
++                }
++
++                Debug.Assert(coresAcquired >= 1);
++                if (LoggingContext.IsValid)
++                {
++                    LoggingContext.LogComment(MessageImportance.Low, "TaskAcquiredCores", _taskLoggingContext.TaskName,
++                        requestedCores, coresAcquired, TotalAcquiredCores);
++                }
++                return coresAcquired;
++            }
++        }
++
++        /// <summary>
++        /// Frees shared CPU resources. Called by a task when it's finished doing multi-threaded/multi-process work.
++        /// </summary>
++        /// <param name="coresToRelease">The number of cores the task wants to return. This number must be between 0 and the number of cores
++        /// granted and not yet released.</param>
++        public void ReleaseCores(int coresToRelease)
++        {
++            ErrorUtilities.VerifyThrowArgumentOutOfRange(coresToRelease > 0, nameof(coresToRelease));
++
++            lock (_callbackMonitor)
++            {
++                int coresBeingReleased = coresToRelease;
++                int previousTotalAcquiredCores = TotalAcquiredCores;
++
++                if (_isImplicitCoreUsed && coresBeingReleased > _additionalAcquiredCores)
++                {
++                    // Release the implicit core last, i.e. only if we're asked to release everything.
++                    coresBeingReleased -= 1;
++                    _isImplicitCoreUsed = false;
++                }
++
++                coresBeingReleased = Math.Min(coresBeingReleased, _additionalAcquiredCores);
++                if (coresBeingReleased >= 1)
++                {
++                    IRequestBuilderCallback builderCallback = _requestEntry.Builder as IRequestBuilderCallback;
++                    builderCallback.ReleaseCores(coresBeingReleased);
++                    _additionalAcquiredCores -= coresBeingReleased;
++                }
++
++                if (LoggingContext.IsValid)
++                {
++                    if (TotalAcquiredCores == previousTotalAcquiredCores - coresToRelease)
++                    {
++                        LoggingContext.LogComment(MessageImportance.Low, "TaskReleasedCores", _taskLoggingContext.TaskName,
++                            coresToRelease, TotalAcquiredCores);
++                    }
++                    else
++                    {
++                        LoggingContext.LogComment(MessageImportance.Low, "TaskReleasedCoresWarning", _taskLoggingContext.TaskName,
++                            coresToRelease, previousTotalAcquiredCores, TotalAcquiredCores);
++                    }
++                }
++            }
++        }
++
++        /// <summary>
++        /// Frees all CPU resources granted so far.
++        /// </summary>
++        internal void ReleaseAllCores()
++        {
++            int coresToRelease = TotalAcquiredCores;
++            if (coresToRelease > 0)
++            {
++                ReleaseCores(coresToRelease);
++            }
++        }
++
+         #endregion
+ 
+         /// <summary>
+@@ -821,6 +954,7 @@ public override object InitializeLifetimeService()
+                 return lease;
+             }
+         }
++#endif
+ 
+         /// <summary>
+         /// Indicates to the TaskHost that it is no longer needed.
+@@ -833,6 +967,8 @@ internal void MarkAsInactive()
+                 VerifyActiveProxy();
+                 _activeProxy = false;
+ 
++                ReleaseAllCores();
++
+                 // Since the task has a pointer to this class it may store it in a static field. Null out
+                 // internal data so the leak of this object doesn't lead to a major memory leak.            
+                 _host = null;
+@@ -842,6 +978,7 @@ internal void MarkAsInactive()
+                 _taskLoggingContext = null;
+                 _targetBuilderCallback = null;
+ 
++#if FEATURE_APPDOMAIN
+                 // Clear out the sponsor (who is responsible for keeping the EngineProxy remoting lease alive until the task is done)
+                 // this will be null if the engine proxy was never sent across an AppDomain boundary.
+                 if (_sponsor != null)
+@@ -853,9 +990,9 @@ internal void MarkAsInactive()
+                     _sponsor.Close();
+                     _sponsor = null;
+                 }
++#endif
+             }
+         }
+-#endif
+ 
+         /// <summary>
+         /// Determine if the event is serializable. If we are running with multiple nodes we need to make sure the logging events are serializable. If not
+diff --git a/src/Build/BackEnd/Components/Scheduler/IScheduler.cs b/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
+index eb30122e633..de90369fabb 100644
+--- a/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/IScheduler.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+ using System.Collections.Generic;
++using System.Threading.Tasks;
+ using Microsoft.Build.Execution;
+ 
+ namespace Microsoft.Build.BackEnd
+@@ -68,5 +69,15 @@ internal interface IScheduler : IBuildComponent
+         /// Writes a detailed summary of the build state which includes informaiton about the scheduling plan.
+         /// </summary>
+         void WriteDetailedSummary(int submissionId);
++
++        /// <summary>
++        /// Requests CPU resources.
++        /// </summary>
++        Task<int> RequestCores(int requestId, int requestedCores, bool waitForCores);
++
++        /// <summary>
++        /// Returns CPU resources.
++        /// </summary>
++        List<ScheduleResponse> ReleaseCores(int requestId, int coresToRelease);
+     }
+ }
+diff --git a/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs b/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
+index 590cc2c74a9..0dbbd72b7f6 100644
+--- a/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
++++ b/src/Build/BackEnd/Components/Scheduler/SchedulableRequest.cs
+@@ -290,6 +290,11 @@ public DateTime EndTime
+             }
+         }
+ 
++        /// <summary>
++        /// Number of cores granted as part of running the build request.
++        /// </summary>
++        public int GrantedCores { get; set; }
++
+         /// <summary>
+         /// Gets the amount of time we spent in the specified state.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+index 0ce340f4828..1e335cedb85 100644
+--- a/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
++++ b/src/Build/BackEnd/Components/Scheduler/Scheduler.cs
+@@ -9,6 +9,7 @@
+ using System.Linq;
+ using System.Text;
+ using System.Threading;
++using System.Threading.Tasks;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Shared;
+@@ -70,6 +71,16 @@ internal class Scheduler : IScheduler
+         /// </summary>
+         private int _nodeLimitOffset;
+ 
++        /// <summary>
++        /// The result of calling NativeMethodsShared.GetLogicalCoreCount() unless overriden with MSBUILDCORELIMIT.
++        /// </summary>
++        private int _coreLimit;
++
++        /// <summary>
++        /// The weight of busy nodes in GetAvailableCoresForExplicitRequests().
++        /// </summary>
++        private int _nodeCoreAllocationWeight;
++
+         /// <summary>
+         /// { nodeId -> NodeInfo }
+         /// A list of nodes we know about.  For the non-distributed case, there will be no more nodes than the
+@@ -94,6 +105,11 @@ internal class Scheduler : IScheduler
+         /// </summary>
+         private SchedulingData _schedulingData;
+ 
++        /// <summary>
++        /// A queue of RequestCores requests waiting for at least one core to become available.
++        /// </summary>
++        private Queue<TaskCompletionSource<int>> _pendingRequestCoresCallbacks;
++
+         #endregion
+ 
+         /// <summary>
+@@ -181,6 +197,23 @@ public Scheduler()
+                 }
+             }
+ 
++            // Resource management tuning knobs:
++            // 1) MSBUILDCORELIMIT is the maximum number of cores we hand out via IBuildEngine9.RequestCores.
++            //    Note that it is independent of build parallelism as given by /m on the command line.
++            if (!int.TryParse(Environment.GetEnvironmentVariable("MSBUILDCORELIMIT"), out _coreLimit) || _coreLimit <= 0)
++            {
++                _coreLimit = NativeMethodsShared.GetLogicalCoreCount();
++            }
++            // 1) MSBUILDNODECOREALLOCATIONWEIGHT is the weight with which executing nodes reduce the number of available cores.
++            //    Example: If the weight is 50, _coreLimit is 8, and there are 4 nodes that are busy executing build requests,
++            //    then the number of cores available via IBuildEngine9.RequestCores is 8 - (0.5 * 4) = 6.
++            if (!int.TryParse(Environment.GetEnvironmentVariable("MSBUILDNODECOREALLOCATIONWEIGHT"), out _nodeCoreAllocationWeight)
++                || _nodeCoreAllocationWeight <= 0
++                || _nodeCoreAllocationWeight > 100)
++            {
++                _nodeCoreAllocationWeight = 0;
++            }
++
+             if (String.IsNullOrEmpty(_debugDumpPath))
+             {
+                 _debugDumpPath = Path.GetTempPath();
+@@ -487,6 +520,7 @@ public void Reset()
+             _schedulingPlan = null;
+             _schedulingData = new SchedulingData();
+             _availableNodes = new Dictionary<int, NodeInfo>(8);
++            _pendingRequestCoresCallbacks = new Queue<TaskCompletionSource<int>>();
+             _currentInProcNodeCount = 0;
+             _currentOutOfProcNodeCount = 0;
+ 
+@@ -516,6 +550,53 @@ public void WriteDetailedSummary(int submissionId)
+             WriteNodeUtilizationGraph(loggingService, context, false /* useConfigurations */);
+         }
+ 
++        /// <summary>
++        /// Requests CPU resources.
++        /// </summary>
++        public Task<int> RequestCores(int requestId, int requestedCores, bool waitForCores)
++        {
++            if (requestedCores == 0)
++            {
++                return Task.FromResult(0);
++            }
++
++            Func<int, int> grantCores = (int availableCores) =>
++            {
++                int grantedCores = Math.Min(requestedCores, availableCores);
++                if (grantedCores > 0)
++                {
++                    _schedulingData.GrantCoresToRequest(requestId, grantedCores);
++                }
++                return grantedCores;
++            };
++
++            int grantedCores = grantCores(GetAvailableCoresForExplicitRequests());
++            if (grantedCores > 0 || !waitForCores)
++            {
++                return Task.FromResult(grantedCores);
++            }
++            else
++            {
++                // We have no cores to grant at the moment, queue up the request.
++                TaskCompletionSource<int> completionSource = new TaskCompletionSource<int>();
++                _pendingRequestCoresCallbacks.Enqueue(completionSource);
++                return completionSource.Task.ContinueWith((Task<int> task) => grantCores(task.Result), TaskContinuationOptions.ExecuteSynchronously);
++            }
++        }
++
++        /// <summary>
++        /// Returns CPU resources.
++        /// </summary>
++        public List<ScheduleResponse> ReleaseCores(int requestId, int coresToRelease)
++        {
++            _schedulingData.RemoveCoresFromRequest(requestId, coresToRelease);
++
++            // Releasing cores means that we may be able to schedule more work.
++            List<ScheduleResponse> responses = new List<ScheduleResponse>();
++            ScheduleUnassignedRequests(responses);
++            return responses;
++        }
++
+         #endregion
+ 
+         #region IBuildComponent Members
+@@ -588,7 +669,8 @@ private void ScheduleUnassignedRequests(List<ScheduleResponse> responses)
+                 }
+                 else
+                 {
+-                    // Nodes still have work, but we have no requests.  Let them proceed.
++                    // Nodes still have work, but we have no requests.  Let them proceed and only handle resource requests.
++                    HandlePendingResourceRequests();
+                     TraceScheduler("{0}: Waiting for existing work to proceed.", schedulingTime);
+                 }
+ 
+@@ -1269,6 +1351,21 @@ private void AssignUnscheduledRequestToNode(SchedulableRequest request, int node
+             request.ResumeExecution(nodeId);
+         }
+ 
++        /// <summary>
++        /// Returns the maximum number of cores that can be returned from a RequestCores() call at the moment.
++        /// </summary>
++        private int GetAvailableCoresForExplicitRequests()
++        {
++            // At least one core is always implicitly granted to the node making the request.
++            // If _nodeCoreAllocationWeight is more than zero, it can increase this value by the specified fraction of executing nodes.
++            int implicitlyGrantedCores = Math.Max(1, (_schedulingData.ExecutingRequestsCount * _nodeCoreAllocationWeight) / 100);
++
++            // The number of explicitly granted cores is a sum of everything we've granted via RequestCores() so far across all nodes.
++            int explicitlyGrantedCores = _schedulingData.ExplicitlyGrantedCores;
++
++            return Math.Max(0, _coreLimit - (implicitlyGrantedCores + explicitlyGrantedCores));
++        }
++
+         /// <summary>
+         /// Returns true if we are at the limit of work we can schedule.
+         /// </summary>
+@@ -1279,6 +1376,15 @@ private bool AtSchedulingLimit()
+                 return false;
+             }
+ 
++            // We're at our limit of schedulable requests if: 
++            // (1) MaxNodeCount requests are currently executing
++            if (_schedulingData.ExecutingRequestsCount >= _componentHost.BuildParameters.MaxNodeCount)
++            {
++                return true;
++            }
++
++            // (2) Fewer than MaxNodeCount requests are currently executing but the sum of executing request,
++            //     yielding requests, and explicitly granted cores exceeds the limit set out below.
+             int limit = _componentHost.BuildParameters.MaxNodeCount switch
+             {
+                 1 => 1,
+@@ -1286,12 +1392,9 @@ private bool AtSchedulingLimit()
+                 _ => _componentHost.BuildParameters.MaxNodeCount + 2 + _nodeLimitOffset,
+             };
+ 
+-            // We're at our limit of schedulable requests if: 
+-            // (1) MaxNodeCount requests are currently executing
+-            // (2) Fewer than MaxNodeCount requests are currently executing but the sum of executing 
+-            //     and yielding requests exceeds the limit set out above.  
+-            return _schedulingData.ExecutingRequestsCount + _schedulingData.YieldingRequestsCount >= limit ||
+-                   _schedulingData.ExecutingRequestsCount >= _componentHost.BuildParameters.MaxNodeCount;
++            return _schedulingData.ExecutingRequestsCount +
++                   _schedulingData.YieldingRequestsCount +
++                   _schedulingData.ExplicitlyGrantedCores >= limit;
+         }
+ 
+         /// <summary>
+@@ -1716,6 +1819,25 @@ private void ResolveRequestFromCacheAndResumeIfPossible(SchedulableRequest reque
+             }
+         }
+ 
++        /// <summary>
++        /// Satisfies pending resource requests. Requests are pulled from the queue in FIFO fashion and granted as many cores
++        /// as possible, optimizing for maximum number of cores granted to a single request, not for maximum number of satisfied
++        /// requests.
++        /// </summary>
++        private void HandlePendingResourceRequests()
++        {
++            while (_pendingRequestCoresCallbacks.Count > 0)
++            {
++                int availableCores = GetAvailableCoresForExplicitRequests();
++                if (availableCores == 0)
++                {
++                    return;
++                }
++                TaskCompletionSource<int> completionSource = _pendingRequestCoresCallbacks.Dequeue();
++                completionSource.SetResult(availableCores);
++            }
++        }
++
+         /// <summary>
+         /// Determines which work is available which must be assigned to the nodes.  This includes:
+         /// 1. Ready requests - those requests which can immediately resume executing.
+@@ -1723,6 +1845,9 @@ private void ResolveRequestFromCacheAndResumeIfPossible(SchedulableRequest reque
+         /// </summary>
+         private void ResumeRequiredWork(List<ScheduleResponse> responses)
+         {
++            // If we have pending RequestCore calls, satisfy those first.
++            HandlePendingResourceRequests();
++
+             // Resume any ready requests on the existing nodes.
+             foreach (int nodeId in _availableNodes.Keys)
+             {
+diff --git a/src/Build/BackEnd/Components/Scheduler/SchedulingData.cs b/src/Build/BackEnd/Components/Scheduler/SchedulingData.cs
+index 804ac117b8a..84e42f3f073 100644
+--- a/src/Build/BackEnd/Components/Scheduler/SchedulingData.cs
++++ b/src/Build/BackEnd/Components/Scheduler/SchedulingData.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Linq;
+ using Microsoft.Build.Shared;
+ using Microsoft.Build.Collections;
+ 
+@@ -86,6 +87,15 @@ internal class SchedulingData
+ 
+         #endregion
+ 
++        #region Resource management
++
++        /// <summary>
++        /// The sum of number of cores explicitly granted to all build requests.
++        /// </summary>
++        private int _grantedCores;
++
++        #endregion
++
+         #region Diagnostic Information
+ 
+         /// <summary>
+@@ -152,6 +162,14 @@ public int ReadyRequestsCount
+             get { return _readyRequests.Count; }
+         }
+ 
++        /// <summary>
++        /// Gets the total number of cores granted to executing and yielding build requests.
++        /// </summary>
++        public int ExplicitlyGrantedCores
++        {
++            get { return _grantedCores; }
++        }
++
+         /// <summary>
+         /// Retrieves all of the blocked requests.
+         /// </summary>
+@@ -477,7 +495,7 @@ public SchedulableRequest GetReadyRequest(int globalRequestId)
+         }
+ 
+         /// <summary>
+-        /// Retrieves a request which has been assigned to a node and is in the executing, blocked or ready states.
++        /// Retrieves a request which has been assigned to a node and is in the executing, yielding, blocked, or ready states.
+         /// </summary>
+         public SchedulableRequest GetScheduledRequest(int globalRequestId)
+         {
+@@ -633,6 +651,33 @@ public bool CanScheduleRequestToNode(SchedulableRequest request, int nodeId)
+             return requiredNodeId == Scheduler.InvalidNodeId || requiredNodeId == nodeId;
+         }
+ 
++        /// <summary>
++        /// Explicitly grants CPU cores to a request.
++        /// </summary>
++        public void GrantCoresToRequest(int globalRequestId, int coresToGrant)
++        {
++            // Update per-request state.
++            SchedulableRequest request = GetScheduledRequest(globalRequestId);
++            request.GrantedCores += coresToGrant;
++
++            // Update global state.
++            _grantedCores += coresToGrant;
++        }
++
++        /// <summary>
++        /// Explicitly removes previously granted CPU cores from a request.
++        /// </summary>
++        public void RemoveCoresFromRequest(int globalRequestId, int coresToRemove)
++        {
++            // Update per-request state.
++            SchedulableRequest request = GetScheduledRequest(globalRequestId);
++            coresToRemove = Math.Min(request.GrantedCores, coresToRemove);
++            request.GrantedCores -= coresToRemove;
++
++            // Update global state.
++            _grantedCores -= coresToRemove;
++        }
++
+         /// <summary>
+         /// Unassigns the node associated with a particular configuration.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Node/InProcNode.cs b/src/Build/BackEnd/Node/InProcNode.cs
+index 0a5db6abbb2..81b4ab63279 100644
+--- a/src/Build/BackEnd/Node/InProcNode.cs
++++ b/src/Build/BackEnd/Node/InProcNode.cs
+@@ -17,7 +17,7 @@
+ namespace Microsoft.Build.BackEnd
+ {
+     /// <summary>
+-    /// This class represents an implementation of INode for out-of-proc nodes.
++    /// This class represents an implementation of INode for in-proc nodes.
+     /// </summary>
+     internal class InProcNode : INode, INodePacketFactory
+     {
+@@ -96,6 +96,11 @@ internal class InProcNode : INode, INodePacketFactory
+         /// </summary>
+         private readonly RequestCompleteDelegate _requestCompleteEventHandler;
+ 
++        /// <summary>
++        /// Handler for resource request events.
++        /// </summary>
++        private readonly ResourceRequestDelegate _resourceRequestHandler;
++
+         /// <summary>
+         /// Constructor.
+         /// </summary>
+@@ -113,6 +118,7 @@ public InProcNode(IBuildComponentHost componentHost, INodeEndpoint inProcNodeEnd
+             _newConfigurationRequestEventHandler = OnNewConfigurationRequest;
+             _requestBlockedEventHandler = OnNewRequest;
+             _requestCompleteEventHandler = OnRequestComplete;
++            _resourceRequestHandler = OnResourceRequest;
+         }
+ 
+         #region INode Members
+@@ -260,6 +266,17 @@ private void OnNewConfigurationRequest(BuildRequestConfiguration config)
+             }
+         }
+ 
++        /// <summary>
++        /// Event handler for the BuildEngine's OnResourceRequest event.
++        /// </summary>
++        private void OnResourceRequest(ResourceRequest request)
++        {
++            if (_nodeEndpoint.LinkStatus == LinkStatus.Active)
++            {
++                _nodeEndpoint.SendData(request);
++            }
++        }
++
+         /// <summary>
+         /// Event handler for the LoggingService's OnLoggingThreadException event.
+         /// </summary>
+@@ -354,6 +371,7 @@ private NodeEngineShutdownReason HandleShutdown(out Exception exception)
+             _buildRequestEngine.OnNewConfigurationRequest -= _newConfigurationRequestEventHandler;
+             _buildRequestEngine.OnRequestBlocked -= _requestBlockedEventHandler;
+             _buildRequestEngine.OnRequestComplete -= _requestCompleteEventHandler;
++            _buildRequestEngine.OnResourceRequest -= _resourceRequestHandler;
+ 
+             return _shutdownReason;
+         }
+@@ -388,6 +406,10 @@ private void HandlePacket(INodePacket packet)
+                 case NodePacketType.NodeBuildComplete:
+                     HandleNodeBuildComplete(packet as NodeBuildComplete);
+                     break;
++
++                case NodePacketType.ResourceResponse:
++                    HandleResourceResponse(packet as ResourceResponse);
++                    break;
+             }
+         }
+ 
+@@ -482,6 +504,7 @@ private void HandleNodeConfiguration(NodeConfiguration configuration)
+             _buildRequestEngine.OnNewConfigurationRequest += _newConfigurationRequestEventHandler;
+             _buildRequestEngine.OnRequestBlocked += _requestBlockedEventHandler;
+             _buildRequestEngine.OnRequestComplete += _requestCompleteEventHandler;
++            _buildRequestEngine.OnResourceRequest += _resourceRequestHandler;
+ 
+             if (_shutdownException != null)
+             {
+@@ -500,5 +523,13 @@ private void HandleNodeBuildComplete(NodeBuildComplete buildComplete)
+             _shutdownReason = buildComplete.PrepareForReuse ? NodeEngineShutdownReason.BuildCompleteReuse : NodeEngineShutdownReason.BuildComplete;
+             _shutdownEvent.Set();
+         }
++
++        /// <summary>
++        /// Handles the ResourceResponse packet.
++        /// </summary>
++        private void HandleResourceResponse(ResourceResponse response)
++        {
++            _buildRequestEngine.GrantResources(response);
++        }
+     }
+ }
+diff --git a/src/Build/BackEnd/Node/NodeConfiguration.cs b/src/Build/BackEnd/Node/NodeConfiguration.cs
+index 5cb25db468c..029b1814605 100644
+--- a/src/Build/BackEnd/Node/NodeConfiguration.cs
++++ b/src/Build/BackEnd/Node/NodeConfiguration.cs
+@@ -40,7 +40,7 @@ internal class NodeConfiguration : INodePacket
+         /// </summary>
+         private LoggingNodeConfiguration _loggingNodeConfiguration;
+ 
+-#if FEATURE_APPDOMAIN
++#pragma warning disable 1572 // appDomainSetup not always there
+         /// <summary>
+         /// Constructor
+         /// </summary>
+@@ -54,38 +54,21 @@ public NodeConfiguration
+             int nodeId,
+             BuildParameters buildParameters,
+             LoggerDescription[] forwardingLoggers,
++#if FEATURE_APPDOMAIN
+             AppDomainSetup appDomainSetup,
++#endif
+             LoggingNodeConfiguration loggingNodeConfiguration
+             )
+         {
+             _nodeId = nodeId;
+             _buildParameters = buildParameters;
+             _forwardingLoggers = forwardingLoggers;
++#if FEATURE_APPDOMAIN
+             _appDomainSetup = appDomainSetup;
++#endif
+             _loggingNodeConfiguration = loggingNodeConfiguration;
+         }
+-#else
+-        /// <summary>
+-        /// Constructor
+-        /// </summary>
+-        /// <param name="nodeId">The node id.</param>
+-        /// <param name="buildParameters">The build parameters</param>
+-        /// <param name="forwardingLoggers">The forwarding loggers.</param>
+-        /// <param name="loggingNodeConfiguration">The logging configuration for the node.</param>
+-        public NodeConfiguration
+-            (
+-            int nodeId,
+-            BuildParameters buildParameters,
+-            LoggerDescription[] forwardingLoggers,
+-            LoggingNodeConfiguration loggingNodeConfiguration
+-            )
+-        {
+-            _nodeId = nodeId;
+-            _buildParameters = buildParameters;
+-            _forwardingLoggers = forwardingLoggers;
+-            _loggingNodeConfiguration = loggingNodeConfiguration;
+-        }
+-#endif
++#pragma warning restore
+ 
+         /// <summary>
+         /// Private constructor for deserialization
+diff --git a/src/Build/BackEnd/Node/OutOfProcNode.cs b/src/Build/BackEnd/Node/OutOfProcNode.cs
+index 0ae529953d0..d70930c1493 100644
+--- a/src/Build/BackEnd/Node/OutOfProcNode.cs
++++ b/src/Build/BackEnd/Node/OutOfProcNode.cs
+@@ -171,6 +171,7 @@ public OutOfProcNode()
+             _buildRequestEngine.OnNewConfigurationRequest += OnNewConfigurationRequest;
+             _buildRequestEngine.OnRequestBlocked += OnNewRequest;
+             _buildRequestEngine.OnRequestComplete += OnRequestComplete;
++            _buildRequestEngine.OnResourceRequest += OnResourceRequest;
+ 
+             (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.BuildRequest, BuildRequest.FactoryForDeserialization, this);
+             (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.BuildRequestConfiguration, BuildRequestConfiguration.FactoryForDeserialization, this);
+@@ -178,6 +179,7 @@ public OutOfProcNode()
+             (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.BuildRequestUnblocker, BuildRequestUnblocker.FactoryForDeserialization, this);
+             (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.NodeConfiguration, NodeConfiguration.FactoryForDeserialization, this);
+             (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.NodeBuildComplete, NodeBuildComplete.FactoryForDeserialization, this);
++            (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.ResourceResponse, ResourceResponse.FactoryForDeserialization, this);
+             (this as INodePacketFactory).RegisterPacketHandler(NodePacketType.ResolveSdkResponse, SdkResult.FactoryForDeserialization, _sdkResolverService as INodePacketHandler);
+         }
+ 
+@@ -398,6 +400,17 @@ private void OnNewConfigurationRequest(BuildRequestConfiguration config)
+             }
+         }
+ 
++        /// <summary>
++        /// Event handler for the BuildEngine's OnResourceRequest event.
++        /// </summary>
++        private void OnResourceRequest(ResourceRequest request)
++        {
++            if (_nodeEndpoint.LinkStatus == LinkStatus.Active)
++            {
++                _nodeEndpoint.SendData(request);
++            }
++        }
++
+         /// <summary>
+         /// Event handler for the LoggingService's OnLoggingThreadException event.
+         /// </summary>
+@@ -594,6 +607,10 @@ private void HandlePacket(INodePacket packet)
+                     HandleBuildRequestUnblocker(packet as BuildRequestUnblocker);
+                     break;
+ 
++                case NodePacketType.ResourceResponse:
++                    HandleResourceResponse(packet as ResourceResponse);
++                    break;
++
+                 case NodePacketType.NodeConfiguration:
+                     HandleNodeConfiguration(packet as NodeConfiguration);
+                     break;
+@@ -636,6 +653,15 @@ private void HandleBuildRequestUnblocker(BuildRequestUnblocker unblocker)
+             _buildRequestEngine.UnblockBuildRequest(unblocker);
+         }
+ 
++        /// <summary>
++        /// Handles the ResourceResponse packet.
++        /// </summary>
++        /// <param name="response"></param>
++        private void HandleResourceResponse(ResourceResponse response)
++        {
++            _buildRequestEngine.GrantResources(response);
++        }
++
+         /// <summary>
+         /// Handles the NodeConfiguration packet.
+         /// </summary>
+diff --git a/src/Build/BackEnd/Shared/ResourceRequest.cs b/src/Build/BackEnd/Shared/ResourceRequest.cs
+new file mode 100644
+index 00000000000..815eedb9200
+--- /dev/null
++++ b/src/Build/BackEnd/Shared/ResourceRequest.cs
+@@ -0,0 +1,111 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++namespace Microsoft.Build.BackEnd
++{
++    /// <summary>
++    /// This packet is sent by a node to request or release resources from/to the scheduler.
++    /// </summary>
++    internal sealed class ResourceRequest : INodePacket
++    {
++        /// <summary>
++        /// The global request id of the request which is asking for resources.
++        /// </summary>
++        private int _globalRequestId;
++
++        /// <summary>
++        /// True if this is a request to acquire resources, false if this is a request to release resources.
++        /// </summary>
++        private bool _isResourceAcquire;
++
++        /// <summary>
++        /// True if the request should be blocking until the resources become available. False if the request should
++        /// be responded to immediately even if the desired resources are not available.
++        /// </summary>
++        private bool _isBlocking;
++
++        /// <summary>
++        /// Number of CPU cores being requested or released.
++        /// </summary>
++        private int _numCores;
++
++        /// <summary>
++        /// Constructor for deserialization.
++        /// </summary>
++        internal ResourceRequest(ITranslator translator)
++        {
++            Translate(translator);
++        }
++
++        /// <summary>
++        /// Private constructor, use CreateAcquireRequest or CreateReleaseRequest to make instances.
++        /// </summary>
++        private ResourceRequest(bool isResourceAcquire, int globalRequestId, int numCores, bool isBlocking)
++        {
++            _isResourceAcquire = isResourceAcquire;
++            _isBlocking = isBlocking;
++            _globalRequestId = globalRequestId;
++            _numCores = numCores;
++        }
++
++        /// <summary>
++        /// Factory method for acquiring.
++        /// </summary>
++        public static ResourceRequest CreateAcquireRequest(int globalRequestId, int numCores, bool isBlocking)
++            => new ResourceRequest(isResourceAcquire: true, globalRequestId, numCores, isBlocking);
++
++        /// <summary>
++        /// Factory method for releasing.
++        /// </summary>
++        public static ResourceRequest CreateReleaseRequest(int globalRequestId, int numCores)
++            => new ResourceRequest(isResourceAcquire: false, globalRequestId, numCores, isBlocking: false);
++
++        /// <summary>
++        /// Returns the type of packet.
++        /// </summary>
++        public NodePacketType Type => NodePacketType.ResourceRequest;
++
++        /// <summary>
++        /// Accessor for the global request id.
++        /// </summary>
++        public int GlobalRequestId => _globalRequestId;
++
++        /// <summary>
++        /// Accessor for _isResourceAcquire.
++        /// </summary>
++        public bool IsResourceAcquire => _isResourceAcquire;
++
++        /// <summary>
++        /// Accessor fro _isBlocking.
++        /// </summary>
++        public bool IsBlocking => _isBlocking;
++
++        /// <summary>
++        /// Accessor for _numCores.
++        /// </summary>
++        public int NumCores => _numCores;
++
++        #region INodePacketTranslatable Members
++
++        /// <summary>
++        /// Serialization method.
++        /// </summary>
++        public void Translate(ITranslator translator)
++        {
++            translator.Translate(ref _globalRequestId);
++            translator.Translate(ref _isResourceAcquire);
++            translator.Translate(ref _isBlocking);
++            translator.Translate(ref _numCores);
++        }
++
++        #endregion
++
++        /// <summary>
++        /// Factory for serialization.
++        /// </summary>
++        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        {
++            return new ResourceRequest(translator);
++        }
++    }
++}
+diff --git a/src/Build/BackEnd/Shared/ResourceResponse.cs b/src/Build/BackEnd/Shared/ResourceResponse.cs
+new file mode 100644
+index 00000000000..22fcefef30f
+--- /dev/null
++++ b/src/Build/BackEnd/Shared/ResourceResponse.cs
+@@ -0,0 +1,74 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++namespace Microsoft.Build.BackEnd
++{
++    /// <summary>
++    /// This packet is sent by the scheduler in response to <see cref="ResourceRequest"/> to grant resources to a node.
++    /// </summary>
++    internal sealed class ResourceResponse : INodePacket
++    {
++        /// <summary>
++        /// The global request id of the request which is being responded to.
++        /// </summary>
++        private int _globalRequestId;
++
++        /// <summary>
++        /// Number of CPU cores being granted.
++        /// </summary>
++        private int _numCores;
++
++        /// <summary>
++        /// Constructor for deserialization.
++        /// </summary>
++        internal ResourceResponse(ITranslator translator)
++        {
++            Translate(translator);
++        }
++
++        /// <summary>
++        /// Constructor for granting cores.
++        /// </summary>
++        internal ResourceResponse(int globalRequestId, int numCores)
++        {
++            _globalRequestId = globalRequestId;
++            _numCores = numCores;
++        }
++
++        /// <summary>
++        /// Returns the type of packet.
++        /// </summary>
++        public NodePacketType Type => NodePacketType.ResourceResponse;
++
++        /// <summary>
++        /// Accessor for the global request id.
++        /// </summary>
++        public int GlobalRequestId => _globalRequestId;
++
++        /// <summary>
++        /// Accessor for _numCores.
++        /// </summary>
++        public int NumCores => _numCores;
++
++        #region INodePacketTranslatable Members
++
++        /// <summary>
++        /// Serialization method.
++        /// </summary>
++        public void Translate(ITranslator translator)
++        {
++            translator.Translate(ref _globalRequestId);
++            translator.Translate(ref _numCores);
++        }
++
++        #endregion
++
++        /// <summary>
++        /// Factory for serialization.
++        /// </summary>
++        internal static INodePacket FactoryForDeserialization(ITranslator translator)
++        {
++            return new ResourceResponse(translator);
++        }
++    }
++}
+diff --git a/src/Build/Microsoft.Build.csproj b/src/Build/Microsoft.Build.csproj
+index 0a5dafcf5e3..2dff53cc972 100644
+--- a/src/Build/Microsoft.Build.csproj
++++ b/src/Build/Microsoft.Build.csproj
+@@ -333,6 +333,8 @@
+     <Compile Include="BackEnd\Shared\BuildRequestBlocker.cs" />
+     <Compile Include="BackEnd\Shared\BuildRequestConfiguration.cs" />
+     <Compile Include="BackEnd\Shared\BuildResult.cs" />
++    <Compile Include="BackEnd\Shared\ResourceRequest.cs" />
++    <Compile Include="BackEnd\Shared\ResourceResponse.cs" />
+     <Compile Include="BackEnd\Shared\CircularDependencyException.cs" />
+     <Compile Include="BackEnd\Shared\BuildRequestUnblocker.cs" />
+     <Compile Include="BackEnd\Shared\IBuildResults.cs" />
+diff --git a/src/Build/Resources/Strings.resx b/src/Build/Resources/Strings.resx
+index 8a8a77610d4..ed692c7d2c3 100644
+--- a/src/Build/Resources/Strings.resx
++++ b/src/Build/Resources/Strings.resx
+@@ -1070,6 +1070,15 @@
+   <data name="OutputPropertyLogMessage" xml:space="preserve">
+     <value>Output Property: {0}={1}</value>
+   </data>
++  <data name="TaskAcquiredCores" xml:space="preserve">
++    <value>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</value>
++  </data>
++  <data name="TaskReleasedCores" xml:space="preserve">
++    <value>Task "{0}" released {1} cores and now holds {2} cores total.</value>
++  </data>
++  <data name="TaskReleasedCoresWarning" xml:space="preserve">
++    <value>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</value>
++  </data>
+   <data name="TaskContinuedDueToContinueOnError" xml:space="preserve">
+     <value>Build continuing because "{0}" on the task "{1}" is set to "{2}".</value>
+   </data>
+diff --git a/src/Build/Resources/xlf/Strings.cs.xlf b/src/Build/Resources/xlf/Strings.cs.xlf
+index 6f48daf8d36..fb1577178b1 100644
+--- a/src/Build/Resources/xlf/Strings.cs.xlf
++++ b/src/Build/Resources/xlf/Strings.cs.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: Úloha {0} vrátila false, ale do protokolu se nezaznamenala chyba.</target>
+diff --git a/src/Build/Resources/xlf/Strings.de.xlf b/src/Build/Resources/xlf/Strings.de.xlf
+index 3e12dd793c1..af64cdfcad4 100644
+--- a/src/Build/Resources/xlf/Strings.de.xlf
++++ b/src/Build/Resources/xlf/Strings.de.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: Die Aufgabe "{0}" hat FALSE zurückgegeben, jedoch keinen Fehler protokolliert.</target>
+diff --git a/src/Build/Resources/xlf/Strings.en.xlf b/src/Build/Resources/xlf/Strings.en.xlf
+index 557613e2413..a030cd7e6bd 100644
+--- a/src/Build/Resources/xlf/Strings.en.xlf
++++ b/src/Build/Resources/xlf/Strings.en.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="new">MSB4181: The "{0}" task returned false but did not log an error.</target>
+diff --git a/src/Build/Resources/xlf/Strings.es.xlf b/src/Build/Resources/xlf/Strings.es.xlf
+index d2a6f93df72..8c22137cad3 100644
+--- a/src/Build/Resources/xlf/Strings.es.xlf
++++ b/src/Build/Resources/xlf/Strings.es.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: La tarea "{0}" devolvió false, pero no registró un error.</target>
+diff --git a/src/Build/Resources/xlf/Strings.fr.xlf b/src/Build/Resources/xlf/Strings.fr.xlf
+index 86246b0867f..6bd6ee632d3 100644
+--- a/src/Build/Resources/xlf/Strings.fr.xlf
++++ b/src/Build/Resources/xlf/Strings.fr.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: la tâche "{0}" a retourné false mais n'a pas journalisé d'erreur.</target>
+diff --git a/src/Build/Resources/xlf/Strings.it.xlf b/src/Build/Resources/xlf/Strings.it.xlf
+index 0dd8e7bce9d..0d6bbe712c2 100644
+--- a/src/Build/Resources/xlf/Strings.it.xlf
++++ b/src/Build/Resources/xlf/Strings.it.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: l'attività "{0}" ha restituito false, ma non è stato registrato alcun errore.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ja.xlf b/src/Build/Resources/xlf/Strings.ja.xlf
+index 192beb71ced..1c1466e6602 100644
+--- a/src/Build/Resources/xlf/Strings.ja.xlf
++++ b/src/Build/Resources/xlf/Strings.ja.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: "{0}" タスクから false が返されましたが、エラーがログに記録されませんでした。</target>
+diff --git a/src/Build/Resources/xlf/Strings.ko.xlf b/src/Build/Resources/xlf/Strings.ko.xlf
+index 601f8e49a00..bc5d299bf55 100644
+--- a/src/Build/Resources/xlf/Strings.ko.xlf
++++ b/src/Build/Resources/xlf/Strings.ko.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: "{0}" 작업이 false를 반환했지만 오류를 기록하지 않았습니다.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pl.xlf b/src/Build/Resources/xlf/Strings.pl.xlf
+index 777231c77a5..7322ba7adab 100644
+--- a/src/Build/Resources/xlf/Strings.pl.xlf
++++ b/src/Build/Resources/xlf/Strings.pl.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: Zadanie „{0}” zwróciło wartość false, ale nie zarejestrowało błędu.</target>
+diff --git a/src/Build/Resources/xlf/Strings.pt-BR.xlf b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+index 04e1a3d63eb..be6f7c9a64f 100644
+--- a/src/Build/Resources/xlf/Strings.pt-BR.xlf
++++ b/src/Build/Resources/xlf/Strings.pt-BR.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: A tarefa "{0}" retornou false, mas não registrou um erro.</target>
+diff --git a/src/Build/Resources/xlf/Strings.ru.xlf b/src/Build/Resources/xlf/Strings.ru.xlf
+index 3da7d8b5bb3..4e34e3068f3 100644
+--- a/src/Build/Resources/xlf/Strings.ru.xlf
++++ b/src/Build/Resources/xlf/Strings.ru.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: задача "{0}" возвратила значение false, но не зарегистрировала ошибку.</target>
+diff --git a/src/Build/Resources/xlf/Strings.tr.xlf b/src/Build/Resources/xlf/Strings.tr.xlf
+index cf33e768a2f..6d050218e1e 100644
+--- a/src/Build/Resources/xlf/Strings.tr.xlf
++++ b/src/Build/Resources/xlf/Strings.tr.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: "{0}" görevi false değerini döndürdü ancak günlüğe hata kaydetmedi.</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hans.xlf b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+index b257204a1d9..f6d789754e2 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hans.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hans.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: “{0}”任务返回了 false，但未记录错误。</target>
+diff --git a/src/Build/Resources/xlf/Strings.zh-Hant.xlf b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+index 9d6e4a89f4a..90446337beb 100644
+--- a/src/Build/Resources/xlf/Strings.zh-Hant.xlf
++++ b/src/Build/Resources/xlf/Strings.zh-Hant.xlf
+@@ -298,6 +298,21 @@
+       LOCALIZATION: {0} is a file, {1} and {2} are semicolon delimited lists of messages
+     </note>
+       </trans-unit>
++      <trans-unit id="TaskAcquiredCores">
++        <source>Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" requested {1} cores, acquired {2} cores, and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCores">
++        <source>Task "{0}" released {1} cores and now holds {2} cores total.</source>
++        <target state="new">Task "{0}" released {1} cores and now holds {2} cores total.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="TaskReleasedCoresWarning">
++        <source>Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</source>
++        <target state="new">Task "{0}" asked to release {1} cores while holding only {2} and now holds {3} cores total.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="TaskReturnedFalseButDidNotLogError">
+         <source>MSB4181: The "{0}" task returned false but did not log an error.</source>
+         <target state="translated">MSB4181: "{0}" 工作傳回了 False，但未記錄錯誤。</target>
+diff --git a/src/Framework/IBuildEngine8.cs b/src/Framework/IBuildEngine8.cs
+index bce28a4cfcf..0caaad46678 100644
+--- a/src/Framework/IBuildEngine8.cs
++++ b/src/Framework/IBuildEngine8.cs
+@@ -1,8 +1,6 @@
+ ﻿// Copyright (c) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE file in the project root for full license information.
+ 
+-using System.Collections.Generic;
+-
+ namespace Microsoft.Build.Framework
+ {
+     /// <summary>
+diff --git a/src/Framework/IBuildEngine9.cs b/src/Framework/IBuildEngine9.cs
+new file mode 100644
+index 00000000000..6e44be92834
+--- /dev/null
++++ b/src/Framework/IBuildEngine9.cs
+@@ -0,0 +1,25 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++namespace Microsoft.Build.Framework
++{
++    /// <summary>
++    /// This interface extends <see cref="IBuildEngine8" /> to provide resource management API to tasks.
++    /// </summary>
++    public interface IBuildEngine9 : IBuildEngine8
++    {
++        /// <summary>
++        /// If a task launches multiple parallel processes, it should ask how many cores it can use.
++        /// </summary>
++        /// <param name="requestedCores">The number of cores a task can potentially use.</param>
++        /// <returns>The number of cores a task is allowed to use.</returns>
++        int RequestCores(int requestedCores);
++
++        /// <summary>
++        /// A task should notify the build manager when all or some of the requested cores are not used anymore.
++        /// When task is finished, the cores it requested are automatically released.
++        /// </summary>
++        /// <param name="coresToRelease">Number of cores no longer in use.</param>
++        void ReleaseCores(int coresToRelease);
++    }
++}
+diff --git a/src/MSBuild/OutOfProcTaskHostNode.cs b/src/MSBuild/OutOfProcTaskHostNode.cs
+index 7339ac36cd0..fa626e3b70d 100644
+--- a/src/MSBuild/OutOfProcTaskHostNode.cs
++++ b/src/MSBuild/OutOfProcTaskHostNode.cs
+@@ -27,38 +27,38 @@ namespace Microsoft.Build.CommandLine
+     /// </summary>
+     internal class OutOfProcTaskHostNode :
+ #if FEATURE_APPDOMAIN
+-        MarshalByRefObject, 
++        MarshalByRefObject,
+ #endif
+         INodePacketFactory, INodePacketHandler,
+ #if CLR2COMPATIBILITY
+         IBuildEngine3
+ #else
+-        IBuildEngine8
++        IBuildEngine9
+ #endif
+     {
+         /// <summary>
+         /// Keeps a record of all environment variables that, on startup of the task host, have a different
+-        /// value from those that are passed to the task host in the configuration packet for the first task.  
+-        /// These environments are assumed to be effectively identical, so the only difference between the 
+-        /// two sets of values should be any environment variables that differ between e.g. a 32-bit and a 64-bit 
+-        /// process.  Those are the variables that this dictionary should store.  
+-        /// 
+-        /// - The key into the dictionary is the name of the environment variable. 
+-        /// - The Key of the KeyValuePair is the value of the variable in the parent process -- the value that we 
+-        ///   wish to ensure is replaced by whatever the correct value in our current process is. 
+-        /// - The Value of the KeyValuePair is the value of the variable in the current process -- the value that 
+-        ///   we wish to replay the Key value with in the environment that we receive from the parent before 
+-        ///   applying it to the current process. 
+-        ///   
+-        /// Note that either value in the KeyValuePair can be null, as it is completely possible to have an 
+-        /// environment variable that is set in 32-bit processes but not in 64-bit, or vice versa.  
+-        /// 
+-        /// This dictionary must be static because otherwise, if a node is sitting around waiting for reuse, it will 
+-        /// have inherited the environment from the previous build, and any differences between the two will be seen 
+-        /// as "legitimate".  There is no way for us to know what the differences between the startup environment of 
+-        /// the previous build and the environment of the first task run in the task host in this build -- so we 
+-        /// must assume that the 4ish system environment variables that this is really meant to catch haven't 
+-        /// somehow magically changed between two builds spaced no more than 15 minutes apart.  
++        /// value from those that are passed to the task host in the configuration packet for the first task.
++        /// These environments are assumed to be effectively identical, so the only difference between the
++        /// two sets of values should be any environment variables that differ between e.g. a 32-bit and a 64-bit
++        /// process.  Those are the variables that this dictionary should store.
++        ///
++        /// - The key into the dictionary is the name of the environment variable.
++        /// - The Key of the KeyValuePair is the value of the variable in the parent process -- the value that we
++        ///   wish to ensure is replaced by whatever the correct value in our current process is.
++        /// - The Value of the KeyValuePair is the value of the variable in the current process -- the value that
++        ///   we wish to replay the Key value with in the environment that we receive from the parent before
++        ///   applying it to the current process.
++        ///
++        /// Note that either value in the KeyValuePair can be null, as it is completely possible to have an
++        /// environment variable that is set in 32-bit processes but not in 64-bit, or vice versa.
++        ///
++        /// This dictionary must be static because otherwise, if a node is sitting around waiting for reuse, it will
++        /// have inherited the environment from the previous build, and any differences between the two will be seen
++        /// as "legitimate".  There is no way for us to know what the differences between the startup environment of
++        /// the previous build and the environment of the first task run in the task host in this build -- so we
++        /// must assume that the 4ish system environment variables that this is really meant to catch haven't
++        /// somehow magically changed between two builds spaced no more than 15 minutes apart.
+         /// </summary>
+         private static IDictionary<string, KeyValuePair<string, string>> s_mismatchedEnvironmentValues;
+ 
+@@ -108,13 +108,13 @@ internal class OutOfProcTaskHostNode :
+         private bool _isTaskExecuting;
+ 
+         /// <summary>
+-        /// The event which is set when a task has completed.  
++        /// The event which is set when a task has completed.
+         /// </summary>
+         private AutoResetEvent _taskCompleteEvent;
+ 
+         /// <summary>
+-        /// Packet containing all the information relating to the 
+-        /// completed state of the task.  
++        /// Packet containing all the information relating to the
++        /// completed state of the task.
+         /// </summary>
+         private TaskHostTaskComplete _taskCompletePacket;
+ 
+@@ -145,15 +145,15 @@ internal class OutOfProcTaskHostNode :
+         private bool _debugCommunications;
+ 
+         /// <summary>
+-        /// Flag indicating whether we should modify the environment based on any differences we find between that of the 
+-        /// task host at startup and the environment passed to us in our initial task configuration packet.  
++        /// Flag indicating whether we should modify the environment based on any differences we find between that of the
++        /// task host at startup and the environment passed to us in our initial task configuration packet.
+         /// </summary>
+         private bool _updateEnvironment;
+ 
+         /// <summary>
+-        /// An interim step between MSBuildTaskHostDoNotUpdateEnvironment=1 and the default update behavior:  go ahead and 
+-        /// do all the updates that we would otherwise have done by default, but log any updates that are made (at low 
+-        /// importance) so that the user is aware.  
++        /// An interim step between MSBuildTaskHostDoNotUpdateEnvironment=1 and the default update behavior:  go ahead and
++        /// do all the updates that we would otherwise have done by default, but log any updates that are made (at low
++        /// importance) so that the user is aware.
+         /// </summary>
+         private bool _updateEnvironmentAndLog;
+ 
+@@ -169,9 +169,9 @@ internal class OutOfProcTaskHostNode :
+         /// </summary>
+         public OutOfProcTaskHostNode()
+         {
+-            // We don't know what the current build thinks this variable should be until RunTask(), but as a fallback in case there are 
++            // We don't know what the current build thinks this variable should be until RunTask(), but as a fallback in case there are
+             // communications before we get the configuration set up, just go with what was already in the environment from when this node
+-            // was initially launched. 
++            // was initially launched.
+             _debugCommunications = (Environment.GetEnvironmentVariable("MSBUILDDEBUGCOMM") == "1");
+ 
+             _receivedPackets = new Queue<INodePacket>();
+@@ -194,7 +194,7 @@ public OutOfProcTaskHostNode()
+         #region IBuildEngine Implementation (Properties)
+ 
+         /// <summary>
+-        /// Returns the value of ContinueOnError for the currently executing task. 
++        /// Returns the value of ContinueOnError for the currently executing task.
+         /// </summary>
+         public bool ContinueOnError
+         {
+@@ -206,7 +206,7 @@ public bool ContinueOnError
+         }
+ 
+         /// <summary>
+-        /// Returns the line number of the location in the project file of the currently executing task. 
++        /// Returns the line number of the location in the project file of the currently executing task.
+         /// </summary>
+         public int LineNumberOfTaskNode
+         {
+@@ -218,7 +218,7 @@ public int LineNumberOfTaskNode
+         }
+ 
+         /// <summary>
+-        /// Returns the column number of the location in the project file of the currently executing task. 
++        /// Returns the column number of the location in the project file of the currently executing task.
+         /// </summary>
+         public int ColumnNumberOfTaskNode
+         {
+@@ -230,7 +230,7 @@ public int ColumnNumberOfTaskNode
+         }
+ 
+         /// <summary>
+-        /// Returns the project file of the currently executing task. 
++        /// Returns the project file of the currently executing task.
+         /// </summary>
+         public string ProjectFileOfTaskNode
+         {
+@@ -246,8 +246,8 @@ public string ProjectFileOfTaskNode
+         #region IBuildEngine2 Implementation (Properties)
+ 
+         /// <summary>
+-        /// Stub implementation of IBuildEngine2.IsRunningMultipleNodes.  The task host does not support this sort of 
+-        /// IBuildEngine callback, so error. 
++        /// Stub implementation of IBuildEngine2.IsRunningMultipleNodes.  The task host does not support this sort of
++        /// IBuildEngine callback, so error.
+         /// </summary>
+         public bool IsRunningMultipleNodes
+         {
+@@ -284,9 +284,9 @@ public bool ShouldTreatWarningAsError(string warningCode)
+         #region IBuildEngine Implementation (Methods)
+ 
+         /// <summary>
+-        /// Sends the provided error back to the parent node to be logged, tagging it with 
+-        /// the parent node's ID so that, as far as anyone is concerned, it might as well have 
+-        /// just come from the parent node to begin with. 
++        /// Sends the provided error back to the parent node to be logged, tagging it with
++        /// the parent node's ID so that, as far as anyone is concerned, it might as well have
++        /// just come from the parent node to begin with.
+         /// </summary>
+         public void LogErrorEvent(BuildErrorEventArgs e)
+         {
+@@ -294,9 +294,9 @@ public void LogErrorEvent(BuildErrorEventArgs e)
+         }
+ 
+         /// <summary>
+-        /// Sends the provided warning back to the parent node to be logged, tagging it with 
+-        /// the parent node's ID so that, as far as anyone is concerned, it might as well have 
+-        /// just come from the parent node to begin with. 
++        /// Sends the provided warning back to the parent node to be logged, tagging it with
++        /// the parent node's ID so that, as far as anyone is concerned, it might as well have
++        /// just come from the parent node to begin with.
+         /// </summary>
+         public void LogWarningEvent(BuildWarningEventArgs e)
+         {
+@@ -304,9 +304,9 @@ public void LogWarningEvent(BuildWarningEventArgs e)
+         }
+ 
+         /// <summary>
+-        /// Sends the provided message back to the parent node to be logged, tagging it with 
+-        /// the parent node's ID so that, as far as anyone is concerned, it might as well have 
+-        /// just come from the parent node to begin with. 
++        /// Sends the provided message back to the parent node to be logged, tagging it with
++        /// the parent node's ID so that, as far as anyone is concerned, it might as well have
++        /// just come from the parent node to begin with.
+         /// </summary>
+         public void LogMessageEvent(BuildMessageEventArgs e)
+         {
+@@ -314,9 +314,9 @@ public void LogMessageEvent(BuildMessageEventArgs e)
+         }
+ 
+         /// <summary>
+-        /// Sends the provided custom event back to the parent node to be logged, tagging it with 
+-        /// the parent node's ID so that, as far as anyone is concerned, it might as well have 
+-        /// just come from the parent node to begin with. 
++        /// Sends the provided custom event back to the parent node to be logged, tagging it with
++        /// the parent node's ID so that, as far as anyone is concerned, it might as well have
++        /// just come from the parent node to begin with.
+         /// </summary>
+         public void LogCustomEvent(CustomBuildEventArgs e)
+         {
+@@ -324,8 +324,8 @@ public void LogCustomEvent(CustomBuildEventArgs e)
+         }
+ 
+         /// <summary>
+-        /// Stub implementation of IBuildEngine.BuildProjectFile.  The task host does not support IBuildEngine 
+-        /// callbacks for the purposes of building projects, so error.  
++        /// Stub implementation of IBuildEngine.BuildProjectFile.  The task host does not support IBuildEngine
++        /// callbacks for the purposes of building projects, so error.
+         /// </summary>
+         public bool BuildProjectFile(string projectFileName, string[] targetNames, IDictionary globalProperties, IDictionary targetOutputs)
+         {
+@@ -338,8 +338,8 @@ public bool BuildProjectFile(string projectFileName, string[] targetNames, IDict
+         #region IBuildEngine2 Implementation (Methods)
+ 
+         /// <summary>
+-        /// Stub implementation of IBuildEngine2.BuildProjectFile.  The task host does not support IBuildEngine 
+-        /// callbacks for the purposes of building projects, so error.  
++        /// Stub implementation of IBuildEngine2.BuildProjectFile.  The task host does not support IBuildEngine
++        /// callbacks for the purposes of building projects, so error.
+         /// </summary>
+         public bool BuildProjectFile(string projectFileName, string[] targetNames, IDictionary globalProperties, IDictionary targetOutputs, string toolsVersion)
+         {
+@@ -348,8 +348,8 @@ public bool BuildProjectFile(string projectFileName, string[] targetNames, IDict
+         }
+ 
+         /// <summary>
+-        /// Stub implementation of IBuildEngine2.BuildProjectFilesInParallel.  The task host does not support IBuildEngine 
+-        /// callbacks for the purposes of building projects, so error.  
++        /// Stub implementation of IBuildEngine2.BuildProjectFilesInParallel.  The task host does not support IBuildEngine
++        /// callbacks for the purposes of building projects, so error.
+         /// </summary>
+         public bool BuildProjectFilesInParallel(string[] projectFileNames, string[] targetNames, IDictionary[] globalProperties, IDictionary[] targetOutputsPerProject, string[] toolsVersion, bool useResultsCache, bool unloadProjectsOnCompletion)
+         {
+@@ -362,8 +362,8 @@ public bool BuildProjectFilesInParallel(string[] projectFileNames, string[] targ
+         #region IBuildEngine3 Implementation
+ 
+         /// <summary>
+-        /// Stub implementation of IBuildEngine3.BuildProjectFilesInParallel.  The task host does not support IBuildEngine 
+-        /// callbacks for the purposes of building projects, so error.  
++        /// Stub implementation of IBuildEngine3.BuildProjectFilesInParallel.  The task host does not support IBuildEngine
++        /// callbacks for the purposes of building projects, so error.
+         /// </summary>
+         public BuildEngineResult BuildProjectFilesInParallel(string[] projectFileNames, string[] targetNames, IDictionary[] globalProperties, IList<string>[] removeGlobalProperties, string[] toolsVersion, bool returnTargetOutputs)
+         {
+@@ -373,7 +373,7 @@ public BuildEngineResult BuildProjectFilesInParallel(string[] projectFileNames,
+ 
+         /// <summary>
+         /// Stub implementation of IBuildEngine3.Yield.  The task host does not support yielding, so just go ahead and silently
+-        /// return, letting the task continue. 
++        /// return, letting the task continue.
+         /// </summary>
+         public void Yield()
+         {
+@@ -381,8 +381,8 @@ public void Yield()
+         }
+ 
+         /// <summary>
+-        /// Stub implementation of IBuildEngine3.Reacquire. The task host does not support yielding, so just go ahead and silently 
+-        /// return, letting the task continue. 
++        /// Stub implementation of IBuildEngine3.Reacquire. The task host does not support yielding, so just go ahead and silently
++        /// return, letting the task continue.
+         /// </summary>
+         public void Reacquire()
+         {
+@@ -468,6 +468,22 @@ public IReadOnlyDictionary<string, string> GetGlobalProperties()
+         }
+ 
+         #endregion
++
++        #region IBuildEngine9 Implementation
++
++        public int RequestCores(int requestedCores)
++        {
++            // No resource management in OOP nodes
++            throw new NotImplementedException();
++        }
++
++        public void ReleaseCores(int coresToRelease)
++        {
++            // No resource management in OOP nodes
++            throw new NotImplementedException();
++        }
++
++        #endregion
+ #endif
+ 
+         #region INodePacketFactory Members
+@@ -627,7 +643,7 @@ private void HandlePacket(INodePacket packet)
+         }
+ 
+         /// <summary>
+-        /// Configure the task host according to the information received in the 
++        /// Configure the task host according to the information received in the
+         /// configuration packet
+         /// </summary>
+         private void HandleTaskHostConfiguration(TaskHostConfiguration taskHostConfiguration)
+@@ -663,10 +679,10 @@ private void CompleteTask()
+ 
+             _currentConfiguration = null;
+ 
+-            // If the task has been canceled, the event will still be set.  
+-            // If so, now that we've completed the task, we want to shut down 
+-            // this node -- with no reuse, since we don't know whether the 
+-            // task we canceled left the node in a good state or not. 
++            // If the task has been canceled, the event will still be set.
++            // If so, now that we've completed the task, we want to shut down
++            // this node -- with no reuse, since we don't know whether the
++            // task we canceled left the node in a good state or not.
+             if (_taskCancelledEvent.WaitOne(0))
+             {
+                 _shutdownReason = NodeEngineShutdownReason.BuildComplete;
+@@ -694,7 +710,7 @@ private void CancelTask()
+                     if (_isTaskExecuting)
+                     {
+ #if FEATURE_THREAD_ABORT
+-                        // The thread will be terminated crudely so our environment may be trashed but it's ok since we are 
++                        // The thread will be terminated crudely so our environment may be trashed but it's ok since we are
+                         // shutting down ASAP.
+                         _taskRunnerThread.Abort();
+ #endif
+@@ -801,9 +817,9 @@ private void RunTask(object state)
+             TaskHostConfiguration taskConfiguration = state as TaskHostConfiguration;
+             IDictionary<string, TaskParameter> taskParams = taskConfiguration.TaskParameters;
+ 
+-            // We only really know the values of these variables for sure once we see what we received from our parent 
+-            // environment -- otherwise if this was a completely new build, we could lose out on expected environment 
+-            // variables.  
++            // We only really know the values of these variables for sure once we see what we received from our parent
++            // environment -- otherwise if this was a completely new build, we could lose out on expected environment
++            // variables.
+             _debugCommunications = taskConfiguration.BuildProcessEnvironment.ContainsValueAndIsEqual("MSBUILDDEBUGCOMM", "1", StringComparison.OrdinalIgnoreCase);
+             _updateEnvironment = !taskConfiguration.BuildProcessEnvironment.ContainsValueAndIsEqual("MSBuildTaskHostDoNotUpdateEnvironment", "1", StringComparison.OrdinalIgnoreCase);
+             _updateEnvironmentAndLog = taskConfiguration.BuildProcessEnvironment.ContainsValueAndIsEqual("MSBuildTaskHostUpdateEnvironmentAndLog", "1", StringComparison.OrdinalIgnoreCase);
+@@ -917,9 +933,9 @@ private void RunTask(object state)
+         }
+ 
+         /// <summary>
+-        /// Set the environment for the task host -- includes possibly munging the given 
+-        /// environment somewhat to account for expected environment differences between, 
+-        /// e.g. parent processes and task hosts of different bitnesses. 
++        /// Set the environment for the task host -- includes possibly munging the given
++        /// environment somewhat to account for expected environment differences between,
++        /// e.g. parent processes and task hosts of different bitnesses.
+         /// </summary>
+         private void SetTaskHostEnvironment(IDictionary<string, string> environment)
+         {
+@@ -933,7 +949,7 @@ private void SetTaskHostEnvironment(IDictionary<string, string> environment)
+                     string oldValue = s_mismatchedEnvironmentValues[variable].Key;
+                     string newValue = s_mismatchedEnvironmentValues[variable].Value;
+ 
+-                    // We don't check the return value, because having the variable not exist == be 
++                    // We don't check the return value, because having the variable not exist == be
+                     // null is perfectly valid, and mismatchedEnvironmentValues stores those values
+                     // as null as well, so the String.Equals should still return that they are equal.
+                     string environmentValue = null;
+@@ -968,8 +984,8 @@ private void SetTaskHostEnvironment(IDictionary<string, string> environment)
+                 }
+             }
+ 
+-            // if it's still null here, there were no changes necessary -- so just 
+-            // set it to what was already passed in. 
++            // if it's still null here, there were no changes necessary -- so just
++            // set it to what was already passed in.
+             if (updatedEnvironment == null)
+             {
+                 updatedEnvironment = environment;
+@@ -979,10 +995,10 @@ private void SetTaskHostEnvironment(IDictionary<string, string> environment)
+         }
+ 
+         /// <summary>
+-        /// Given the environment of the task host at the end of task execution, make sure that any 
+-        /// processor-specific variables have been re-applied in the correct form for the main node, 
+-        /// so that when we pass this dictionary back to the main node, all it should have to do 
+-        /// is just set it.  
++        /// Given the environment of the task host at the end of task execution, make sure that any
++        /// processor-specific variables have been re-applied in the correct form for the main node,
++        /// so that when we pass this dictionary back to the main node, all it should have to do
++        /// is just set it.
+         /// </summary>
+         private IDictionary<string, string> UpdateEnvironmentForMainNode(IDictionary<string, string> environment)
+         {
+@@ -993,14 +1009,14 @@ private IDictionary<string, string> UpdateEnvironmentForMainNode(IDictionary<str
+             {
+                 foreach (string variable in s_mismatchedEnvironmentValues.Keys)
+                 {
+-                    // Since this is munging the property list for returning to the parent process, 
+-                    // then the value we wish to replace is the one that is in this process, and the 
+-                    // replacement value is the one that originally came from the parent process, 
++                    // Since this is munging the property list for returning to the parent process,
++                    // then the value we wish to replace is the one that is in this process, and the
++                    // replacement value is the one that originally came from the parent process,
+                     // instead of the other way around.
+                     string oldValue = s_mismatchedEnvironmentValues[variable].Value;
+                     string newValue = s_mismatchedEnvironmentValues[variable].Key;
+ 
+-                    // We don't check the return value, because having the variable not exist == be 
++                    // We don't check the return value, because having the variable not exist == be
+                     // null is perfectly valid, and mismatchedEnvironmentValues stores those values
+                     // as null as well, so the String.Equals should still return that they are equal.
+                     string environmentValue = null;
+@@ -1025,8 +1041,8 @@ private IDictionary<string, string> UpdateEnvironmentForMainNode(IDictionary<str
+                 }
+             }
+ 
+-            // if it's still null here, there were no changes necessary -- so just 
+-            // set it to what was already passed in. 
++            // if it's still null here, there were no changes necessary -- so just
++            // set it to what was already passed in.
+             if (updatedEnvironment == null)
+             {
+                 updatedEnvironment = environment;
+@@ -1036,20 +1052,20 @@ private IDictionary<string, string> UpdateEnvironmentForMainNode(IDictionary<str
+         }
+ 
+         /// <summary>
+-        /// Make sure the mismatchedEnvironmentValues table has been populated.  Note that this should 
+-        /// only do actual work on the very first run of a task in the task host -- otherwise, it should 
+-        /// already have been populated. 
++        /// Make sure the mismatchedEnvironmentValues table has been populated.  Note that this should
++        /// only do actual work on the very first run of a task in the task host -- otherwise, it should
++        /// already have been populated.
+         /// </summary>
+         private void InitializeMismatchedEnvironmentTable(IDictionary<string, string> environment)
+         {
+             if (s_mismatchedEnvironmentValues == null)
+             {
+-                // This is the first time that we have received a TaskHostConfiguration packet, so we 
+-                // need to construct the mismatched environment table based on our current environment 
++                // This is the first time that we have received a TaskHostConfiguration packet, so we
++                // need to construct the mismatched environment table based on our current environment
+                 // (assumed to be effectively identical to startup) and the environment we were given
+-                // via the task host configuration, assumed to be effectively identical to the startup 
++                // via the task host configuration, assumed to be effectively identical to the startup
+                 // environment of the task host, given that the configuration packet is sent immediately
+-                // after the node is launched.  
++                // after the node is launched.
+                 s_mismatchedEnvironmentValues = new Dictionary<string, KeyValuePair<string, string>>(StringComparer.OrdinalIgnoreCase);
+ 
+                 foreach (string variable in _savedEnvironment.Keys)
+@@ -1089,7 +1105,7 @@ private void InitializeMismatchedEnvironmentTable(IDictionary<string, string> en
+         }
+ 
+         /// <summary>
+-        /// Sends the requested packet across to the main node. 
++        /// Sends the requested packet across to the main node.
+         /// </summary>
+         private void SendBuildEvent(BuildEventArgs e)
+         {
+@@ -1098,7 +1114,7 @@ private void SendBuildEvent(BuildEventArgs e)
+                 if (!e.GetType().GetTypeInfo().IsSerializable)
+                 {
+                     // log a warning and bail.  This will end up re-calling SendBuildEvent, but we know for a fact
+-                    // that the warning that we constructed is serializable, so everything should be good.  
++                    // that the warning that we constructed is serializable, so everything should be good.
+                     LogWarningFromResource("ExpectedEventToBeSerializable", e.GetType().Name);
+                     return;
+                 }
+diff --git a/src/Shared/INodePacket.cs b/src/Shared/INodePacket.cs
+index 7ae2da0fc2e..501402c8756 100644
+--- a/src/Shared/INodePacket.cs
++++ b/src/Shared/INodePacket.cs
+@@ -174,9 +174,19 @@ internal enum NodePacketType : byte
+         ResolveSdkRequest,
+ 
+         /// <summary>
+-        /// Message sent from back to a node when an SDK has been resolved.
++        /// Message sent back to a node when an SDK has been resolved.
+         /// </summary>
+         ResolveSdkResponse,
++
++        /// <summary>
++        /// Message sent from a node when a task is requesting or returning resources from the scheduler.
++        /// </summary>
++        ResourceRequest,
++
++        /// <summary>
++        /// Message sent back to a node informing it about the resource that were granted by the scheduler.
++        /// </summary>
++        ResourceResponse,
+     }
+     #endregion
+ 
+diff --git a/src/Tasks.UnitTests/ResourceManagement_Tests.cs b/src/Tasks.UnitTests/ResourceManagement_Tests.cs
+new file mode 100644
+index 00000000000..d75cdd4e120
+--- /dev/null
++++ b/src/Tasks.UnitTests/ResourceManagement_Tests.cs
+@@ -0,0 +1,157 @@
++﻿// Copyright (c) Microsoft. All rights reserved.
++// Licensed under the MIT license. See LICENSE file in the project root for full license information.
++
++using Microsoft.Build.Framework;
++using Microsoft.Build.UnitTests;
++using System.Collections.Generic;
++using System.Linq;
++using Xunit;
++using Shouldly;
++
++namespace Microsoft.Build.Tasks.UnitTests
++{
++    public class ResourceManagement_Tests
++    {
++        [Fact]
++        public void SingleCoreRequest()
++        {
++            var messages = AssertBuildSucceededAndGetMessages(@"
++                {
++                    int grantedCores = BuildEngine9.RequestCores(1337);
++                    Log.LogMessage(""Number of cores acquired: "" + grantedCores);
++                    BuildEngine9.ReleaseCores(grantedCores);
++                }", "<UseCores />");
++
++            var filteredMessages = messages.Where(m => m.Message.StartsWith("Number of cores acquired: ")).ToArray();
++            filteredMessages.Count().ShouldBe(1);
++            GetTrailingIntegerFromMessage(filteredMessages[0]).ShouldBeGreaterThan(0);
++        }
++
++        [Fact]
++        public void SingleCoreRequestWithNoRelease()
++        {
++            var messages = AssertBuildSucceededAndGetMessages(@"
++                {
++                    int grantedCores = BuildEngine9.RequestCores(1337);
++                    Log.LogMessage(""Number of cores acquired: "" + grantedCores);
++                    // Note that we're missing a call to ReleaseCores() so we rely on cores being released after the task is finished.
++                }", "<UseCores /> <UseCores />");
++
++            var filteredMessages = messages.Where(m => m.Message.StartsWith("Number of cores acquired: ")).ToArray();
++            filteredMessages.Count().ShouldBe(2);
++
++            int grantedCores1 = GetTrailingIntegerFromMessage(filteredMessages[0]);
++            int grantedCores2 = GetTrailingIntegerFromMessage(filteredMessages[1]);
++
++            // Both tasks were able to get the same number of cores because cores were auto-released.
++            grantedCores1.ShouldBeGreaterThan(0);
++            grantedCores2.ShouldBe(grantedCores1);
++        }
++
++        [Fact]
++        public void SingleCoreRequestWithReacquire()
++        {
++            var messages = AssertBuildSucceededAndGetMessages(@"
++                {
++                    int grantedCores1 = BuildEngine9.RequestCores(1337);
++                    Log.LogMessage(""Number of cores acquired: "" + grantedCores1);
++
++                    BuildEngine9.Yield();
++                    // Reacquire releases all cores.
++                    BuildEngine9.Reacquire();
++
++                    int grantedCores2 = BuildEngine9.RequestCores(1337);
++                    Log.LogMessage(""Number of cores acquired: "" + grantedCores2);
++                }", "<UseCores />");
++
++            var filteredMessages = messages.Where(m => m.Message.StartsWith("Number of cores acquired: ")).ToArray();
++            filteredMessages.Count().ShouldBe(2);
++
++            int grantedCores1 = GetTrailingIntegerFromMessage(filteredMessages[0]);
++            int grantedCores2 = GetTrailingIntegerFromMessage(filteredMessages[1]);
++
++            // Both tasks were able to get the same number of cores because cores were auto-released.
++            grantedCores1.ShouldBeGreaterThan(0);
++            grantedCores2.ShouldBe(grantedCores1);
++        }
++
++        [Fact]
++        public void MultipleCoreRequests()
++        {
++            // Exercise concurrent RequestCores() and ReleaseCores() calls.
++            AssertBuildSucceededAndGetMessages(@"
++                {
++                    const int coresToAcquire = 1337;
++                    int acquiredCores = 0;
++                    int done = 0;
++                    System.Threading.Thread requestThread = new System.Threading.Thread(() =>
++                    {
++                        for (int i = 0; i &lt; coresToAcquire; i++)
++                        {
++                            BuildEngine9.RequestCores(1);
++                            System.Threading.Interlocked.Increment(ref acquiredCores);
++                        }
++                        System.Threading.Thread.VolatileWrite(ref done, 1);
++                    });
++                    System.Threading.Thread releaseThread = new System.Threading.Thread(() =>
++                    {
++                            while (System.Threading.Thread.VolatileRead(ref done) == 0 || System.Threading.Thread.VolatileRead(ref acquiredCores) > 0)
++                            {
++                                if (System.Threading.Thread.VolatileRead(ref acquiredCores) > 0)
++                                {
++                                    BuildEngine9.ReleaseCores(1);
++                                    System.Threading.Interlocked.Decrement(ref acquiredCores);
++                                }
++                                else
++                                {
++                                    System.Threading.Thread.Yield();
++                                }
++                            }
++                    });
++
++                    // One thread is acquiring cores, the other is releasing them. The releasing thread is running with a lower
++                    // priority to increase the chances of contention where all cores are allocated and RequestCores() blocks.
++                    requestThread.Start();
++                    releaseThread.Priority = System.Threading.ThreadPriority.BelowNormal;
++                    releaseThread.Start();
++
++                    requestThread.Join();
++                    releaseThread.Join();
++                }", "<UseCores />");
++        }
++
++        private List<BuildMessageEventArgs> AssertBuildSucceededAndGetMessages(string taskCode, string targetContent)
++        {
++            string text = $@"
++<Project>
++  <UsingTask
++    TaskName=""UseCores""
++    TaskFactory=""RoslynCodeTaskFactory""
++    AssemblyFile=""$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll"" >
++    <Task>
++      <Reference Include=""{typeof(Enumerable).Assembly.Location}"" />
++      <Code Type=""Fragment"" Language=""cs"">
++        {taskCode}
++      </Code>
++    </Task>
++  </UsingTask>
++
++  <Target Name=""Build"">
++        {targetContent}
++  </Target>
++</Project>";
++            using var env = TestEnvironment.Create();
++
++            var projectFile = env.CreateTestProjectWithFiles("test.proj", text);
++            var logger = projectFile.BuildProjectExpectSuccess();
++            return logger.BuildMessageEvents;
++        }
++
++        private int GetTrailingIntegerFromMessage(BuildMessageEventArgs msg)
++        {
++            string[] messageComponents = msg.Message.Split(' ');
++            int.TryParse(messageComponents.Last(), out int trailingInteger).ShouldBeTrue();
++            return trailingInteger;
++        }
++    }
++}
+diff --git a/src/Utilities/Task.cs b/src/Utilities/Task.cs
+index a9f3de6ff36..2ca6e4a10d9 100644
+--- a/src/Utilities/Task.cs
++++ b/src/Utilities/Task.cs
+@@ -99,6 +99,11 @@ protected Task(ResourceManager taskResources, string helpKeywordPrefix)
+         /// </summary>
+         public IBuildEngine8 BuildEngine8 => (IBuildEngine8)BuildEngine;
+ 
++        /// <summary>
++        /// Retrieves the <see cref="IBuildEngine9" /> version of the build engine interface provided by the host.
++        /// </summary>
++        public IBuildEngine9 BuildEngine9 => (IBuildEngine9)BuildEngine;
++
+         /// <summary>
+         /// The build engine sets this property if the host IDE has associated a host object with this particular task.
+         /// </summary>

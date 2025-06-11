@@ -1,0 +1,317 @@
+diff --git a/eng/dependabot/Packages.props b/eng/dependabot/Packages.props
+index b098ccc9e3a..665f96765b1 100644
+--- a/eng/dependabot/Packages.props
++++ b/eng/dependabot/Packages.props
+@@ -37,6 +37,9 @@
+     <PackageVersion Include="Shouldly" Version="4.2.1" />
+     <PackageVersion Update="Shouldly" Condition="'$(ShouldlyVersion)' != ''" Version="$(ShouldlyVersion)" />
+ 
++    <PackageVersion Include="FakeItEasy" Version="8.1.0" />
++    <PackageVersion Update="FakeItEasy" Condition="'$(FakeItEasyVersion)' != ''" Version="$(FakeItEasyVersion)" />
++
+     <PackageVersion Include="System.CodeDom" Version="8.0.0" />
+     <PackageVersion Update="System.CodeDom" Condition="'$(SystemCodeDomVersion)' != ''" Version="$(SystemCodeDomVersion)" />
+ 
+diff --git a/src/Build.UnitTests/BinaryLogger_Tests.cs b/src/Build.UnitTests/BinaryLogger_Tests.cs
+index ccd837ef921..43fa2696859 100644
+--- a/src/Build.UnitTests/BinaryLogger_Tests.cs
++++ b/src/Build.UnitTests/BinaryLogger_Tests.cs
+@@ -8,12 +8,14 @@
+ using System.Linq;
+ using System.Reflection;
+ using System.Text;
++using FakeItEasy;
+ using FluentAssertions;
+ using Microsoft.Build.BackEnd.Logging;
+ using Microsoft.Build.Evaluation;
+ using Microsoft.Build.Execution;
+ using Microsoft.Build.Framework;
+ using Microsoft.Build.Logging;
++using Microsoft.Build.Shared;
+ using Microsoft.Build.UnitTests.Shared;
+ using Shouldly;
+ using Xunit;
+@@ -637,6 +639,61 @@ public void SuppressCommandOutputForNonDiagVerbosity()
+             }
+         }
+ 
++        [Theory]
++        // Wildcard - new scenario
++        [InlineData("mylog-{}-foo", "mylog-xxxxx-foo.binlog")]
++        [InlineData("mylog-{}-foo-{}", "mylog-xxxxx-foo-xxxxx.binlog")]
++        [InlineData("\"mylog-{}-foo\"", "mylog-xxxxx-foo.binlog")]
++        [InlineData("foo\\bar\\mylog-{}-foo.binlog", "foo\\bar\\mylog-xxxxx-foo.binlog")]
++        [InlineData("ProjectImports=None;LogFile=mylog-{}-foo", "mylog-xxxxx-foo.binlog")]
++        // No wildcard - pre-existing scenarios
++        [InlineData("mylog-foo.binlog", "mylog-foo.binlog")]
++        [InlineData("\"mylog-foo.binlog\"", "mylog-foo.binlog")]
++        [InlineData("foo\\bar\\mylog-foo.binlog", "foo\\bar\\mylog-foo.binlog")]
++        [InlineData("ProjectImports=None;LogFile=mylog-foo.binlog", "mylog-foo.binlog")]
++        public void BinlogFileNameParameterParsing(string parameters, string expectedBinlogFile)
++        {
++            var binaryLogger = new BinaryLogger
++            {
++                Parameters = parameters
++            };
++            string random = "xxxxx";
++            binaryLogger.PathParameterExpander = _ => random;
++
++            var eventSource = A.Fake<IEventSource>();
++
++            binaryLogger.Initialize(eventSource);
++            string expectedLog = Path.GetFullPath(expectedBinlogFile);
++            binaryLogger.FilePath.Should().BeEquivalentTo(expectedLog);
++            binaryLogger.Shutdown();
++            File.Exists(binaryLogger.FilePath).ShouldBeTrue();
++            FileUtilities.DeleteNoThrow(binaryLogger.FilePath);
++
++            // We need to create the file to satisfy the invariant set by the ctor of this testclass
++            File.Create(_logFile);
++        }
++
++        [Fact]
++        public void BinlogFileNameWildcardGeneration()
++        {
++            var binaryLogger = new BinaryLogger
++            {
++                Parameters = "{}"
++            };
++
++            var eventSource = A.Fake<IEventSource>();
++
++            binaryLogger.Initialize(eventSource);
++            binaryLogger.FilePath.Should().EndWith(".binlog");
++            binaryLogger.FilePath.Length.ShouldBeGreaterThan(10);
++            binaryLogger.Shutdown();
++            File.Exists(binaryLogger.FilePath).ShouldBeTrue();
++            FileUtilities.DeleteNoThrow(binaryLogger.FilePath);
++
++            // We need to create the file to satisfy the invariant set by the ctor of this testclass
++            File.Create(_logFile);
++        }
++
+         public void Dispose()
+         {
+             _env.Dispose();
+diff --git a/src/Build.UnitTests/Microsoft.Build.Engine.UnitTests.csproj b/src/Build.UnitTests/Microsoft.Build.Engine.UnitTests.csproj
+index b9c1cefc88c..a5f9ba12a47 100644
+--- a/src/Build.UnitTests/Microsoft.Build.Engine.UnitTests.csproj
++++ b/src/Build.UnitTests/Microsoft.Build.Engine.UnitTests.csproj
+@@ -19,6 +19,7 @@
+     <PackageReference Include="FluentAssertions" />
+     <PackageReference Include="System.Configuration.ConfigurationManager" />
+     <PackageReference Include="Shouldly" />
++    <PackageReference Include="FakeItEasy" />
+     <PackageReference Include="System.Net.Http" />
+     <PackageReference Include="Microsoft.CodeAnalysis.Build.Tasks" />
+     <PackageReference Include="NuGet.Frameworks">
+diff --git a/src/Build/Logging/BinaryLogger/BinaryLogger.cs b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+index 8be89caf254..a7b005a1925 100644
+--- a/src/Build/Logging/BinaryLogger/BinaryLogger.cs
++++ b/src/Build/Logging/BinaryLogger/BinaryLogger.cs
+@@ -121,7 +121,7 @@ public enum ProjectImportsCollectionMode
+         /// </summary>
+         public ProjectImportsCollectionMode CollectProjectImports { get; set; } = ProjectImportsCollectionMode.Embed;
+ 
+-        private string FilePath { get; set; }
++        internal string FilePath { get; private set; }
+ 
+         /// <summary> Gets or sets the verbosity level.</summary>
+         /// <remarks>
+@@ -135,6 +135,15 @@ public enum ProjectImportsCollectionMode
+         /// </summary>
+         public string Parameters { get; set; }
+ 
++        /// <summary>
++        /// Optional expander of wildcard(s) within the LogFile path parameter of a binlog <see cref="Parameters"/>.
++        /// Wildcards can be used in the LogFile parameter in a form for curly brackets ('{}', '{[param]}').
++        /// Currently, the only supported wildcard is '{}', the optional parameters within the curly brackets
++        ///  are not currently supported, however the string parameter to the <see cref="PathParameterExpander"/> func
++        /// is reserved for this purpose.
++        /// </summary>
++        internal Func<string, string> PathParameterExpander { private get; set; } = ExpandPathParameter;
++
+         /// <summary>
+         /// Initializes the logger by subscribing to events of the specified event source and embedded content source.
+         /// </summary>
+@@ -417,15 +426,9 @@ private void ProcessParameters(out bool omitInitialInfo)
+                 {
+                     omitInitialInfo = true;
+                 }
+-                else if (parameter.EndsWith(".binlog", StringComparison.OrdinalIgnoreCase))
++                else if (TryInterpretPathParameter(parameter, out string filePath))
+                 {
+-                    FilePath = parameter;
+-                    if (FilePath.StartsWith("LogFile=", StringComparison.OrdinalIgnoreCase))
+-                    {
+-                        FilePath = FilePath.Substring("LogFile=".Length);
+-                    }
+-
+-                    FilePath = FilePath.Trim('"');
++                    FilePath = filePath;
+                 }
+                 else
+                 {
+@@ -451,5 +454,47 @@ private void ProcessParameters(out bool omitInitialInfo)
+                 throw new LoggerException(message, e, errorCode, helpKeyword);
+             }
+         }
++
++        private bool TryInterpretPathParameter(string parameter, out string filePath)
++        {
++            bool hasPathPrefix = parameter.StartsWith("LogFile=", StringComparison.OrdinalIgnoreCase);
++
++            if (hasPathPrefix)
++            {
++                parameter = parameter.Substring("LogFile=".Length);
++            }
++
++            parameter = parameter.Trim('"');
++
++            bool isWildcard = ChangeWaves.AreFeaturesEnabled(ChangeWaves.Wave17_12) && parameter.Contains("{}");
++            bool hasProperExtension = parameter.EndsWith(".binlog", StringComparison.OrdinalIgnoreCase);
++            filePath = parameter;
++
++            if (!isWildcard)
++            {
++                return hasProperExtension;
++            }
++
++            filePath = parameter.Replace("{}", GetUniqueStamp(), StringComparison.Ordinal);
++
++            if (!hasProperExtension)
++            {
++                filePath += ".binlog";
++            }
++            return true;
++        }
++
++        private string GetUniqueStamp()
++            => (PathParameterExpander ?? ExpandPathParameter)(string.Empty);
++
++        private static string ExpandPathParameter(string parameters)
++            => $"{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss")}--{ProcessId}--{StringUtils.GenerateRandomString(6)}";
++
++        private static int ProcessId
++#if NET
++            => Environment.ProcessId;
++#else
++            => System.Diagnostics.Process.GetCurrentProcess().Id;
++#endif
+     }
+ }
+diff --git a/src/Framework/StringUtils.cs b/src/Framework/StringUtils.cs
+new file mode 100644
+index 00000000000..e5502ab7320
+--- /dev/null
++++ b/src/Framework/StringUtils.cs
+@@ -0,0 +1,34 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++
++namespace Microsoft.Build.Framework;
++
++internal static class StringUtils
++{
++    /// <summary>
++    /// Generates a random string of the specified length.
++    /// The generated string is suitable for use in file paths.
++    /// The randomness distribution is given by the System.Random.
++    /// </summary>
++    /// <param name="length"></param>
++    /// <returns></returns>
++    internal static string GenerateRandomString(int length)
++    {
++        // Base64, 2^6 = 64
++        const int eachStringCharEncodesBites = 6;
++        const int eachByteHasBits = 8;
++        const double bytesNumNeededForSingleStringChar = eachStringCharEncodesBites / (double)eachByteHasBits;
++
++        int randomBytesNeeded = (int)Math.Ceiling(length * bytesNumNeededForSingleStringChar);
++        Random random = new();
++
++        byte[] randomBytes = new byte[randomBytesNeeded];
++        random.NextBytes(randomBytes);
++        // Base64: [A-Z], [a-z], [0-9], +, /, =
++        // We are replacing '/' to get a valid path
++        string randomBase64String = Convert.ToBase64String(randomBytes).Replace('/', '_');
++        return randomBase64String.Substring(0, length);
++    }
++}
+diff --git a/src/Tasks/ManifestUtil/ManifestFormatter.cs b/src/Tasks/ManifestUtil/ManifestFormatter.cs
+index 7171fff8e71..d7d7ee01eb1 100644
+--- a/src/Tasks/ManifestUtil/ManifestFormatter.cs
++++ b/src/Tasks/ManifestUtil/ManifestFormatter.cs
+@@ -16,8 +16,8 @@ internal static class ManifestFormatter
+         public static Stream Format(Stream input)
+         {
+             int t1 = Environment.TickCount;
+-
+-            using var r = new XmlTextReader(input)
++#pragma warning disable CA2000 // Dispose objects before losing scope - caller needs underlying stream
++            var r = new XmlTextReader(input)
+             {
+                 DtdProcessing = DtdProcessing.Ignore,
+                 WhitespaceHandling = WhitespaceHandling.None
+@@ -25,12 +25,13 @@ public static Stream Format(Stream input)
+             XmlNamespaceManager nsmgr = XmlNamespaces.GetNamespaceManager(r.NameTable);
+ 
+             var m = new MemoryStream();
+-            using var w = new XmlTextWriter(m, Encoding.UTF8)
++            var w = new XmlTextWriter(m, Encoding.UTF8)
+             {
+                 Formatting = Formatting.Indented,
+                 Indentation = 2
+             };
+             w.WriteStartDocument();
++#pragma warning restore CA2000 // Dispose objects before losing scope
+ 
+             while (r.Read())
+             {
+@@ -100,4 +101,4 @@ public static Stream Format(Stream input)
+             return m;
+         }
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/src/Tasks/ManifestUtil/ManifestReader.cs b/src/Tasks/ManifestUtil/ManifestReader.cs
+index 013388c22d7..3d6393e6518 100644
+--- a/src/Tasks/ManifestUtil/ManifestReader.cs
++++ b/src/Tasks/ManifestUtil/ManifestReader.cs
+@@ -238,7 +238,7 @@ private static Manifest Deserialize(Stream s)
+             var xs = new XmlSerializer(t);
+ 
+             int t1 = Environment.TickCount;
+-            var xrSettings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore };
++            var xrSettings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore, CloseInput = false };
+             using (XmlReader xr = XmlReader.Create(s, xrSettings))
+             {
+                 var m = (Manifest)xs.Deserialize(xr);
+diff --git a/src/Tasks/ManifestUtil/XmlUtil.cs b/src/Tasks/ManifestUtil/XmlUtil.cs
+index 709aaa1e9e3..32f985124aa 100644
+--- a/src/Tasks/ManifestUtil/XmlUtil.cs
++++ b/src/Tasks/ManifestUtil/XmlUtil.cs
+@@ -114,8 +114,10 @@ public static Stream XslTransform(string resource, Stream input, params Dictiona
+                     }
+                 }
+ 
+-                using var m = new MemoryStream();
+-                using var w = new XmlTextWriter(m, Encoding.UTF8);
++#pragma warning disable CA2000 // Dispose objects before losing scope - the caller expects to receive an open stream
++                var m = new MemoryStream();
++                var w = new XmlTextWriter(m, Encoding.UTF8);
++#pragma warning restore CA2000 // Dispose objects before losing scope
+                 w.WriteStartDocument();
+ 
+                 int t5 = Environment.TickCount;
+@@ -127,6 +129,7 @@ public static Stream XslTransform(string resource, Stream input, params Dictiona
+                 m.Position = 0;
+ 
+                 Util.WriteLog(String.Format(CultureInfo.CurrentCulture, "XslCompiledTransform(\"{0}\") t={1}", resource, Environment.TickCount - t1));
++
+                 return m;
+             }
+         }
